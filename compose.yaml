@@ -2,9 +2,10 @@ services:
   daemon:
     build: .
     network_mode: host
-    command: ["serve", "--state-dir", "/state", "--host", "127.0.0.1", "--port", "7331"]
+    command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--host", "127.0.0.1", "--port", "7331"]
     volumes:
       - platform-state:/state
+      - memory-libraries:/memory-libraries
     healthcheck:
       test:
         - CMD
@@ -41,6 +42,7 @@ services:
       API_KEY_FILE: /state/api-key
     volumes:
       - platform-state:/state:ro
+      - memory-libraries:/memory-libraries
       - ./tests:/app/tests:ro
     depends_on:
       daemon:
@@ -50,3 +52,4 @@ services:
 
 volumes:
   platform-state:
+  memory-libraries:

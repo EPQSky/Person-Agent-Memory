@@ -1,13 +1,43 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
+import stat
+import uuid
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
+
+LibraryKind = Literal["user", "project"]
+
+
+class LibraryRegistrationError(ValueError):
+    """Raised when a path cannot safely become a memory library."""
+
+
+class DuplicateLibraryError(LibraryRegistrationError):
+    def __init__(self, library_id: str) -> None:
+        self.library_id = library_id
+        super().__init__("canonical path is already registered")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryLibrary:
+    id: str
+    kind: LibraryKind
+    canonical_path: str
+    availability: str
+    sync_status: str
+
+    def payload(self) -> dict[str, str]:
+        return asdict(self)
 
 
 class PlatformState:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, library_roots: tuple[Path, ...] = ()) -> None:
         self.database_path = database_path
+        self.library_roots = library_roots
         self.connection: sqlite3.Connection | None = None
         self.worker_task: asyncio.Task[None] | None = None
         self.stop_worker = asyncio.Event()
@@ -36,6 +66,13 @@ class PlatformState:
                     kind TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_libraries (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK(kind IN ('user', 'project')),
+                    canonical_path TEXT NOT NULL UNIQUE,
+                    sync_status TEXT NOT NULL DEFAULT 'not_started',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 """
@@ -87,6 +124,117 @@ class PlatformState:
             "SELECT status FROM background_jobs WHERE id = ?", (job_id,)
         ).fetchone()
         return None if row is None else str(row[0])
+
+    def register_library(self, requested_path: str, kind: LibraryKind) -> MemoryLibrary:
+        assert self.connection is not None
+        if not requested_path.strip():
+            raise LibraryRegistrationError("memory library path must not be empty")
+        requested = Path(requested_path).expanduser()
+        if requested.is_symlink() and not requested.exists():
+            raise LibraryRegistrationError(
+                "memory library path cannot be resolved: dangling or cyclic symbolic link"
+            )
+        try:
+            path = requested.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise LibraryRegistrationError(
+                f"memory library path cannot be resolved: {error}"
+            ) from error
+        self._validate_library_path(path)
+        canonical_path = os.path.normcase(str(path))
+        duplicate = self.connection.execute(
+            "SELECT id FROM memory_libraries WHERE canonical_path = ?", (canonical_path,)
+        ).fetchone()
+        if duplicate is not None:
+            raise DuplicateLibraryError(str(duplicate[0]))
+
+        if path.exists():
+            if not path.is_dir():
+                raise LibraryRegistrationError("memory library path must be a directory")
+        else:
+            try:
+                path.mkdir(parents=True, mode=0o700)
+            except OSError as error:
+                raise LibraryRegistrationError(
+                    f"memory library directory could not be created: {error.strerror or error}"
+                ) from error
+        self._require_accessible_directory(path)
+
+        library_id = str(uuid.uuid4())
+        self.connection.execute(
+            "INSERT INTO memory_libraries (id, kind, canonical_path) VALUES (?, ?, ?)",
+            (library_id, kind, canonical_path),
+        )
+        self.connection.commit()
+        return MemoryLibrary(library_id, kind, canonical_path, "available", "not_started")
+
+    def list_libraries(self) -> list[MemoryLibrary]:
+        assert self.connection is not None
+        rows = self.connection.execute(
+            """SELECT id, kind, canonical_path, sync_status
+               FROM memory_libraries ORDER BY created_at, id"""
+        ).fetchall()
+        return [
+            MemoryLibrary(
+                id=str(row[0]),
+                kind=row[1],
+                canonical_path=str(row[2]),
+                availability=self._availability(Path(str(row[2]))),
+                sync_status=str(row[3]),
+            )
+            for row in rows
+        ]
+
+    def library(self, library_id: str) -> MemoryLibrary | None:
+        return next((item for item in self.list_libraries() if item.id == library_id), None)
+
+    def _validate_library_path(self, path: Path) -> None:
+        if not self.library_roots:
+            raise LibraryRegistrationError("no allowed memory library roots are configured")
+        if not any(path == root or path.is_relative_to(root) for root in self.library_roots):
+            roots = ", ".join(str(root) for root in self.library_roots)
+            raise LibraryRegistrationError(f"path is outside allowed roots: {roots}")
+
+    @staticmethod
+    def _require_accessible_directory(path: Path) -> None:
+        try:
+            mode = path.stat().st_mode
+        except OSError as error:
+            raise LibraryRegistrationError(
+                f"memory library path is not accessible: {error.strerror or error}"
+            ) from error
+        if not stat.S_ISDIR(mode):
+            raise LibraryRegistrationError("memory library path must be a directory")
+        if mode & 0o222 == 0:
+            raise LibraryRegistrationError("memory library directory must be writable")
+        if mode & 0o444 == 0 or mode & 0o111 == 0:
+            raise LibraryRegistrationError(
+                "memory library directory must be readable and searchable"
+            )
+        if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+            raise LibraryRegistrationError(
+                "memory library directory is not accessible to the daemon user"
+            )
+
+    def _availability(self, path: Path) -> str:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "unavailable"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "unavailable"
+
+        try:
+            current_path = path.resolve(strict=True)
+            if os.path.normcase(str(current_path)) != os.path.normcase(str(path)):
+                return "unavailable"
+            self._validate_library_path(current_path)
+            self._require_accessible_directory(current_path)
+        except (LibraryRegistrationError, OSError, RuntimeError):
+            return "unavailable"
+        return "available"
 
     def _execute_pending_jobs(self) -> None:
         assert self.connection is not None

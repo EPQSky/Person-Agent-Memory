@@ -8,7 +8,9 @@ Python 3.11 or newer and `uv` are required.
 
 ```bash
 uv sync --all-extras
-uv run personal-agent-memory serve --state-dir ~/.local/share/personal-agent-memory
+uv run personal-agent-memory serve \
+  --state-dir ~/.local/share/personal-agent-memory \
+  --library-root ~/memory-libraries
 ```
 
 Open `http://127.0.0.1:7331` to load the public login shell, then enter the API key
@@ -16,7 +18,8 @@ to retrieve protected service status. The login shell contains no service status
 key material. The first startup writes the generated API key to
 `~/.local/share/personal-agent-memory/api-key` with mode `0600`; the key is kept only
 in the page's current input value and request header. The daemon rejects non-loopback
-listen addresses.
+listen addresses. Repeat `--library-root` to allow additional local directory trees;
+registration resolves symlinks and rejects paths outside those explicit boundaries.
 
 ## Verify
 

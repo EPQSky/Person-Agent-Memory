@@ -9,14 +9,20 @@
       body { margin: 0; }
       header { background: #143d2b; color: white; padding: 18px 28px; }
       h1 { font-size: 20px; margin: 0; letter-spacing: 0; }
-      main { max-width: 760px; margin: 48px auto; padding: 0 24px; }
+      main { max-width: 920px; margin: 48px auto; padding: 0 24px; }
       section { border: 1px solid #ccd5cf; background: white; border-radius: 8px; padding: 24px; }
+      section + section { margin-top: 20px; }
       label { display: block; font-weight: 650; margin-bottom: 8px; }
-      input { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #8d9b92; }
+      input, select { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #8d9b92; }
       button { margin-top: 12px; padding: 10px 16px; border: 0; background: #176943; color: white; cursor: pointer; }
       dl { display: grid; grid-template-columns: 180px 1fr; gap: 8px; }
       dt { color: #526158; } dd { margin: 0; font-family: monospace; }
       .error { color: #9d241d; }
+      .field { margin-top: 14px; }
+      table { width: 100%; border-collapse: collapse; margin-top: 18px; }
+      th, td { padding: 10px 8px; border-bottom: 1px solid #dbe2de; text-align: left; vertical-align: top; }
+      th { color: #526158; font-size: 13px; text-transform: uppercase; }
+      td.path { overflow-wrap: anywhere; }
     </style>
   </head>
   <body>
@@ -29,7 +35,63 @@
         const response = await fetch('/api/v1/status', {headers: {Authorization: `Bearer ${key}`}});
         if (!response.ok) { document.querySelector('#message').className = 'error'; document.querySelector('#message').textContent = 'Authentication failed.'; return; }
         const data = await response.json();
-        root.innerHTML = `<h2>Service ready</h2><dl><dt>Database</dt><dd>${data.database}</dd><dt>Background worker</dt><dd>${data.background_worker}</dd><dt>API key fingerprint</dt><dd>${data.api_key_fingerprint}</dd><dt>Startup count</dt><dd>${data.startup_count}</dd></dl>`;
+        root.replaceChildren();
+        const statusHeading = document.createElement('h2');
+        statusHeading.textContent = 'Service ready';
+        const statusList = document.createElement('dl');
+        for (const [label, value] of [['Database', data.database], ['Background worker', data.background_worker], ['API key fingerprint', data.api_key_fingerprint], ['Startup count', data.startup_count]]) {
+          const term = document.createElement('dt');
+          const detail = document.createElement('dd');
+          term.textContent = label;
+          detail.textContent = value;
+          statusList.append(term, detail);
+        }
+        const heading = document.createElement('h2');
+        heading.textContent = 'Memory libraries';
+        const form = document.createElement('form');
+        form.innerHTML = '<div class="field"><label for="path">Directory path</label><input id="path" required></div><div class="field"><label for="kind">Library type</label><select id="kind"><option value="project">Project</option><option value="user">User</option></select></div><button type="submit">Register library</button><p id="library-message"></p>';
+        const table = document.createElement('table');
+        table.innerHTML = '<thead><tr><th>Identifier</th><th>Type</th><th>Path</th><th>Availability</th><th>Sync</th></tr></thead><tbody></tbody>';
+        root.append(statusHeading, statusList, heading, form, table);
+
+        async function refresh() {
+          const response = await fetch('/api/v1/libraries', {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) return;
+          const libraries = await response.json();
+          const body = table.querySelector('tbody');
+          body.replaceChildren();
+          for (const library of libraries) {
+            const row = document.createElement('tr');
+            for (const value of [library.id, library.kind, library.canonical_path, library.availability, library.sync_status]) {
+              const cell = document.createElement('td');
+              cell.textContent = value;
+              if (value === library.canonical_path) cell.className = 'path';
+              row.append(cell);
+            }
+            body.append(row);
+          }
+        }
+
+        form.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const response = await fetch('/api/v1/libraries', {
+            method: 'POST',
+            headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'},
+            body: JSON.stringify({path: form.querySelector('#path').value, kind: form.querySelector('#kind').value}),
+          });
+          const message = form.querySelector('#library-message');
+          if (!response.ok) {
+            const failure = await response.json();
+            message.className = 'error';
+            message.textContent = typeof failure.detail === 'string' ? failure.detail : failure.detail.reason;
+            return;
+          }
+          message.className = '';
+          message.textContent = 'Library registered.';
+          form.querySelector('#path').value = '';
+          await refresh();
+        });
+        await refresh();
       });
     </script>
   </body>

@@ -23,9 +23,16 @@ class Settings:
     state_dir: Path
     host: str = "127.0.0.1"
     port: int = 7331
+    library_roots: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_dir", self.state_dir.expanduser().resolve())
+        roots = self.library_roots or (self.state_dir.parent / "memory-libraries",)
+        object.__setattr__(
+            self,
+            "library_roots",
+            tuple(root.expanduser().resolve() for root in roots),
+        )
         if not _is_loopback(self.host):
             raise ConfigurationError("host must be an explicit loopback address")
         if not 1 <= self.port <= 65535:
