@@ -1,0 +1,4 @@
+interface:
+  display_name: "Batch Grill With Docs"
+  short_description: "批量澄清设计问题并同步记录项目领域文档与关键决策内容"
+  default_prompt: "Use $batch-grill-with-docs to batch-clarify this plan and capture stable domain decisions."

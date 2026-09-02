@@ -1,0 +1,6 @@
+interface:
+  display_name: "Vibe Guide"
+  short_description: "Route work through the installed workflow"
+  default_prompt: "Use $vibe-guide to choose the smallest complete workflow for this task."
+policy:
+  allow_implicit_invocation: false

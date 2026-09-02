@@ -1,0 +1,2 @@
+# Codex loads this file only after the project is trusted.
+# Add only portable project settings. Do not commit credentials or machine-specific absolute paths.

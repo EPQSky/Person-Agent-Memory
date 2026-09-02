@@ -1,0 +1,120 @@
+schema_version = 1
+generated_at = "2026-08-26"
+
+[[tools]]
+name = "openai-codex-plugin-validator"
+repository = "https://github.com/openai/codex"
+commit = "c9b19deb09c1841ce7acc33ddb96276030936a29"
+license = "Apache-2.0"
+upstream_paths = [
+  "codex-rs/skills/src/assets/samples/plugin-creator/scripts/validate_plugin.py",
+  "codex-rs/skills/src/assets/samples/plugin-creator/scripts/identifier_validation.py",
+]
+usage = "CI downloads and executes these files from the fixed commit; they are not redistributed in the Plugin archive."
+
+[[sources]]
+name = "mattpocock-skills"
+repository = "https://github.com/mattpocock/skills"
+release_tag = "v1.2.3"
+commit = "6acc160e4e0cd062dbbbd7a1b26ae92855edf07e"
+reviewed_head = "6acc160e4e0cd062dbbbd7a1b26ae92855edf07e"
+license = "MIT"
+copyright = "Copyright (c) 2026 Matt Pocock"
+upstream_paths = [
+  "skills/engineering/ask-matt",
+  "skills/engineering/code-review",
+  "skills/engineering/domain-modeling",
+  "skills/engineering/grill-with-docs",
+  "skills/engineering/implement",
+  "skills/engineering/setup-matt-pocock-skills",
+  "skills/engineering/tdd",
+  "skills/engineering/to-spec",
+  "skills/engineering/to-tickets",
+  "skills/engineering/triage",
+  "skills/productivity/grill-me",
+  "skills/productivity/grilling",
+  "skills/productivity/handoff",
+]
+not_imported = [
+  "skills/engineering/codebase-design",
+  "skills/engineering/diagnosing-bugs",
+  "skills/engineering/improve-codebase-architecture",
+  "skills/engineering/prototype",
+  "skills/engineering/research",
+  "skills/engineering/resolving-merge-conflicts",
+  "skills/engineering/wayfinder",
+  "skills/engineering/wizard",
+  "skills/in-progress",
+  "skills/misc",
+  "skills/productivity/teach",
+  "skills/productivity/to-questionnaire",
+  "skills/productivity/wait-what",
+  "skills/productivity/writing-for-agents",
+]
+local_changes = [
+  "Renamed ask-matt to vibe-guide and removed routes to unavailable upstream skills.",
+  "Adapted the v1.2.3 phase-boundary guidance to Codex tasks, $handoff, optional delegation, and context compaction.",
+  "Forked setup-matt-pocock-skills as the idempotent, dry-run-first vibe-init entry point.",
+  "Changed user-facing invocation examples from slash syntax to Codex $skill-name syntax.",
+  "Removed legacy disable-model-invocation frontmatter in favor of agents/openai.yaml policy.",
+  "Kept the project-approved sequential grilling rhythm and exposed v1.2.3's batched frontier behavior through batch-grill-me and batch-grill-with-docs.",
+  "Applied the v1.2.3 grilling question format and fact-finding rule without requiring delegation when unavailable.",
+  "Did not import v1.2.3 references that depend on skills outside the curated VibeForge Lite distribution.",
+  "Made implement commits opt-in and expanded code-review to include committed, staged, unstaged, and untracked work.",
+  "Added explicit untrusted-data boundaries for issue, pull-request, comment, attachment, and reporter-command inputs.",
+  "Limited to-spec to one testing-seam confirmation without reopening product discovery.",
+  "Kept parent specs out of implementation-ready state and reused spec-approved seams without repeated TDD confirmation.",
+  "Aligned local tracker states to ready-for-agent, in-progress, and done.",
+  "Added Codex UI metadata and project-specific documentation integrations.",
+  "Added dry-run-first project-local skill vendoring with provenance, license, upgrade, and conflict tracking.",
+]
+
+[[sources]]
+name = "execute-spec-tickets-attachment"
+repository = "user-supplied-attachment"
+archive_sha256 = "b33360071acffb8ad7613394c4935b6e28dfab33ce9e8e30004562a61477e3f1"
+license = "project"
+project_paths = [
+  "execute-spec-tickets",
+]
+local_changes = [
+  "Moved the validator tests from the distributable skill scripts directory into the repository test suite.",
+  "Made validator command examples portable across project-local and Plugin installations.",
+  "Treat explicit execute-spec-tickets invocation as authorization for one scoped commit per completed ticket, without repeated confirmation prompts.",
+  "Require blocked reviews to return to repair before any done state, staging, or pre-commit gate invocation; the commit gate only validates already-passed review candidates.",
+  "Integrated the skill into VibeForge Lite routing, project guidance, release metadata, and provenance records.",
+  "Raised the per-ticket repair limit from five rounds to nine and aligned the hard gate and tests.",
+  "Limited blocking review findings to high-confidence incorrect results, resource exhaustion, or acceptance failures so low-impact advice cannot consume repair rounds.",
+]
+
+[[sources]]
+name = "vibeforge-lite-local-extensions"
+repository = "local"
+commit = "dfd5b5c8419bb10cfac2368aefea21af7d28407c"
+license = "project"
+project_paths = [
+  "batch-grill-with-docs",
+  "vibe-guide",
+  "vibe-init",
+]
+local_changes = [
+  "Project-maintained documentation composition, workflow router, executable initializer, and Codex UI metadata.",
+]
+
+[skills]
+batch-grill-me = "mattpocock-skills"
+batch-grill-with-docs = "vibeforge-lite-local-extensions"
+code-review = "mattpocock-skills"
+domain-modeling = "mattpocock-skills"
+execute-spec-tickets = "execute-spec-tickets-attachment"
+grill-me = "mattpocock-skills"
+grill-with-docs = "mattpocock-skills"
+grilling = "mattpocock-skills"
+handoff = "mattpocock-skills"
+implement = "mattpocock-skills"
+tdd = "mattpocock-skills"
+to-spec = "mattpocock-skills"
+to-tickets = "mattpocock-skills"
+triage = "mattpocock-skills"
+vibe-guide = "vibeforge-lite-local-extensions"
+vibe-init = "vibeforge-lite-local-extensions"

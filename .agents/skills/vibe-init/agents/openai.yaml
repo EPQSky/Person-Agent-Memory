@@ -1,0 +1,6 @@
+interface:
+  display_name: "Vibe Init"
+  short_description: "Initialize or migrate a repository workflow"
+  default_prompt: "Use $vibe-init to inspect this repository and show a dry-run initialization plan."
+policy:
+  allow_implicit_invocation: false
