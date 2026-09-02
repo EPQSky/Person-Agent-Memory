@@ -1,0 +1,52 @@
+services:
+  daemon:
+    build: .
+    network_mode: host
+    command: ["serve", "--state-dir", "/state", "--host", "127.0.0.1", "--port", "7331"]
+    volumes:
+      - platform-state:/state
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import pathlib, urllib.request
+          key = pathlib.Path('/state/api-key').read_text().strip()
+          request = urllib.request.Request(
+              'http://127.0.0.1:7331/health/live',
+              headers={'Authorization': f'Bearer {key}'},
+          )
+          urllib.request.urlopen(request)
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  fake-model:
+    build: .
+    network_mode: host
+    entrypoint: ["python", "-m", "uvicorn"]
+    command: ["personal_agent_memory.fake_model:app", "--host", "127.0.0.1", "--port", "18080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/health')"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  acceptance:
+    build: .
+    network_mode: host
+    entrypoint: ["python", "/app/tests/docker_acceptance.py"]
+    environment:
+      API_KEY_FILE: /state/api-key
+    volumes:
+      - platform-state:/state:ro
+      - ./tests:/app/tests:ro
+    depends_on:
+      daemon:
+        condition: service_healthy
+      fake-model:
+        condition: service_healthy
+
+volumes:
+  platform-state:
