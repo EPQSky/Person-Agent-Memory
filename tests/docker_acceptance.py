@@ -9,12 +9,16 @@ import stat
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
 def request(
-    url: str, key: str | None = None, payload: dict[str, object] | None = None
+    url: str,
+    key: str | None = None,
+    payload: dict[str, object] | None = None,
+    method: str | None = None,
 ) -> tuple[int, dict[str, object]]:
     headers = {} if key is None else {"Authorization": f"Bearer {key}"}
     data = None
@@ -22,9 +26,10 @@ def request(
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode()
     try:
-        request_value = urllib.request.Request(url, headers=headers, data=data)
+        request_value = urllib.request.Request(url, headers=headers, data=data, method=method)
         with urllib.request.urlopen(request_value, timeout=2) as response:
-            return response.status, json.load(response)
+            body = response.read()
+            return response.status, {} if not body else json.loads(body)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
 
@@ -122,9 +127,7 @@ outside_replacement.mkdir(exist_ok=True)
 created_path = Path(str(created["canonical_path"]))
 created_path.rmdir()
 created_path.symlink_to(existing, target_is_directory=True)
-replacement_code, replacement_list = request(
-    "http://127.0.0.1:7331/api/v1/libraries", key
-)
+replacement_code, replacement_list = request("http://127.0.0.1:7331/api/v1/libraries", key)
 assert replacement_code == 200
 replacement = next(item for item in replacement_list if item["id"] == created["id"])
 assert replacement["availability"] == "unavailable"
@@ -141,9 +144,7 @@ outside_replacement_code, outside_replacement_list = request(
     "http://127.0.0.1:7331/api/v1/libraries", key
 )
 assert outside_replacement_code == 200
-outside_health = next(
-    item for item in outside_replacement_list if item["id"] == created["id"]
-)
+outside_health = next(item for item in outside_replacement_list if item["id"] == created["id"])
 assert outside_health["availability"] == "unavailable"
 
 source_parent = memory_root / "source-parent"
@@ -165,9 +166,7 @@ assert ancestor_target_code == 201
 source_path.rmdir()
 source_parent.rmdir()
 source_parent.symlink_to(target_parent, target_is_directory=True)
-ancestor_code, ancestor_list = request(
-    "http://127.0.0.1:7331/api/v1/libraries", key
-)
+ancestor_code, ancestor_list = request("http://127.0.0.1:7331/api/v1/libraries", key)
 assert ancestor_code == 200
 ancestor_by_id = {item["id"]: item for item in ancestor_list}
 assert ancestor_by_id[ancestor_source["id"]]["canonical_path"] == str(source_path)
@@ -179,6 +178,209 @@ ancestor_sync_code, ancestor_sync = request(
 )
 assert ancestor_sync_code == 200
 assert ancestor_sync["availability"] == "unavailable"
+
+# Project binding and Codex cwd resolution use explicit canonical roots only.
+project_library_code, project_library = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(memory_root / "binding-project"), "kind": "project"},
+)
+replacement_library_code, replacement_library = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(memory_root / "binding-replacement"), "kind": "project"},
+)
+assert project_library_code == replacement_library_code == 201
+docker_projects = Path("/project-roots")
+shutil.rmtree(docker_projects, ignore_errors=True)
+same_name_one = docker_projects / "one" / "service"
+same_name_two = docker_projects / "two" / "service"
+nested_project = same_name_one / "packages" / "nested"
+unbound_same_name = docker_projects / "unbound" / "service"
+worktree = docker_projects / "worktrees" / "feature"
+embedded_worktree = same_name_one / ".worktrees" / "feature"
+for path in (
+    same_name_one / "src",
+    same_name_two / "src",
+    nested_project / "src",
+    unbound_same_name / "src",
+    worktree / "src",
+    embedded_worktree / "src",
+):
+    path.mkdir(parents=True)
+main_git = same_name_one / ".git"
+worktree_git_dir = main_git / "worktrees" / "feature"
+worktree_git_dir.mkdir(parents=True)
+(main_git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+(embedded_worktree / ".git").write_text(
+    f"gitdir: {os.path.relpath(worktree_git_dir, embedded_worktree)}\n",
+    encoding="utf-8",
+)
+(worktree_git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+(worktree_git_dir / "gitdir").write_text(
+    f"{os.path.relpath(embedded_worktree / '.git', worktree_git_dir)}\n",
+    encoding="utf-8",
+)
+(worktree_git_dir / "HEAD").write_text("ref: refs/heads/feature\n", encoding="utf-8")
+fake_marker_root = same_name_one / "ordinary-marker"
+(fake_marker_root / "src").mkdir(parents=True)
+(fake_marker_root / ".git").write_text(
+    "gitdir: /untrusted/content/is/not-read\n", encoding="utf-8"
+)
+
+user_binding_code, user_binding = request(
+    "http://127.0.0.1:7331/api/v1/project-bindings",
+    key,
+    {"project_root": str(same_name_one), "library_id": created["id"]},
+)
+assert user_binding_code == 422
+assert "project memory library" in user_binding["detail"]
+empty_bindings_code, empty_bindings = request("http://127.0.0.1:7331/api/v1/project-bindings", key)
+assert empty_bindings_code == 200
+assert empty_bindings == []
+
+
+def bind(root: Path, library_id: object) -> dict[str, object]:
+    code, binding = request(
+        "http://127.0.0.1:7331/api/v1/project-bindings",
+        key,
+        {"project_root": str(root), "library_id": library_id},
+    )
+    assert code == 201
+    return binding
+
+
+main_binding = bind(same_name_one, project_library["id"])
+other_binding = bind(same_name_two, replacement_library["id"])
+nested_binding = bind(nested_project, replacement_library["id"])
+
+resolve_url = "http://127.0.0.1:7331/api/v1/project-bindings/resolve?cwd="
+main_code, main_resolution = request(
+    resolve_url + urllib.parse.quote(str(same_name_one / "src")), key
+)
+other_code, other_resolution = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(same_name_two / "src")},
+)
+nested_code, nested_resolution = request(
+    resolve_url + urllib.parse.quote(str(nested_project / "src")), key
+)
+unbound_code, unbound_resolution = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(unbound_same_name / "src")},
+)
+worktree_before_code, worktree_before = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(worktree / "src")},
+)
+assert main_code == other_code == nested_code == unbound_code == worktree_before_code == 200
+assert main_resolution["project_id"] == main_binding["id"]
+assert main_resolution["library_id"] == project_library["id"]
+assert other_resolution["project_id"] == other_binding["id"]
+assert other_resolution["library_id"] == replacement_library["id"]
+assert nested_resolution["project_id"] == nested_binding["id"]
+assert nested_resolution["library_id"] == replacement_library["id"]
+assert unbound_resolution["status"] == "unbound"
+assert worktree_before["status"] == "unbound"
+embedded_before_code, embedded_before = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(embedded_worktree / "src")},
+)
+assert embedded_before_code == 200
+assert embedded_before["status"] == "unbound"
+fake_marker_code, fake_marker_resolution = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(fake_marker_root / "src")},
+)
+assert fake_marker_code == 200
+assert fake_marker_resolution["project_id"] == main_binding["id"]
+
+worktree_code, worktree_binding = request(
+    "http://127.0.0.1:7331/api/v1/project-bindings/worktrees",
+    key,
+    {
+        "worktree_root": str(worktree),
+        "main_project_binding_id": main_binding["id"],
+    },
+)
+assert worktree_code == 201
+worktree_after_code, worktree_after = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(worktree / "src")},
+)
+assert worktree_after_code == 200
+assert worktree_after["project_id"] == main_binding["id"]
+assert worktree_after["binding_id"] == worktree_binding["id"]
+assert worktree_after["library_id"] == project_library["id"]
+
+embedded_code, embedded_binding = request(
+    "http://127.0.0.1:7331/api/v1/project-bindings/worktrees",
+    key,
+    {
+        "worktree_root": str(embedded_worktree),
+        "main_project_binding_id": main_binding["id"],
+    },
+)
+assert embedded_code == 201
+embedded_after_code, embedded_after = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(embedded_worktree / "src")},
+)
+assert embedded_after_code == 200
+assert embedded_after["binding_id"] == embedded_binding["id"]
+assert embedded_after["project_id"] == main_binding["id"]
+assert embedded_after["library_id"] == project_library["id"]
+
+update_code, updated_binding = request(
+    f"http://127.0.0.1:7331/api/v1/project-bindings/{main_binding['id']}",
+    key,
+    {"library_id": replacement_library["id"]},
+    method="PUT",
+)
+assert update_code == 200
+assert updated_binding["library_id"] == replacement_library["id"]
+inherited_update_code, inherited_update = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(worktree / "src")},
+)
+assert inherited_update_code == 200
+assert inherited_update["library_id"] == replacement_library["id"]
+
+delete_code, _ = request(
+    f"http://127.0.0.1:7331/api/v1/project-bindings/{nested_binding['id']}",
+    key,
+    method="DELETE",
+)
+assert delete_code == 204
+after_delete_code, after_delete = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(nested_project / "src")},
+)
+assert after_delete_code == 200
+assert after_delete["project_id"] == main_binding["id"]
+
+same_name_one.rename(docker_projects / "moved-service")
+same_name_one.mkdir(parents=True)
+diagnostic_code, diagnostics = request("http://127.0.0.1:7331/api/v1/project-bindings", key)
+assert diagnostic_code == 200
+diagnostic = next(item for item in diagnostics if item["id"] == main_binding["id"])
+assert diagnostic["availability"] == "replaced"
+replacement_resolution_code, replacement_resolution = request(
+    "http://127.0.0.1:7331/mcp/project-bindings/resolve",
+    key,
+    {"cwd": str(same_name_one)},
+)
+assert replacement_resolution_code == 200
+assert replacement_resolution["status"] == "unbound"
 
 # Exercise persistence across two real daemon processes inside the isolated acceptance container.
 restart_state = Path("/tmp/pam-restart-state")
@@ -276,13 +478,9 @@ try:
     permission_key = ""
     while time.monotonic() < deadline:
         if (permission_state / "api-key").exists():
-            permission_key = (permission_state / "api-key").read_text(
-                encoding="utf-8"
-            ).strip()
+            permission_key = (permission_state / "api-key").read_text(encoding="utf-8").strip()
             try:
-                if request(
-                    "http://127.0.0.1:17332/api/v1/status", permission_key
-                )[0] == 200:
+                if request("http://127.0.0.1:17332/api/v1/status", permission_key)[0] == 200:
                     break
             except OSError:
                 pass
@@ -303,9 +501,7 @@ try:
     assert inaccessible[0]["id"] == permission_registered["id"]
     assert inaccessible[0]["availability"] == "unavailable"
     permission_parent.chmod(0o700)
-    recovered_code, recovered = request(
-        "http://127.0.0.1:17332/api/v1/libraries", permission_key
-    )
+    recovered_code, recovered = request("http://127.0.0.1:17332/api/v1/libraries", permission_key)
     assert recovered_code == 200
     assert recovered[0]["id"] == permission_registered["id"]
     assert recovered[0]["availability"] == "available"
@@ -319,9 +515,7 @@ assert request(
     "http://127.0.0.1:18080/v1/chat/completions",
     payload={"messages": [{"role": "user", "content": "fixture"}]},
 )[1]["choices"]
-assert request("http://127.0.0.1:18080/v1/embeddings", payload={"input": ["fixture"]})[1][
-    "data"
-]
+assert request("http://127.0.0.1:18080/v1/embeddings", payload={"input": ["fixture"]})[1]["data"]
 assert request(
     "http://127.0.0.1:18080/v1/rerank",
     payload={"query": "fixture", "documents": ["a", "longer"]},

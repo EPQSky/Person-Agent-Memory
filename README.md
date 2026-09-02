@@ -32,6 +32,8 @@ uv run mypy
 Docker acceptance uses a deterministic local OpenAI-compatible fake model and no paid service:
 
 ```bash
-docker compose up --build --abort-on-container-exit --exit-code-from acceptance
-docker compose down --volumes
+./scripts/verify-docker.sh
 ```
+
+The verifier uses a unique Compose project for every run and removes its containers,
+networks, and named volumes on success, failure, or interruption.

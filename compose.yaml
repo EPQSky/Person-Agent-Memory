@@ -1,11 +1,11 @@
 services:
   daemon:
     build: .
-    network_mode: host
     command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--host", "127.0.0.1", "--port", "7331"]
     volumes:
       - platform-state:/state
       - memory-libraries:/memory-libraries
+      - project-roots:/project-roots
     healthcheck:
       test:
         - CMD
@@ -25,7 +25,7 @@ services:
 
   fake-model:
     build: .
-    network_mode: host
+    network_mode: "service:daemon"
     entrypoint: ["python", "-m", "uvicorn"]
     command: ["personal_agent_memory.fake_model:app", "--host", "127.0.0.1", "--port", "18080"]
     healthcheck:
@@ -33,16 +33,20 @@ services:
       interval: 1s
       timeout: 2s
       retries: 30
+    depends_on:
+      daemon:
+        condition: service_started
 
   acceptance:
     build: .
-    network_mode: host
+    network_mode: "service:daemon"
     entrypoint: ["python", "/app/tests/docker_acceptance.py"]
     environment:
       API_KEY_FILE: /state/api-key
     volumes:
       - platform-state:/state:ro
       - memory-libraries:/memory-libraries
+      - project-roots:/project-roots
       - ./tests:/app/tests:ro
     depends_on:
       daemon:
@@ -53,3 +57,4 @@ services:
 volumes:
   platform-state:
   memory-libraries:
+  project-roots:

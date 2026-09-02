@@ -15,6 +15,7 @@
       label { display: block; font-weight: 650; margin-bottom: 8px; }
       input, select { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #8d9b92; }
       button { margin-top: 12px; padding: 10px 16px; border: 0; background: #176943; color: white; cursor: pointer; }
+      button.danger { background: #9d241d; margin: 0; }
       dl { display: grid; grid-template-columns: 180px 1fr; gap: 8px; }
       dt { color: #526158; } dd { margin: 0; font-family: monospace; }
       .error { color: #9d241d; }
@@ -52,12 +53,37 @@
         form.innerHTML = '<div class="field"><label for="path">Directory path</label><input id="path" required></div><div class="field"><label for="kind">Library type</label><select id="kind"><option value="project">Project</option><option value="user">User</option></select></div><button type="submit">Register library</button><p id="library-message"></p>';
         const table = document.createElement('table');
         table.innerHTML = '<thead><tr><th>Identifier</th><th>Type</th><th>Path</th><th>Availability</th><th>Sync</th></tr></thead><tbody></tbody>';
-        root.append(statusHeading, statusList, heading, form, table);
+        const bindingHeading = document.createElement('h2');
+        bindingHeading.textContent = 'Project bindings';
+        const bindingForm = document.createElement('form');
+        bindingForm.innerHTML = '<div class="field"><label for="project-root">Project root</label><input id="project-root" required></div><div class="field"><label for="project-library">Project memory library</label><select id="project-library" required></select></div><button type="submit">Bind project</button><p id="binding-message"></p>';
+        const worktreeForm = document.createElement('form');
+        worktreeForm.innerHTML = '<div class="field"><label for="worktree-root">Worktree root</label><input id="worktree-root" required></div><div class="field"><label for="main-binding">Main project</label><select id="main-binding" required></select></div><button type="submit">Associate worktree</button><p id="worktree-message"></p>';
+        const bindingTable = document.createElement('table');
+        bindingTable.innerHTML = '<thead><tr><th>Project</th><th>Kind</th><th>Root</th><th>Library</th><th>Availability</th><th>Actions</th></tr></thead><tbody></tbody>';
+        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable);
+
+        let projectLibraries = [];
+        let projectBindings = [];
+
+        function fillSelect(select, options, valueFor, labelFor) {
+          const selected = select.value;
+          select.replaceChildren();
+          for (const optionValue of options) {
+            const option = document.createElement('option');
+            option.value = valueFor(optionValue);
+            option.textContent = labelFor(optionValue);
+            select.append(option);
+          }
+          if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+        }
 
         async function refresh() {
           const response = await fetch('/api/v1/libraries', {headers: {Authorization: `Bearer ${key}`}});
           if (!response.ok) return;
           const libraries = await response.json();
+          projectLibraries = libraries.filter((library) => library.kind === 'project');
+          fillSelect(bindingForm.querySelector('#project-library'), projectLibraries, (library) => library.id, (library) => `${library.canonical_path} (${library.id})`);
           const body = table.querySelector('tbody');
           body.replaceChildren();
           for (const library of libraries) {
@@ -68,6 +94,49 @@
               if (value === library.canonical_path) cell.className = 'path';
               row.append(cell);
             }
+            body.append(row);
+          }
+          await refreshBindings();
+        }
+
+        async function refreshBindings() {
+          const response = await fetch('/api/v1/project-bindings', {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) return;
+          projectBindings = await response.json();
+          const directBindings = projectBindings.filter((binding) => binding.kind === 'project');
+          fillSelect(worktreeForm.querySelector('#main-binding'), directBindings, (binding) => binding.id, (binding) => `${binding.canonical_root} (${binding.id})`);
+          const body = bindingTable.querySelector('tbody');
+          body.replaceChildren();
+          for (const binding of projectBindings) {
+            const row = document.createElement('tr');
+            for (const value of [binding.project_id, binding.kind, binding.canonical_root, binding.library_id, binding.availability]) {
+              const cell = document.createElement('td');
+              cell.textContent = value;
+              if (value === binding.canonical_root) cell.className = 'path';
+              row.append(cell);
+            }
+            const actions = document.createElement('td');
+            if (binding.kind === 'project') {
+              const librarySelect = document.createElement('select');
+              fillSelect(librarySelect, projectLibraries, (library) => library.id, (library) => library.canonical_path);
+              librarySelect.value = binding.library_id;
+              librarySelect.setAttribute('aria-label', `Memory library for ${binding.canonical_root}`);
+              librarySelect.addEventListener('change', async () => {
+                await fetch(`/api/v1/project-bindings/${binding.id}`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({library_id: librarySelect.value})});
+                await refreshBindings();
+              });
+              actions.append(librarySelect);
+            }
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'danger';
+            remove.textContent = binding.kind === 'project' ? 'Unbind' : 'Remove association';
+            remove.addEventListener('click', async () => {
+              await fetch(`/api/v1/project-bindings/${binding.id}`, {method: 'DELETE', headers: {Authorization: `Bearer ${key}`}});
+              await refreshBindings();
+            });
+            actions.append(remove);
+            row.append(actions);
             body.append(row);
           }
         }
@@ -90,6 +159,26 @@
           message.textContent = 'Library registered.';
           form.querySelector('#path').value = '';
           await refresh();
+        });
+        bindingForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const response = await fetch('/api/v1/project-bindings', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({project_root: bindingForm.querySelector('#project-root').value, library_id: bindingForm.querySelector('#project-library').value})});
+          const message = bindingForm.querySelector('#binding-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = typeof failure.detail === 'string' ? failure.detail : failure.detail.reason; return; }
+          message.className = '';
+          message.textContent = 'Project bound.';
+          bindingForm.querySelector('#project-root').value = '';
+          await refreshBindings();
+        });
+        worktreeForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const response = await fetch('/api/v1/project-bindings/worktrees', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({worktree_root: worktreeForm.querySelector('#worktree-root').value, main_project_binding_id: worktreeForm.querySelector('#main-binding').value})});
+          const message = worktreeForm.querySelector('#worktree-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = typeof failure.detail === 'string' ? failure.detail : failure.detail.reason; return; }
+          message.className = '';
+          message.textContent = 'Worktree associated.';
+          worktreeForm.querySelector('#worktree-root').value = '';
+          await refreshBindings();
         });
         await refresh();
       });

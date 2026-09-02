@@ -6,22 +6,42 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 from personal_agent_memory.config import Settings
 from personal_agent_memory.security import ApiKeyStore
 from personal_agent_memory.state import (
     DuplicateLibraryError,
+    DuplicateProjectBindingError,
     LibraryKind,
     LibraryRegistrationError,
     PlatformState,
+    ProjectBindingError,
 )
 
 
 class LibraryRegistration(BaseModel):
     path: str
     kind: LibraryKind
+
+
+class ProjectBindingRegistration(BaseModel):
+    project_root: str
+    library_id: str
+
+
+class ProjectBindingUpdate(BaseModel):
+    library_id: str
+
+
+class WorktreeAssociation(BaseModel):
+    worktree_root: str
+    main_project_binding_id: str
+
+
+class CwdResolution(BaseModel):
+    cwd: str
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -95,9 +115,7 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def register_library(registration: LibraryRegistration) -> dict[str, str]:
         try:
-            return platform_state.register_library(
-                registration.path, registration.kind
-            ).payload()
+            return platform_state.register_library(registration.path, registration.kind).payload()
         except DuplicateLibraryError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -116,9 +134,96 @@ def create_app(settings: Settings) -> FastAPI:
     async def mcp_list_libraries() -> list[dict[str, str]]:
         return libraries_payload()
 
-    @app.get(
-        "/mcp/libraries/{library_id}/sync-status", dependencies=[Depends(authenticate)]
+    def project_bindings_payload() -> list[dict[str, str]]:
+        return [binding.payload() for binding in platform_state.list_project_bindings()]
+
+    @app.get("/api/v1/project-bindings/resolve", dependencies=[Depends(authenticate)])
+    async def resolve_project_binding(cwd: str) -> dict[str, str]:
+        try:
+            return platform_state.resolve_project_binding(cwd)
+        except ProjectBindingError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
+    @app.post("/mcp/project-bindings/resolve", dependencies=[Depends(authenticate)])
+    async def mcp_resolve_project_binding(resolution: CwdResolution) -> dict[str, str]:
+        try:
+            return platform_state.resolve_project_binding(resolution.cwd)
+        except ProjectBindingError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
+    @app.post(
+        "/api/v1/project-bindings/worktrees",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_201_CREATED,
     )
+    async def associate_worktree(association: WorktreeAssociation) -> dict[str, str]:
+        try:
+            return platform_state.associate_worktree(
+                association.worktree_root, association.main_project_binding_id
+            ).payload()
+        except DuplicateProjectBindingError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason": str(error), "binding_id": error.binding_id},
+            ) from error
+        except ProjectBindingError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
+    @app.post(
+        "/api/v1/project-bindings",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def bind_project(binding: ProjectBindingRegistration) -> dict[str, str]:
+        try:
+            return platform_state.bind_project(binding.project_root, binding.library_id).payload()
+        except DuplicateProjectBindingError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason": str(error), "binding_id": error.binding_id},
+            ) from error
+        except ProjectBindingError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
+    @app.get("/api/v1/project-bindings", dependencies=[Depends(authenticate)])
+    async def list_project_bindings() -> list[dict[str, str]]:
+        return project_bindings_payload()
+
+    @app.put("/api/v1/project-bindings/{binding_id}", dependencies=[Depends(authenticate)])
+    async def update_project_binding(
+        binding_id: str, update: ProjectBindingUpdate
+    ) -> dict[str, str]:
+        try:
+            return platform_state.update_project_binding(binding_id, update.library_id).payload()
+        except ProjectBindingError as error:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if str(error) == "project binding not found"
+                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            )
+            raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+    @app.delete(
+        "/api/v1/project-bindings/{binding_id}",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_project_binding(binding_id: str) -> Response:
+        try:
+            platform_state.delete_project_binding(binding_id)
+        except ProjectBindingError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.get("/mcp/libraries/{library_id}/sync-status", dependencies=[Depends(authenticate)])
     async def mcp_sync_status(library_id: str) -> dict[str, str]:
         library = platform_state.library(library_id)
         if library is None:
