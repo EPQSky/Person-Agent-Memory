@@ -20,6 +20,19 @@ key material. The first startup writes the generated API key to
 in the page's current input value and request header. The daemon rejects non-loopback
 listen addresses. Repeat `--library-root` to allow additional local directory trees;
 registration resolves symlinks and rejects paths outside those explicit boundaries.
+Existing Markdown is indexed at registration without rewriting the files. The scanner skips
+version-control, dependency, build, cache, virtual-environment and platform-state directories.
+Symbolic links and non-regular files are intentionally excluded. A Markdown file that cannot be
+read completely as UTF-8, or any transient filesystem inspection failure, makes the scan fail
+without removing prior index entries. Use the authenticated ignore-rule and scan endpoints to apply
+library-specific exclusions and incrementally reconcile additions, changes and deletions:
+`GET`/`PUT /api/v1/libraries/{library_id}/ignore-rules` and
+`POST /api/v1/libraries/{library_id}/scan`.
+
+Direct keyword search is available through `POST /api/v1/search`, `POST /mcp/search`, and the Web
+interface. Both APIs accept `cwd`, `query`, and an optional `limit`; the daemon resolves `cwd`
+through explicit project bindings and searches only that project's memory library. Unbound
+working directories return an explicit `unbound` response with no results.
 
 ## Verify
 

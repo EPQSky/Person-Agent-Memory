@@ -24,6 +24,9 @@
       th, td { padding: 10px 8px; border-bottom: 1px solid #dbe2de; text-align: left; vertical-align: top; }
       th { color: #526158; font-size: 13px; text-transform: uppercase; }
       td.path { overflow-wrap: anywhere; }
+      .search-result { border-top: 1px solid #dbe2de; padding: 14px 0; }
+      .search-result pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source { color: #526158; font: 13px/1.4 monospace; }
     </style>
   </head>
   <body>
@@ -61,7 +64,11 @@
         worktreeForm.innerHTML = '<div class="field"><label for="worktree-root">Worktree root</label><input id="worktree-root" required></div><div class="field"><label for="main-binding">Main project</label><select id="main-binding" required></select></div><button type="submit">Associate worktree</button><p id="worktree-message"></p>';
         const bindingTable = document.createElement('table');
         bindingTable.innerHTML = '<thead><tr><th>Project</th><th>Kind</th><th>Root</th><th>Library</th><th>Availability</th><th>Actions</th></tr></thead><tbody></tbody>';
-        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable);
+        const searchHeading = document.createElement('h2');
+        searchHeading.textContent = 'Search project memory';
+        const searchForm = document.createElement('form');
+        searchForm.innerHTML = '<div class="field"><label for="search-cwd">Project working directory</label><input id="search-cwd" required></div><div class="field"><label for="search-query">Keywords</label><input id="search-query" required></div><button type="submit">Search</button><p id="search-message"></p><div id="search-results"></div>';
+        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm);
 
         let projectLibraries = [];
         let projectBindings = [];
@@ -179,6 +186,28 @@
           message.textContent = 'Worktree associated.';
           worktreeForm.querySelector('#worktree-root').value = '';
           await refreshBindings();
+        });
+        searchForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const response = await fetch('/api/v1/search', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({cwd: searchForm.querySelector('#search-cwd').value, query: searchForm.querySelector('#search-query').value})});
+          const message = searchForm.querySelector('#search-message');
+          const results = searchForm.querySelector('#search-results');
+          results.replaceChildren();
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          const payload = await response.json();
+          message.className = '';
+          message.textContent = payload.status === 'unbound' ? 'No project memory library is bound to this directory.' : `${payload.results.length} direct result(s).`;
+          for (const hit of payload.results) {
+            const article = document.createElement('article');
+            article.className = 'search-result';
+            const source = document.createElement('div');
+            source.className = 'source';
+            source.textContent = `${hit.path}:${hit.start_line}-${hit.end_line} · ${hit.heading || 'Untitled'} · ${hit.source_version}`;
+            const content = document.createElement('pre');
+            content.textContent = hit.content;
+            article.append(source, content);
+            results.append(article);
+          }
         });
         await refresh();
       });

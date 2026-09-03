@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import stat
 import uuid
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
+
+from personal_agent_memory.markdown_index import (
+    StoredChunk,
+    chunk_markdown,
+    fts_query,
+    infer_legacy_chunk_kind,
+    match_chunk_ids,
+    scan_markdown,
+    stable_document_id,
+    validate_ignore_patterns,
+)
 
 LibraryKind = Literal["user", "project"]
 BindingKind = Literal["project", "worktree"]
@@ -98,6 +111,28 @@ class PlatformState:
                     sync_status TEXT NOT NULL DEFAULT 'not_started',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS memory_documents (
+                    id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL,
+                    source_version TEXT NOT NULL,
+                    UNIQUE(library_id, path)
+                );
+                CREATE TABLE IF NOT EXISTS memory_chunks (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL REFERENCES memory_documents(id) ON DELETE CASCADE,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    heading TEXT,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    source_version TEXT NOT NULL
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunk_search USING fts5(
+                    chunk_id UNINDEXED, content, heading, path, tokenize='unicode61'
+                );
                 CREATE TABLE IF NOT EXISTS project_bindings (
                     id TEXT PRIMARY KEY,
                     kind TEXT NOT NULL CHECK(kind IN ('project', 'worktree')),
@@ -118,6 +153,31 @@ class PlatformState:
                 );
                 """
             )
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(memory_libraries)")
+            }
+            if "ignore_patterns" not in columns:
+                connection.execute(
+                    """ALTER TABLE memory_libraries
+                       ADD COLUMN ignore_patterns TEXT NOT NULL DEFAULT '[]'"""
+                )
+            chunk_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(memory_chunks)")
+            }
+            if "kind" not in chunk_columns:
+                connection.execute(
+                    "ALTER TABLE memory_chunks ADD COLUMN kind TEXT NOT NULL DEFAULT 'paragraph'"
+                )
+                legacy_chunks = connection.execute(
+                    "SELECT id, content FROM memory_chunks"
+                ).fetchall()
+                connection.executemany(
+                    "UPDATE memory_chunks SET kind = ? WHERE id = ?",
+                    [
+                        (infer_legacy_chunk_kind(str(row[1])), str(row[0]))
+                        for row in legacy_chunks
+                    ],
+                )
             previous_count = self._metadata("startup_count")
             previous_clean = self._metadata("clean_shutdown")
             self.startup_count = int(previous_count or "0") + 1
@@ -207,7 +267,12 @@ class PlatformState:
             (library_id, kind, canonical_path),
         )
         self.connection.commit()
-        return MemoryLibrary(library_id, kind, canonical_path, "available", "not_started")
+        # Registration remains durable so the user can repair the corpus and rescan.
+        with suppress(LibraryRegistrationError):
+            self.scan_library(library_id)
+        library = self.library(library_id)
+        assert library is not None
+        return library
 
     def list_libraries(self) -> list[MemoryLibrary]:
         assert self.connection is not None
@@ -228,6 +293,233 @@ class PlatformState:
 
     def library(self, library_id: str) -> MemoryLibrary | None:
         return next((item for item in self.list_libraries() if item.id == library_id), None)
+
+    def library_ignore_patterns(self, library_id: str) -> tuple[str, ...]:
+        row = self.connection_or_raise.execute(
+            "SELECT ignore_patterns FROM memory_libraries WHERE id = ?", (library_id,)
+        ).fetchone()
+        if row is None:
+            raise LibraryRegistrationError("memory library not found")
+        value = json.loads(str(row[0]))
+        return tuple(str(item) for item in value)
+
+    def update_library_ignore_patterns(
+        self, library_id: str, patterns: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        try:
+            normalized = validate_ignore_patterns(patterns)
+        except ValueError as error:
+            raise LibraryRegistrationError(str(error)) from error
+        cursor = self.connection_or_raise.execute(
+            "UPDATE memory_libraries SET ignore_patterns = ? WHERE id = ?",
+            (json.dumps(normalized), library_id),
+        )
+        if cursor.rowcount == 0:
+            raise LibraryRegistrationError("memory library not found")
+        self.connection_or_raise.commit()
+        self.scan_library(library_id)
+        return normalized
+
+    def scan_library(self, library_id: str) -> dict[str, int | str]:
+        library = self.library(library_id)
+        if library is None:
+            raise LibraryRegistrationError("memory library not found")
+        if library.availability != "available":
+            raise LibraryRegistrationError("memory library is not available")
+        root = Path(library.canonical_path)
+        patterns = self.library_ignore_patterns(library_id)
+        current = {
+            str(row[0]): (str(row[1]), str(row[2]))
+            for row in self.connection_or_raise.execute(
+                "SELECT path, id, source_version FROM memory_documents WHERE library_id = ?",
+                (library_id,),
+            )
+        }
+        changed = 0
+        unchanged = 0
+        self.connection_or_raise.execute(
+            "UPDATE memory_libraries SET sync_status = 'scanning' WHERE id = ?", (library_id,)
+        )
+        self.connection_or_raise.commit()
+        scan = scan_markdown(root, patterns, (self.database_path.parent,))
+        if not scan.complete:
+            self.connection_or_raise.execute(
+                "UPDATE memory_libraries SET sync_status = 'error' WHERE id = ?", (library_id,)
+            )
+            self.connection_or_raise.commit()
+            details = "; ".join(scan.errors[:3])
+            raise LibraryRegistrationError(f"Markdown scan incomplete: {details}")
+        documents = scan.documents
+        found = {document.path for document in documents}
+        try:
+            for document in documents:
+                existing = current.get(document.path)
+                if existing is not None and existing[1] == document.version:
+                    unchanged += 1
+                    continue
+                document_id = (
+                    existing[0]
+                    if existing is not None
+                    else stable_document_id(library_id, document.path)
+                )
+                if existing is not None:
+                    old_chunks = self.connection_or_raise.execute(
+                        """SELECT id, kind, content, heading, start_line, end_line
+                           FROM memory_chunks
+                           WHERE document_id = ? ORDER BY start_line, id""",
+                        (document_id,),
+                    ).fetchall()
+                    self.connection_or_raise.executemany(
+                        "DELETE FROM memory_chunk_search WHERE chunk_id = ?",
+                        [(str(row[0]),) for row in old_chunks],
+                    )
+                    self.connection_or_raise.execute(
+                        "DELETE FROM memory_chunks WHERE document_id = ?", (document_id,)
+                    )
+                else:
+                    old_chunks = []
+                self.connection_or_raise.execute(
+                    """INSERT INTO memory_documents (id, library_id, path, source_version)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET source_version = excluded.source_version""",
+                    (document_id, library_id, document.path, document.version),
+                )
+                chunks = chunk_markdown(document.content)
+                chunk_ids = match_chunk_ids(
+                    [
+                        StoredChunk(
+                            id=str(row[0]),
+                            kind=str(row[1]),
+                            content=str(row[2]),
+                            heading=None if row[3] is None else str(row[3]),
+                            start_line=int(row[4]),
+                            end_line=int(row[5]),
+                        )
+                        for row in old_chunks
+                    ],
+                    chunks,
+                )
+                for chunk, chunk_id in zip(chunks, chunk_ids, strict=True):
+                    self.connection_or_raise.execute(
+                        """INSERT INTO memory_chunks
+                           (id, document_id, library_id, path, kind, heading, start_line,
+                            end_line, content, source_version)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            chunk_id,
+                            document_id,
+                            library_id,
+                            document.path,
+                            chunk.kind,
+                            chunk.heading,
+                            chunk.start_line,
+                            chunk.end_line,
+                            chunk.content,
+                            document.version,
+                        ),
+                    )
+                    self.connection_or_raise.execute(
+                        """INSERT INTO memory_chunk_search (chunk_id, content, heading, path)
+                           VALUES (?, ?, ?, ?)""",
+                        (chunk_id, chunk.content, chunk.heading or "", document.path),
+                    )
+                changed += 1
+
+            removed_paths = set(current) - found
+            for path in removed_paths:
+                document_id = current[path][0]
+                chunk_ids = self.connection_or_raise.execute(
+                    "SELECT id FROM memory_chunks WHERE document_id = ?", (document_id,)
+                ).fetchall()
+                self.connection_or_raise.executemany(
+                    "DELETE FROM memory_chunk_search WHERE chunk_id = ?", chunk_ids
+                )
+                self.connection_or_raise.execute(
+                    "DELETE FROM memory_documents WHERE id = ?", (document_id,)
+                )
+            self.connection_or_raise.execute(
+                "UPDATE memory_libraries SET sync_status = 'ready' WHERE id = ?", (library_id,)
+            )
+            self.connection_or_raise.commit()
+        except BaseException:
+            self.connection_or_raise.rollback()
+            self.connection_or_raise.execute(
+                "UPDATE memory_libraries SET sync_status = 'error' WHERE id = ?", (library_id,)
+            )
+            self.connection_or_raise.commit()
+            raise
+        return {
+            "library_id": library_id,
+            "documents": len(documents),
+            "changed": changed,
+            "unchanged": unchanged,
+            "removed": len(set(current) - found),
+        }
+
+    def search_project(self, requested_cwd: str, query: str, limit: int = 10) -> dict[str, object]:
+        if not query.strip():
+            raise ValueError("search query must not be empty")
+        expression = fts_query(query)
+        binding = self.resolve_project_binding(requested_cwd)
+        if binding["status"] == "unbound":
+            return {"status": "unbound", "query": query, "results": []}
+        library_id = binding["library_id"]
+        bounded_limit = max(1, min(limit, 100))
+        rows = self.connection_or_raise.execute(
+            """SELECT chunk.id, chunk.document_id, chunk.content, chunk.library_id,
+                      chunk.path, chunk.heading,
+                      chunk.start_line, chunk.end_line, chunk.source_version,
+                      bm25(memory_chunk_search) AS rank
+               FROM memory_chunk_search
+               JOIN memory_chunks AS chunk ON chunk.id = memory_chunk_search.chunk_id
+               WHERE memory_chunk_search MATCH ? AND chunk.library_id = ?
+               ORDER BY rank, chunk.path, chunk.start_line
+               LIMIT ?""",
+            (expression, library_id, bounded_limit),
+        ).fetchall()
+        seen = {str(row[0]) for row in rows}
+        keyword = query.strip().casefold()
+        if len(rows) < bounded_limit:
+            fallback_rows = self.connection_or_raise.execute(
+                """SELECT id, document_id, content, library_id, path, heading,
+                          start_line, end_line, source_version, 0.0 AS rank
+                   FROM memory_chunks
+                   WHERE library_id = ?
+                   ORDER BY path, start_line""",
+                (library_id,),
+            ).fetchall()
+            rows.extend(
+                row
+                for row in fallback_rows
+                if str(row[0]) not in seen
+                and keyword
+                in "\n".join((str(row[2]), "" if row[5] is None else str(row[5]))).casefold()
+            )
+            rows = rows[:bounded_limit]
+        results = [
+            {
+                "chunk_id": str(row[0]),
+                "document_id": str(row[1]),
+                "content": str(row[2]),
+                "library_id": str(row[3]),
+                "path": str(row[4]),
+                "heading": None if row[5] is None else str(row[5]),
+                "start_line": int(row[6]),
+                "end_line": int(row[7]),
+                "source_version": str(row[8]),
+                "source_type": "markdown",
+                "classification": "direct",
+                "score": float(-row[9]),
+            }
+            for row in rows
+        ]
+        return {
+            "status": "bound",
+            "project_id": binding["project_id"],
+            "library_id": library_id,
+            "query": query,
+            "results": results,
+        }
 
     def bind_project(self, requested_root: str, library_id: str) -> ProjectBinding:
         root, device, inode = self._canonical_project_root(requested_root)

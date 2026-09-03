@@ -180,6 +180,42 @@ assert ancestor_sync_code == 200
 assert ancestor_sync["availability"] == "unavailable"
 
 # Project binding and Codex cwd resolution use explicit canonical roots only.
+retrieval_library_path = memory_root / "binding-project"
+retrieval_library_path.mkdir(parents=True, exist_ok=True)
+retrieval_note = retrieval_library_path / "真实语料.md"
+retrieval_note.write_text(
+    """# Architecture 决策
+
+English and 中文 share DockerNeedle42 in the current project memory.
+
+## Repeated evidence
+
+The same supporting paragraph appears twice.
+
+The same supporting paragraph appears twice.
+
+## Long paragraph
+
+"""
+    + "Long source context " * 80
+    + """
+
+## Complete code
+
+```python
+def docker_fixture() -> str:
+    return "FenceNeedle77"
+```
+""",
+    encoding="utf-8",
+)
+(retrieval_library_path / "ignored.md").write_text("IgnoredNeedle", encoding="utf-8")
+(retrieval_library_path / "node_modules").mkdir()
+(retrieval_library_path / "node_modules" / "hidden.md").write_text(
+    "DependencyNeedle", encoding="utf-8"
+)
+(Path("/tmp") / "outside-retrieval.md").write_text("OutsideNeedle", encoding="utf-8")
+(retrieval_library_path / "escape.md").symlink_to(Path("/tmp") / "outside-retrieval.md")
 project_library_code, project_library = request(
     "http://127.0.0.1:7331/api/v1/libraries",
     key,
@@ -318,6 +354,87 @@ assert worktree_after_code == 200
 assert worktree_after["project_id"] == main_binding["id"]
 assert worktree_after["binding_id"] == worktree_binding["id"]
 assert worktree_after["library_id"] == project_library["id"]
+
+search_code, search = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "DockerNeedle42"},
+)
+assert search_code == 200
+assert search["status"] == "bound"
+assert search["library_id"] == project_library["id"]
+assert len(search["results"]) == 1
+search_hit = search["results"][0]
+assert search_hit["path"] == "真实语料.md"
+assert search_hit["heading"] == "Architecture 决策"
+assert search_hit["start_line"] == 3
+assert search_hit["source_type"] == "markdown"
+assert search_hit["classification"] == "direct"
+assert len(search_hit["document_id"]) == 36
+assert len(search_hit["chunk_id"]) == 36
+assert len(search_hit["source_version"]) == 64
+chinese_code, chinese_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "中文"},
+)
+assert chinese_code == 200
+assert chinese_search["results"][0]["path"] == "真实语料.md"
+
+code_search_code, code_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "FenceNeedle77"},
+)
+assert code_search_code == 200
+assert code_search["results"][0]["content"].count("```") == 2
+ignore_code, ignore_result = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/ignore-rules",
+    key,
+    {"patterns": ["ignored.md"]},
+    method="PUT",
+)
+assert ignore_code == 200
+assert ignore_result["patterns"] == ["ignored.md"]
+for excluded_query in ("IgnoredNeedle", "DependencyNeedle", "OutsideNeedle"):
+    excluded_code, excluded = request(
+        "http://127.0.0.1:7331/mcp/search",
+        key,
+        {"cwd": str(same_name_one / "src"), "query": excluded_query},
+    )
+    assert excluded_code == 200
+    assert excluded["results"] == []
+
+retrieval_note.write_text("# Updated\n\nIncrementalNeedle99\n", encoding="utf-8")
+rescan_code, rescan = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/scan",
+    key,
+    method="POST",
+)
+assert rescan_code == 200
+assert rescan["changed"] == 1
+updated_code, updated_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "IncrementalNeedle99"},
+)
+assert updated_code == 200
+assert len(updated_search["results"]) == 1
+retrieval_note.unlink()
+delete_rescan_code, delete_rescan = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/scan",
+    key,
+    method="POST",
+)
+assert delete_rescan_code == 200
+assert delete_rescan["removed"] == 1
+deleted_code, deleted_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "IncrementalNeedle99"},
+)
+assert deleted_code == 200
+assert deleted_search["results"] == []
 
 embedded_code, embedded_binding = request(
     "http://127.0.0.1:7331/api/v1/project-bindings/worktrees",

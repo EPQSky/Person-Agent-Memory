@@ -44,6 +44,16 @@ class CwdResolution(BaseModel):
     cwd: str
 
 
+class IgnoreRulesUpdate(BaseModel):
+    patterns: list[str]
+
+
+class SearchRequest(BaseModel):
+    cwd: str
+    query: str
+    limit: int = 10
+
+
 def create_app(settings: Settings) -> FastAPI:
     key_store = ApiKeyStore(settings.state_dir / "api-key")
     platform_state = PlatformState(
@@ -125,6 +135,43 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
             ) from error
+
+    @app.post("/api/v1/libraries/{library_id}/scan", dependencies=[Depends(authenticate)])
+    async def scan_library(library_id: str) -> dict[str, int | str]:
+        try:
+            return platform_state.scan_library(library_id)
+        except LibraryRegistrationError as error:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if str(error) == "memory library not found"
+                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            )
+            raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+    @app.get("/api/v1/libraries/{library_id}/ignore-rules", dependencies=[Depends(authenticate)])
+    async def get_ignore_rules(library_id: str) -> dict[str, object]:
+        try:
+            patterns = platform_state.library_ignore_patterns(library_id)
+        except LibraryRegistrationError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+        return {"library_id": library_id, "patterns": patterns}
+
+    @app.put("/api/v1/libraries/{library_id}/ignore-rules", dependencies=[Depends(authenticate)])
+    async def update_ignore_rules(
+        library_id: str, update: IgnoreRulesUpdate
+    ) -> dict[str, object]:
+        try:
+            patterns = platform_state.update_library_ignore_patterns(
+                library_id, tuple(update.patterns)
+            )
+        except LibraryRegistrationError as error:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if str(error) == "memory library not found"
+                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            )
+            raise HTTPException(status_code=status_code, detail=str(error)) from error
+        return {"library_id": library_id, "patterns": patterns}
 
     @app.get("/api/v1/libraries", dependencies=[Depends(authenticate)])
     async def list_libraries() -> list[dict[str, str]]:
@@ -233,6 +280,26 @@ def create_app(settings: Settings) -> FastAPI:
             "availability": library.availability,
             "sync_status": library.sync_status,
         }
+
+    def search_payload(request: SearchRequest) -> dict[str, object]:
+        try:
+            return platform_state.search_project(request.cwd, request.query, request.limit)
+        except ProjectBindingError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
+    @app.post("/api/v1/search", dependencies=[Depends(authenticate)])
+    async def search(request: SearchRequest) -> dict[str, object]:
+        return search_payload(request)
+
+    @app.post("/mcp/search", dependencies=[Depends(authenticate)])
+    async def mcp_search(request: SearchRequest) -> dict[str, object]:
+        return search_payload(request)
 
     frontend = Path(__file__).parent / "static" / "index.html"
 
