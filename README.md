@@ -4,7 +4,7 @@ Local-first memory platform for a single user and local Codex sessions.
 
 ## Run
 
-Python 3.11 or newer and `uv` are required.
+Python 3.11 or newer, Git, and `uv` are required.
 
 ```bash
 uv sync --all-extras
@@ -33,6 +33,21 @@ Direct keyword search is available through `POST /api/v1/search`, `POST /mcp/sea
 interface. Both APIs accept `cwd`, `query`, and an optional `limit`; the daemon resolves `cwd`
 through explicit project bindings and searches only that project's memory library. Unbound
 working directories return an explicit `unbound` response with no results.
+
+The Web interface can browse indexed Markdown, edit source, render a sandboxed preview, inspect a
+save diff, and audit or restore local history. Equivalent authenticated REST endpoints live under
+`/api/v1/libraries/{library_id}/documents`, `/document`, and `/history`. Every edit or restore needs
+an expected source version and an idempotent operation identifier, replaces one document atomically,
+reindexes it, and creates one local commit with the fixed `Personal Agent Memory` service identity.
+Actor type and operation source are recorded separately in platform state.
+
+By default each library uses a bare sidecar repository below the platform state directory, with the
+memory directory only as its work tree; no nested `.git`, remote, pull, or push is created. An existing
+dedicated repository is reused only when registration explicitly sends `reuse_existing_git: true`.
+History commits are built with an isolated temporary Git index and track only Markdown, the portable
+library manifest, and reserved tombstone paths, so a containing project repository's index, branch,
+history, and unrelated working tree remain untouched. MCP exposes search and status but no direct
+document edit or history-restore operation.
 
 ## Verify
 

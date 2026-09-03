@@ -13,7 +13,8 @@
       section { border: 1px solid #ccd5cf; background: white; border-radius: 8px; padding: 24px; }
       section + section { margin-top: 20px; }
       label { display: block; font-weight: 650; margin-bottom: 8px; }
-      input, select { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #8d9b92; }
+      input, select, textarea { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #8d9b92; }
+      input[type="checkbox"] { width: auto; }
       button { margin-top: 12px; padding: 10px 16px; border: 0; background: #176943; color: white; cursor: pointer; }
       button.danger { background: #9d241d; margin: 0; }
       dl { display: grid; grid-template-columns: 180px 1fr; gap: 8px; }
@@ -27,11 +28,21 @@
       .search-result { border-top: 1px solid #dbe2de; padding: 14px 0; }
       .search-result pre { white-space: pre-wrap; overflow-wrap: anywhere; }
       .source { color: #526158; font: 13px/1.4 monospace; }
+      .editor-layout { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(0, 3fr); gap: 18px; }
+      .document-tree, .history { max-height: 520px; overflow: auto; border-right: 1px solid #dbe2de; padding-right: 12px; }
+      .document-tree button, .history button { display: block; width: 100%; margin: 0 0 6px; text-align: left; overflow-wrap: anywhere; }
+      textarea { min-height: 480px; resize: vertical; font: 14px/1.5 monospace; white-space: pre; overflow: auto; }
+      iframe { width: 100%; min-height: 480px; border: 1px solid #ccd5cf; background: white; }
+      .editor-tabs { display: flex; gap: 8px; margin: 12px 0; }
+      .editor-tabs button { margin: 0; }
+      .diff { max-height: 420px; overflow: auto; white-space: pre; font: 13px/1.5 monospace; background: #f4f6f5; padding: 12px; }
+      @media (max-width: 720px) { main { margin: 20px auto; } .editor-layout { grid-template-columns: 1fr; } .document-tree, .history { border-right: 0; max-height: 220px; } }
     </style>
   </head>
   <body>
     <header><h1>Personal Agent Memory</h1></header>
     <main><section id="root"><label for="key">API key</label><input id="key" type="password" autocomplete="off"><button id="connect">Connect</button><p id="message">Enter the key stored in your platform state directory.</p></section></main>
+    <script src="/editor-history.js"></script>
     <script>
       const root = document.querySelector('#root');
       document.querySelector('#connect').addEventListener('click', async () => {
@@ -53,7 +64,7 @@
         const heading = document.createElement('h2');
         heading.textContent = 'Memory libraries';
         const form = document.createElement('form');
-        form.innerHTML = '<div class="field"><label for="path">Directory path</label><input id="path" required></div><div class="field"><label for="kind">Library type</label><select id="kind"><option value="project">Project</option><option value="user">User</option></select></div><button type="submit">Register library</button><p id="library-message"></p>';
+        form.innerHTML = '<div class="field"><label for="path">Directory path</label><input id="path" required></div><div class="field"><label for="kind">Library type</label><select id="kind"><option value="project">Project</option><option value="user">User</option></select></div><div class="field"><label><input id="reuse-existing-git" type="checkbox"> Authorize this dedicated memory repository</label></div><button type="submit">Register library</button><p id="library-message"></p>';
         const table = document.createElement('table');
         table.innerHTML = '<thead><tr><th>Identifier</th><th>Type</th><th>Path</th><th>Availability</th><th>Sync</th></tr></thead><tbody></tbody>';
         const bindingHeading = document.createElement('h2');
@@ -68,10 +79,32 @@
         searchHeading.textContent = 'Search project memory';
         const searchForm = document.createElement('form');
         searchForm.innerHTML = '<div class="field"><label for="search-cwd">Project working directory</label><input id="search-cwd" required></div><div class="field"><label for="search-query">Keywords</label><input id="search-query" required></div><button type="submit">Search</button><p id="search-message"></p><div id="search-results"></div>';
-        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm);
+        const editorHeading = document.createElement('h2');
+        editorHeading.textContent = 'Memory documents';
+        const editorLibrary = document.createElement('select');
+        editorLibrary.setAttribute('aria-label', 'Memory library to edit');
+        const editorLayout = document.createElement('div');
+        editorLayout.className = 'editor-layout';
+        const documentTree = document.createElement('nav');
+        documentTree.className = 'document-tree';
+        const editor = document.createElement('div');
+        editor.innerHTML = '<strong id="document-path">Select a document</strong><div class="editor-tabs"><button type="button" id="source-tab">Source</button><button type="button" id="preview-tab">Preview</button><button type="button" id="diff-tab">Diff</button></div><textarea id="document-source" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Rendered Markdown preview"></iframe><pre id="document-diff" class="diff" hidden></pre><button type="button" id="preview-change" disabled>Preview changes</button><button type="button" id="save-change" disabled>Save</button><p id="editor-message"></p>';
+        editorLayout.append(documentTree, editor);
+        const historyHeading = document.createElement('h2');
+        historyHeading.textContent = 'Local history';
+        const history = document.createElement('div');
+        history.className = 'history';
+        const restoreAction = document.createElement('div');
+        const historyDiff = document.createElement('pre');
+        historyDiff.className = 'diff';
+        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, editorHeading, editorLibrary, editorLayout, historyHeading, history, restoreAction, historyDiff);
 
         let projectLibraries = [];
         let projectBindings = [];
+        let allLibraries = [];
+        let activeDocument = null;
+        const historySelection = PamHistory.selectionStore();
+        const editorContext = PamHistory.contextStore();
 
         function fillSelect(select, options, valueFor, labelFor) {
           const selected = select.value;
@@ -89,7 +122,9 @@
           const response = await fetch('/api/v1/libraries', {headers: {Authorization: `Bearer ${key}`}});
           if (!response.ok) return;
           const libraries = await response.json();
+          allLibraries = libraries;
           projectLibraries = libraries.filter((library) => library.kind === 'project');
+          fillSelect(editorLibrary, libraries, (library) => library.id, (library) => `${library.canonical_path} (${library.kind})`);
           fillSelect(bindingForm.querySelector('#project-library'), projectLibraries, (library) => library.id, (library) => `${library.canonical_path} (${library.id})`);
           const body = table.querySelector('tbody');
           body.replaceChildren();
@@ -104,6 +139,127 @@
             body.append(row);
           }
           await refreshBindings();
+          await refreshDocuments();
+        }
+
+        async function refreshDocuments() {
+          const selectedLibrary = editorLibrary.value;
+          const requestContext = editorContext.selectLibrary(selectedLibrary);
+          documentTree.replaceChildren();
+          history.replaceChildren();
+          restoreAction.replaceChildren();
+          historySelection.clear();
+          historyDiff.textContent = '';
+          activeDocument = null;
+          editor.querySelector('#document-path').textContent = 'Select a document';
+          editor.querySelector('#document-source').value = '';
+          editor.querySelector('#document-source').disabled = true;
+          editor.querySelector('#preview-change').disabled = true;
+          editor.querySelector('#save-change').disabled = true;
+          if (!selectedLibrary) return;
+          const response = await fetch(`/api/v1/libraries/${selectedLibrary}/documents`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) return;
+          if (!editorContext.isCurrent(requestContext)) return;
+          for (const item of await response.json()) {
+            if (!editorContext.isCurrent(requestContext)) return;
+            const button = documentTree.appendChild(document.createElement('button'));
+            button.type = 'button';
+            button.textContent = item.path;
+            button.addEventListener('click', () => loadDocument(item.path));
+          }
+          await refreshHistory();
+        }
+
+        async function loadDocument(path) {
+          restoreAction.replaceChildren();
+          historySelection.clear();
+          const selectedLibrary = editorLibrary.value;
+          const requestContext = editorContext.requestDocument(selectedLibrary, path);
+          const response = await fetch(`/api/v1/libraries/${selectedLibrary}/document?path=${encodeURIComponent(path)}`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) return;
+          const loaded = await response.json();
+          const accepted = editorContext.acceptDocument(requestContext, loaded);
+          if (!accepted) return;
+          activeDocument = loaded;
+          editor.querySelector('#document-path').textContent = activeDocument.path;
+          editor.querySelector('#document-source').value = activeDocument.content;
+          editor.querySelector('#document-source').disabled = false;
+          editor.querySelector('#preview-change').disabled = false;
+          editor.querySelector('#save-change').disabled = false;
+          showEditorPanel('source');
+          await refreshHistory();
+        }
+
+        function showEditorPanel(panel) {
+          editor.querySelector('#document-source').hidden = panel !== 'source';
+          editor.querySelector('#document-preview').hidden = panel !== 'preview';
+          editor.querySelector('#document-diff').hidden = panel !== 'diff';
+        }
+
+        async function previewChange(context = editorContext.snapshot()) {
+          if (!context || !context.path || !context.sourceVersion) return false;
+          const previewRequest = PamHistory.previewRequest(context);
+          const response = await fetch(previewRequest.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(previewRequest.body)});
+          const message = editor.querySelector('#editor-message');
+          if (!editorContext.isCurrent(context)) return false;
+          if (!response.ok) { const failure = await response.json(); if (!editorContext.isCurrent(context)) return false; message.className = 'error'; message.textContent = failure.detail; return false; }
+          const preview = await response.json();
+          if (!editorContext.isCurrent(context)) return false;
+          editor.querySelector('#document-preview').srcdoc = preview.rendered_html;
+          editor.querySelector('#document-diff').textContent = preview.diff || 'No changes.';
+          message.className = '';
+          message.textContent = 'Preview updated.';
+          showEditorPanel('diff');
+          return true;
+        }
+
+        async function refreshHistory() {
+          const context = editorContext.snapshot();
+          history.replaceChildren();
+          if (!context || !context.libraryId) return;
+          const selectedLibrary = context.libraryId;
+          const response = await fetch(`/api/v1/libraries/${selectedLibrary}/history`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) return;
+          if (!editorContext.isCurrent(context)) return;
+          for (const entry of await response.json()) {
+            if (!editorContext.isCurrent(context)) return;
+            const button = history.appendChild(document.createElement('button'));
+            button.type = 'button';
+            button.textContent = `${entry.commit.slice(0, 12)}  ${entry.subject}`;
+            button.title = `${entry.authored_at} · ${entry.actor_type || 'platform'} · ${entry.source || 'initialization'}`;
+            button.addEventListener('click', async () => {
+              const actionContext = editorContext.snapshot();
+              if (!actionContext || !actionContext.path) return;
+              const diffResponse = await fetch(`/api/v1/libraries/${selectedLibrary}/history/${entry.commit}/diff`, {headers: {Authorization: `Bearer ${key}`}});
+              if (!editorContext.isCurrent(actionContext)) return;
+              const diffPayload = diffResponse.ok ? await diffResponse.json() : null;
+              if (!editorContext.isCurrent(actionContext)) return;
+              if (diffPayload) historyDiff.textContent = diffPayload.diff;
+              restoreAction.replaceChildren();
+              const selection = historySelection.select(selectedLibrary, {
+                path: actionContext.path,
+                source_version: actionContext.sourceVersion,
+                token: actionContext.token,
+              }, entry.commit);
+              const restore = document.createElement('button');
+              restore.type = 'button';
+              restore.textContent = `Restore ${selection.path} from ${selection.commit.slice(0, 12)}`;
+              restore.addEventListener('click', () => restoreDocument(selection));
+              restoreAction.append(restore);
+            });
+          }
+        }
+
+        async function restoreDocument(selection) {
+          const context = editorContext.snapshot();
+          if (!context || context.token !== selection.contextToken) return;
+          const restore = PamHistory.request(selection, crypto.randomUUID());
+          const response = await fetch(restore.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(restore.body)});
+          if (!editorContext.isCurrent(context)) return;
+          if (!response.ok) { const failure = await response.json(); if (!editorContext.isCurrent(context)) return; editor.querySelector('#editor-message').className = 'error'; editor.querySelector('#editor-message').textContent = failure.detail; return; }
+          restoreAction.replaceChildren();
+          historySelection.clear();
+          if (editorContext.isCurrent(context)) await loadDocument(selection.path);
         }
 
         async function refreshBindings() {
@@ -153,7 +309,7 @@
           const response = await fetch('/api/v1/libraries', {
             method: 'POST',
             headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'},
-            body: JSON.stringify({path: form.querySelector('#path').value, kind: form.querySelector('#kind').value}),
+            body: JSON.stringify({path: form.querySelector('#path').value, kind: form.querySelector('#kind').value, reuse_existing_git: form.querySelector('#reuse-existing-git').checked}),
           });
           const message = form.querySelector('#library-message');
           if (!response.ok) {
@@ -208,6 +364,28 @@
             article.append(source, content);
             results.append(article);
           }
+        });
+        editorLibrary.addEventListener('change', refreshDocuments);
+        editor.querySelector('#source-tab').addEventListener('click', () => showEditorPanel('source'));
+        editor.querySelector('#preview-tab').addEventListener('click', async () => { if (await previewChange()) showEditorPanel('preview'); });
+        editor.querySelector('#diff-tab').addEventListener('click', previewChange);
+        editor.querySelector('#preview-change').addEventListener('click', previewChange);
+        editor.querySelector('#document-source').addEventListener('input', () => {
+          editorContext.edit(editor.querySelector('#document-source').value);
+          restoreAction.replaceChildren();
+          historySelection.clear();
+        });
+        editor.querySelector('#save-change').addEventListener('click', async () => {
+          const context = editorContext.snapshot();
+          if (!context || !(await previewChange(context)) || !editorContext.isCurrent(context)) return;
+          const saveRequest = PamHistory.saveRequest(context, crypto.randomUUID());
+          const response = await fetch(saveRequest.url, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(saveRequest.body)});
+          const message = editor.querySelector('#editor-message');
+          if (!editorContext.isCurrent(context)) return;
+          if (!response.ok) { const failure = await response.json(); if (!editorContext.isCurrent(context)) return; message.className = 'error'; message.textContent = failure.detail; return; }
+          message.className = '';
+          message.textContent = 'Document saved.';
+          await loadDocument(context.path);
         });
         await refresh();
       });

@@ -67,6 +67,7 @@ class StoredChunk:
 class MarkdownScan:
     documents: tuple[MarkdownDocument, ...]
     errors: tuple[str, ...]
+    identities: tuple[tuple[str, str, int, int, str], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -135,6 +136,165 @@ def scan_markdown(
 
     walk(root, PurePosixPath())
     return MarkdownScan(tuple(documents), tuple(errors))
+
+
+def scan_markdown_fd(
+    root_fd: int,
+    root: Path,
+    custom_ignores: tuple[str, ...],
+    excluded_roots: tuple[Path, ...] = (),
+) -> MarkdownScan:
+    documents: list[MarkdownDocument] = []
+    identities: list[tuple[str, str, int, int, str]] = []
+    errors: list[str] = []
+
+    def walk(directory_fd: int, relative: PurePosixPath) -> None:
+        relative_text = relative.as_posix()
+        metadata = os.fstat(directory_fd)
+        identities.append(
+            (
+                relative_text,
+                "directory",
+                metadata.st_dev,
+                metadata.st_ino,
+                "",
+            )
+        )
+        try:
+            with os.scandir(directory_fd) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except OSError:
+            errors.append(f"cannot enumerate directory: {relative_text}")
+            return
+        for entry in entries:
+            child_relative = relative / entry.name
+            child_text = child_relative.as_posix()
+            try:
+                entry_metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(entry_metadata.st_mode):
+                    target = os.readlink(entry.name, dir_fd=directory_fd)
+                    confirmed = os.stat(
+                        entry.name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (confirmed.st_dev, confirmed.st_ino) != (
+                        entry_metadata.st_dev,
+                        entry_metadata.st_ino,
+                    ):
+                        errors.append(f"{child_text}: source changed while scanning")
+                        continue
+                    identities.append(
+                        (
+                            child_text,
+                            "symlink",
+                            confirmed.st_dev,
+                            confirmed.st_ino,
+                            hashlib.sha256(os.fsencode(target)).hexdigest(),
+                        )
+                    )
+                    continue
+                if stat.S_ISDIR(entry_metadata.st_mode):
+                    if _excluded(root / child_relative, excluded_roots) or _ignored(
+                        child_text, entry.name, True, custom_ignores
+                    ):
+                        identities.append(
+                            (
+                                child_text,
+                                "directory",
+                                entry_metadata.st_dev,
+                                entry_metadata.st_ino,
+                                "",
+                            )
+                        )
+                        continue
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        opened = os.fstat(child_fd)
+                        if (
+                            not stat.S_ISDIR(opened.st_mode)
+                            or (opened.st_dev, opened.st_ino)
+                            != (entry_metadata.st_dev, entry_metadata.st_ino)
+                        ):
+                            errors.append(f"{child_text}: source changed while scanning")
+                            continue
+                        walk(child_fd, child_relative)
+                    finally:
+                        os.close(child_fd)
+                elif (
+                    stat.S_ISREG(entry_metadata.st_mode)
+                    and entry.name.lower().endswith(".md")
+                    and not _ignored(child_text, entry.name, False, custom_ignores)
+                ):
+                    descriptor = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        before = os.fstat(descriptor)
+                        if (
+                            not stat.S_ISREG(before.st_mode)
+                            or (before.st_dev, before.st_ino)
+                            != (entry_metadata.st_dev, entry_metadata.st_ino)
+                        ):
+                            errors.append(f"{child_text}: source changed while scanning")
+                            continue
+                        raw = bytearray()
+                        while block := os.read(descriptor, 1024 * 1024):
+                            raw.extend(block)
+                        after = os.fstat(descriptor)
+                        if (
+                            before.st_size,
+                            before.st_mtime_ns,
+                            before.st_ctime_ns,
+                        ) != (
+                            after.st_size,
+                            after.st_mtime_ns,
+                            after.st_ctime_ns,
+                        ):
+                            errors.append(f"{child_text}: source changed while scanning")
+                            continue
+                    finally:
+                        os.close(descriptor)
+                    try:
+                        content = bytes(raw).decode("utf-8")
+                    except UnicodeDecodeError:
+                        errors.append(f"{child_text}: Markdown file is not valid UTF-8")
+                        continue
+                    version = hashlib.sha256(bytes(raw)).hexdigest()
+                    documents.append(MarkdownDocument(child_text, content, version))
+                    identities.append(
+                        (child_text, "file", before.st_dev, before.st_ino, version)
+                    )
+                else:
+                    identities.append(
+                        (
+                            child_text,
+                            "other",
+                            entry_metadata.st_dev,
+                            entry_metadata.st_ino,
+                            (
+                                f"{entry_metadata.st_mode}:{entry_metadata.st_size}:"
+                                f"{entry_metadata.st_mtime_ns}:{entry_metadata.st_ctime_ns}"
+                            ),
+                        )
+                    )
+            except OSError as error:
+                errors.append(
+                    f"cannot inspect {child_text}: {error.strerror or error}"
+                )
+
+    descriptor = os.dup(root_fd)
+    try:
+        walk(descriptor, PurePosixPath())
+    finally:
+        os.close(descriptor)
+    return MarkdownScan(
+        tuple(documents), tuple(errors), tuple(sorted(identities))
+    )
 
 
 def chunk_markdown(content: str) -> list[MarkdownChunk]:

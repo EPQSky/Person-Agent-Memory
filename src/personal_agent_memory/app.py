@@ -4,9 +4,11 @@ import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import FileResponse, HTMLResponse, Response
+from markdown_it import MarkdownIt
 from pydantic import BaseModel
 
 from personal_agent_memory.config import Settings
@@ -16,6 +18,7 @@ from personal_agent_memory.state import (
     DuplicateProjectBindingError,
     LibraryKind,
     LibraryRegistrationError,
+    MemoryMutationError,
     PlatformState,
     ProjectBindingError,
 )
@@ -24,6 +27,7 @@ from personal_agent_memory.state import (
 class LibraryRegistration(BaseModel):
     path: str
     kind: LibraryKind
+    reuse_existing_git: bool = False
 
 
 class ProjectBindingRegistration(BaseModel):
@@ -54,11 +58,33 @@ class SearchRequest(BaseModel):
     limit: int = 10
 
 
+class DocumentPreview(BaseModel):
+    path: str
+    content: str
+    expected_source_version: str
+
+
+class DocumentEdit(DocumentPreview):
+    operation_id: str
+    actor_type: Literal["user", "platform"] = "user"
+    source: str = "web"
+
+
+class DocumentRestore(BaseModel):
+    path: str
+    commit: str
+    expected_source_version: str
+    operation_id: str
+    actor_type: Literal["user", "platform"] = "user"
+    source: str = "web"
+
+
 def create_app(settings: Settings) -> FastAPI:
     key_store = ApiKeyStore(settings.state_dir / "api-key")
     platform_state = PlatformState(
         settings.state_dir / "platform.sqlite3", library_roots=settings.library_roots
     )
+    markdown = MarkdownIt("commonmark", {"html": False})
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -125,7 +151,11 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def register_library(registration: LibraryRegistration) -> dict[str, str]:
         try:
-            return platform_state.register_library(registration.path, registration.kind).payload()
+            return platform_state.register_library(
+                registration.path,
+                registration.kind,
+                registration.reuse_existing_git,
+            ).payload()
         except DuplicateLibraryError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -301,7 +331,108 @@ def create_app(settings: Settings) -> FastAPI:
     async def mcp_search(request: SearchRequest) -> dict[str, object]:
         return search_payload(request)
 
+    def mutation_error(error: MemoryMutationError) -> HTTPException:
+        detail = str(error)
+        if detail in {"memory library not found", "memory document not found"}:
+            code = status.HTTP_404_NOT_FOUND
+        elif "version conflict" in detail or "changed outside" in detail:
+            code = status.HTTP_409_CONFLICT
+        else:
+            code = status.HTTP_422_UNPROCESSABLE_CONTENT
+        return HTTPException(status_code=code, detail=detail)
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/documents", dependencies=[Depends(authenticate)]
+    )
+    async def list_documents(library_id: str) -> list[dict[str, object]]:
+        try:
+            return platform_state.list_documents(library_id)
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)]
+    )
+    async def read_document(library_id: str, path: str) -> dict[str, str]:
+        try:
+            return platform_state.read_document(library_id, path)
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/document/preview",
+        dependencies=[Depends(authenticate)],
+    )
+    async def preview_document(library_id: str, preview: DocumentPreview) -> dict[str, object]:
+        try:
+            result = platform_state.preview_document_edit(
+                library_id, preview.path, preview.content, preview.expected_source_version
+            )
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+        result["rendered_html"] = markdown.render(preview.content)
+        return result
+
+    @app.put(
+        "/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)]
+    )
+    async def edit_document(library_id: str, edit: DocumentEdit) -> dict[str, str]:
+        try:
+            return platform_state.edit_document(
+                library_id,
+                edit.path,
+                edit.content,
+                edit.expected_source_version,
+                edit.operation_id,
+                edit.actor_type,
+                edit.source,
+            )
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/history", dependencies=[Depends(authenticate)]
+    )
+    async def library_history(library_id: str, limit: int = 50) -> list[dict[str, str]]:
+        try:
+            return platform_state.library_history(library_id, limit)
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/history/{commit}/diff",
+        dependencies=[Depends(authenticate)],
+    )
+    async def history_diff(library_id: str, commit: str) -> dict[str, object]:
+        try:
+            return platform_state.history_diff(library_id, commit)
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/history/restore",
+        dependencies=[Depends(authenticate)],
+    )
+    async def restore_document(library_id: str, restore: DocumentRestore) -> dict[str, str]:
+        try:
+            return platform_state.restore_document(
+                library_id,
+                restore.path,
+                restore.commit,
+                restore.expected_source_version,
+                restore.operation_id,
+                restore.actor_type,
+                restore.source,
+            )
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
     frontend = Path(__file__).parent / "static" / "index.html"
+    editor_history = Path(__file__).parent / "static" / "editor_history.js"
+
+    @app.get("/editor-history.js")
+    def editor_history_script() -> FileResponse:
+        return FileResponse(editor_history, media_type="text/javascript")
 
     @app.get("/", response_class=HTMLResponse)
     def management_interface() -> FileResponse:

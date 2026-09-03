@@ -627,6 +627,150 @@ finally:
     permission_process.send_signal(signal.SIGINT)
     assert permission_process.wait(timeout=10) == 0
 
+# Authoritative edits use isolated Git history even when a memory directory is
+# physically inside a real project repository.
+history_project = Path("/project-roots/history-project")
+history_library = history_project / "memory"
+history_library.mkdir(parents=True)
+(history_project / ".gitignore").write_text("/memory/\n", encoding="utf-8")
+history_document = history_library / "decisions.md"
+history_original = "# Docker decision\n\nUse DockerHistoryOld.\n"
+history_updated = (
+    "# Docker decision\n\nUse DockerHistoryNew.\n\n```python\nprint('history')\n```\n\n"
+    + "Long editable paragraph. " * 400
+)
+history_document.write_text(history_original, encoding="utf-8")
+subprocess.run(["git", "init", "-b", "main", str(history_project)], check=True)
+subprocess.run(["git", "-C", str(history_project), "add", ".gitignore"], check=True)
+subprocess.run(
+    [
+        "git",
+        "-C",
+        str(history_project),
+        "-c",
+        "user.name=Docker Owner",
+        "-c",
+        "user.email=owner@docker.invalid",
+        "commit",
+        "-m",
+        "project baseline",
+    ],
+    check=True,
+)
+
+
+def project_git_fingerprint() -> tuple[str, str, str, str]:
+    def git_output(*arguments: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(history_project), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    return (
+        git_output("rev-parse", "HEAD"),
+        git_output("branch", "--show-current"),
+        hashlib.sha256((history_project / ".git" / "index").read_bytes()).hexdigest(),
+        git_output("status", "--porcelain=v2"),
+    )
+
+
+project_before = project_git_fingerprint()
+history_register_code, history_registered = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(history_library), "kind": "project"},
+)
+assert history_register_code == 201
+history_id = str(history_registered["id"])
+documents_code, documents = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/documents", key
+)
+assert documents_code == 200
+assert documents[0]["path"] == "decisions.md"
+document_url = (
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/document?"
+    + urllib.parse.urlencode({"path": "decisions.md"})
+)
+loaded_code, loaded = request(document_url, key)
+assert loaded_code == 200
+preview_code, preview = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/document/preview",
+    key,
+    {
+        "path": "decisions.md",
+        "content": history_updated,
+        "expected_source_version": loaded["source_version"],
+    },
+)
+assert preview_code == 200
+assert "+Use DockerHistoryNew." in preview["diff"]
+assert "language-python" in preview["rendered_html"]
+edit_code, edited = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/document",
+    key,
+    {
+        "path": "decisions.md",
+        "content": history_updated,
+        "expected_source_version": loaded["source_version"],
+        "operation_id": "docker-edit-1",
+        "actor_type": "user",
+        "source": "docker-web",
+    },
+    method="PUT",
+)
+assert edit_code == 200
+assert history_document.read_text(encoding="utf-8") == history_updated
+retry_code, retry = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/document",
+    key,
+    {
+        "path": "decisions.md",
+        "content": history_updated,
+        "expected_source_version": loaded["source_version"],
+        "operation_id": "docker-edit-1",
+        "actor_type": "user",
+        "source": "docker-web",
+    },
+    method="PUT",
+)
+assert retry_code == 200
+assert retry == edited
+history_code, commits = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)
+assert history_code == 200
+assert len(commits) == 2
+assert commits[0]["author_name"] == "Personal Agent Memory"
+assert commits[0]["author_email"] == "memory-platform@localhost"
+assert commits[0]["actor_type"] == "user"
+diff_code, commit_diff = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history/{edited['commit']}/diff",
+    key,
+)
+assert diff_code == 200
+assert {line["kind"] for line in commit_diff["lines"]} >= {"addition", "deletion"}
+restore_code, restored = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history/restore",
+    key,
+    {
+        "path": "decisions.md",
+        "commit": commits[1]["commit"],
+        "expected_source_version": edited["source_version"],
+        "operation_id": "docker-restore-1",
+        "actor_type": "user",
+        "source": "docker-history",
+    },
+)
+assert restore_code == 200
+assert restored["commit"] != edited["commit"]
+assert history_document.read_text(encoding="utf-8") == history_original
+assert request(
+    f"http://127.0.0.1:7331/mcp/libraries/{history_id}/document", key
+)[0] == 404
+assert project_git_fingerprint() == project_before
+
 assert request("http://127.0.0.1:18080/v1/models")[1]["data"]
 assert request(
     "http://127.0.0.1:18080/v1/chat/completions",

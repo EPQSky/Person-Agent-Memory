@@ -1,7 +1,7 @@
 services:
   daemon:
     build: .
-    command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--host", "127.0.0.1", "--port", "7331"]
+    command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--library-root", "/project-roots", "--host", "127.0.0.1", "--port", "7331"]
     volumes:
       - platform-state:/state
       - memory-libraries:/memory-libraries
