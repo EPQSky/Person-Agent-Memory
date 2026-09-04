@@ -188,6 +188,8 @@ retrieval_note.write_text(
 
 English and 中文 share DockerNeedle42 in the current project memory.
 
+Deploy each release to production with a reversible rollback plan.
+
 ## Repeated evidence
 
 The same supporting paragraph appears twice.
@@ -354,6 +356,94 @@ assert worktree_after_code == 200
 assert worktree_after["project_id"] == main_binding["id"]
 assert worktree_after["binding_id"] == worktree_binding["id"]
 assert worktree_after["library_id"] == project_library["id"]
+
+# Build the derivative vector projection, then exercise deterministic hybrid retrieval.
+rebuild_code, rebuild = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/vector-index/rebuild",
+    key,
+    {},
+)
+assert rebuild_code == 202
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    rebuild_status_code, rebuild_status = request(
+        f"http://127.0.0.1:7331/api/v1/jobs/{rebuild['job_id']}", key
+    )
+    assert rebuild_status_code == 200
+    if rebuild_status["status"] in {"done", "error"}:
+        break
+    time.sleep(0.05)
+assert rebuild_status["status"] == "done"
+
+semantic_code, semantic = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "ship a production release"},
+)
+assert semantic_code == 200
+assert semantic["degraded"] is False
+assert semantic["vector_index_status"] == "ready"
+assert "vector" in semantic["results"][0]["retrieval_sources"]
+assert [item["score"] for item in semantic["results"]] == sorted(
+    (item["score"] for item in semantic["results"]), reverse=True
+)
+
+duplicate_code, duplicate_hybrid = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "DockerNeedle42 production"},
+)
+assert duplicate_code == 200
+assert len({item["chunk_id"] for item in duplicate_hybrid["results"]}) == len(
+    duplicate_hybrid["results"]
+)
+
+assert request("http://127.0.0.1:18080/control/reranker/malformed", payload={})[0] == 200
+rerank_degraded_code, rerank_degraded = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "DockerNeedle42"},
+)
+assert rerank_degraded_code == 200
+assert rerank_degraded["degradation"] == ["reranker_unavailable"]
+assert rerank_degraded["results"][0]["path"] == "真实语料.md"
+assert request("http://127.0.0.1:18080/control/reranker/ok", payload={})[0] == 200
+
+assert request("http://127.0.0.1:18080/control/embedding/error", payload={})[0] == 200
+offline_code, offline = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "FenceNeedle77"},
+)
+assert offline_code == 200
+assert "embedding_unavailable" in offline["degradation"]
+assert offline["results"][0]["path"] == "真实语料.md"
+assert request("http://127.0.0.1:18080/control/reranker/error", payload={})[0] == 200
+fully_offline_code, fully_offline = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "DockerNeedle42"},
+)
+assert fully_offline_code == 200
+assert set(fully_offline["degradation"]) == {
+    "embedding_unavailable",
+    "reranker_unavailable",
+}
+assert fully_offline["results"]
+assert request("http://127.0.0.1:18080/control/reranker/ok", payload={})[0] == 200
+
+assert request("http://127.0.0.1:18080/control/embedding/timeout", payload={})[0] == 200
+timeout_started = time.monotonic()
+timeout_code, timeout_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "DockerNeedle42"},
+)
+assert timeout_code == 200
+assert time.monotonic() - timeout_started < 1.5
+assert "embedding_unavailable" in timeout_search["degradation"]
+assert timeout_search["results"]
+assert request("http://127.0.0.1:18080/control/embedding/ok", payload={})[0] == 200
 
 search_code, search = request(
     "http://127.0.0.1:7331/api/v1/search",

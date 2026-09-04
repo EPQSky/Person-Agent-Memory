@@ -1,7 +1,7 @@
 services:
   daemon:
     build: .
-    command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--library-root", "/project-roots", "--host", "127.0.0.1", "--port", "7331"]
+    command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--library-root", "/project-roots", "--host", "127.0.0.1", "--port", "7331", "--embedding-url", "http://127.0.0.1:18080", "--embedding-model", "deterministic-test-model", "--reranker-url", "http://127.0.0.1:18080", "--reranker-model", "deterministic-reranker", "--model-timeout", "0.3", "--model-retries", "1"]
     volumes:
       - platform-state:/state
       - memory-libraries:/memory-libraries

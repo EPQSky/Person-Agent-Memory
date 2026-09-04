@@ -12,6 +12,7 @@ from markdown_it import MarkdownIt
 from pydantic import BaseModel
 
 from personal_agent_memory.config import Settings
+from personal_agent_memory.model_client import OpenAICompatibleClient
 from personal_agent_memory.security import ApiKeyStore
 from personal_agent_memory.state import (
     DuplicateLibraryError,
@@ -82,7 +83,9 @@ class DocumentRestore(BaseModel):
 def create_app(settings: Settings) -> FastAPI:
     key_store = ApiKeyStore(settings.state_dir / "api-key")
     platform_state = PlatformState(
-        settings.state_dir / "platform.sqlite3", library_roots=settings.library_roots
+        settings.state_dir / "platform.sqlite3",
+        library_roots=settings.library_roots,
+        model_client=OpenAICompatibleClient(settings.embedding, settings.reranker),
     )
     markdown = MarkdownIt("commonmark", {"html": False})
 
@@ -177,6 +180,30 @@ def create_app(settings: Settings) -> FastAPI:
                 else status.HTTP_422_UNPROCESSABLE_CONTENT
             )
             raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/vector-index/rebuild",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def rebuild_vector_index(library_id: str) -> dict[str, object]:
+        try:
+            job_id = platform_state.enqueue_vector_rebuild(library_id)
+        except LibraryRegistrationError as error:
+            code = (
+                status.HTTP_404_NOT_FOUND
+                if str(error) == "memory library not found"
+                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            )
+            raise HTTPException(status_code=code, detail=str(error)) from error
+        return {"library_id": library_id, "job_id": job_id, "status": "pending"}
+
+    @app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(authenticate)])
+    async def background_job(job_id: int) -> dict[str, object]:
+        job_state = platform_state.job_status(job_id)
+        if job_state is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
+        return {"job_id": job_id, "status": job_state}
 
     @app.get("/api/v1/libraries/{library_id}/ignore-rules", dependencies=[Depends(authenticate)])
     async def get_ignore_rules(library_id: str) -> dict[str, object]:
@@ -311,9 +338,9 @@ def create_app(settings: Settings) -> FastAPI:
             "sync_status": library.sync_status,
         }
 
-    def search_payload(request: SearchRequest) -> dict[str, object]:
+    async def search_payload(request: SearchRequest) -> dict[str, object]:
         try:
-            return platform_state.search_project(request.cwd, request.query, request.limit)
+            return await platform_state.search_project(request.cwd, request.query, request.limit)
         except ProjectBindingError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
@@ -325,11 +352,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/v1/search", dependencies=[Depends(authenticate)])
     async def search(request: SearchRequest) -> dict[str, object]:
-        return search_payload(request)
+        return await search_payload(request)
 
     @app.post("/mcp/search", dependencies=[Depends(authenticate)])
     async def mcp_search(request: SearchRequest) -> dict[str, object]:
-        return search_payload(request)
+        return await search_payload(request)
 
     def mutation_error(error: MemoryMutationError) -> HTTPException:
         detail = str(error)

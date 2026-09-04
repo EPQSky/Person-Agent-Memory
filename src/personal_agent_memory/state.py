@@ -7,6 +7,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import stat
@@ -15,7 +16,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, cast
 
 from personal_agent_memory.git_history import (
     GitHistoryError,
@@ -35,6 +36,11 @@ from personal_agent_memory.markdown_index import (
     scan_markdown_fd,
     stable_document_id,
     validate_ignore_patterns,
+)
+from personal_agent_memory.model_client import (
+    ModelServiceError,
+    OpenAICompatibleClient,
+    cosine_similarity,
 )
 
 LibraryKind = Literal["user", "project"]
@@ -118,6 +124,7 @@ class LibraryIndexSnapshot:
     documents: tuple[tuple[object, ...], ...]
     chunks: tuple[tuple[object, ...], ...]
     searches: tuple[tuple[object, ...], ...]
+    vectors: tuple[tuple[object, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +153,12 @@ class ProjectBinding:
 
 
 class PlatformState:
-    def __init__(self, database_path: Path, library_roots: tuple[Path, ...] = ()) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        library_roots: tuple[Path, ...] = (),
+        model_client: OpenAICompatibleClient | None = None,
+    ) -> None:
         self.database_path = database_path
         self.library_roots = library_roots
         self.connection: sqlite3.Connection | None = None
@@ -154,6 +166,7 @@ class PlatformState:
         self.stop_worker = asyncio.Event()
         self.startup_count = 0
         self.previous_shutdown_clean = True
+        self.model_client = model_client or OpenAICompatibleClient(None, None)
 
     async def start(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -206,6 +219,21 @@ class PlatformState:
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunk_search USING fts5(
                     chunk_id UNINDEXED, content, heading, path, tokenize='unicode61'
+                );
+                CREATE TABLE IF NOT EXISTS memory_chunk_vectors (
+                    chunk_id TEXT PRIMARY KEY REFERENCES memory_chunks(id) ON DELETE CASCADE,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    source_version TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    vector_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_vector_indexes (
+                    library_id TEXT PRIMARY KEY
+                        REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    dimension INTEGER NOT NULL CHECK(dimension >= 0),
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS project_bindings (
                     id TEXT PRIMARY KEY,
@@ -302,7 +330,7 @@ class PlatformState:
 
     async def _worker(self) -> None:
         while not self.stop_worker.is_set():
-            self._execute_pending_jobs()
+            await self._execute_pending_jobs()
             try:
                 await asyncio.wait_for(self.stop_worker.wait(), timeout=0.1)
             except TimeoutError:
@@ -316,6 +344,13 @@ class PlatformState:
         self.connection.commit()
         assert cursor.lastrowid is not None
         return cursor.lastrowid
+
+    def enqueue_vector_rebuild(self, library_id: str) -> int:
+        if self.library(library_id) is None:
+            raise LibraryRegistrationError("memory library not found")
+        if self.model_client.embedding is None:
+            raise LibraryRegistrationError("embedding is not configured")
+        return self._queue_vector_rebuild(library_id, False)
 
     def job_status(self, job_id: int) -> str | None:
         assert self.connection is not None
@@ -643,6 +678,7 @@ class PlatformState:
             )
             if not participate_in_transaction:
                 self.connection_or_raise.commit()
+            self._queue_vector_rebuild(library_id, participate_in_transaction)
         except BaseException:
             if not participate_in_transaction:
                 self.connection_or_raise.rollback()
@@ -1551,7 +1587,14 @@ class PlatformState:
                     chunk_ids,
                 )
             )
-        return LibraryIndexSnapshot(sync_status, documents, chunks, searches)
+        vectors = tuple(
+            connection.execute(
+                "SELECT chunk_id, library_id, source_version, model, vector_json, created_at "
+                "FROM memory_chunk_vectors WHERE library_id = ? ORDER BY chunk_id",
+                (library_id,),
+            )
+        )
+        return LibraryIndexSnapshot(sync_status, documents, chunks, searches, vectors)
 
     def _restore_library_index(
         self, library_id: str, snapshot: LibraryIndexSnapshot
@@ -1584,6 +1627,12 @@ class PlatformState:
             "INSERT INTO memory_chunk_search (chunk_id, content, heading, path) "
             "VALUES (?, ?, ?, ?)",
             snapshot.searches,
+        )
+        connection.executemany(
+            "INSERT INTO memory_chunk_vectors "
+            "(chunk_id, library_id, source_version, model, vector_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            snapshot.vectors,
         )
         connection.execute(
             "UPDATE memory_libraries SET sync_status = ? WHERE id = ?",
@@ -1643,7 +1692,9 @@ class PlatformState:
                 yield
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
-    def search_project(self, requested_cwd: str, query: str, limit: int = 10) -> dict[str, object]:
+    async def search_project(
+        self, requested_cwd: str, query: str, limit: int = 10
+    ) -> dict[str, object]:
         if not query.strip():
             raise ValueError("search query must not be empty")
         expression = fts_query(query)
@@ -1652,6 +1703,7 @@ class PlatformState:
             return {"status": "unbound", "query": query, "results": []}
         library_id = binding["library_id"]
         bounded_limit = max(1, min(limit, 100))
+        candidate_limit = min(500, max(20, bounded_limit * 5))
         rows = self.connection_or_raise.execute(
             """SELECT chunk.id, chunk.document_id, chunk.content, chunk.library_id,
                       chunk.path, chunk.heading,
@@ -1662,11 +1714,11 @@ class PlatformState:
                WHERE memory_chunk_search MATCH ? AND chunk.library_id = ?
                ORDER BY rank, chunk.path, chunk.start_line
                LIMIT ?""",
-            (expression, library_id, bounded_limit),
+            (expression, library_id, candidate_limit),
         ).fetchall()
         seen = {str(row[0]) for row in rows}
         keyword = query.strip().casefold()
-        if len(rows) < bounded_limit:
+        if len(rows) < candidate_limit:
             fallback_rows = self.connection_or_raise.execute(
                 """SELECT id, document_id, content, library_id, path, heading,
                           start_line, end_line, source_version, 0.0 AS rank
@@ -1682,9 +1734,10 @@ class PlatformState:
                 and keyword
                 in "\n".join((str(row[2]), "" if row[5] is None else str(row[5]))).casefold()
             )
-            rows = rows[:bounded_limit]
-        results = [
-            {
+            rows = rows[:candidate_limit]
+        candidates: dict[str, dict[str, object]] = {}
+        for rank, row in enumerate(rows):
+            candidates[str(row[0])] = {
                 "chunk_id": str(row[0]),
                 "document_id": str(row[1]),
                 "content": str(row[2]),
@@ -1696,15 +1749,137 @@ class PlatformState:
                 "source_version": str(row[8]),
                 "source_type": "markdown",
                 "classification": "direct",
-                "score": float(-row[9]),
+                "score": 1.0 / (60.0 + rank),
+                "retrieval_sources": ["full_text"],
             }
-            for row in rows
-        ]
+        degradation: list[str] = []
+        embedding = self.model_client.embedding
+        vector_status = "not_configured" if embedding is None else "ready"
+        if embedding is not None:
+            latest_job = self.connection_or_raise.execute(
+                "SELECT status FROM background_jobs WHERE kind = 'vector_rebuild' "
+                "AND json_extract(payload, '$.library_id') = ? ORDER BY id DESC LIMIT 1",
+                (library_id,),
+            ).fetchone()
+            if latest_job is not None and str(latest_job[0]) in {"pending", "running"}:
+                vector_status = "building"
+            elif latest_job is not None and str(latest_job[0]) == "error":
+                vector_status = "error"
+                degradation.append("vector_index_unavailable")
+            index_row = self.connection_or_raise.execute(
+                "SELECT model, dimension FROM memory_vector_indexes WHERE library_id = ?",
+                (library_id,),
+            ).fetchone()
+            if vector_status != "ready":
+                pass
+            elif index_row is None or str(index_row[0]) != embedding.model:
+                if vector_status != "building":
+                    vector_status = "error"
+                    if "vector_index_unavailable" not in degradation:
+                        degradation.append("vector_index_unavailable")
+            elif int(index_row[1]) > 0:
+                index_dimension = int(index_row[1])
+                try:
+                    query_vector = (
+                        await asyncio.to_thread(self.model_client.embed, [query])
+                    )[0]
+                    if len(query_vector) != index_dimension:
+                        raise ModelServiceError("embedding dimension changed")
+                    vector_rows = self.connection_or_raise.execute(
+                        """SELECT chunk.id, chunk.document_id, chunk.content, chunk.library_id,
+                                  chunk.path, chunk.heading, chunk.start_line, chunk.end_line,
+                                  chunk.source_version, vector.vector_json
+                           FROM memory_chunk_vectors AS vector
+                           JOIN memory_chunks AS chunk ON chunk.id = vector.chunk_id
+                           WHERE vector.library_id = ?
+                             AND vector.source_version = chunk.source_version
+                             AND vector.model = ?""",
+                        (library_id, embedding.model),
+                    ).fetchall()
+                    decoded_rows: list[tuple[list[float], tuple[object, ...]]] = []
+                    for row in vector_rows:
+                        raw_vector = json.loads(str(row[9]))
+                        if (
+                            not isinstance(raw_vector, list)
+                            or len(raw_vector) != index_dimension
+                            or any(
+                                not isinstance(value, (int, float))
+                                or not math.isfinite(float(value))
+                                for value in raw_vector
+                            )
+                        ):
+                            raise ModelServiceError("stored vector index is malformed")
+                        decoded_rows.append(([float(value) for value in raw_vector], row))
+                    scored = sorted(
+                        (
+                            (cosine_similarity(query_vector, stored_vector), row)
+                            for stored_vector, row in decoded_rows
+                        ),
+                        key=lambda item: (-item[0], str(item[1][4]), int(str(item[1][6]))),
+                    )[:candidate_limit]
+                    for rank, (similarity, row) in enumerate(scored):
+                        if similarity <= 0.05:
+                            continue
+                        chunk_id = str(row[0])
+                        semantic_score = max(0.0, similarity) / (60.0 + rank)
+                        existing = candidates.get(chunk_id)
+                        if existing is not None:
+                            existing["score"] = cast(float, existing["score"]) + semantic_score
+                            sources = existing["retrieval_sources"]
+                            assert isinstance(sources, list)
+                            sources.append("vector")
+                        else:
+                            candidates[chunk_id] = {
+                                "chunk_id": chunk_id,
+                                "document_id": str(row[1]),
+                                "content": str(row[2]),
+                                "library_id": str(row[3]),
+                                "path": str(row[4]),
+                                "heading": None if row[5] is None else str(row[5]),
+                                "start_line": int(str(row[6])),
+                                "end_line": int(str(row[7])),
+                                "source_version": str(row[8]),
+                                "source_type": "markdown",
+                                "classification": "direct",
+                                "score": semantic_score,
+                                "retrieval_sources": ["vector"],
+                            }
+                except (ModelServiceError, json.JSONDecodeError, TypeError, ValueError):
+                    vector_status = "error"
+                    degradation.append("embedding_unavailable")
+        results = sorted(
+            candidates.values(),
+            key=lambda item: (
+                -cast(float, item["score"]),
+                str(item["path"]),
+                cast(int, item["start_line"]),
+            ),
+        )
+        if self.model_client.reranker is not None and results:
+            original = results
+            try:
+                reranked = await asyncio.to_thread(
+                    self.model_client.rerank,
+                    query,
+                    [str(item["content"]) for item in original],
+                )
+                results = []
+                for index, score in reranked:
+                    item = dict(original[index])
+                    item["score"] = score
+                    results.append(item)
+            except ModelServiceError:
+                results = original
+                degradation.append("reranker_unavailable")
+        results = results[:bounded_limit]
         return {
             "status": "bound",
             "project_id": binding["project_id"],
             "library_id": library_id,
             "query": query,
+            "degraded": bool(degradation),
+            "degradation": degradation,
+            "vector_index_status": vector_status,
             "results": results,
         }
 
@@ -2071,12 +2246,116 @@ class PlatformState:
             return "unavailable"
         return "available"
 
-    def _execute_pending_jobs(self) -> None:
+    async def _execute_pending_jobs(self) -> None:
         assert self.connection is not None
-        self.connection.execute(
-            "UPDATE background_jobs SET status = 'done' WHERE status = 'pending'"
+        job = self.connection.execute(
+            "SELECT id, kind, payload FROM background_jobs "
+            "WHERE status = 'pending' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if job is None:
+            return
+        job_id, kind, payload = job
+        claimed = self.connection.execute(
+            "UPDATE background_jobs SET status = 'running' "
+            "WHERE id = ? AND status = 'pending'",
+            (job_id,),
         )
         self.connection.commit()
+        if claimed.rowcount != 1:
+            return
+        try:
+            if str(kind) == "vector_rebuild":
+                parsed = json.loads(str(payload))
+                await self._rebuild_vectors(str(parsed["library_id"]))
+            self.connection.execute(
+                "UPDATE background_jobs SET status = 'done' WHERE id = ?", (job_id,)
+            )
+        except (ModelServiceError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self.connection.rollback()
+            self.connection.execute(
+                "UPDATE background_jobs SET status = 'error' WHERE id = ?", (job_id,)
+            )
+        self.connection.commit()
+
+    def _queue_vector_rebuild(self, library_id: str, participate_in_transaction: bool) -> int:
+        if self.model_client.embedding is None:
+            return 0
+        pending = self.connection_or_raise.execute(
+            "SELECT id FROM background_jobs WHERE kind = 'vector_rebuild' "
+            "AND status = 'pending' AND json_extract(payload, '$.library_id') = ? "
+            "ORDER BY id LIMIT 1",
+            (library_id,),
+        ).fetchone()
+        if pending is not None:
+            return int(pending[0])
+        cursor = self.connection_or_raise.execute(
+            "INSERT INTO background_jobs (kind, payload) VALUES ('vector_rebuild', ?)",
+            (json.dumps({"library_id": library_id}),),
+        )
+        if not participate_in_transaction:
+            self.connection_or_raise.commit()
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
+    async def _rebuild_vectors(self, library_id: str) -> None:
+        endpoint = self.model_client.embedding
+        if endpoint is None:
+            raise ModelServiceError("embedding is not configured")
+        rows = self.connection_or_raise.execute(
+            "SELECT id, content, source_version FROM memory_chunks "
+            "WHERE library_id = ? ORDER BY id",
+            (library_id,),
+        ).fetchall()
+        rebuilt: list[tuple[str, str, str, str, str]] = []
+        dimension: int | None = None
+        for offset in range(0, len(rows), 32):
+            batch = rows[offset : offset + 32]
+            vectors = await asyncio.to_thread(
+                self.model_client.embed, [str(row[1]) for row in batch]
+            )
+            batch_dimension = len(vectors[0])
+            if dimension is None:
+                dimension = batch_dimension
+            elif dimension != batch_dimension:
+                raise ModelServiceError("embedding dimension changed during rebuild")
+            rebuilt.extend(
+                (
+                    str(row[0]),
+                    library_id,
+                    str(row[2]),
+                    endpoint.model,
+                    json.dumps(vector, separators=(",", ":")),
+                )
+                for row, vector in zip(batch, vectors, strict=True)
+            )
+        self.connection_or_raise.execute("BEGIN IMMEDIATE")
+        current = {
+            (str(row[0]), str(row[1]))
+            for row in self.connection_or_raise.execute(
+                "SELECT id, source_version FROM memory_chunks WHERE library_id = ?",
+                (library_id,),
+            )
+        }
+        expected = {(row[0], row[2]) for row in rebuilt}
+        if current != expected:
+            self.connection_or_raise.rollback()
+            self._queue_vector_rebuild(library_id, False)
+            return
+        self.connection_or_raise.execute(
+            "DELETE FROM memory_chunk_vectors WHERE library_id = ?", (library_id,)
+        )
+        self.connection_or_raise.executemany(
+            "INSERT INTO memory_chunk_vectors "
+            "(chunk_id, library_id, source_version, model, vector_json) VALUES (?, ?, ?, ?, ?)",
+            rebuilt,
+        )
+        self.connection_or_raise.execute(
+            "INSERT INTO memory_vector_indexes (library_id, model, dimension) VALUES (?, ?, ?) "
+            "ON CONFLICT(library_id) DO UPDATE SET model = excluded.model, "
+            "dimension = excluded.dimension, updated_at = CURRENT_TIMESTAMP",
+            (library_id, endpoint.model, 0 if dimension is None else dimension),
+        )
+        self.connection_or_raise.commit()
 
     def _metadata(self, key: str) -> str | None:
         assert self.connection is not None

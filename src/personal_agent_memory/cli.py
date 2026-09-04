@@ -8,6 +8,7 @@ import uvicorn
 
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import ConfigurationError, Settings
+from personal_agent_memory.model_client import ModelEndpoint
 
 cli = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -37,6 +38,19 @@ def serve(
     ),
     host: str = typer.Option("127.0.0.1", help="Loopback listen address."),
     port: int = typer.Option(7331, min=1, max=65535),
+    embedding_url: str | None = typer.Option(None, help="OpenAI-compatible embedding base URL."),
+    embedding_model: str = typer.Option("text-embedding", help="Embedding model name."),
+    embedding_api_key_file: str | None = typer.Option(
+        None, help="File containing the embedding service API key."
+    ),
+    reranker_url: str | None = typer.Option(None, help="OpenAI-compatible reranker base URL."),
+    reranker_model: str = typer.Option("reranker", help="Reranker model name."),
+    reranker_api_key_file: str | None = typer.Option(
+        None, help="File containing the reranker service API key."
+    ),
+    model_timeout: float = typer.Option(2.0, min=0.05, max=30.0),
+    model_concurrency: int = typer.Option(2, min=1, max=32),
+    model_retries: int = typer.Option(1, min=0, max=3),
 ) -> None:
     """Run the single local memory daemon."""
     try:
@@ -45,9 +59,33 @@ def serve(
             host=host,
             port=port,
             library_roots=tuple(Path(root) for root in library_root or ()),
+            embedding=(
+                ModelEndpoint(
+                    embedding_url,
+                    embedding_model,
+                    None if embedding_api_key_file is None else Path(embedding_api_key_file),
+                    model_timeout,
+                    model_concurrency,
+                    model_retries,
+                )
+                if embedding_url is not None
+                else None
+            ),
+            reranker=(
+                ModelEndpoint(
+                    reranker_url,
+                    reranker_model,
+                    None if reranker_api_key_file is None else Path(reranker_api_key_file),
+                    model_timeout,
+                    model_concurrency,
+                    model_retries,
+                )
+                if reranker_url is not None
+                else None
+            ),
         )
         ensure_port_available(settings.host, settings.port)
-    except ConfigurationError as error:
+    except (ConfigurationError, ValueError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=2) from error
     uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)

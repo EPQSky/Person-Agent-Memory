@@ -49,6 +49,15 @@ library manifest, and reserved tombstone paths, so a containing project reposito
 history, and unrelated working tree remain untouched. MCP exposes search and status but no direct
 document edit or history-restore operation.
 
+Embedding and reranking are independently optional OpenAI-compatible services configured with
+`--embedding-url` and `--reranker-url`. API keys are read only from the corresponding
+`--embedding-api-key-file` and `--reranker-api-key-file`; they are not stored in a library, Git, or
+response payload. Vector data is a rebuildable SQLite projection. A scan invalidates vectors for
+changed chunks and schedules a bounded background rebuild. Search merges and deduplicates full-text
+and semantic candidates, while embedding failures retain full-text results and reranker failures
+retain the pre-rerank order with an explicit degradation marker. Model calls have configurable
+timeouts, concurrency limits, and at most three retries.
+
 ## Verify
 
 ```bash
