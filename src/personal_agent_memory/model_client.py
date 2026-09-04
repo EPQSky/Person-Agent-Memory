@@ -52,15 +52,20 @@ class OpenAICompatibleClient:
         self,
         embedding: ModelEndpoint | None,
         reranker: ModelEndpoint | None,
+        graph: ModelEndpoint | None = None,
     ) -> None:
         self.embedding = embedding
         self.reranker = reranker
+        self.graph = graph
         self._limits = {
             "embedding": threading.BoundedSemaphore(
                 embedding.max_concurrency if embedding is not None else 1
             ),
             "reranker": threading.BoundedSemaphore(
                 reranker.max_concurrency if reranker is not None else 1
+            ),
+            "graph": threading.BoundedSemaphore(
+                graph.max_concurrency if graph is not None else 1
             ),
         }
 
@@ -126,6 +131,46 @@ class OpenAICompatibleClient:
             seen.add(index)
             ordered.append((index, float(score)))
         return ordered
+
+    def extract_graph(self, document: str) -> dict[str, object]:
+        endpoint = self.graph
+        if endpoint is None:
+            raise ModelServiceError("graph LLM is not configured")
+        response = self._request(
+            "graph",
+            endpoint,
+            "/v1/chat/completions",
+            {
+                "model": endpoint.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "graph-extraction-v1: return JSON with entities and relations; "
+                            "each relation source and target must name an entity"
+                        ),
+                    },
+                    {"role": "user", "content": document},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+        )
+        choices = response.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            raise ModelServiceError("graph LLM returned malformed data")
+        choice = choices[0]
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise ModelServiceError("graph LLM returned malformed data")
+        content = choice["message"].get("content")
+        if not isinstance(content, str):
+            raise ModelServiceError("graph LLM returned malformed data")
+        try:
+            decoded = json.loads(content)
+        except json.JSONDecodeError as error:
+            raise ModelServiceError("graph LLM returned malformed JSON") from error
+        if not isinstance(decoded, dict):
+            raise ModelServiceError("graph LLM returned malformed JSON")
+        return decoded
 
     def _request(
         self,

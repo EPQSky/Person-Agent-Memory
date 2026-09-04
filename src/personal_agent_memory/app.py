@@ -9,9 +9,10 @@ from typing import Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from markdown_it import MarkdownIt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from personal_agent_memory.config import Settings
+from personal_agent_memory.graph_adapter import JiuwenMilvusGraphAdapter
 from personal_agent_memory.model_client import OpenAICompatibleClient
 from personal_agent_memory.security import ApiKeyStore
 from personal_agent_memory.state import (
@@ -57,6 +58,7 @@ class SearchRequest(BaseModel):
     cwd: str
     query: str
     limit: int = 10
+    graph_hops: int = Field(default=1, ge=1, le=2)
 
 
 class DocumentPreview(BaseModel):
@@ -82,10 +84,12 @@ class DocumentRestore(BaseModel):
 
 def create_app(settings: Settings) -> FastAPI:
     key_store = ApiKeyStore(settings.state_dir / "api-key")
+    model_client = OpenAICompatibleClient(settings.embedding, settings.reranker, settings.graph)
     platform_state = PlatformState(
         settings.state_dir / "platform.sqlite3",
         library_roots=settings.library_roots,
-        model_client=OpenAICompatibleClient(settings.embedding, settings.reranker),
+        model_client=model_client,
+        graph_adapter=JiuwenMilvusGraphAdapter(settings.state_dir / "graphs", model_client),
     )
     markdown = MarkdownIt("commonmark", {"html": False})
 
@@ -197,6 +201,33 @@ def create_app(settings: Settings) -> FastAPI:
             )
             raise HTTPException(status_code=code, detail=str(error)) from error
         return {"library_id": library_id, "job_id": job_id, "status": "pending"}
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/graph-index/rebuild",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def rebuild_graph_index(library_id: str) -> dict[str, object]:
+        try:
+            job_id = platform_state.enqueue_graph_rebuild(library_id)
+        except LibraryRegistrationError as error:
+            code = (
+                status.HTTP_404_NOT_FOUND
+                if str(error) == "memory library not found"
+                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            )
+            raise HTTPException(status_code=code, detail=str(error)) from error
+        return {"library_id": library_id, "job_id": job_id, "status": "pending"}
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/graph-status",
+        dependencies=[Depends(authenticate)],
+    )
+    async def graph_status(library_id: str) -> dict[str, object]:
+        try:
+            return platform_state.graph_status(library_id)
+        except LibraryRegistrationError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(authenticate)])
     async def background_job(job_id: int) -> dict[str, object]:
@@ -340,7 +371,9 @@ def create_app(settings: Settings) -> FastAPI:
 
     async def search_payload(request: SearchRequest) -> dict[str, object]:
         try:
-            return await platform_state.search_project(request.cwd, request.query, request.limit)
+            return await platform_state.search_project(
+                request.cwd, request.query, request.limit, request.graph_hops
+            )
         except ProjectBindingError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)

@@ -28,6 +28,7 @@ class Settings:
     library_roots: tuple[Path, ...] = ()
     embedding: ModelEndpoint | None = None
     reranker: ModelEndpoint | None = None
+    graph: ModelEndpoint | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_dir", self.state_dir.expanduser().resolve())
@@ -37,7 +38,7 @@ class Settings:
             "library_roots",
             tuple(root.expanduser().resolve() for root in roots),
         )
-        for endpoint in (self.embedding, self.reranker):
+        for endpoint in (self.embedding, self.reranker, self.graph):
             if endpoint is None or endpoint.api_key_file is None:
                 continue
             if any(

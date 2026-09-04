@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
+import re
 import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI(title="Deterministic OpenAI-compatible fake model")
-MODES = {"embedding": "ok", "reranker": "ok"}
+MODES = {"embedding": "ok", "reranker": "ok", "graph": "ok"}
 
 
 @app.get("/health")
@@ -50,8 +52,39 @@ def _vector(value: str) -> list[float]:
 
 @app.post("/v1/chat/completions")
 def chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
-    content = "deterministic-response"
-    if payload.get("messages"):
+    if _apply_mode("graph") == "malformed":
+        content = "not-json"
+    elif any(
+        "graph-extraction-v1" in str(message.get("content", ""))
+        for message in payload.get("messages", [])
+        if isinstance(message, dict)
+    ):
+        source = str(payload.get("messages", [{}, {}])[-1].get("content", ""))
+        entities: dict[str, str] = {}
+        relations: list[dict[str, str]] = []
+        for match in re.finditer(
+            r"(?m)^Graph:\s*([^\n:>-]+?)\s*->\s*([^\n:]+?)(?::\s*(.+))?$", source
+        ):
+            left, right = match.group(1).strip(), match.group(2).strip()
+            description = (match.group(3) or f"{left} relates to {right}").strip()
+            entities.setdefault(left, left)
+            entities.setdefault(right, right)
+            relations.append({"source": left, "target": right, "content": description})
+        for match in re.finditer(r"(?m)^Entity:\s*([^\n:]+?)(?::\s*(.+))?$", source):
+            name = match.group(1).strip()
+            entities[name] = (match.group(2) or name).strip()
+        content = json.dumps(
+            {
+                "entities": [
+                    {"name": name, "content": description}
+                    for name, description in sorted(entities.items())
+                ],
+                "relations": relations,
+            }
+        )
+    else:
+        content = "deterministic-response"
+    if content == "deterministic-response" and payload.get("messages"):
         content = str(payload["messages"][-1].get("content", content))
     return {
         "id": "chatcmpl-test",

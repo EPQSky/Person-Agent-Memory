@@ -3,7 +3,7 @@ name = "personal-agent-memory"
 version = "0.1.0"
 description = "Local-first personal memory platform for coding agents"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 classifiers = [
@@ -14,7 +14,10 @@ classifiers = [
 ]
 dependencies = [
   "fastapi>=0.116,<1",
+  "JiuwenMemory==0.1.2",
   "markdown-it-py>=4,<5",
+  "milvus-lite==2.5.1",
+  "setuptools<81",
   "typer>=0.16,<1",
   "uvicorn>=0.35,<1",
 ]

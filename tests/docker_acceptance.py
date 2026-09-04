@@ -211,6 +211,20 @@ def docker_fixture() -> str:
 """,
     encoding="utf-8",
 )
+(retrieval_library_path / "graph-seed.md").write_text(
+    "# Graph seed\n\nGraphSeedNeedle anchors Alpha.\n\n"
+    "Graph: Alpha -> Beta: Alpha points to Beta.\n",
+    encoding="utf-8",
+)
+(retrieval_library_path / "graph-one.md").write_text(
+    "# Graph one\n\nEntity: Beta: One-hop authoritative source.\n\n"
+    "Graph: Beta -> Gamma: Beta points to Gamma.\n",
+    encoding="utf-8",
+)
+(retrieval_library_path / "graph-two.md").write_text(
+    "# Graph two\n\nEntity: Gamma: Two-hop authoritative source.\n",
+    encoding="utf-8",
+)
 (retrieval_library_path / "ignored.md").write_text("IgnoredNeedle", encoding="utf-8")
 (retrieval_library_path / "node_modules").mkdir()
 (retrieval_library_path / "node_modules" / "hidden.md").write_text(
@@ -364,7 +378,7 @@ rebuild_code, rebuild = request(
     {},
 )
 assert rebuild_code == 202
-deadline = time.monotonic() + 10
+deadline = time.monotonic() + 30
 while time.monotonic() < deadline:
     rebuild_status_code, rebuild_status = request(
         f"http://127.0.0.1:7331/api/v1/jobs/{rebuild['job_id']}", key
@@ -374,6 +388,248 @@ while time.monotonic() < deadline:
         break
     time.sleep(0.05)
 assert rebuild_status["status"] == "done"
+
+graph_rebuild_code, graph_rebuild = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/graph-index/rebuild",
+    key,
+    {},
+)
+assert graph_rebuild_code == 202
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    graph_job_code, graph_job = request(
+        f"http://127.0.0.1:7331/api/v1/jobs/{graph_rebuild['job_id']}", key
+    )
+    assert graph_job_code == 200
+    if graph_job["status"] in {"done", "error"}:
+        break
+    time.sleep(0.05)
+assert graph_job["status"] == "done"
+graph_status_code, graph_status = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/graph-status",
+    key,
+)
+assert graph_status_code == 200
+assert graph_status["status"] == "ready"
+assert graph_status["projected_documents"] == graph_status["total_documents"]
+
+one_hop_code, one_hop = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 1},
+)
+assert one_hop_code == 200
+assert [(item["path"], item["classification"]) for item in one_hop["results"]] == [
+    ("graph-seed.md", "direct"),
+    ("graph-one.md", "graph_expansion"),
+]
+assert one_hop["results"][1]["graph_hop"] == 1
+assert one_hop["results"][1]["content"] == "Entity: Beta: One-hop authoritative source."
+assert one_hop["results"][1]["heading"] == "Graph one"
+assert one_hop["results"][1]["start_line"] == 3
+
+two_hop_code, two_hop = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 2},
+)
+assert two_hop_code == 200
+assert [item["path"] for item in two_hop["results"]] == [
+    "graph-seed.md",
+    "graph-one.md",
+    "graph-two.md",
+]
+assert two_hop["results"][2]["graph_hop"] == 2
+
+assert request("http://127.0.0.1:18080/control/graph/error", payload={})[0] == 200
+failed_rebuild_code, failed_rebuild = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/graph-index/rebuild",
+    key,
+    {},
+)
+assert failed_rebuild_code == 202
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    failed_job_code, failed_job = request(
+        f"http://127.0.0.1:7331/api/v1/jobs/{failed_rebuild['job_id']}", key
+    )
+    assert failed_job_code == 200
+    if failed_job["status"] in {"done", "error"}:
+        break
+    time.sleep(0.05)
+assert failed_job["status"] == "error"
+graph_fallback_code, graph_fallback = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 2},
+)
+assert graph_fallback_code == 200
+assert [item["path"] for item in graph_fallback["results"]] == ["graph-seed.md"]
+assert "graph_unavailable" in graph_fallback["degradation"]
+assert request("http://127.0.0.1:18080/control/graph/ok", payload={})[0] == 200
+recovered_rebuild_code, recovered_rebuild = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/graph-index/rebuild",
+    key,
+    {},
+)
+assert recovered_rebuild_code == 202
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    recovered_job_code, recovered_job = request(
+        f"http://127.0.0.1:7331/api/v1/jobs/{recovered_rebuild['job_id']}", key
+    )
+    assert recovered_job_code == 200
+    if recovered_job["status"] in {"done", "error"}:
+        break
+    time.sleep(0.05)
+assert recovered_job["status"] == "done"
+
+# A platform edit invalidates the old source version synchronously. The old
+# projection must not leak its graph hit while the replacement builds, and the
+# background projection must converge to the edited authoritative Markdown.
+graph_one_url = (
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/document?"
+    + urllib.parse.urlencode({"path": "graph-one.md"})
+)
+graph_one_code, graph_one = request(graph_one_url, key)
+assert graph_one_code == 200
+graph_history_code, graph_history = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/history", key
+)
+assert graph_history_code == 200
+graph_original_commit = str(graph_history[-1]["commit"])
+edited_graph_content = (
+    "# Graph one\n\nEntity: Beta: Edited one-hop authoritative source.\n\n"
+    "Graph: Beta -> Gamma: Edited Beta points to Gamma.\n"
+)
+graph_edit_code, graph_edit = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/document",
+    key,
+    {
+        "path": "graph-one.md",
+        "content": edited_graph_content,
+        "expected_source_version": graph_one["source_version"],
+        "operation_id": "docker-graph-edit-1",
+        "actor_type": "user",
+        "source": "docker-graph-acceptance",
+    },
+    method="PUT",
+)
+assert graph_edit_code == 200
+stale_graph_code, stale_graph = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 1},
+)
+assert stale_graph_code == 200
+assert [item["path"] for item in stale_graph["results"]] == ["graph-seed.md"]
+assert stale_graph["graph_index_status"] == "building"
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    _, edited_graph_status = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/graph-status",
+        key,
+    )
+    if edited_graph_status["status"] in {"ready", "error"}:
+        break
+    time.sleep(0.05)
+assert edited_graph_status["status"] == "ready"
+edited_graph_code, edited_graph = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 1},
+)
+assert edited_graph_code == 200
+assert [item["path"] for item in edited_graph["results"]] == [
+    "graph-seed.md",
+    "graph-one.md",
+]
+assert edited_graph["results"][1]["content"] == (
+    "Entity: Beta: Edited one-hop authoritative source."
+)
+
+# Restoring through the isolated history is another real source-version change.
+# It receives the same immediate stale-result filter and eventual convergence.
+graph_restore_code, graph_restore = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/history/restore",
+    key,
+    {
+        "path": "graph-one.md",
+        "commit": graph_original_commit,
+        "expected_source_version": graph_edit["source_version"],
+        "operation_id": "docker-graph-restore-1",
+        "actor_type": "user",
+        "source": "docker-graph-acceptance",
+    },
+)
+assert graph_restore_code == 200
+restoring_graph_code, restoring_graph = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 1},
+)
+assert restoring_graph_code == 200
+assert [item["path"] for item in restoring_graph["results"]] == ["graph-seed.md"]
+assert restoring_graph["graph_index_status"] == "building"
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    _, restored_graph_status = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/graph-status",
+        key,
+    )
+    if restored_graph_status["status"] in {"ready", "error"}:
+        break
+    time.sleep(0.05)
+assert restored_graph_status["status"] == "ready"
+restored_graph_code, restored_graph = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 1},
+)
+assert restored_graph_code == 200
+assert [item["path"] for item in restored_graph["results"]] == [
+    "graph-seed.md",
+    "graph-one.md",
+]
+assert restored_graph["results"][1]["content"] == (
+    "Entity: Beta: One-hop authoritative source."
+)
+
+# Removing a real source file and scanning it out immediately prevents the old
+# graph projection from returning it, then clears it from the durable projection.
+(retrieval_library_path / "graph-one.md").unlink()
+graph_delete_scan_code, graph_delete_scan = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/scan",
+    key,
+    method="POST",
+)
+assert graph_delete_scan_code == 200
+assert graph_delete_scan["removed"] == 1
+missing_source_code, missing_source = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 2},
+)
+assert missing_source_code == 200
+assert [item["path"] for item in missing_source["results"]] == ["graph-seed.md"]
+assert missing_source["graph_index_status"] == "building"
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    _, deleted_graph_status = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/graph-status",
+        key,
+    )
+    if deleted_graph_status["status"] in {"ready", "error"}:
+        break
+    time.sleep(0.05)
+assert deleted_graph_status["status"] == "ready"
+deleted_graph_code, deleted_graph = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "GraphSeedNeedle", "graph_hops": 2},
+)
+assert deleted_graph_code == 200
+assert [item["path"] for item in deleted_graph["results"]] == ["graph-seed.md"]
 
 semantic_code, semantic = request(
     "http://127.0.0.1:7331/mcp/search",

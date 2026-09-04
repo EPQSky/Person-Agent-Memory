@@ -66,7 +66,7 @@
         const form = document.createElement('form');
         form.innerHTML = '<div class="field"><label for="path">Directory path</label><input id="path" required></div><div class="field"><label for="kind">Library type</label><select id="kind"><option value="project">Project</option><option value="user">User</option></select></div><div class="field"><label><input id="reuse-existing-git" type="checkbox"> Authorize this dedicated memory repository</label></div><button type="submit">Register library</button><p id="library-message"></p>';
         const table = document.createElement('table');
-        table.innerHTML = '<thead><tr><th>Identifier</th><th>Type</th><th>Path</th><th>Availability</th><th>Sync</th></tr></thead><tbody></tbody>';
+        table.innerHTML = '<thead><tr><th>Identifier</th><th>Type</th><th>Path</th><th>Availability</th><th>Text</th><th>Graph</th><th>Graph progress</th><th>Graph error</th></tr></thead><tbody></tbody>';
         const bindingHeading = document.createElement('h2');
         bindingHeading.textContent = 'Project bindings';
         const bindingForm = document.createElement('form');
@@ -130,7 +130,7 @@
           body.replaceChildren();
           for (const library of libraries) {
             const row = document.createElement('tr');
-            for (const value of [library.id, library.kind, library.canonical_path, library.availability, library.sync_status]) {
+            for (const value of [library.id, library.kind, library.canonical_path, library.availability, library.sync_status, library.graph_status, library.graph_progress, library.graph_last_error || 'None']) {
               const cell = document.createElement('td');
               cell.textContent = value;
               if (value === library.canonical_path) cell.className = 'path';
@@ -352,13 +352,13 @@
           if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
           const payload = await response.json();
           message.className = '';
-          message.textContent = payload.status === 'unbound' ? 'No project memory library is bound to this directory.' : `${payload.results.length} direct result(s).`;
+          message.textContent = payload.status === 'unbound' ? 'No project memory library is bound to this directory.' : `${payload.results.length} result(s) · graph ${payload.graph_index_status}${payload.degraded ? ` · degraded: ${payload.degradation.join(', ')}` : ''}.`;
           for (const hit of payload.results) {
             const article = document.createElement('article');
             article.className = 'search-result';
             const source = document.createElement('div');
             source.className = 'source';
-            source.textContent = `${hit.path}:${hit.start_line}-${hit.end_line} · ${hit.heading || 'Untitled'} · ${hit.source_version}`;
+            source.textContent = `${hit.path}:${hit.start_line}-${hit.end_line} · ${hit.heading || 'Untitled'} · ${hit.classification}${hit.graph_hop ? ` hop ${hit.graph_hop}` : ''} · ${hit.source_version}`;
             const content = document.createElement('pre');
             content.textContent = hit.content;
             article.append(source, content);

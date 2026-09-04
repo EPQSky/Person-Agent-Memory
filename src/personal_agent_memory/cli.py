@@ -48,6 +48,11 @@ def serve(
     reranker_api_key_file: str | None = typer.Option(
         None, help="File containing the reranker service API key."
     ),
+    graph_url: str | None = typer.Option(None, help="OpenAI-compatible graph LLM base URL."),
+    graph_model: str = typer.Option("graph-extraction", help="Graph LLM model name."),
+    graph_api_key_file: str | None = typer.Option(
+        None, help="File containing the graph LLM API key."
+    ),
     model_timeout: float = typer.Option(2.0, min=0.05, max=30.0),
     model_concurrency: int = typer.Option(2, min=1, max=32),
     model_retries: int = typer.Option(1, min=0, max=3),
@@ -81,6 +86,18 @@ def serve(
                     model_retries,
                 )
                 if reranker_url is not None
+                else None
+            ),
+            graph=(
+                ModelEndpoint(
+                    graph_url,
+                    graph_model,
+                    None if graph_api_key_file is None else Path(graph_api_key_file),
+                    model_timeout,
+                    model_concurrency,
+                    model_retries,
+                )
+                if graph_url is not None
                 else None
             ),
         )

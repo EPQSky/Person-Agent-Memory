@@ -24,6 +24,11 @@ from personal_agent_memory.git_history import (
     GitRepository,
     allowed_markdown_path,
 )
+from personal_agent_memory.graph_adapter import (
+    GraphAdapter,
+    GraphAdapterError,
+    GraphSourceDocument,
+)
 from personal_agent_memory.markdown_index import (
     MarkdownDocument,
     MarkdownScan,
@@ -134,6 +139,9 @@ class MemoryLibrary:
     canonical_path: str
     availability: str
     sync_status: str
+    graph_status: str
+    graph_progress: str
+    graph_last_error: str
 
     def payload(self) -> dict[str, str]:
         return asdict(self)
@@ -158,6 +166,7 @@ class PlatformState:
         database_path: Path,
         library_roots: tuple[Path, ...] = (),
         model_client: OpenAICompatibleClient | None = None,
+        graph_adapter: GraphAdapter | None = None,
     ) -> None:
         self.database_path = database_path
         self.library_roots = library_roots
@@ -167,6 +176,7 @@ class PlatformState:
         self.startup_count = 0
         self.previous_shutdown_clean = True
         self.model_client = model_client or OpenAICompatibleClient(None, None)
+        self.graph_adapter = graph_adapter
 
     async def start(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -234,6 +244,23 @@ class PlatformState:
                     model TEXT NOT NULL,
                     dimension INTEGER NOT NULL CHECK(dimension >= 0),
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_graph_indexes (
+                    library_id TEXT PRIMARY KEY
+                        REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'not_configured',
+                    total_documents INTEGER NOT NULL DEFAULT 0,
+                    projected_documents INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_graph_documents (
+                    library_id TEXT NOT NULL
+                        REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    document_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    source_version TEXT NOT NULL,
+                    PRIMARY KEY(library_id, document_id)
                 );
                 CREATE TABLE IF NOT EXISTS project_bindings (
                     id TEXT PRIMARY KEY,
@@ -351,6 +378,13 @@ class PlatformState:
         if self.model_client.embedding is None:
             raise LibraryRegistrationError("embedding is not configured")
         return self._queue_vector_rebuild(library_id, False)
+
+    def enqueue_graph_rebuild(self, library_id: str) -> int:
+        if self.library(library_id) is None:
+            raise LibraryRegistrationError("memory library not found")
+        if self.graph_adapter is None or self.model_client.graph is None:
+            raise LibraryRegistrationError("graph projection is not configured")
+        return self._queue_graph_rebuild(library_id, False)
 
     def job_status(self, job_id: int) -> str | None:
         assert self.connection is not None
@@ -503,8 +537,13 @@ class PlatformState:
     def list_libraries(self) -> list[MemoryLibrary]:
         assert self.connection is not None
         rows = self.connection.execute(
-            """SELECT id, kind, canonical_path, sync_status
-               FROM memory_libraries ORDER BY created_at, id"""
+            """SELECT library.id, library.kind, library.canonical_path,
+                      library.sync_status, COALESCE(graph.status, 'not_configured'),
+                      COALESCE(graph.projected_documents, 0),
+                      COALESCE(graph.total_documents, 0), COALESCE(graph.last_error, '')
+               FROM memory_libraries AS library
+               LEFT JOIN memory_graph_indexes AS graph ON graph.library_id = library.id
+               ORDER BY library.created_at, library.id"""
         ).fetchall()
         return [
             MemoryLibrary(
@@ -513,6 +552,9 @@ class PlatformState:
                 canonical_path=str(row[2]),
                 availability=self._availability(Path(str(row[2]))),
                 sync_status=str(row[3]),
+                graph_status=str(row[4]),
+                graph_progress=f"{int(row[5])}/{int(row[6])}",
+                graph_last_error=str(row[7]),
             )
             for row in rows
         ]
@@ -679,6 +721,7 @@ class PlatformState:
             if not participate_in_transaction:
                 self.connection_or_raise.commit()
             self._queue_vector_rebuild(library_id, participate_in_transaction)
+            self._queue_graph_rebuild(library_id, participate_in_transaction)
         except BaseException:
             if not participate_in_transaction:
                 self.connection_or_raise.rollback()
@@ -1693,7 +1736,11 @@ class PlatformState:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
     async def search_project(
-        self, requested_cwd: str, query: str, limit: int = 10
+        self,
+        requested_cwd: str,
+        query: str,
+        limit: int = 10,
+        max_graph_hops: int = 1,
     ) -> dict[str, object]:
         if not query.strip():
             raise ValueError("search query must not be empty")
@@ -1871,7 +1918,115 @@ class PlatformState:
             except ModelServiceError:
                 results = original
                 degradation.append("reranker_unavailable")
-        results = results[:bounded_limit]
+        graph_status = self.graph_status(library_id)
+        ordered_direct = results
+        graph_capacity = (
+            min(5, max(1, bounded_limit * 3 // 10))
+            if graph_status["status"] == "ready" and bounded_limit >= 2
+            else 0
+        )
+        results = ordered_direct[: bounded_limit - graph_capacity]
+        graph_limit = graph_capacity
+        if (
+            results
+            and graph_limit
+            and self.graph_adapter is not None
+            and graph_status["status"] == "ready"
+        ):
+            seed_document_ids = tuple(
+                dict.fromkeys(str(item["document_id"]) for item in results)
+            )
+            try:
+                expanded = await self.graph_adapter.expand(
+                    library_id,
+                    seed_document_ids,
+                    max_hops=max(1, min(max_graph_hops, 2)),
+                    limit=graph_limit,
+                )
+                current_sources: dict[
+                    str, list[tuple[str, str, str, str, str | None, int, int]]
+                ] = {}
+                for row in self.connection_or_raise.execute(
+                    "SELECT document.id, document.path, document.source_version, "
+                    "chunk.id, chunk.content, chunk.heading, chunk.start_line, "
+                    "chunk.end_line FROM memory_documents AS document "
+                    "JOIN memory_chunks AS chunk ON chunk.document_id = document.id "
+                    "WHERE document.library_id = ? "
+                    "ORDER BY document.path, chunk.start_line, chunk.id",
+                    (library_id,),
+                ):
+                    current_sources.setdefault(str(row[0]), []).append(
+                        (
+                            str(row[1]),
+                            str(row[2]),
+                            str(row[3]),
+                            str(row[4]),
+                            None if row[5] is None else str(row[5]),
+                            int(row[6]),
+                            int(row[7]),
+                        )
+                    )
+                for expansion in expanded:
+                    document_sources = current_sources.get(expansion.document_id)
+                    if (
+                        not document_sources
+                        or document_sources[0][0] != expansion.path
+                        or document_sources[0][1] != expansion.source_version
+                    ):
+                        continue
+                    anchor = expansion.source_anchor.casefold()
+                    source = next(
+                        (
+                            item
+                            for item in document_sources
+                            if anchor
+                            and anchor
+                            in "\n".join((item[3], item[4] or "")).casefold()
+                        ),
+                        document_sources[0],
+                    )
+                    results.append(
+                        {
+                            "chunk_id": f"graph:{source[2]}:{expansion.hop}",
+                            "document_id": expansion.document_id,
+                            "content": source[3],
+                            "library_id": library_id,
+                            "path": source[0],
+                            "heading": source[4],
+                            "start_line": source[5],
+                            "end_line": source[6],
+                            "source_version": source[1],
+                            "source_type": "markdown",
+                            "classification": "graph_expansion",
+                            "graph_object_type": expansion.graph_object_type,
+                            "graph_hop": expansion.hop,
+                            "score": 0.0,
+                            "retrieval_sources": ["graph"],
+                        }
+                    )
+            except GraphAdapterError as error:
+                degradation.append("graph_unavailable")
+                self.connection_or_raise.execute(
+                    "UPDATE memory_graph_indexes SET status = 'error', last_error = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE library_id = ?",
+                    (str(error)[:1000], library_id),
+                )
+                self.connection_or_raise.commit()
+                graph_status = self.graph_status(library_id)
+        if (
+            results
+            and self.model_client.graph is not None
+            and graph_status["status"] == "error"
+            and "graph_unavailable" not in degradation
+        ):
+            degradation.append("graph_unavailable")
+        included_chunks = {str(item["chunk_id"]) for item in results}
+        for item in ordered_direct:
+            if len(results) >= bounded_limit:
+                break
+            if str(item["chunk_id"]) not in included_chunks:
+                results.append(item)
+                included_chunks.add(str(item["chunk_id"]))
         return {
             "status": "bound",
             "project_id": binding["project_id"],
@@ -1880,7 +2035,34 @@ class PlatformState:
             "degraded": bool(degradation),
             "degradation": degradation,
             "vector_index_status": vector_status,
+            "graph_index_status": graph_status["status"],
             "results": results,
+        }
+
+    def graph_status(self, library_id: str) -> dict[str, object]:
+        if self.library(library_id) is None:
+            raise LibraryRegistrationError("memory library not found")
+        row = self.connection_or_raise.execute(
+            "SELECT status, total_documents, projected_documents, last_error, updated_at "
+            "FROM memory_graph_indexes WHERE library_id = ?",
+            (library_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "library_id": library_id,
+                "status": "not_configured",
+                "total_documents": 0,
+                "projected_documents": 0,
+                "last_error": "",
+                "updated_at": None,
+            }
+        return {
+            "library_id": library_id,
+            "status": str(row[0]),
+            "total_documents": int(row[1]),
+            "projected_documents": int(row[2]),
+            "last_error": str(row[3]),
+            "updated_at": str(row[4]),
         }
 
     def bind_project(self, requested_root: str, library_id: str) -> ProjectBinding:
@@ -2267,11 +2449,33 @@ class PlatformState:
             if str(kind) == "vector_rebuild":
                 parsed = json.loads(str(payload))
                 await self._rebuild_vectors(str(parsed["library_id"]))
+            elif str(kind) == "graph_rebuild":
+                parsed = json.loads(str(payload))
+                await self._rebuild_graph(str(parsed["library_id"]))
             self.connection.execute(
                 "UPDATE background_jobs SET status = 'done' WHERE id = ?", (job_id,)
             )
-        except (ModelServiceError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        except (
+            GraphAdapterError,
+            ModelServiceError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
             self.connection.rollback()
+            if str(kind) == "graph_rebuild":
+                with suppress(KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    library_id = str(json.loads(str(payload))["library_id"])
+                    self.connection.execute(
+                        "INSERT INTO memory_graph_indexes "
+                        "(library_id, status, last_error) VALUES (?, 'error', ?) "
+                        "ON CONFLICT(library_id) DO UPDATE SET status = 'error', "
+                        "last_error = excluded.last_error, updated_at = CURRENT_TIMESTAMP",
+                        (library_id, str(error)[:1000]),
+                    )
             self.connection.execute(
                 "UPDATE background_jobs SET status = 'error' WHERE id = ?", (job_id,)
             )
@@ -2296,6 +2500,94 @@ class PlatformState:
             self.connection_or_raise.commit()
         assert cursor.lastrowid is not None
         return int(cursor.lastrowid)
+
+    def _queue_graph_rebuild(self, library_id: str, participate_in_transaction: bool) -> int:
+        if self.graph_adapter is None or self.model_client.graph is None:
+            self.connection_or_raise.execute(
+                "INSERT INTO memory_graph_indexes (library_id, status) "
+                "VALUES (?, 'not_configured') ON CONFLICT(library_id) DO NOTHING",
+                (library_id,),
+            )
+            if not participate_in_transaction:
+                self.connection_or_raise.commit()
+            return 0
+        pending = self.connection_or_raise.execute(
+            "SELECT id FROM background_jobs WHERE kind = 'graph_rebuild' "
+            "AND status = 'pending' AND json_extract(payload, '$.library_id') = ? "
+            "ORDER BY id LIMIT 1",
+            (library_id,),
+        ).fetchone()
+        if pending is not None:
+            return int(pending[0])
+        cursor = self.connection_or_raise.execute(
+            "INSERT INTO background_jobs (kind, payload) VALUES ('graph_rebuild', ?)",
+            (json.dumps({"library_id": library_id}),),
+        )
+        self.connection_or_raise.execute(
+            "INSERT INTO memory_graph_indexes (library_id, status, last_error) "
+            "VALUES (?, 'building', '') ON CONFLICT(library_id) DO UPDATE SET "
+            "status = 'building', last_error = '', updated_at = CURRENT_TIMESTAMP",
+            (library_id,),
+        )
+        if not participate_in_transaction:
+            self.connection_or_raise.commit()
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
+    async def _rebuild_graph(self, library_id: str) -> None:
+        adapter = self.graph_adapter
+        if adapter is None:
+            raise GraphAdapterError("graph projection is not configured")
+        rows = self.connection_or_raise.execute(
+            "SELECT document.id, document.path, document.source_version, "
+            "group_concat(chunk.content, char(10) || char(10)) "
+            "FROM memory_documents AS document "
+            "LEFT JOIN memory_chunks AS chunk ON chunk.document_id = document.id "
+            "WHERE document.library_id = ? GROUP BY document.id "
+            "ORDER BY document.path",
+            (library_id,),
+        ).fetchall()
+        documents = tuple(
+            GraphSourceDocument(str(row[0]), str(row[1]), str(row[2]), str(row[3] or ""))
+            for row in rows
+        )
+        self.connection_or_raise.execute(
+            "UPDATE memory_graph_indexes SET total_documents = ?, "
+            "projected_documents = 0, updated_at = CURRENT_TIMESTAMP WHERE library_id = ?",
+            (len(documents), library_id),
+        )
+        self.connection_or_raise.commit()
+        await adapter.rebuild(library_id, documents)
+        current = {
+            (str(row[0]), str(row[1]))
+            for row in self.connection_or_raise.execute(
+                "SELECT id, source_version FROM memory_documents WHERE library_id = ?",
+                (library_id,),
+            )
+        }
+        expected = {(document.document_id, document.source_version) for document in documents}
+        if current != expected:
+            self._queue_graph_rebuild(library_id, False)
+            return
+        self.connection_or_raise.execute("BEGIN IMMEDIATE")
+        self.connection_or_raise.execute(
+            "DELETE FROM memory_graph_documents WHERE library_id = ?", (library_id,)
+        )
+        self.connection_or_raise.executemany(
+            "INSERT INTO memory_graph_documents "
+            "(library_id, document_id, path, source_version) VALUES (?, ?, ?, ?)",
+            [
+                (library_id, item.document_id, item.path, item.source_version)
+                for item in documents
+            ],
+        )
+        self.connection_or_raise.execute(
+            "UPDATE memory_graph_indexes SET status = 'ready', total_documents = ?, "
+            "projected_documents = ?, last_error = '', updated_at = CURRENT_TIMESTAMP "
+            "WHERE library_id = ?",
+            (len(documents), len(documents), library_id),
+        )
+        self.connection_or_raise.commit()
 
     async def _rebuild_vectors(self, library_id: str) -> None:
         endpoint = self.model_client.embedding

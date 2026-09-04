@@ -58,6 +58,16 @@ and semantic candidates, while embedding failures retain full-text results and r
 retain the pre-rerank order with an explicit degradation marker. Model calls have configurable
 timeouts, concurrency limits, and at most three retries.
 
+Graph projection uses the pinned `JiuwenMemory==0.1.2` graph object contract through a
+project-owned adapter and stores each library in its own local Milvus Lite file under platform
+state. Configure its independent OpenAI-compatible extraction model with `--graph-url`,
+`--graph-model`, and optionally `--graph-api-key-file`. Published Markdown is projected
+asynchronously; every graph row carries the authoritative document identifier and source version.
+Graph expansion begins only after direct Markdown hits, uses one hop by default, and accepts at
+most two hops. Search validates every expanded result against the current SQLite Markdown index,
+so edits and deletions invalidate stale graph data immediately even while rebuilding. Graph or LLM
+failure leaves direct Markdown retrieval available and reports `graph_unavailable`.
+
 ## Verify
 
 ```bash
