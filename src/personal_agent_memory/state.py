@@ -1744,11 +1744,59 @@ class PlatformState:
     ) -> dict[str, object]:
         if not query.strip():
             raise ValueError("search query must not be empty")
-        expression = fts_query(query)
         binding = self.resolve_project_binding(requested_cwd)
         if binding["status"] == "unbound":
-            return {"status": "unbound", "query": query, "results": []}
-        library_id = binding["library_id"]
+            return {
+                "status": "unbound",
+                "scope": {"kind": "project_cwd", "cwd": requested_cwd},
+                "query": query,
+                "results": [],
+            }
+        return await self._search_library(
+            str(binding["library_id"]),
+            query,
+            limit,
+            max_graph_hops,
+            scope={
+                "kind": "project_cwd",
+                "cwd": requested_cwd,
+                "project_id": binding["project_id"],
+                "library_id": binding["library_id"],
+            },
+        )
+
+    async def search_library(
+        self,
+        library_id: str,
+        query: str,
+        limit: int = 10,
+        max_graph_hops: int = 1,
+    ) -> dict[str, object]:
+        if not query.strip():
+            raise ValueError("search query must not be empty")
+        library = self.library(library_id)
+        if library is None:
+            raise LibraryRegistrationError("memory library not found")
+        return await self._search_library(
+            library.id,
+            query,
+            limit,
+            max_graph_hops,
+            scope={"kind": "explicit_library", "library_id": library.id},
+        )
+
+    async def _search_library(
+        self,
+        library_id: str,
+        query: str,
+        limit: int,
+        max_graph_hops: int,
+        *,
+        scope: dict[str, object],
+    ) -> dict[str, object]:
+        if not query.strip():
+            raise ValueError("search query must not be empty")
+        expression = fts_query(query)
         bounded_limit = max(1, min(limit, 100))
         candidate_limit = min(500, max(20, bounded_limit * 5))
         rows = self.connection_or_raise.execute(
@@ -2027,9 +2075,12 @@ class PlatformState:
             if str(item["chunk_id"]) not in included_chunks:
                 results.append(item)
                 included_chunks.add(str(item["chunk_id"]))
-        return {
+        for item in results:
+            item["degraded"] = bool(degradation)
+            item["degradation"] = list(degradation)
+        response: dict[str, object] = {
             "status": "bound",
-            "project_id": binding["project_id"],
+            "scope": scope,
             "library_id": library_id,
             "query": query,
             "degraded": bool(degradation),
@@ -2038,6 +2089,9 @@ class PlatformState:
             "graph_index_status": graph_status["status"],
             "results": results,
         }
+        if "project_id" in scope:
+            response["project_id"] = scope["project_id"]
+        return response
 
     def graph_status(self, library_id: str) -> dict[str, object]:
         if self.library(library_id) is None:

@@ -68,6 +68,21 @@ most two hops. Search validates every expanded result against the current SQLite
 so edits and deletions invalidate stale graph data immediately even while rebuilding. Graph or LLM
 failure leaves direct Markdown retrieval available and reports `graph_unavailable`.
 
+Search returns a `memory-context-package/v1` response from both `POST /api/v1/search` and
+`POST /mcp/search`. Callers select exactly one scope: a project `cwd`, or an explicit
+`library_id` (required for user libraries). The server counts the complete JSON package with the
+requested `target_model` tokenizer, falls back to conservative UTF-8 byte counting when that
+tokenizer is unavailable, and enforces both `token_budget` and the absolute 10,000-token ceiling.
+The `budget.telemetry_accounting` field identifies the counting convention. Under
+`conservative_fixed_width_v1`, telemetry integers are normalized to fixed-width upper-bound
+placeholders before counting, so `used_tokens` is a stable conservative upper bound for the final
+serialized package rather than a self-referential exact count; the server separately verifies that
+the actual final JSON also fits the effective budget.
+Direct Markdown receives at least 60% of available result capacity, graph expansion receives at
+most 30%, and source/structure metadata receives at most 10%; unused graph capacity is returned to
+direct hits. Every result carries source and degradation metadata, and the package marks recalled
+content as untrusted data with no policy, tool-authorization, or command semantics.
+
 ## Verify
 
 ```bash

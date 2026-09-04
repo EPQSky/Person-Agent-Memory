@@ -1916,7 +1916,10 @@ def test_direct_search_is_project_scoped_source_attributed_and_incremental(
             headers=headers,
             json={"cwd": str(unbound_project), "query": "ExactNeedle42"},
         ).json()
-        assert unbound == {"status": "unbound", "query": "ExactNeedle42", "results": []}
+        assert unbound["status"] == "unbound"
+        assert unbound["query"] == "ExactNeedle42"
+        assert unbound["results"] == []
+        assert unbound["scope"]["kind"] == "project_cwd"
 
         original_chunk_id = hit["chunk_id"]
         source.write_text("# 新决策\n\nProject alpha uses ExactNeedle42.\n", encoding="utf-8")

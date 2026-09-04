@@ -1301,6 +1301,7 @@ dependencies = [
     { name = "markdown-it-py" },
     { name = "milvus-lite" },
     { name = "setuptools" },
+    { name = "tiktoken" },
     { name = "typer" },
     { name = "uvicorn" },
 ]
@@ -1324,6 +1325,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4,<9" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
     { name = "setuptools", specifier = "<81" },
+    { name = "tiktoken", specifier = ">=0.11,<1" },
     { name = "typer", specifier = ">=0.16,<1" },
     { name = "uvicorn", specifier = ">=0.35,<1" },
 ]
@@ -1688,6 +1690,62 @@ wheels = [
 ]
 
 [[package]]
+name = "regex"
+version = "2026.9.3"
+source = { registry = "https://mirrors.cloud.tencent.com/pypi/simple" }
+sdist = { url = "https://mirrors.cloud.tencent.com/pypi/packages/19/c1/6b30b775c7bcc6cf6506a4d4741c2123e8d99cd50f3fe8cbd731f5fef526/regex-2026.9.3.tar.gz", hash = "sha256:aabd43208e335f4c3f0b56de3464b066dd425983a58f6eeb5738bcd7465403db" }
+wheels = [
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/db/fc/b4ff5d9550796f9f955b6c2470f37e2b582ec944638f3004499929a69c96/regex-2026.9.3-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:6fe39780de6916ecb1c664eda81802e6310fd9d4a07dccb13a86b63918e00e65" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/49/6b/ab60a24883b810a4b29065540f56e6f72590bb97d704d7e0ee7bcd2ba98c/regex-2026.9.3-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:3d75065d9f6ed1afb2a41588def408cf442cee65b3651cbd7e86650146127bb4" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/6c/e6/e3bf61522cd82eda85a90dd8f69c839f0ce1da64dc6e87f803bb79267c59/regex-2026.9.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:5dd356a646fe549d42b766cb9075b54eccd3f20604d87a3eff25f1430bba5b2e" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/b1/b2/e8492b054c5c9fe09bc0aefdc308b8f845ec2094b1ae779accec8f14dedb/regex-2026.9.3-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:90aa2a7f9cc1cd2e8082db61618a2ed0f4197eef52266a6420e88277f184e328" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/48/03/429ee3479bb438f7b2b41147fa68d63a7ef9c7486fcd3960e04e61133cf3/regex-2026.9.3-cp311-cp311-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:1f975a75dae06e88665e4a709873d936a7e8f9445e3d354b75de0e735d28cf71" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/cb/9e/6ebf3cec538ed49d0a4cf5729129fe39580ddfa80c1c59c4274651762202/regex-2026.9.3-cp311-cp311-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:d1d52739de118acf82bfbaf7046955ead4fb613d24ba4187be565cd91ff9a64e" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/19/e4/a7bb1e4038a170714c824dc7c739f8b911cb1172f87ab950be39e0691f95/regex-2026.9.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:99034ec353c973e2c89555866083491b9a2dbe81f2fbe15fb0f2b68506232f01" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/bd/47/1b318fb249d5fa3dcb0375ad284d34155f0da4a2fe92c8f01edef0cb0258/regex-2026.9.3-cp311-cp311-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:3cc1a82779315f7b2a4642d5028b39057838cd4c0415744d4e53c8b512352141" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/a6/16/63f2644a0a3e92623f83ccadd04873916f5b650e2028bc44ee9df104a839/regex-2026.9.3-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:c0ea77435b1d5a27cccf27f8762f50e73fd2d94e8e412a8e5cdedb650b36d5fc" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/ca/f2/f078963d1dbd3632f6e25f7d972cc9a9332649ed239995bfeb403cf88a3b/regex-2026.9.3-cp311-cp311-musllinux_1_2_ppc64le.whl", hash = "sha256:6c997a1703401089bc02d731e360127428fb4ecdf6524268e8975882ff02528b" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/53/46/457ac94a2a2aaa2ab5c076324dfd7e38e76f36d4d78923c4ddb8c3d93d75/regex-2026.9.3-cp311-cp311-musllinux_1_2_riscv64.whl", hash = "sha256:70082b2a8f099b8bf660b553b22a4b8ffd34fcc09ef154fc6b9c7108518fc124" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/66/1c/db145a6ad935cdc6c694381543d53e6e7d7212287d4f8885f965e91ea4a4/regex-2026.9.3-cp311-cp311-musllinux_1_2_s390x.whl", hash = "sha256:f5e8a0ce681ddabf6a35d7b817d74a94ab237ae7233a5b97118db0b4e524473f" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/76/00/100346c5cc2384a7ce0adfb7dbb11f4a865c76e3a920fe68542042da66ea/regex-2026.9.3-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:3367d5eefae493ac2a1586ec11cc8213c3305528ed3f8e19d5c3871cc01da6ce" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/39/62/d878c1d3eed2768f19e8b6fa4aa81b0a0e6bc23fa34e64173ef48816844a/regex-2026.9.3-cp311-cp311-win32.whl", hash = "sha256:33d3a772ff62c882a5d1402045e17c0199f33b9b173139071c4203e7e0292420" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/e5/da/6a0ac27bacb39aca3452cdd7d1bfc361608ad000cea3e1b0d7dbaa1e2b15/regex-2026.9.3-cp311-cp311-win_amd64.whl", hash = "sha256:8c8a63d55cdf3c716225a2f8741a1df7a52b5fa98ac7530165c9cc9b32feabcc" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/d8/a2/b23997814f48f823bcda615764b4fb00d72a5a06bdbb41cafa895ec62428/regex-2026.9.3-cp311-cp311-win_arm64.whl", hash = "sha256:cb6374a84f11a6b25e63aa69ee2d015286048c1efee93c4a3b5b8df62da79ff8" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/da/cb/cba530bc3b068fc337f8f455c63ef5ee91a4eb4c76ecf5998e5cef5aaa6b/regex-2026.9.3-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:5db80d0b1c8238940b5957dd66b5c818ea40a221f6652fb717c027a562d09c77" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/81/39/f2e9fb6bbbc80f8bf67ad79d7e2e8866f7837d7c24c692f7faf8f1272e7e/regex-2026.9.3-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:35d48ce3dee087b63b15cd0a7a3110d0a76c29edbe1f2ad0520b8c4adb7cb596" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/a1/b6/c16ee58840baf7659def27ef6f62f3d9a9909670d3c1b4b98bb8b8ee47e2/regex-2026.9.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:1f22e0d21ae7016c77175c139a7fca465b988efc1280df4816c79752068d9e2e" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/cb/b4/4987bf0f17604669b4ea5aef219886d0a73188c4716ff3a7d275d4d15c15/regex-2026.9.3-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:233662cf8cfdfe3c0e58aa8f7bbefc579b5be0ac34546f123c159804179e8687" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/0b/95/2a9ab02a68c8a61dc0b4882ed643b1a95740d9dc291dc26c77d19af79691/regex-2026.9.3-cp312-cp312-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:7d2eed2e4d231278a2ccab3f4bfa2c1e39855f336475f7756a281d767d2b1753" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/04/92/0570d41559b446c97c1148cb9ebc1df09f2949b03c7c9bfee09976b3465f/regex-2026.9.3-cp312-cp312-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:5e674cecb61cb160be392da07fd8a71509ef927f437fbf3215432692ed385151" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/4b/8b/9cc6d4123033f7cb82df6cd8ce19eb0fc18a964afe060a03c9b26757c9f3/regex-2026.9.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:665207e41bacd435db001099eeab44103197c2c1a729d73ade74688a905ed4ce" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/c9/98/39262e91aa87a67c82cbe90a0df4c3d382c7a44811fe80067904085211b4/regex-2026.9.3-cp312-cp312-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:7a7ddc9a8ca1795166a1ca80364b8ce74187fc210e112d3fb048b711b934f36c" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/24/e9/3bb93fe4ee4b6f8ce7ba69b527c4a63cfa3393fc425ab26486041fe441c8/regex-2026.9.3-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:e3037d02425863ce9501afbaa04ba967162810004bacde39a53ea9a5b740eb32" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/f9/05/31d5bc2553a700c0dfc6b5b6a13c61cdcd1210fde1e304cfa18a33f138b2/regex-2026.9.3-cp312-cp312-musllinux_1_2_ppc64le.whl", hash = "sha256:3de4eab8c763393b75bbb26f81934ab2cc8794f48f79e90622e3ab7ea57f3d14" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/65/a3/2e1e854d80becda0f061093805bbfc037a5849448f46d0a2b71a070d45e2/regex-2026.9.3-cp312-cp312-musllinux_1_2_riscv64.whl", hash = "sha256:98620c9c4c22568ad70f57b80527c780b6f8fd26e36507bf8e2273262a228275" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/6a/d6/43d02948cedde2e8476ac893ea02755ee5ee1b21c531fda92d80e114f0bc/regex-2026.9.3-cp312-cp312-musllinux_1_2_s390x.whl", hash = "sha256:0b1ba3aaaf5776de473ee16625ac60ac195abb0343afb273575a8201d99be089" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/21/ff/adb4e2d08afe8f4c6df004d94604257e1f72af7ba328af7715601585aba4/regex-2026.9.3-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:56d8659c65166641d8f1b5efccc391c62c8a899eff4d528b981cc62b7b402a4b" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/c3/e1/1490d1351758e87f6e702cf2025036bdc7bc59182e2ff5c7bec004b19aed/regex-2026.9.3-cp312-cp312-win32.whl", hash = "sha256:837c1859913798d8bebcd98d4a037e113f8d79e81733009bf590e449769eecb3" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/d5/49/4c40cf722d84d60e807a08ef4c3f579216bf97df60c4a1b10be49655d302/regex-2026.9.3-cp312-cp312-win_amd64.whl", hash = "sha256:1ba1dbbb93c5c5629c1861763aec5bfa9f05ad24ef450694130e25029ce7bc36" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/aa/af/c48b3b2b4244b4b090554c78d3387e9ae7b859f3dbf7148a27d427e9e5b8/regex-2026.9.3-cp312-cp312-win_arm64.whl", hash = "sha256:d7b3a8a4bbd83ad8b29758f5d24bab10a3f2de87970db36f1e3651c733353136" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/9b/d8/1fb6053247efc5b5a1d7b3b7881dcf42861f8ba46bd72a2ff126469d4053/regex-2026.9.3-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:1d9148e47cfa1a067138867996b1d5d825de0132fed8dac3c92eebaaf312d280" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/5b/b7/0b9c1c0385365ad12deba0bdf93a70ad9f97d1a919cc5699c33b449ad662/regex-2026.9.3-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:33c2860b73ea342c0a42bee9ebe3b3a0de3d68c580c4dcb52241cf4b6663731b" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/e6/eb/5750ebabdb010ffb0d31fceae68c7a8f3876c06140c3bd6a7feff6240d6d/regex-2026.9.3-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:e33dfc13c02d9c4e55bcf3f3b2eb448537823a6f6f30bf737b2974b63a530bc9" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/96/12/3ee1542b6428a0955ac5a31562d87966a417c0e0a4c1e5c62ec822fe78de/regex-2026.9.3-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:48e84252a16234ee860206a738f9a5084f830a5d0a1370a418d3af4e917f5e08" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/0a/24/5ad415b80958d79f2da66a1997743ea8c38a1e9e2f63660f7cbf9303eda4/regex-2026.9.3-cp313-cp313-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:3077ace9bf59f8513c8471a817a5af63699987dc024f535c1eac3447a4d70211" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/2b/8a/c298d469f5dd12b11d4e7b8c7714c808b9edace73118eaf753fc327c9429/regex-2026.9.3-cp313-cp313-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:635482cd183a1856da75a39c473a2e222697b7927f1955f586db83fc8a5da17c" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/3f/a6/e9a59b507cdf7a9735df4bab92b4ea9d2ca2e665c6de14c112db7e3c0926/regex-2026.9.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:27f0809798071f56fb1bc536bb93714a95e8ed2ec0dfd869f095deebb30fd11a" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/56/1d/443e5541fd23d97c841ccddf90dbc9a964bd00e0ec9219b45a3eb0cde552/regex-2026.9.3-cp313-cp313-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:d514026ca1c473cc14440e4d7bdf6721c642455b647a74c8143c0f22da358c28" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/7e/ae/78d48b14582f5733facaa2e001499b98707d8b8b1b31ab7559053c18f168/regex-2026.9.3-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:b9190d4901d7786af9ab0ec46172e27cf7d72cdba2b82ee38eb40aadd3239a6e" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/55/42/2f4ac830de12d264c1486f749988003a7f5a0366d7557a75de2418461466/regex-2026.9.3-cp313-cp313-musllinux_1_2_ppc64le.whl", hash = "sha256:6c0f60b05cc708e6cdf68dbca86b7a36d99695962db0189bb1b3884ca3b28e90" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/47/50/6b44c6cf56f353744e6066a1310177b7b195afb11d33dff4d6cf3ec52720/regex-2026.9.3-cp313-cp313-musllinux_1_2_riscv64.whl", hash = "sha256:b7b7e6be82fd6d5256adabb82253c5c307de981cc20c0ce4cff0cbe6de88529b" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/64/0f/c5a8023dfc988cddd2c614b1afbe547aedab1ffebd5b5d9cd58f6ab28908/regex-2026.9.3-cp313-cp313-musllinux_1_2_s390x.whl", hash = "sha256:b5f85bffdfe17da7dfff78eb32b261c27f3cd64c060033645079493f4cebc8e9" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/8f/f4/ab0ba467ebcaecfddf72ea7b3527a6088863094377c1303a3379284ef621/regex-2026.9.3-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:d10a442c6450ebd35aa89392b8e4b0459ba474df63fc5e6828573d0a31a627ec" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/4e/fa/8e2f3021ff5ee3aafc80eed8f16663be5e16c7b663d72e4bd2c9e71e1433/regex-2026.9.3-cp313-cp313-win32.whl", hash = "sha256:63fa79eab192623acb169de1dfe8e733598c4047d06f7712347d1bb810a5ad20" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/6d/25/6d20a309c2e4b554cc33579dd55b0bb50d0c2ace7ce6f084be2327c330fc/regex-2026.9.3-cp313-cp313-win_amd64.whl", hash = "sha256:185c1ae881856208dda05708b6c908aff76878e59c998c8548d365c1bbcaf1bd" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/cc/b3/0282ae58fc167953809a968850622f89955e0fd70a65df882e5d488138b0/regex-2026.9.3-cp313-cp313-win_arm64.whl", hash = "sha256:db6538d733047f9ce4b74ee29c77643a1f99e4ca36e273495da93fbeedd2f03f" },
+]
+
+[[package]]
 name = "requests"
 version = "2.34.2"
 source = { registry = "https://mirrors.cloud.tencent.com/pypi/simple" }
@@ -1844,6 +1902,39 @@ source = { registry = "https://mirrors.cloud.tencent.com/pypi/simple" }
 sdist = { url = "https://mirrors.cloud.tencent.com/pypi/packages/47/c6/ee486fd809e357697ee8a44d3d69222b344920433d3b6666ccd9b374630c/tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a" }
 wheels = [
     { url = "https://mirrors.cloud.tencent.com/pypi/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55" },
+]
+
+[[package]]
+name = "tiktoken"
+version = "0.14.0"
+source = { registry = "https://mirrors.cloud.tencent.com/pypi/simple" }
+dependencies = [
+    { name = "regex" },
+    { name = "requests" },
+]
+sdist = { url = "https://mirrors.cloud.tencent.com/pypi/packages/66/62/167a842aa0429d45f5e797354fd4343a96f6043d67d0513c675c7b8d36e6/tiktoken-0.14.0.tar.gz", hash = "sha256:231dec90efcdccf1b565a1416107736f1e09b1a08fe736ef9d6363e626d03874" }
+wheels = [
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/8f/c5/9d848b7f408241171e1f843deb8bfa626086452bc9c78beee500829583e3/tiktoken-0.14.0-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:c2edf09b381fafbc014ae8e018ed25087abb9a3dafa8465a0ea63c6558c47a79" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/2d/a9/d94302340304328961d6f0c35ca4e60617fbb57a5cf667e2ed1692cb9e57/tiktoken-0.14.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:cd8ca1305c1c902fe42c486165f2e4808d9997625c98ffb05b9e0366d99d3948" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/c8/b6/31da98ee871383509cae2ba96a9ddef1965e3c4f8cb6dc7bcda3379398db/tiktoken-0.14.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:1f83081065ee5833d35b49e9180f3d8d15622a603dd1c435da0da6cc12b3662f" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/24/65/8c5dddd7cb67f6571d154a58d7c6e2f07da54bf84c49b6a1839965b7c35e/tiktoken-0.14.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:f5e7665f6624e052e5e7f6a36919ab69279decdc976d7b16b4fa15e1897d0513" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/d1/04/522ec59d30dd9a2f3ab837011cd4fc5d1178dc4a2fa07c9fa4b90af6ba9d/tiktoken-0.14.0-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:144a3fc369f92b7d548995217c5d6e84038d3572157a0f6f34080d65291d0f78" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/69/84/9019e272bad188a1c61ecf44f25a9ba2368744644e3ac1f3d6516f3c9e80/tiktoken-0.14.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:151d37a150c8f3dfc5f4345597b10e101876bd1bd13494e0185af6b508758d2e" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/24/7f/fff1217240343c0c11b5938b98aeae0e3a266cacfac25f86f91cdcd748f0/tiktoken-0.14.0-cp311-cp311-win_amd64.whl", hash = "sha256:c77d4a3e1deb2707819df92046b89aad1ac81d27e07616b797cbff3f62c037da" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/8c/da/e273746b9d24a63c776bc60fba914351573ad9c575b52601eb5e60632564/tiktoken-0.14.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:8e947aefe98ef74cce94923f90e48c98fe34eb1ec0a6bfdfadfc5a96359bfc36" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/69/9f/fe6b1aca23331aa5271df5a4bd07bf68a7059254d47faee1b8272592a777/tiktoken-0.14.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:d6cebe67765569df3dafac8474e4eccf5c19d24140492567a5e58a11445732a4" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/0b/35/e9f47647c9e163bd1de30fe1a491669b7248cfc67b7404c35c009a701e1a/tiktoken-0.14.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:7db45b98e94adf4173a5cd7422b150999a7ee11ff847783a14f6e1b80cc38cb6" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/51/11/9976ad86980a00cdef05e730a0127a2578a1bc6d11644d8d47246de2eb26/tiktoken-0.14.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:7896eea257fe497a2b7134474d909156c6744ce8da35bce88011a960e008aa0d" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/d4/9c/7035b0bcfaa68d1ee4803fc5be5214ad865669b05bd20e7105ae8a18afc6/tiktoken-0.14.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:b950248272f1b303dc32986396e2dccfa10cf6d1e83ec8f0bba1776660305482" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/bc/1d/69cabf18bed7f4366da076735816abce0d4db3fae491ae338a6612128777/tiktoken-0.14.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:3de75343041a1c57333b1e707ac8a9769738241d7d6a55d39e12cf84548337c6" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/bd/bd/a2e884fb1402cba5be08836590320012b2d8ada0e2eef9911a64df4bcd2d/tiktoken-0.14.0-cp312-cp312-win_amd64.whl", hash = "sha256:087538c080e5ff421abd3a0785ed63c5111d06af98e6cd0d374dbe5969147ca3" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/50/53/ee1453623bf65f019328721ccb6587846d2c5b7b82f34e73ca09101f072e/tiktoken-0.14.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:e9c5fe393aab56469f04e432ff851216d3def3436cf5f07e442a240164bf500f" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/ad/5f/6448cfe278c3664ba9ec5b5ac08344341f7dc3d42888476e215a14eda2be/tiktoken-0.14.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:cbe2cc3bba939bcdaf103e03df9d5039d33887080b315624be28ec69059e5f94" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/69/3b/d67eac1bcce9dee3abe23aff5e3ded3116bbebaf67b80a0811c06d3806fc/tiktoken-0.14.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:2157f52e4b4d7ac5ecc7457b3716834706e7ef9a46f5144029bfeb7cf71f4e06" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/37/62/cae690d9783146b0f81f564ada0f8f611de68178c0c9c7e1e969f0516b48/tiktoken-0.14.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:26e60f6a956ee171ab728b37b8439905d7ea1db435c30f9822f291e9861c861d" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/b9/1e/633e30237b94e383cf814145499079f3bb9cdd4aeafc1bc42e01b0f810a6/tiktoken-0.14.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:380873f330b741c4435574f37edb20813d04603ace2d53e0a63560e1fec83010" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/cb/56/4c12f07b812f84206f38d723eb1ebfdd34bad9309b5dbc0bee6bbcff4cbf/tiktoken-0.14.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:3fd7c14b1cb45b486c39fc9b3443bb341f3e2fc7e6f31247f3435a5836651632" },
+    { url = "https://mirrors.cloud.tencent.com/pypi/packages/c9/e0/c65603f0c44811def666d3fbf611bf2af3b5e1ef613e06c19411419830b3/tiktoken-0.14.0-cp313-cp313-win_amd64.whl", hash = "sha256:90a762670c7f968184723769a06ed51f5cf5ce5dcd1e30164f25c72d85c2d1f1" },
 ]
 
 [[package]]

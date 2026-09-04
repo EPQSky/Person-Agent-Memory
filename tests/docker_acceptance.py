@@ -440,6 +440,11 @@ assert [item["path"] for item in two_hop["results"]] == [
     "graph-two.md",
 ]
 assert two_hop["results"][2]["graph_hop"] == 2
+graph_allocation = two_hop["budget"]["allocation"]
+assert any(item["classification"] == "graph_expansion" for item in two_hop["results"])
+assert graph_allocation["direct_limit"] >= graph_allocation["available_tokens"] * 0.60 - 1
+assert graph_allocation["graph_used"] <= graph_allocation["graph_limit"]
+assert graph_allocation["metadata_used"] <= graph_allocation["metadata_limit"]
 
 assert request("http://127.0.0.1:18080/control/graph/error", payload={})[0] == 200
 failed_rebuild_code, failed_rebuild = request(
@@ -700,6 +705,116 @@ assert time.monotonic() - timeout_started < 1.5
 assert "embedding_unavailable" in timeout_search["degradation"]
 assert timeout_search["results"]
 assert request("http://127.0.0.1:18080/control/embedding/ok", payload={})[0] == 200
+
+# The public REST/MCP contract budgets the complete encoded context package.
+budget_note = retrieval_library_path / "budget.md"
+budget_note.write_text(
+    "# Budget\n\nBudgetNeedle " + ("多字节 memory content. " * 4_000) + "\n",
+    encoding="utf-8",
+)
+budget_scan_code, budget_scan = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/scan",
+    key,
+    method="POST",
+)
+assert budget_scan_code == 200
+assert budget_scan["changed"] == 1
+
+low_code, low_budget = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {
+        "cwd": str(same_name_one / "src"),
+        "query": "BudgetNeedle",
+        "token_budget": 4_000,
+    },
+)
+assert low_code == 200
+assert low_budget["budget"]["effective_tokens"] == 4_000
+assert low_budget["budget"]["used_tokens"] <= 4_000
+assert low_budget["results"][0]["truncated"] is True
+assert low_budget["results"][0]["content"].count("```") % 2 == 0
+
+exact_code, exact_budget = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {
+        "library_id": project_library["id"],
+        "query": "BudgetNeedle",
+        "token_budget": 10_000,
+    },
+)
+assert exact_code == 200
+assert exact_budget["budget"]["requested_tokens"] == 10_000
+assert exact_budget["budget"]["effective_tokens"] == 10_000
+assert exact_budget["budget"]["used_tokens"] <= 10_000
+assert exact_budget["results"][0]["truncated"] is True
+assert "多字节" in exact_budget["results"][0]["content"]
+
+hard_cap_code, hard_cap = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {
+        "cwd": str(same_name_one / "src"),
+        "query": "BudgetNeedle",
+        "token_budget": 20_000,
+    },
+)
+assert hard_cap_code == 200
+assert hard_cap["budget"]["effective_tokens"] == 10_000
+assert hard_cap["budget"]["used_tokens"] <= 10_000
+
+fallback_code, fallback_budget = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {
+        "cwd": str(same_name_one / "src"),
+        "query": "BudgetNeedle",
+        "target_model": "unsupported-tokenizer-model",
+    },
+)
+assert fallback_code == 200
+assert fallback_budget["budget"]["tokenizer"] == "conservative_utf8_bytes"
+assert "tokenizer_fallback" in fallback_budget["degradation"]
+fallback_json = json.dumps(fallback_budget, ensure_ascii=False, separators=(",", ":"))
+assert len(fallback_json.encode("utf-8")) <= 10_000
+
+explicit_user_root = memory_root / "explicit-user"
+explicit_user_root.mkdir()
+(explicit_user_root / "private.md").write_text(
+    "# Private\n\nExplicitUserNeedle belongs only to the user library.\n",
+    encoding="utf-8",
+)
+explicit_user_code, explicit_user = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(explicit_user_root), "kind": "user"},
+)
+assert explicit_user_code == 201
+default_user_code, default_user = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "ExplicitUserNeedle"},
+)
+assert default_user_code == 200
+assert default_user["results"] == []
+explicit_user_search_code, explicit_user_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"library_id": explicit_user["id"], "query": "ExplicitUserNeedle"},
+)
+assert explicit_user_search_code == 200
+assert explicit_user_search["results"][0]["path"] == "private.md"
+
+unbound_search_code, unbound_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"cwd": str(unbound_same_name / "src"), "query": "DockerNeedle42"},
+)
+assert unbound_search_code == 200
+assert unbound_search["status"] == "unbound"
+assert unbound_search["results"] == []
+assert unbound_search["scope"]["kind"] == "project_cwd"
 
 search_code, search = request(
     "http://127.0.0.1:7331/api/v1/search",

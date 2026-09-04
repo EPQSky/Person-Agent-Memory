@@ -9,9 +9,10 @@ from typing import Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from markdown_it import MarkdownIt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from personal_agent_memory.config import Settings
+from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
 from personal_agent_memory.graph_adapter import JiuwenMilvusGraphAdapter
 from personal_agent_memory.model_client import OpenAICompatibleClient
 from personal_agent_memory.security import ApiKeyStore
@@ -55,10 +56,19 @@ class IgnoreRulesUpdate(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    cwd: str
+    cwd: str | None = None
+    library_id: str | None = None
     query: str
     limit: int = 10
     graph_hops: int = Field(default=1, ge=1, le=2)
+    token_budget: int = Field(default=10_000, ge=MIN_TOKEN_BUDGET)
+    target_model: str = Field(default="gpt-4o-mini", min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> SearchRequest:
+        if (self.cwd is None) == (self.library_id is None):
+            raise ValueError("exactly one of cwd or library_id is required")
+        return self
 
 
 class DocumentPreview(BaseModel):
@@ -371,13 +381,34 @@ def create_app(settings: Settings) -> FastAPI:
 
     async def search_payload(request: SearchRequest) -> dict[str, object]:
         try:
-            return await platform_state.search_project(
-                request.cwd, request.query, request.limit, request.graph_hops
+            raw = (
+                await platform_state.search_project(
+                    request.cwd, request.query, request.limit, request.graph_hops
+                )
+                if request.cwd is not None
+                else await platform_state.search_library(
+                    request.library_id or "",
+                    request.query,
+                    request.limit,
+                    request.graph_hops,
+                )
+            )
+            return build_context_package(
+                raw,
+                requested_budget=request.token_budget,
+                target_model=request.target_model,
             )
         except ProjectBindingError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
             ) from error
+        except LibraryRegistrationError as error:
+            status_code = (
+                status.HTTP_404_NOT_FOUND
+                if str(error) == "memory library not found"
+                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            )
+            raise HTTPException(status_code=status_code, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
