@@ -187,10 +187,13 @@ class OpenAICompatibleClient:
                         "role": "system",
                         "content": (
                             "candidate-extraction-v1: return one JSON object with eligible, "
-                            "suggested_type, and body. Only durable decisions, constraints, "
+                            "suggested_type, body, confidence, evidence_kind, source_valid, "
+                            "conflict, and policy_allowed. Only durable decisions, constraints, "
                             "preferences, domain facts, reusable experience, or external "
                             "references are eligible. Never include hidden reasoning, tool output, "
-                            "complete files, injected memory, or transient task progress."
+                            "complete files, injected memory, or transient task progress. "
+                            "evidence_kind is user_confirmed only when the user message itself "
+                            "confirms the fact; an assistant reply alone is never evidence."
                         ),
                     },
                     {"role": "user", "content": conversation},

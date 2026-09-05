@@ -6,9 +6,12 @@ import difflib
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
+import re
+import secrets
 import sqlite3
 import stat
 import uuid
@@ -47,10 +50,19 @@ from personal_agent_memory.model_client import (
     OpenAICompatibleClient,
     cosine_similarity,
 )
+from personal_agent_memory.sensitive import (
+    SensitiveFinding,
+    controlled_sensitive_summary,
+    inspect_sensitive_text,
+)
 
 LibraryKind = Literal["user", "project"]
 BindingKind = Literal["project", "worktree"]
 RENAME_EXCHANGE = 2
+SENSITIVE_QUARANTINE_TTL_DAYS = 30
+SENSITIVE_QUARANTINE_MAX_RECORDS = 512
+SENSITIVE_QUARANTINE_MAX_BYTES = 64 * 1024
+SENSITIVE_QUARANTINE_PAGE_LIMIT = 100
 
 
 def _rename_exchange(
@@ -184,6 +196,13 @@ class CandidateMemory:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class GovernanceFact:
+    relation: str
+    value: str
+    scope: frozenset[str]
+
+
 class PlatformState:
     def __init__(
         self,
@@ -199,11 +218,13 @@ class PlatformState:
         self.stop_worker = asyncio.Event()
         self.startup_count = 0
         self.previous_shutdown_clean = True
+        self.sensitive_dedupe_key = b""
         self.model_client = model_client or OpenAICompatibleClient(None, None)
         self.graph_adapter = graph_adapter
 
     async def start(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.sensitive_dedupe_key = self._load_or_create_sensitive_dedupe_key()
         connection = sqlite3.connect(self.database_path)
         self.connection = connection
         try:
@@ -381,8 +402,48 @@ class PlatformState:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY(session_id, turn_id)
                 );
+                CREATE TABLE IF NOT EXISTS sensitive_quarantine (
+                    id TEXT PRIMARY KEY,
+                    source_kind TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    library_id TEXT,
+                    disposition TEXT NOT NULL CHECK(disposition IN ('discarded', 'quarantined')),
+                    categories_json TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    dedupe_key TEXT,
+                    stored_bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    resolved_at TEXT,
+                    resolution TEXT,
+                    UNIQUE(source_kind, source_id)
+                );
                 """
             )
+            quarantine_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(sensitive_quarantine)")
+            }
+            if "dedupe_key" not in quarantine_columns:
+                connection.execute(
+                    "ALTER TABLE sensitive_quarantine ADD COLUMN dedupe_key TEXT"
+                )
+            if "stored_bytes" not in quarantine_columns:
+                connection.execute(
+                    "ALTER TABLE sensitive_quarantine "
+                    "ADD COLUMN stored_bytes INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                "UPDATE sensitive_quarantine SET stored_bytes = "
+                "length(CAST(source_kind || source_id || coalesce(library_id, '') || "
+                "disposition || categories_json || summary || fingerprint AS BLOB)) "
+                "WHERE stored_bytes = 0"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sensitive_quarantine_dedupe "
+                "ON sensitive_quarantine(dedupe_key) WHERE dedupe_key IS NOT NULL"
+            )
+            self._prune_sensitive_quarantine(connection)
             columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(memory_libraries)")
             }
@@ -447,6 +508,28 @@ class PlatformState:
             raise
         self.stop_worker.clear()
         self.worker_task = asyncio.create_task(self._worker(), name="memory-background-worker")
+
+    def _load_or_create_sensitive_dedupe_key(self) -> bytes:
+        path = self.database_path.parent / "sensitive-dedupe-key"
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise sqlite3.DatabaseError("sensitive dedupe key is not a regular file")
+            os.fchmod(descriptor, 0o600)
+            key = os.read(descriptor, 64)
+            if not key:
+                key = secrets.token_bytes(32)
+                os.write(descriptor, key)
+                os.fsync(descriptor)
+            if len(key) != 32:
+                raise sqlite3.DatabaseError("sensitive dedupe key is invalid")
+            return key
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     async def close(self) -> None:
         if self.worker_task is not None:
@@ -543,6 +626,9 @@ class PlatformState:
             root_identity = root_metadata.st_dev, root_metadata.st_ino
             registration_scan = scan_markdown_fd(
                 root_fd, path, (), (self.database_path.parent,)
+            )
+            self._ensure_scan_has_no_sensitive_content(
+                registration_scan, LibraryRegistrationError
             )
             self._verify_registration_tree(
                 path, root_fd, root_identity, registration_scan, None
@@ -714,11 +800,6 @@ class PlatformState:
         }
         changed = 0
         unchanged = 0
-        self.connection_or_raise.execute(
-            "UPDATE memory_libraries SET sync_status = 'scanning' WHERE id = ?", (library_id,)
-        )
-        if not participate_in_transaction:
-            self.connection_or_raise.commit()
         scan = frozen_scan or scan_markdown(
             root, patterns, (self.database_path.parent,)
         )
@@ -730,6 +811,12 @@ class PlatformState:
                 self.connection_or_raise.commit()
             details = "; ".join(scan.errors[:3])
             raise LibraryRegistrationError(f"Markdown scan incomplete: {details}")
+        self._ensure_scan_has_no_sensitive_content(scan, LibraryRegistrationError)
+        self.connection_or_raise.execute(
+            "UPDATE memory_libraries SET sync_status = 'scanning' WHERE id = ?", (library_id,)
+        )
+        if not participate_in_transaction:
+            self.connection_or_raise.commit()
         documents = scan.documents
         found = {document.path for document in documents}
         try:
@@ -864,6 +951,27 @@ class PlatformState:
         idempotency_key: str,
     ) -> dict[str, object]:
         self._require_available_library(library_id)
+        persisted_input = "\n".join((body, *source_references, creator, idempotency_key))
+        finding = inspect_sensitive_text(persisted_input)
+        if finding is not None:
+            disposition = (
+                "discarded" if finding.disposition == "discard" else "quarantined"
+            )
+            self._record_sensitive_quarantine(
+                "candidate",
+                str(uuid.uuid4()),
+                library_id,
+                disposition,
+                finding.categories,
+                controlled_sensitive_summary(finding, persisted_input),
+                finding.fingerprint,
+                body if inspect_sensitive_text(body) is not None else persisted_input,
+            )
+            raise CandidateGovernanceError(
+                "candidate content was discarded"
+                if finding.disposition == "discard"
+                else "candidate content was quarantined"
+            )
         normalized_type = self._validate_candidate_content(
             suggested_type, body, source_references, creator
         )
@@ -944,11 +1052,30 @@ class PlatformState:
             raise CandidateGovernanceError("invalid capture event kind")
         if not content.strip() or len(content.encode()) > 64 * 1024 or "\x00" in content:
             raise CandidateGovernanceError("invalid capture content")
+        persisted_input = "\n".join(
+            (event_id, session_id, turn_id, event_kind, content, occurred_at, cwd)
+        )
+        finding = inspect_sensitive_text(persisted_input)
+        if finding is not None:
+            return self._quarantine_capture_event(
+                finding,
+                persisted_input,
+                dedupe_material=content if inspect_sensitive_text(content) is not None else None,
+            )
         binding = self.resolve_project_binding(cwd)
         if binding["status"] != "bound":
             return {"status": "unbound", "event_id": event_id}
         library_id = str(binding["library_id"])
         project_id = str(binding["project_id"])
+        persisted_input = "\n".join((persisted_input, project_id, library_id))
+        finding = inspect_sensitive_text(persisted_input)
+        if finding is not None:
+            return self._quarantine_capture_event(
+                finding,
+                persisted_input,
+                library_id,
+                content if inspect_sensitive_text(content) is not None else None,
+            )
         request_hash = hashlib.sha256(
             json.dumps(
                 {
@@ -1006,6 +1133,26 @@ class PlatformState:
             ) from error
         return {"status": "accepted", "event_id": event_id, "duplicate": False}
 
+    def _quarantine_capture_event(
+        self,
+        finding: SensitiveFinding,
+        inspected_text: str,
+        library_id: str | None = None,
+        dedupe_material: str | None = None,
+    ) -> dict[str, object]:
+        disposition = "discarded" if finding.disposition == "discard" else "quarantined"
+        self._record_sensitive_quarantine(
+            "capture",
+            "opaque:" + uuid.uuid4().hex,
+            library_id,
+            disposition,
+            finding.categories,
+            controlled_sensitive_summary(finding, inspected_text),
+            finding.fingerprint,
+            dedupe_material or inspected_text,
+        )
+        return {"status": disposition, "event_id": "withheld", "duplicate": False}
+
     def trigger_capture_consolidation(self, session_id: str | None = None) -> int:
         rows = self.connection_or_raise.execute(
             """SELECT session_id, turn_id FROM capture_rounds
@@ -1034,6 +1181,129 @@ class PlatformState:
             "content", "occurred_at", "received_at", "consolidated_at",
         )
         return [dict(zip(keys, row, strict=True)) for row in rows]
+
+    def list_sensitive_quarantine(
+        self, offset: int = 0, limit: int = SENSITIVE_QUARANTINE_PAGE_LIMIT
+    ) -> list[dict[str, object]]:
+        if offset < 0 or not 1 <= limit <= SENSITIVE_QUARANTINE_PAGE_LIMIT:
+            raise CandidateGovernanceError("invalid sensitive quarantine page")
+        rows = self.connection_or_raise.execute(
+            """SELECT id, source_kind, source_id, library_id, disposition,
+                      categories_json, summary, fingerprint, created_at, resolved_at, resolution
+               FROM sensitive_quarantine ORDER BY created_at DESC, id DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+        keys = (
+            "id", "source_kind", "source_id", "library_id", "disposition", "categories",
+            "summary", "fingerprint", "created_at", "resolved_at", "resolution",
+        )
+        return [
+            dict(zip(keys, (*row[:5], json.loads(str(row[5])), *row[6:]), strict=True))
+            for row in rows
+        ]
+
+    def resolve_sensitive_quarantine(
+        self, record_id: str, resolution: str
+    ) -> dict[str, object]:
+        if resolution not in {"discard", "acknowledge"}:
+            raise CandidateGovernanceError("invalid sensitive-content resolution")
+        updated = self.connection_or_raise.execute(
+            """UPDATE sensitive_quarantine SET resolved_at = CURRENT_TIMESTAMP, resolution = ?
+               WHERE id = ? AND resolved_at IS NULL""",
+            (resolution, record_id),
+        )
+        if updated.rowcount != 1:
+            raise CandidateGovernanceError("sensitive quarantine record not found or resolved")
+        self.connection_or_raise.commit()
+        row = self.connection_or_raise.execute(
+            """SELECT id, source_kind, source_id, library_id, disposition,
+                      categories_json, summary, fingerprint, created_at, resolved_at, resolution
+               FROM sensitive_quarantine WHERE id = ?""",
+            (record_id,),
+        ).fetchone()
+        assert row is not None
+        keys = (
+            "id", "source_kind", "source_id", "library_id", "disposition", "categories",
+            "summary", "fingerprint", "created_at", "resolved_at", "resolution",
+        )
+        return dict(zip(keys, (*row[:5], json.loads(str(row[5])), *row[6:]), strict=True))
+
+    def _record_sensitive_quarantine(
+        self,
+        source_kind: str,
+        source_id: str,
+        library_id: str | None,
+        disposition: str,
+        categories: tuple[str, ...],
+        summary: str,
+        fingerprint: str,
+        dedupe_material: str,
+    ) -> None:
+        encoded_summary = summary.encode()
+        bounded_summary = encoded_summary[:1024].decode("utf-8", errors="ignore")
+        dedupe_key = hmac.new(
+            self.sensitive_dedupe_key,
+            f"{source_kind}\0{disposition}\0{dedupe_material}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        connection = self.connection_or_raise
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO sensitive_quarantine
+                   (id, source_kind, source_id, library_id, disposition, categories_json,
+                    summary, fingerprint, dedupe_key, stored_bytes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
+                (
+                    str(uuid.uuid4()), source_kind, source_id, library_id, disposition,
+                    json.dumps(categories), bounded_summary, fingerprint, dedupe_key,
+                    sum(
+                        len(str(value).encode())
+                        for value in (
+                            source_kind, source_id, library_id or "", disposition,
+                            json.dumps(categories), bounded_summary, fingerprint, dedupe_key,
+                        )
+                    ),
+                ),
+            )
+            self._prune_sensitive_quarantine(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _prune_sensitive_quarantine(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "DELETE FROM sensitive_quarantine "
+            f"WHERE created_at < datetime('now', '-{SENSITIVE_QUARANTINE_TTL_DAYS} days')"
+        )
+        rows = connection.execute(
+            """SELECT id, stored_bytes FROM sensitive_quarantine
+               ORDER BY (resolved_at IS NULL) DESC, created_at DESC, id DESC"""
+        ).fetchall()
+        kept: list[str] = []
+        total_bytes = 0
+        for row in rows:
+            row_bytes = max(0, int(row[1]))
+            if (
+                len(kept) < SENSITIVE_QUARANTINE_MAX_RECORDS
+                and total_bytes + row_bytes <= SENSITIVE_QUARANTINE_MAX_BYTES
+            ):
+                kept.append(str(row[0]))
+                total_bytes += row_bytes
+        if len(kept) == len(rows):
+            return
+        if kept:
+            placeholders = ",".join("?" for _ in kept)
+            connection.execute(
+                f"DELETE FROM sensitive_quarantine WHERE id NOT IN ({placeholders})",
+                kept,
+            )
+        else:
+            connection.execute("DELETE FROM sensitive_quarantine")
 
     def list_capture_rounds(self, session_id: str | None = None) -> list[dict[str, object]]:
         rows = self.connection_or_raise.execute(
@@ -1106,6 +1376,8 @@ class PlatformState:
             raise CandidateGovernanceError("only pending candidates can be edited")
         if not body.strip() or "\x00" in body:
             raise CandidateGovernanceError("candidate body must contain Markdown text")
+        if inspect_sensitive_text("\n".join((body, operator, reason))) is not None:
+            raise CandidateGovernanceError("candidate content requires sensitive review")
         if body == current["body"]:
             return current
         try:
@@ -1135,11 +1407,18 @@ class PlatformState:
         operator: str,
         reason: str,
         operation_id: str,
+        *,
+        publication_source: str = "candidate-approval",
+        commit_message: str | None = None,
     ) -> dict[str, object]:
         self._validate_governance_actor(operator, reason)
         self._validate_operation_identifier(operation_id, "operation_id")
         self._ensure_decision_operation_available(candidate_id, operation_id)
         current = self.candidate(candidate_id)
+        if inspect_sensitive_text(
+            "\n".join((str(current["body"]), operator, reason, operation_id))
+        ) is not None:
+            raise CandidateGovernanceError("candidate content requires sensitive review")
         decision_hash = self._decision_request_hash(
             candidate_id, "approved", str(current["body"]), operator, reason
         )
@@ -1157,7 +1436,7 @@ class PlatformState:
                 str(current["library_id"]),
                 path,
                 persisted_content.decode(),
-                "candidate-approval",
+                publication_source,
             )
             persisted = self._persisted_publication(
                 str(current["library_id"]),
@@ -1243,13 +1522,384 @@ class PlatformState:
             content,
             operation_id,
             operator,
-            "candidate-approval",
-            f"Publish candidate memory {candidate_id}",
+            publication_source,
+            commit_message or f"Publish candidate memory {candidate_id}",
             record_approval,
             approval_is_persisted,
             compensate_approval,
         )
         return self.candidate(candidate_id)
+
+    def _auto_promotion_blockers(
+        self,
+        candidate: dict[str, object],
+        extracted: dict[str, object],
+        user_content: str,
+        session_id: str,
+        turn_id: str,
+    ) -> tuple[str, ...]:
+        blockers: list[str] = []
+        if candidate["suggested_type"] not in {
+            "preference", "decision", "constraint", "domain_fact",
+            "reusable_experience", "external_reference",
+        }:
+            blockers.append("type")
+        if extracted.get("evidence_kind") != "user_confirmed" or not self._user_confirms_fact(
+            user_content, str(candidate["body"])
+        ):
+            blockers.append("evidence")
+        if extracted.get("source_valid") is not True or not self._valid_capture_sources(
+            candidate, session_id, turn_id
+        ):
+            blockers.append("source")
+        if extracted.get("conflict") is not False or self._candidate_conflicts_with_library(
+            candidate
+        ):
+            blockers.append("conflict")
+        if extracted.get("policy_allowed") is not True or not self._library_policy_allows(
+            candidate
+        ):
+            blockers.append("policy")
+        confidence = extracted.get("confidence")
+        if (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or confidence < 0.9
+        ):
+            blockers.append("confidence")
+        if inspect_sensitive_text(str(candidate["body"])) is not None:
+            blockers.append("sensitive")
+        normalized = self._governance_text(str(candidate["body"]))
+        existing = self.connection_or_raise.execute(
+            "SELECT content FROM memory_chunks WHERE library_id = ?",
+            (candidate["library_id"],),
+        ).fetchall()
+        if any(normalized == self._governance_text(str(row[0])) for row in existing):
+            blockers.append("duplicate")
+        approved = self.connection_or_raise.execute(
+            """SELECT body FROM candidate_memories
+               WHERE library_id = ? AND status = 'approved' AND id != ?""",
+            (candidate["library_id"], candidate["id"]),
+        ).fetchall()
+        if any(normalized == self._governance_text(str(row[0])) for row in approved):
+            blockers.append("duplicate")
+        return tuple(blockers)
+
+    @staticmethod
+    def _valid_capture_sources(
+        candidate: dict[str, object], session_id: str, turn_id: str
+    ) -> bool:
+        references = cast(tuple[str, ...], candidate["source_references"])
+        prefix = f"capture:{session_id}:{turn_id}:"
+        return len(references) == 2 and all(
+            reference.startswith(prefix) for reference in references
+        )
+
+    @staticmethod
+    def _governance_text(content: str) -> str:
+        meaningful = " ".join(
+            line for line in content.casefold().splitlines() if not line.lstrip().startswith("#")
+        )
+        return " ".join(meaningful.split())
+
+    def _candidate_conflicts_with_library(self, candidate: dict[str, object]) -> bool:
+        proposed = self._governance_text(str(candidate["body"]))
+        current_documents = tuple(
+            self._governance_text(str(row[0]))
+            for row in self.connection_or_raise.execute(
+                "SELECT content FROM memory_chunks WHERE library_id = ?",
+                (candidate["library_id"],),
+            )
+        )
+        instead = proposed.partition(" instead of ")
+        if instead[1] and instead[2] and any(
+            instead[2] in current for current in current_documents
+        ):
+            return True
+        proposed_facts = self._governance_facts(proposed)
+        for current in current_documents:
+            for proposed_fact in proposed_facts:
+                if any(
+                    proposed_fact.relation == current_fact.relation
+                    and proposed_fact.value != current_fact.value
+                    and self._scopes_may_conflict(
+                        proposed_fact.scope, current_fact.scope
+                    )
+                    for current_fact in self._governance_facts(current)
+                ):
+                    return True
+        for marker in ("must not ", "never ", "禁止", "不得"):
+            if marker in proposed:
+                remainder = proposed.partition(marker)[2].strip(" .")
+                positive = marker.strip() in {"must not", "never"}
+                if remainder and any(
+                    (positive and f"must {remainder}" in current)
+                    or (not positive and remainder in current)
+                    for current in current_documents
+                ):
+                    return True
+        return False
+
+    @classmethod
+    def _governance_facts(cls, content: str) -> tuple[GovernanceFact, ...]:
+        patterns = (
+            re.compile(
+                r"\b(?:use|uses|adopt|adopts|prefer|prefers|choose|chooses|select|selects)\s+"
+                r"(?P<value>[a-z0-9][a-z0-9 _.+#-]{0,80}?)\s+for\s+(?:the\s+)?"
+                r"(?P<scope>[a-z0-9][a-z0-9 _-]{0,80}?)(?=[,.;]|$)"
+            ),
+            re.compile(
+                r"(?P<scope>[a-z0-9][a-z0-9 _-]{0,80}?)\s+"
+                r"(?:use|uses|adopt|adopts|prefer|prefers)\s+"
+                r"(?P<value>[a-z0-9][a-z0-9 _.+#-]{0,80}?)(?=[,.;]|$)"
+            ),
+            re.compile(
+                r"(?P<scope>[a-z0-9][a-z0-9 _-]{0,80}?)\s+"
+                r"(?:is|are|equals?)\s+"
+                r"(?P<value>[a-z0-9][a-z0-9 _.+#-]{0,80}?)(?=[,.;]|$)"
+            ),
+        )
+        facts: list[GovernanceFact] = []
+        for pattern in patterns:
+            for match in pattern.finditer(content.casefold()):
+                scope = cls._decision_scope(match.group("scope"))
+                value = cls._canonical_fact_value(match.group("value"))
+                if value in {"approved", "confirmed", "decided", "remembered"}:
+                    continue
+                fact = GovernanceFact("selection", value, scope)
+                if scope and fact not in facts:
+                    facts.append(fact)
+        return tuple(facts)
+
+    @staticmethod
+    def _canonical_fact_value(value: str) -> str:
+        aliases = {"postgres": "postgresql", "rabbit-mq": "rabbitmq"}
+        normalized = " ".join(value.casefold().rstrip(".,;").split())
+        return aliases.get(normalized, normalized)
+
+    @staticmethod
+    def _decision_scope(content: str) -> frozenset[str]:
+        aliases = {
+            "app": "application",
+            "db": "database",
+            "tests": "test",
+            "testing": "test",
+            "fixtures": "fixture",
+        }
+        ignored = {
+            "a", "an", "the", "our", "we", "remember", "confirmed", "decided",
+            "decision", "to", "that",
+        }
+        return frozenset(
+            aliases.get(token, token)
+            for token in re.findall(r"[a-z0-9][a-z0-9_-]*", content.casefold())
+            if token not in ignored
+        )
+
+    @staticmethod
+    def _scopes_may_conflict(left: frozenset[str], right: frozenset[str]) -> bool:
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        generic_scopes = {"broker", "cache", "database", "queue", "service", "store"}
+        return (
+            len(left) == 1
+            and left <= generic_scopes
+            and left <= right
+        ) or (
+            len(right) == 1
+            and right <= generic_scopes
+            and right <= left
+        )
+
+    @staticmethod
+    def _library_policy_allows(candidate: dict[str, object]) -> bool:
+        content = str(candidate["body"]).casefold()
+        transient_markers = (
+            "task progress", "temporary plan", "one-off output", "unverified",
+            "speculation", "guess", "todo", "work in progress", "任务进度",
+            "临时计划", "一次性输出", "未验证", "猜测",
+        )
+        number_unit = r"(?:one|two|three|four|five|six|seven|eight|nine)"
+        number_small = (
+            rf"(?:zero|{number_unit}|ten|eleven|twelve|thirteen|fourteen|fifteen|"
+            r"sixteen|seventeen|eighteen|nineteen)"
+        )
+        number_tens = r"(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+        number_under_hundred = rf"(?:{number_tens}(?:[- ]{number_unit})?|{number_small})"
+        number_under_thousand = (
+            rf"(?:{number_unit}\s+hundred(?:\s+(?:and\s+)?{number_under_hundred})?"
+            rf"|{number_under_hundred})"
+        )
+        english_number = (
+            rf"(?:{number_under_thousand}\s+thousand"
+            rf"(?:\s+(?:and\s+)?{number_under_thousand})?|{number_under_thousand})"
+        )
+        progress_number = rf"(?:\d+|{english_number})"
+        progress_patterns = (
+            r"\b(?:implementation|work|task|migration|rollout)\s+is\s+"
+            r"(?:halfway|partly|partially|almost|currently|still)\b",
+            r"\b(?:halfway|partly|partially|almost)\s+complete\b",
+            r"\b(?:complete|finish|ship|deploy)(?:ed|ing)?\s+(?:today|tomorrow|this week)\b",
+            r"\b(?:today|tomorrow|this week)\b.*\b(?:progress|complete|finish|ship|deploy)",
+            r"\b(?:implementation|work|task|migration|rollout|upgrade|deployment)\b"
+            r".{0,48}\b(?:reached|hit|at|is|was|now)\s+\d{1,3}%",
+            r"\b(?:implementation|work|task|migration|rollout|upgrade|deployment)\b"
+            r".{0,48}\b(?:reached|hit|at|is|was|now)\s+\d{1,3}\s+"
+            r"(?:percent|per\s*cent)\b(?:\s+(?:complete|completed|done))?",
+            r"\b(?:reached|hit)\s+\d{1,3}%.{0,32}\b"
+            r"(?:today|yesterday|tomorrow|this|last|next|currently|now)\b",
+            r"\b(?:implementation|work|task|migration|rollout|upgrade|deployment)\b"
+            r".{0,48}\b(?:reached|hit|at|is|was|now)\s+"
+            r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+            r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+            r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)(?:[- ](?:one|"
+            r"two|three|four|five|six|seven|eight|nine))?\s+per\s*cent\b",
+            r"\b(?:completed|finished|done|processed|migrated)\s+\d+\s+of\s+\d+\b"
+            r"(?:\s+[a-z][a-z0-9_-]*){0,3}",
+            rf"\b{progress_number}\s+(?:of|out\s+of)\s+{progress_number}\s+"
+            r"(?:implementation|work|migration|rollout|upgrade|deployment)\s+"
+            r"(?:tasks?|steps?)\s+(?:are|were|is|was)\s+"
+            r"(?:complete|completed|done)\b",
+            rf"\b{progress_number}\s+(?:of|out\s+of)\s+{progress_number}\s+"
+            r"(?:tasks?|steps?)\s+(?:are|were|is|was)\s+"
+            r"(?:complete|completed|done)\b",
+            rf"\b{progress_number}\s+(?:tasks?|steps?)\s+(?:of|out\s+of)\s+"
+            rf"{progress_number}\s+(?:(?:are|were|is|was|have\s+been|had\s+been)\s+)?"
+            r"(?:complete|completed|done|finished)\b",
+            r"\b(?:tasks?|steps?)\s+(?:complete|completed|done|finished)"
+            r"(?:\s*[:=-]\s*|\s+)"
+            rf"{progress_number}\s+(?:of|out\s+of)\s+{progress_number}\b",
+            r"\b(?:implementation|work|task|migration|rollout|upgrade|deployment)\s+"
+            rf"(?:is|was)\s+{progress_number}\s+(?:of|out\s+of)\s+{progress_number}\s+"
+            r"(?:complete|completed|done)\b",
+            r"\b(?:completed|finished|processed|migrated)\s+"
+            rf"{progress_number}\s+(?:of|out\s+of)\s+{progress_number}\s+"
+            r"(?:implementation|work|migration|rollout|upgrade|deployment)\s+"
+            r"(?:tasks?|steps?)\b",
+            r"\b(?:completed|finished|processed|migrated)\s+"
+            rf"{progress_number}\s+(?:of|out\s+of)\s+{progress_number}\s+"
+            r"(?:tasks?|steps?)\b",
+            r"\b(?:implementation|work|task|migration|rollout|upgrade|deployment)\b"
+            r".{0,48}\b(?:has|have|with)\s+(?:\d+|one|two|three|four|five|six|"
+            r"seven|eight|nine|ten)\s+(?:tasks?|steps?)\s+"
+            r"(?:remaining|left)\b",
+            r"\b\d+\s+(?:tasks?|steps?)\s+(?:remain|remaining|left)\b",
+            r"\b(?:one|two|three|four|1|2|3|4)[- ]quarters?\s+"
+            r"(?:complete|completed|done|remaining|left)\b",
+            r"\b\d+\s*/\s*\d+\s+(?:complete|completed|done|remaining|left)\b",
+            r"\b\d+\s*/\s*\d+\s+"
+            r"(?:implementation|work|migration|rollout|upgrade|deployment)\s+"
+            r"(?:tasks?|steps?)\s+(?:are|were)\s+(?:complete|completed|done)\b",
+            r"\b\d+\s+of\s+\d+\s+"
+            r"(?:implementation|work|migration|rollout|upgrade|deployment)\s+"
+            r"(?:tasks?|steps?)\s+(?:are|were)\s+(?:complete|completed|done)\b",
+            r"\bthere\s+(?:remain|remains|are|is)\s+(?:\d+|one|two|three|four|five|"
+            r"six|seven|eight|nine|ten)\s+"
+            r"(?:implementation|work|migration|rollout|upgrade|deployment)\s+"
+            r"(?:tasks?|steps?)\b",
+            r"\b(?:implementation|work|task|migration|rollout|upgrade|deployment)\b"
+            r".{0,48}\bstands?\s+at\s+(?:\d{1,3}\s*%|\d{1,3}\s+per\s*cent|"
+            r"\d{1,3}\s+percent)\b",
+            r"\b(?:only|just|another|still|there\s+(?:are|is))\s+\d+\s+"
+            r"(?:tasks?|steps?)\s+before\s+(?:launch|release|completion|shipping|deploying)\b",
+        )
+        return not any(marker in content for marker in transient_markers) and not any(
+            re.search(pattern, content) for pattern in progress_patterns
+        )
+
+    @staticmethod
+    def _user_confirms_fact(content: str, candidate_body: str) -> bool:
+        normalized = content.casefold()
+        if "?" in normalized or "？" in normalized:
+            return False
+        indicators = (
+            "remember", "confirmed", "we decided", "i decided", "must ", "always ",
+            "prefer", "记住", "确认", "决定", "必须", "始终", "偏好", "采用",
+        )
+        confirmation_segments = tuple(
+            segment
+            for segment in re.split(r"[.!?。！？;；\n]+", normalized)
+            if any(indicator in segment for indicator in indicators)
+        )
+        if not confirmation_segments:
+            return False
+        ignored = {
+            "adopt", "always", "captured", "confirmed", "decided", "decision", "remember", "must",
+            "prefer", "preference", "should", "this", "that", "with", "from", "into",
+            "have", "will", "would", "could", "about", "using", "use", "used", "user",
+            "project", "system", "application", "memory", "fact", "constraint", "external",
+            "database", "service", "technology", "tool", "framework", "option", "recommend",
+            "suggest", "assistant", "please",
+        }
+
+        def terms(value: str) -> set[str]:
+            return {
+                token
+                for token in re.findall(r"[a-z0-9][a-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", value)
+                if token not in ignored and not token.startswith("decision")
+            }
+
+        candidate_segments = tuple(
+            segment
+            for segment in re.split(
+                r"[.!?。！？;；,，\n]+|\b(?:and|or)\b|(?:以及|并且|或者|或是|且)",
+                candidate_body.casefold(),
+            )
+            if segment.strip()
+            and not segment.lstrip().startswith("#")
+            and not re.fullmatch(
+                r"\s*(?:user|assistant(?:\s+final\s+reply)?)\s*:\s*",
+                segment,
+            )
+        )
+        candidate_propositions = tuple(
+            (segment, segment_terms)
+            for segment in candidate_segments
+            if (segment_terms := terms(segment))
+        )
+
+        def proposition_is_confirmed(
+            proposition: str, proposition_terms: set[str]
+        ) -> bool:
+            candidate_facts = PlatformState._governance_facts(proposition)
+            if not candidate_facts:
+                return any(
+                    proposition_terms <= terms(confirmation)
+                    for confirmation in confirmation_segments
+                )
+            if not all(
+                any(
+                    candidate_fact.relation == confirmation_fact.relation
+                    and candidate_fact.value == confirmation_fact.value
+                    and PlatformState._scopes_may_conflict(
+                        candidate_fact.scope, confirmation_fact.scope
+                    )
+                    for confirmation in confirmation_segments
+                    for confirmation_fact in PlatformState._governance_facts(
+                        confirmation
+                    )
+                )
+                for candidate_fact in candidate_facts
+            ):
+                return False
+            represented_terms = set().union(
+                *(
+                    terms(" ".join((*candidate_fact.scope, candidate_fact.value)))
+                    for candidate_fact in candidate_facts
+                )
+            )
+            unconsumed_terms = proposition_terms - represented_terms
+            return not unconsumed_terms or any(
+                unconsumed_terms <= terms(confirmation)
+                for confirmation in confirmation_segments
+            )
+
+        return bool(candidate_propositions) and all(
+            proposition_is_confirmed(proposition, proposition_terms)
+            for proposition, proposition_terms in candidate_propositions
+        )
 
     def reject_candidate(
         self,
@@ -1262,6 +1912,10 @@ class PlatformState:
         self._validate_operation_identifier(operation_id, "operation_id")
         self._ensure_decision_operation_available(candidate_id, operation_id)
         current = self.candidate(candidate_id)
+        if inspect_sensitive_text(
+            "\n".join((str(current["body"]), operator, reason, operation_id))
+        ) is not None:
+            raise CandidateGovernanceError("candidate content requires sensitive review")
         decision_hash = self._decision_request_hash(
             candidate_id, "rejected", str(current["body"]), operator, reason
         )
@@ -1611,6 +2265,7 @@ class PlatformState:
             raise MemoryMutationError("source must be present and at most 200 characters")
         if "\x00" in content:
             raise MemoryMutationError("Markdown content cannot contain NUL bytes")
+        self._ensure_markdown_has_no_sensitive_content(content)
         request_hash = hashlib.sha256(
             json.dumps(
                 {
@@ -1883,6 +2538,7 @@ class PlatformState:
             raise MemoryMutationError("published memory path must be at the library root")
         if "\x00" in content:
             raise MemoryMutationError("Markdown content cannot contain NUL bytes")
+        self._ensure_markdown_has_no_sensitive_content(content)
         request_hash = self._publication_request_hash(
             library_id, normalized, content, source
         )
@@ -2374,7 +3030,24 @@ class PlatformState:
         if not scan.complete:
             details = "; ".join(scan.errors[:3])
             raise MemoryMutationError(f"Markdown scan incomplete: {details}")
+        self._ensure_scan_has_no_sensitive_content(scan, MemoryMutationError)
         return scan
+
+    @staticmethod
+    def _ensure_markdown_has_no_sensitive_content(content: str) -> None:
+        if inspect_sensitive_text(content) is not None:
+            raise MemoryMutationError("Markdown content contains confirmed sensitive data")
+
+    @staticmethod
+    def _ensure_scan_has_no_sensitive_content(
+        scan: MarkdownScan,
+        error_type: type[LibraryRegistrationError] | type[MemoryMutationError],
+    ) -> None:
+        if any(
+            inspect_sensitive_text("\n".join((document.path, document.content))) is not None
+            for document in scan.documents
+        ):
+            raise error_type("Markdown scan contains confirmed sensitive data")
 
     def _trusted_library_scan(
         self,
@@ -3675,6 +4348,29 @@ class PlatformState:
                 + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest(),
             )
             candidate_id = str(candidate["id"])
+            blockers = self._auto_promotion_blockers(
+                candidate,
+                extracted,
+                str(by_kind["user"][3]),
+                session_id,
+                turn_id,
+            )
+            if not blockers:
+                operation_id = (
+                    "auto-promotion:"
+                    + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest()
+                )
+                promoted = self.approve_candidate(
+                    candidate_id,
+                    "platform:auto-promotion",
+                    f"Background auto-promotion from source session {session_id}, turn {turn_id}",
+                    operation_id,
+                    publication_source=f"background-auto-promotion:{session_id}:{turn_id}",
+                    commit_message=(
+                        f"Auto-promote candidate {candidate_id} from session {session_id}"
+                    ),
+                )
+                candidate_id = str(promoted["id"])
         self.connection_or_raise.execute(
             """UPDATE capture_rounds SET status = 'done', candidate_id = ?, last_error = '',
                updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND turn_id = ?""",

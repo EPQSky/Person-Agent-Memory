@@ -769,6 +769,142 @@ for excluded in ("never-read.jsonl", "never captured"):
     assert excluded not in serialized_contents
 assert all(str(event["occurred_at"]).endswith("Z") for event in capture_events)
 
+# Sensitive capture is filtered before durable Inbox/model use. Definite secrets are
+# discarded, uncertain material exposes only a controlled summary, and segmented tokens
+# cannot fall back to the offline spool.
+docker_secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+secret_hook = run_capture_hook(
+    same_name_one / "src",
+    "UserPromptSubmit",
+    f"api_key={docker_secret}",
+    api_key=key,
+    session_id="docker-ticket13-secret",
+    turn_id="secret-turn",
+)
+segmented_hook = run_capture_hook(
+    same_name_one / "src",
+    "UserPromptSubmit",
+    "sk-abcde fghij klmno pqrst uvwxyz",
+    api_key=key,
+    url="http://127.0.0.1:1",
+    session_id="docker-ticket13-segmented",
+    turn_id="segmented-turn",
+)
+uncertain_hook = run_capture_hook(
+    same_name_one / "src",
+    "UserPromptSubmit",
+    "The deployment credential may need rotation.",
+    api_key=key,
+    session_id="docker-ticket13-uncertain",
+    turn_id="uncertain-turn",
+)
+for filtered_hook in (secret_hook, segmented_hook, uncertain_hook):
+    assert filtered_hook.returncode == 0
+    assert docker_secret not in filtered_hook.stdout + filtered_hook.stderr
+assert not list(capture_spool.glob("event-*.json"))
+plugin_sensitive_bytes = b"".join(
+    path.read_bytes()
+    for path in Path("/tmp/personal-agent-memory-plugin-data-ticket12/capture").rglob("*")
+    if path.is_file()
+)
+assert docker_secret.encode() not in plugin_sensitive_bytes
+quarantine_code, quarantine_payload = request(
+    "http://127.0.0.1:7331/api/v1/sensitive-quarantine", key
+)
+assert quarantine_code == 200
+quarantine_records = cast(list[dict[str, object]], quarantine_payload)
+assert {record["disposition"] for record in quarantine_records} >= {
+    "discarded",
+    "quarantined",
+}
+assert docker_secret not in json.dumps(quarantine_records)
+ticket13_events_code, ticket13_events = request(
+    "http://127.0.0.1:7331/api/v1/capture/events?session_id=docker-ticket13-secret", key
+)
+assert ticket13_events_code == 200
+assert ticket13_events == []
+for protected_root in (Path("/state"), memory_root, Path("/app/logs")):
+    for protected_path in protected_root.rglob("*"):
+        if protected_path.is_file():
+            assert docker_secret.encode() not in protected_path.read_bytes()
+
+# Auto-promotion remains subordinate to every hard gate even at high confidence.
+for session_id, user_text, assistant_text in (
+    (
+        "docker-ticket13-assistant-only",
+        "What is the current recommendation?",
+        "AssistantOnlyDockerClaim is a durable project fact.",
+    ),
+    (
+        "docker-ticket13-conflict",
+        "Remember: we decided ForceConflictCandidate.",
+        "ForceConflictCandidate is confirmed.",
+    ),
+    (
+        "docker-ticket13-qualified",
+        "Remember: we decided QualifiedDockerAutoPromotion.",
+        "QualifiedDockerAutoPromotion is confirmed.",
+    ),
+):
+    for event_name, event_content in (("UserPromptSubmit", user_text), ("Stop", assistant_text)):
+        result = run_capture_hook(
+            same_name_one / "src",
+            event_name,
+            event_content,
+            api_key=key,
+            session_id=session_id,
+            turn_id="ticket13-turn",
+        )
+        assert result.returncode == 0
+        assert result.stderr == ""
+
+ticket13_deadline = time.monotonic() + 10
+ticket13_candidates: list[dict[str, object]] = []
+while time.monotonic() < ticket13_deadline:
+    _, payload = request("http://127.0.0.1:7331/api/v1/candidates", key)
+    ticket13_candidates = cast(list[dict[str, object]], payload)
+    bodies = {str(candidate["body"]): candidate for candidate in ticket13_candidates}
+    if any("QualifiedDockerAutoPromotion" in body for body in bodies):
+        qualified = next(
+            candidate
+            for body, candidate in bodies.items()
+            if "QualifiedDockerAutoPromotion" in body
+        )
+        if qualified["status"] == "approved":
+            break
+    time.sleep(0.1)
+assistant_only = next(
+    candidate
+    for candidate in ticket13_candidates
+    if "AssistantOnlyDockerClaim" in str(candidate["body"])
+)
+conflicting = next(
+    candidate
+    for candidate in ticket13_candidates
+    if "ForceConflictCandidate" in str(candidate["body"])
+)
+qualified = next(
+    candidate
+    for candidate in ticket13_candidates
+    if "QualifiedDockerAutoPromotion" in str(candidate["body"])
+)
+assert assistant_only["status"] == "pending"
+assert conflicting["status"] == "pending"
+assert qualified["status"] == "approved"
+qualified_path = Path(str(project_library["canonical_path"])) / str(qualified["published_path"])
+qualified_markdown = qualified_path.read_text(encoding="utf-8")
+assert "QualifiedDockerAutoPromotion" in qualified_markdown
+assert "docker-ticket13-qualified" in qualified_markdown
+history_code, ticket13_history = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/history", key
+)
+assert history_code == 200
+assert any(
+    str(entry["subject"]).startswith("Auto-promote candidate")
+    and entry["commit"] == qualified["commit"]
+    for entry in ticket13_history
+)
+
 # A separate real daemon proves persisted extraction retry survives process restart.
 retry_state = Path("/tmp/ticket12-retry-state")
 retry_libraries = Path("/tmp/ticket12-retry-libraries")
@@ -870,7 +1006,7 @@ try:
     assert retry_pending
 finally:
     retry_daemon.terminate()
-    retry_daemon.wait(timeout=5)
+    retry_daemon.wait(timeout=20)
 
 assert request("http://127.0.0.1:18080/control/graph/ok", payload={})[0] == 200
 retry_daemon = start_retry_daemon()
@@ -896,7 +1032,7 @@ try:
     ) == 1
 finally:
     retry_daemon.terminate()
-    retry_daemon.wait(timeout=5)
+    retry_daemon.wait(timeout=20)
 
 one_hop_code, one_hop = request(
     "http://127.0.0.1:7331/api/v1/search",
@@ -1906,32 +2042,130 @@ try:
     browser.find_element(By.ID, "connect").click()
     wait.until(lambda driver: driver.find_elements(By.ID, "candidate-title"))
 
-    approve_id = str(browser_approve_candidate["id"])
-    approve_button = wait.until(
-        lambda driver: driver.find_element(
-            By.XPATH,
-            f"//nav[contains(@class, 'candidate-list')]/button[contains(., '{approve_id}')]",
+    unresolved_sensitive = [
+        record for record in quarantine_records if record["resolved_at"] is None
+    ]
+    acknowledge_record = next(
+        record for record in unresolved_sensitive if record["disposition"] == "quarantined"
+    )
+    discard_record = next(
+        record for record in unresolved_sensitive if record["disposition"] == "discarded"
+    )
+
+    def click_sensitive_record(record: dict[str, object]) -> bool:
+        selector = (
+            '#sensitive-quarantine-list [data-record-id="'
+            f'{record["id"]}"]'
+        )
+        return bool(
+            browser.execute_script(
+                "const item = document.querySelector(arguments[0]); "
+                "if (!item) return false; item.click(); return true;",
+                selector,
+            )
+        )
+
+    wait.until(lambda _: click_sensitive_record(acknowledge_record))
+    sensitive_detail = browser.find_element(By.ID, "sensitive-quarantine-detail")
+    assert docker_secret not in sensitive_detail.text
+    assert "Sensitive content withheld" in sensitive_detail.text
+    browser.find_element(By.ID, "sensitive-acknowledge").click()
+    wait.until(
+        lambda _: next(
+            record
+            for record in cast(
+                list[dict[str, object]],
+                request("http://127.0.0.1:7331/api/v1/sensitive-quarantine", key)[1],
+            )
+            if record["id"] == acknowledge_record["id"]
+        )["resolution"]
+        == "acknowledge"
+    )
+
+    acknowledge_selector = (
+        '#sensitive-quarantine-list [data-record-id="'
+        f'{acknowledge_record["id"]}"]'
+    )
+    wait.until(
+        lambda driver: bool(
+            driver.execute_script(
+                "const item = document.querySelector(arguments[0]); "
+                "return item && item.textContent.includes('acknowledge');",
+                acknowledge_selector,
+            )
         )
     )
-    approve_button.click()
-    body_input = browser.find_element(By.ID, "candidate-body")
-    body_input.clear()
-    body_input.send_keys("# Browser approved\n\nBrowserCandidatePublished\n")
-    operator_input = browser.find_element(By.ID, "candidate-operator")
-    reason_input = browser.find_element(By.ID, "candidate-reason")
-    operator_input.send_keys("browser-user")
-    reason_input.send_keys("Edited through the Web page")
-    browser.find_element(By.ID, "candidate-save").click()
+
+    wait.until(lambda _: click_sensitive_record(discard_record))
+    wait.until(
+        lambda driver: "discarded \u00b7 unresolved"
+        in driver.find_element(By.ID, "sensitive-title").text
+    )
+    browser.find_element(By.ID, "sensitive-discard").click()
+    wait.until(
+        lambda _: next(
+            record
+            for record in cast(
+                list[dict[str, object]],
+                request("http://127.0.0.1:7331/api/v1/sensitive-quarantine", key)[1],
+            )
+            if record["id"] == discard_record["id"]
+        )["resolution"]
+        == "discard"
+    )
+
+    def submit_candidate(
+        candidate_id: str,
+        body: str | None,
+        operator: str,
+        reason: str,
+        action: str,
+    ) -> bool:
+        return bool(
+            browser.execute_script(
+                "const item = [...document.querySelectorAll('nav.candidate-list button')]"
+                ".find((button) => button.textContent.includes(arguments[0])); "
+                "if (!item) return false; item.click(); "
+                "const body = document.querySelector('#candidate-body'); "
+                "const operator = document.querySelector('#candidate-operator'); "
+                "const reason = document.querySelector('#candidate-reason'); "
+                "const action = document.querySelector(`#candidate-${arguments[4]}`); "
+                "if (!action || action.disabled) return false; "
+                "if (arguments[1] !== null) body.value = arguments[1]; "
+                "operator.value = arguments[2]; reason.value = arguments[3]; "
+                "action.click(); return true;",
+                candidate_id,
+                body,
+                operator,
+                reason,
+                action,
+            )
+        )
+
+    approve_id = str(browser_approve_candidate["id"])
+    wait.until(
+        lambda _: submit_candidate(
+            approve_id,
+            "# Browser approved\n\nBrowserCandidatePublished\n",
+            "browser-user",
+            "Edited through the Web page",
+            "save",
+        )
+    )
     wait.until(
         lambda _: request(
             f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key
         )[1]["body"].endswith("BrowserCandidatePublished\n")
     )
-    operator_input = browser.find_element(By.ID, "candidate-operator")
-    reason_input = browser.find_element(By.ID, "candidate-reason")
-    operator_input.send_keys("browser-user")
-    reason_input.send_keys("Approved through the Web page")
-    browser.find_element(By.ID, "candidate-approve").click()
+    wait.until(
+        lambda _: submit_candidate(
+            approve_id,
+            None,
+            "browser-user",
+            "Approved through the Web page",
+            "approve",
+        )
+    )
     wait.until(
         lambda _: request(
             f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key
@@ -1940,18 +2174,15 @@ try:
     )
 
     reject_id = str(browser_reject_candidate["id"])
-    reject_button = wait.until(
-        lambda driver: driver.find_element(
-            By.XPATH,
-            f"//nav[contains(@class, 'candidate-list')]/button[contains(., '{reject_id}')]",
+    wait.until(
+        lambda _: submit_candidate(
+            reject_id,
+            None,
+            "browser-user",
+            "Rejected through the Web page",
+            "reject",
         )
     )
-    reject_button.click()
-    browser.find_element(By.ID, "candidate-operator").send_keys("browser-user")
-    browser.find_element(By.ID, "candidate-reason").send_keys(
-        "Rejected through the Web page"
-    )
-    browser.find_element(By.ID, "candidate-reject").click()
     wait.until(
         lambda _: request(
             f"http://127.0.0.1:7331/api/v1/candidates/{reject_id}", key

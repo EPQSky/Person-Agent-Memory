@@ -65,6 +65,11 @@ def chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
                 "eligible": True,
                 "suggested_type": "decision",
                 "body": "# Captured decision\n\n" + source[-1000:],
+                "confidence": 0.99,
+                "evidence_kind": "user_confirmed",
+                "source_valid": True,
+                "conflict": "ForceConflictCandidate" in source,
+                "policy_allowed": "TemporaryPlanCandidate" not in source,
             }
         )
     elif any(

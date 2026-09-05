@@ -96,6 +96,21 @@
         const candidateDetail = document.createElement('div');
         candidateDetail.innerHTML = '<strong id="candidate-title">Select a candidate</strong><p id="candidate-sources" class="source"></p><textarea id="candidate-body" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">Operator</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">Reason</label><input id="candidate-reason" disabled></div><div class="candidate-actions"><button type="button" id="candidate-save" disabled>Save</button><button type="button" id="candidate-approve" disabled>Approve</button><button type="button" id="candidate-reject" class="danger" disabled>Reject</button></div><p id="candidate-message"></p>';
         candidateLayout.append(candidateList, candidateDetail);
+        const sensitiveHeading = document.createElement('h2');
+        sensitiveHeading.textContent = 'Sensitive quarantine';
+        const sensitiveLayout = document.createElement('div');
+        sensitiveLayout.className = 'candidate-layout';
+        const sensitiveList = document.createElement('nav');
+        sensitiveList.id = 'sensitive-quarantine-list';
+        sensitiveList.className = 'candidate-list';
+        const sensitivePagination = document.createElement('div');
+        sensitivePagination.className = 'candidate-actions';
+        sensitivePagination.innerHTML = '<button type="button" id="sensitive-previous">Previous</button><span id="sensitive-page"></span><button type="button" id="sensitive-next">Next</button><button type="button" id="sensitive-refresh">Refresh</button>';
+        sensitiveList.append(sensitivePagination);
+        const sensitiveDetail = document.createElement('div');
+        sensitiveDetail.id = 'sensitive-quarantine-detail';
+        sensitiveDetail.innerHTML = '<strong id="sensitive-title">Select a quarantine record</strong><p id="sensitive-summary"></p><p id="sensitive-metadata" class="source"></p><div class="candidate-actions"><button type="button" id="sensitive-acknowledge" disabled>Acknowledge</button><button type="button" id="sensitive-discard" class="danger" disabled>Discard</button></div><p id="sensitive-message"></p>';
+        sensitiveLayout.append(sensitiveList, sensitiveDetail);
         const editorHeading = document.createElement('h2');
         editorHeading.textContent = 'Memory documents';
         const editorLibrary = document.createElement('select');
@@ -114,13 +129,16 @@
         const restoreAction = document.createElement('div');
         const historyDiff = document.createElement('pre');
         historyDiff.className = 'diff';
-        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, candidateHeading, candidateStatus, candidateLayout, editorHeading, editorLibrary, editorLayout, historyHeading, history, restoreAction, historyDiff);
+        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, candidateHeading, candidateStatus, candidateLayout, sensitiveHeading, sensitiveLayout, editorHeading, editorLibrary, editorLayout, historyHeading, history, restoreAction, historyDiff);
 
         let projectLibraries = [];
         let projectBindings = [];
         let allLibraries = [];
         let activeDocument = null;
         let activeCandidate = null;
+        let activeSensitiveRecord = null;
+        let sensitiveOffset = 0;
+        const sensitivePageSize = 50;
         const historySelection = PamHistory.selectionStore();
         const editorContext = PamHistory.contextStore();
 
@@ -158,6 +176,7 @@
           }
           await refreshBindings();
           await refreshCandidates();
+          await refreshSensitiveQuarantine();
           await refreshDocuments();
         }
 
@@ -213,6 +232,62 @@
           showCandidate(activeCandidate);
           await refreshCandidates(activeCandidate.id);
           if (action === 'approve') await refreshDocuments();
+        }
+
+        async function refreshSensitiveQuarantine(selectedId = activeSensitiveRecord?.id) {
+          const response = await fetch(`/api/v1/sensitive-quarantine?offset=${sensitiveOffset}&limit=${sensitivePageSize + 1}`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) return;
+          const payload = await response.json();
+          const records = payload.slice(0, sensitivePageSize);
+          const hasNextPage = payload.length > sensitivePageSize;
+          sensitiveList.replaceChildren();
+          for (const record of records) {
+            const button = sensitiveList.appendChild(document.createElement('button'));
+            button.type = 'button';
+            button.dataset.recordId = record.id;
+            const status = record.resolved_at ? record.resolution : 'unresolved';
+            button.textContent = `${record.disposition} · ${status} · ${record.created_at}`;
+            button.addEventListener('click', () => showSensitiveRecord(record));
+          }
+          sensitivePagination.querySelector('#sensitive-previous').disabled = sensitiveOffset === 0;
+          sensitivePagination.querySelector('#sensitive-next').disabled = !hasNextPage;
+          sensitivePagination.querySelector('#sensitive-page').textContent = `${sensitiveOffset + 1}-${sensitiveOffset + records.length}`;
+          sensitiveList.append(sensitivePagination);
+          const selected = records.find((record) => record.id === selectedId);
+          if (selected) showSensitiveRecord(selected);
+          else clearSensitiveRecord();
+        }
+
+        function clearSensitiveRecord() {
+          activeSensitiveRecord = null;
+          sensitiveDetail.querySelector('#sensitive-title').textContent = 'Select a quarantine record';
+          sensitiveDetail.querySelector('#sensitive-summary').textContent = '';
+          sensitiveDetail.querySelector('#sensitive-metadata').textContent = '';
+          sensitiveDetail.querySelector('#sensitive-message').textContent = '';
+          sensitiveDetail.querySelector('#sensitive-acknowledge').disabled = true;
+          sensitiveDetail.querySelector('#sensitive-discard').disabled = true;
+        }
+
+        function showSensitiveRecord(record) {
+          activeSensitiveRecord = record;
+          const open = !record.resolved_at;
+          sensitiveDetail.querySelector('#sensitive-title').textContent = `${record.disposition} · ${open ? 'unresolved' : record.resolution}`;
+          sensitiveDetail.querySelector('#sensitive-summary').textContent = record.summary;
+          sensitiveDetail.querySelector('#sensitive-metadata').textContent = `${record.categories.join(', ')} · created ${record.created_at}${record.resolved_at ? ` · resolved ${record.resolved_at}` : ''}`;
+          sensitiveDetail.querySelector('#sensitive-message').textContent = open ? '' : `Resolution: ${record.resolution}`;
+          sensitiveDetail.querySelector('#sensitive-acknowledge').disabled = !open;
+          sensitiveDetail.querySelector('#sensitive-discard').disabled = !open;
+        }
+
+        async function resolveSensitiveRecord(resolution) {
+          if (!activeSensitiveRecord || activeSensitiveRecord.resolved_at) return;
+          const response = await fetch(`/api/v1/sensitive-quarantine/${activeSensitiveRecord.id}/resolve`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({resolution})});
+          const message = sensitiveDetail.querySelector('#sensitive-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          message.className = '';
+          activeSensitiveRecord = await response.json();
+          showSensitiveRecord(activeSensitiveRecord);
+          await refreshSensitiveQuarantine(activeSensitiveRecord.id);
         }
 
         async function refreshDocuments() {
@@ -442,6 +517,11 @@
         candidateDetail.querySelector('#candidate-save').addEventListener('click', () => candidateAction('edit'));
         candidateDetail.querySelector('#candidate-approve').addEventListener('click', () => candidateAction('approve'));
         candidateDetail.querySelector('#candidate-reject').addEventListener('click', () => candidateAction('reject'));
+        sensitiveDetail.querySelector('#sensitive-acknowledge').addEventListener('click', () => resolveSensitiveRecord('acknowledge'));
+        sensitiveDetail.querySelector('#sensitive-discard').addEventListener('click', () => resolveSensitiveRecord('discard'));
+        sensitivePagination.querySelector('#sensitive-previous').addEventListener('click', () => { sensitiveOffset = Math.max(0, sensitiveOffset - sensitivePageSize); refreshSensitiveQuarantine(); });
+        sensitivePagination.querySelector('#sensitive-next').addEventListener('click', () => { sensitiveOffset += sensitivePageSize; refreshSensitiveQuarantine(); });
+        sensitivePagination.querySelector('#sensitive-refresh').addEventListener('click', () => refreshSensitiveQuarantine());
         editorLibrary.addEventListener('change', refreshDocuments);
         editor.querySelector('#source-tab').addEventListener('click', () => showEditorPanel('source'));
         editor.querySelector('#preview-tab').addEventListener('click', async () => { if (await previewChange()) showEditorPanel('preview'); });

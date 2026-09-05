@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   mkdir,
   open,
@@ -28,6 +28,115 @@ const MAX_STATE_FILES = 256;
 const MAX_STATE_BYTES = 1024 * 1024;
 const TURN_TTL_MS = 24 * 60 * 60 * 1000;
 const IDENTITY_TTL_MS = 60 * 60 * 1000;
+
+function inspectSensitive(content) {
+  const patterns = [
+    ["private-key", /-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----/i],
+    ["aws-access-key", /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/],
+    ["github-token", /\bgh[pousr]_[A-Za-z0-9]{20,}\b/],
+    ["api-token", /\bsk[-\s_]+[A-Za-z0-9_-]{20,}\b/i],
+    ["bearer-token", /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b/i],
+  ];
+  const assignedSecretKey = /(?<![a-z0-9_-])["']?((?:[a-z0-9]+[_-])*(?:api[\s_-]*key|access[\s_-]*token|client[\s_-]*secret|secret[\s_-]*access[\s_-]*key|password|passwd|pass|secret|token))\b["']?\s*(?::|=)\s*/gi;
+  const compact = content.replace(/[\s\\]+/g, "");
+  const placeholder = /\b(?:example|sample|placeholder|redacted|masked|dummy|fake|not-a-secret|\*{4,})\b/i;
+  const assignedPlaceholder = /^(?:example|sample|placeholder|redacted|masked|dummy|fake|not-a-secret|\*{4,})$/i;
+  const benignAssignedValue = (value) => {
+    const candidate = value.trim().replace(/[,.;)]+$/, "");
+    const normalized = candidate.replace(/[\s_]+/g, "-");
+    const benign = /^(?:\$\{?[A-Z][A-Z0-9_]*\}?|(?:env|environment)(?::|[._-])?[A-Z][A-Z0-9_]*|vault:\/\/[a-z0-9._-]+(?:\/[a-z0-9._-]+)+#[a-z0-9._-]+|(?:generated|managed|configured|injected|provided|resolved|loaded|fetched)(?:[-_](?:at|by|from|during|via)[-_][a-z0-9_-]+)+)$/i;
+    return assignedPlaceholder.test(candidate) || benign.test(candidate) || benign.test(normalized);
+  };
+  const assignedSecretValues = [];
+  for (const match of content.matchAll(assignedSecretKey)) {
+    const start = match.index + match[0].length;
+    const quote = ['"', "'"].includes(content[start]) ? content[start] : undefined;
+    const valueStart = quote ? start + 1 : start;
+    let end = valueStart;
+    if (quote) {
+      let escaped = false;
+      while (end < content.length) {
+        const character = content[end];
+        if ((character === "\n" || character === "\r") && !escaped) break;
+        if (character === quote && !escaped) break;
+        escaped = character === "\\" && !escaped;
+        if (character !== "\\") escaped = false;
+        end += 1;
+      }
+    } else {
+      const boundaries = [content.indexOf(";", valueStart), content.indexOf("\n", valueStart)]
+        .filter((boundary) => boundary >= 0);
+      end = boundaries.length ? Math.min(...boundaries) : content.length;
+    }
+    assignedSecretValues.push([match[1], content.slice(valueStart, end).trim()]);
+  }
+  const categories = patterns.filter(([, pattern]) => pattern.test(content)).map(([name]) => name);
+  if (assignedSecretValues.some(([, value]) => {
+    const candidate = value.trim().replace(/[,.;)]+$/, "");
+    return candidate.length > 0 && !benignAssignedValue(candidate);
+  })) {
+    categories.push("assigned-secret");
+  }
+  for (const [name, pattern] of [
+    ["api-token", /\bsk-[A-Za-z0-9_-]{20,}\b/i],
+    ["github-token", /\bgh[pousr]_[A-Za-z0-9]{20,}\b/],
+    ["aws-access-key", /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/],
+  ]) {
+    if (pattern.test(compact) && !categories.includes(name)) categories.push(name);
+  }
+  if (categories.length) return { disposition: "discarded", categories };
+  const uncertain = /\b(?:credential|api[\s_-]*key|access[\s_-]*token|password|passwd|private[\s_-]*key|secret|token)\b(?:\s+\w+){0,3}\s+(?:may|might|could|possibly)\b(?:\s+\w+){0,3}/i.exec(content);
+  if (uncertain && !placeholder.test(uncertain[0])) {
+    return { disposition: "quarantined", categories: ["sensitive-language"] };
+  }
+}
+
+async function quarantineSensitive(content, finding, key, deadline) {
+  const directories = await spoolDirectories();
+  if (!directories) return;
+  const fingerprint = `opaque:${randomUUID()}`;
+  const record = {
+    disposition: finding.disposition,
+    categories: finding.categories,
+    summary: `Sensitive content withheld; ${Buffer.byteLength(content)} bytes; reference ${fingerprint}.`,
+    fingerprint,
+    created_at: new Date().toISOString(),
+  };
+  const identity = createHmac("sha256", key).update(content).digest("hex");
+  const path = join(directories.quarantine, `sensitive-${identity}.json`);
+  try {
+    await writeFile(path, JSON.stringify(record), {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  const maintained = await withSpoolLock(directories, async () => {
+    await pruneSpool(directories, path, deadline);
+  }, deadline);
+  if (!maintained && Date.now() < deadline) await pruneSpool(directories, path, deadline);
+}
+
+async function reportSensitiveCapture(content, finding, key, hookDeadline, eventKind = "user") {
+  const remaining = hookDeadline - Date.now();
+  if (remaining > 0) {
+    const withheld = {
+      event_id: randomUUID(),
+      session_id: "withheld",
+      turn_id: randomUUID(),
+      event_kind: eventKind,
+      content,
+      occurred_at: new Date().toISOString(),
+      cwd: "/",
+    };
+    try {
+      if (await request("/api/v1/capture/events", withheld, key, remaining) === "accepted") return;
+    } catch {}
+  }
+  await quarantineSensitive(content, finding, key, hookDeadline).catch(() => {});
+}
 
 async function readStdin() {
   const chunks = [];
@@ -449,6 +558,21 @@ async function main() {
   if (["PreCompact", "SessionEnd"].includes(name)) {
     await replay(key, hookDeadline);
     const sessionId = typeof event.session_id === "string" ? event.session_id.slice(0, 1000) : undefined;
+    const maintenanceMetadata = [
+      event.session_id,
+      event.cwd,
+      event.turn_id,
+      event.occurred_at,
+      event.timestamp,
+      event.hook_event_name,
+    ].filter((value) => typeof value === "string").join("\n");
+    const sensitive = inspectSensitive(maintenanceMetadata);
+    if (sensitive) {
+      await reportSensitiveCapture(maintenanceMetadata, sensitive, key, hookDeadline);
+      await pruneState(hookDeadline);
+      process.stdout.write("{}\n");
+      return;
+    }
     const remaining = hookDeadline - Date.now();
     if (remaining > 0) {
       await request("/api/v1/capture/consolidate", { session_id: sessionId }, key, remaining).catch(
@@ -478,6 +602,23 @@ async function main() {
         ? event.timestamp
         : new Date().toISOString();
   const occurredAt = eventTime.slice(0, 100);
+  const inspectedInput = [
+    event.session_id,
+    event.cwd,
+    event.turn_id,
+    event.occurred_at,
+    event.timestamp,
+    event.hook_event_name,
+    content,
+  ].filter((value) => typeof value === "string").join("\n");
+  const sensitive = inspectSensitive(inspectedInput);
+  if (sensitive) {
+    await reportSensitiveCapture(inspectedInput, sensitive, key, hookDeadline, kind);
+    await replay(key, hookDeadline);
+    await pruneState(hookDeadline);
+    if (name === "Stop") process.stdout.write("{}\n");
+    return;
+  }
   const turnId = await activeTurn(event, kind, content);
   const eventId = digest(event.session_id, name, turnId, content);
   const capture = {
@@ -498,7 +639,9 @@ async function main() {
       remaining > 0
         ? await request("/api/v1/capture/events", capture, key, remaining)
         : "transient";
-    if (result !== "accepted") await spoolEvent(capture, hookDeadline);
+    if (result !== "accepted") {
+      await spoolEvent(capture, hookDeadline);
+    }
   } catch {
     await spoolEvent(capture, hookDeadline).catch(() => {});
   }

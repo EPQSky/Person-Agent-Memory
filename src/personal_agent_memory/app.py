@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -144,6 +144,10 @@ class CaptureEvent(BaseModel):
 
 class CaptureConsolidation(BaseModel):
     session_id: str | None = Field(default=None, min_length=1, max_length=1000)
+
+
+class SensitiveResolution(BaseModel):
+    resolution: Literal["discard", "acknowledge"]
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -524,6 +528,25 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/api/v1/capture/events", dependencies=[Depends(authenticate)])
     async def capture_events(session_id: str | None = None) -> list[dict[str, object]]:
         return platform_state.list_capture_events(session_id)
+
+    @app.get("/api/v1/sensitive-quarantine", dependencies=[Depends(authenticate)])
+    async def sensitive_quarantine(
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=100),
+    ) -> list[dict[str, object]]:
+        return platform_state.list_sensitive_quarantine(offset, limit)
+
+    @app.post(
+        "/api/v1/sensitive-quarantine/{record_id}/resolve",
+        dependencies=[Depends(authenticate)],
+    )
+    async def resolve_sensitive_quarantine(
+        record_id: str, decision: SensitiveResolution
+    ) -> dict[str, object]:
+        try:
+            return platform_state.resolve_sensitive_quarantine(record_id, decision.resolution)
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
 
     @app.get("/api/v1/capture/rounds", dependencies=[Depends(authenticate)])
     async def capture_rounds(session_id: str | None = None) -> list[dict[str, object]]:
