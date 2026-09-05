@@ -172,6 +172,49 @@ class OpenAICompatibleClient:
             raise ModelServiceError("graph LLM returned malformed JSON")
         return decoded
 
+    def extract_candidate(self, conversation: str) -> dict[str, object]:
+        endpoint = self.graph
+        if endpoint is None:
+            raise ModelServiceError("candidate extraction LLM is not configured")
+        response = self._request(
+            "graph",
+            endpoint,
+            "/v1/chat/completions",
+            {
+                "model": endpoint.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "candidate-extraction-v1: return one JSON object with eligible, "
+                            "suggested_type, and body. Only durable decisions, constraints, "
+                            "preferences, domain facts, reusable experience, or external "
+                            "references are eligible. Never include hidden reasoning, tool output, "
+                            "complete files, injected memory, or transient task progress."
+                        ),
+                    },
+                    {"role": "user", "content": conversation},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+        )
+        choices = response.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            raise ModelServiceError("candidate extraction returned malformed data")
+        choice = choices[0]
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise ModelServiceError("candidate extraction returned malformed data")
+        content = choice["message"].get("content")
+        if not isinstance(content, str):
+            raise ModelServiceError("candidate extraction returned malformed data")
+        try:
+            decoded = json.loads(content)
+        except json.JSONDecodeError as error:
+            raise ModelServiceError("candidate extraction returned malformed JSON") from error
+        if not isinstance(decoded, dict):
+            raise ModelServiceError("candidate extraction returned malformed JSON")
+        return decoded
+
     def _request(
         self,
         component: str,

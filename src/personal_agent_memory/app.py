@@ -132,6 +132,20 @@ class CandidateDecision(BaseModel):
     operation_id: str = Field(min_length=1, max_length=200)
 
 
+class CaptureEvent(BaseModel):
+    event_id: str = Field(min_length=1, max_length=200)
+    session_id: str = Field(min_length=1, max_length=1000)
+    turn_id: str = Field(min_length=1, max_length=200)
+    event_kind: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=65_536)
+    occurred_at: str = Field(min_length=1, max_length=100)
+    cwd: str = Field(min_length=1, max_length=4096)
+
+
+class CaptureConsolidation(BaseModel):
+    session_id: str | None = Field(default=None, min_length=1, max_length=1000)
+
+
 def create_app(settings: Settings) -> FastAPI:
     key_store = ApiKeyStore(settings.state_dir / "api-key")
     model_client = OpenAICompatibleClient(settings.embedding, settings.reranker, settings.graph)
@@ -154,6 +168,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(title="Personal Agent Memory", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
+    app.state.platform_state = platform_state
 
     def authenticate(authorization: str | None = Header(default=None)) -> None:
         scheme, _, supplied = (authorization or "").partition(" ")
@@ -486,6 +501,41 @@ def create_app(settings: Settings) -> FastAPI:
             if isinstance(error, MemoryMutationError):
                 raise mutation_error(error) from error
             raise candidate_error(error) from error
+
+    @app.post(
+        "/api/v1/capture/events",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(authenticate)],
+    )
+    async def capture_event(event: CaptureEvent) -> dict[str, object]:
+        try:
+            return platform_state.ingest_capture_event(
+                event.event_id,
+                event.session_id,
+                event.turn_id,
+                event.event_kind,
+                event.content,
+                event.occurred_at,
+                event.cwd,
+            )
+        except (CandidateGovernanceError, ProjectBindingError) as error:
+            raise candidate_error(CandidateGovernanceError(str(error))) from error
+
+    @app.get("/api/v1/capture/events", dependencies=[Depends(authenticate)])
+    async def capture_events(session_id: str | None = None) -> list[dict[str, object]]:
+        return platform_state.list_capture_events(session_id)
+
+    @app.get("/api/v1/capture/rounds", dependencies=[Depends(authenticate)])
+    async def capture_rounds(session_id: str | None = None) -> list[dict[str, object]]:
+        return platform_state.list_capture_rounds(session_id)
+
+    @app.post(
+        "/api/v1/capture/consolidate",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(authenticate)],
+    )
+    async def consolidate_capture(request: CaptureConsolidation) -> dict[str, int]:
+        return {"queued": platform_state.trigger_capture_consolidation(request.session_id)}
 
     @app.post(
         "/mcp/candidates",

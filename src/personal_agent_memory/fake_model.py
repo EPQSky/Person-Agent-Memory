@@ -55,6 +55,19 @@ def chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
     if _apply_mode("graph") == "malformed":
         content = "not-json"
     elif any(
+        "candidate-extraction-v1" in str(message.get("content", ""))
+        for message in payload.get("messages", [])
+        if isinstance(message, dict)
+    ):
+        source = str(payload.get("messages", [{}, {}])[-1].get("content", ""))
+        content = json.dumps(
+            {
+                "eligible": True,
+                "suggested_type": "decision",
+                "body": "# Captured decision\n\n" + source[-1000:],
+            }
+        )
+    elif any(
         "graph-extraction-v1" in str(message.get("content", ""))
         for message in payload.get("messages", [])
         if isinstance(message, dict)

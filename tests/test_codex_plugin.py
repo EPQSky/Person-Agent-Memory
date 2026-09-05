@@ -143,13 +143,20 @@ def test_plugin_is_globally_installable_with_discovered_hooks_and_mcp() -> None:
     assert manifest["name"] == PLUGIN.name
     assert manifest["mcpServers"] == "./.mcp.json"
     assert "hooks" not in manifest
-    assert set(hooks["hooks"]) == {"UserPromptSubmit", "PreCompact", "SessionStart"}
+    assert set(hooks["hooks"]) == {
+        "UserPromptSubmit",
+        "Stop",
+        "PreCompact",
+        "SessionStart",
+        "SessionEnd",
+    }
     commands = [
         item["hooks"][0]["command"]
         for event in hooks["hooks"].values()
         for item in event
     ]
-    assert all("${PLUGIN_ROOT}/scripts/recall.mjs" in command for command in commands)
+    assert all("${PLUGIN_ROOT}/scripts/" in command for command in commands)
+    assert any("capture.mjs" in command for command in commands)
     assert hooks["hooks"]["SessionStart"][0]["matcher"] == "^compact$"
     assert mcp["mcpServers"]["personal-agent-memory"] == {
         "type": "http",

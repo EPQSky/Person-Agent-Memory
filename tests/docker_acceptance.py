@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -59,7 +60,9 @@ def wait_for(url: str) -> None:
 wait_for("http://127.0.0.1:18080/health")
 
 hook_script = Path("/app/plugins/personal-agent-memory/scripts/recall.mjs")
+capture_script = Path("/app/plugins/personal-agent-memory/scripts/capture.mjs")
 assert hook_script.is_file()
+assert capture_script.is_file()
 assert subprocess.run(["node", "--version"], capture_output=True, check=False).returncode == 0
 
 
@@ -97,6 +100,51 @@ def run_recall_hook(
             "PERSONAL_AGENT_MEMORY_PRECOMPACT_QUERY": prompt,
             "PERSONAL_AGENT_MEMORY_URL": url,
             "PERSONAL_AGENT_MEMORY_TIMEOUT_MS": str(timeout_ms),
+        },
+        check=False,
+    )
+
+
+def run_capture_hook(
+    cwd: Path,
+    event_name: str,
+    content: str,
+    *,
+    api_key: str,
+    timestamp: str | None = None,
+    url: str = "http://127.0.0.1:7331",
+    session_id: str = "docker-ticket12",
+    turn_id: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    event: dict[str, object] = {
+        "session_id": session_id,
+        "transcript_path": "/private/never-read.jsonl",
+        "cwd": str(cwd),
+        "hook_event_name": event_name,
+        "hidden_reasoning": "never captured",
+        "tool_output": "never captured",
+        "memory_context": "never captured",
+    }
+    if timestamp is not None:
+        event["timestamp"] = timestamp
+    if turn_id is not None:
+        event["turn_id"] = turn_id
+    if event_name == "UserPromptSubmit":
+        event["prompt"] = content
+    else:
+        event["last_assistant_message"] = content
+    return subprocess.run(
+        ["node", str(capture_script)],
+        input=json.dumps(event),
+        text=True,
+        capture_output=True,
+        timeout=4,
+        env={
+            **os.environ,
+            "PERSONAL_AGENT_MEMORY_API_KEY": api_key,
+            "PLUGIN_DATA": "/tmp/personal-agent-memory-plugin-data-ticket12",
+            "PERSONAL_AGENT_MEMORY_URL": url,
+            "PERSONAL_AGENT_MEMORY_TIMEOUT_MS": "300",
         },
         check=False,
     )
@@ -600,6 +648,255 @@ restore_hook = run_recall_hook(
 compact_context = hook_context(restore_hook, "SessionStart")
 assert "personal-agent-memory-context" in compact_context
 assert "DockerNeedle42" in compact_context
+
+# Session capture uses the actual Node adapter out of order with the official turn identifier.
+capture_assistant = run_capture_hook(
+    same_name_one / "src",
+    "Stop",
+    "DockerCaptureDecision42 is confirmed as the project decision.",
+    api_key=key,
+    turn_id="docker-out-of-order-turn",
+)
+capture_user = run_capture_hook(
+    same_name_one / "src",
+    "UserPromptSubmit",
+    "Remember the durable DockerCaptureDecision42.",
+    api_key=key,
+    turn_id="docker-out-of-order-turn",
+)
+capture_duplicate = run_capture_hook(
+    same_name_one / "src",
+    "Stop",
+    "DockerCaptureDecision42 is confirmed as the project decision.",
+    api_key=key,
+    turn_id="docker-out-of-order-turn",
+)
+for capture_result in (capture_assistant, capture_user, capture_duplicate):
+    assert capture_result.returncode == 0
+    assert capture_result.stderr == ""
+assert capture_user.stdout == ""
+assert json.loads(capture_assistant.stdout) == {}
+assert json.loads(capture_duplicate.stdout) == {}
+
+# An interrupted prompt is spooled while the daemon endpoint is unavailable and replayed later.
+spooled_capture = run_capture_hook(
+    same_name_one / "src",
+    "UserPromptSubmit",
+    "InterruptedDockerCapture43 remains in the Inbox.",
+    api_key=key,
+    timestamp="2026-09-05T10:01:00Z",
+    url="http://127.0.0.1:1",
+)
+assert spooled_capture.returncode == 0
+assert spooled_capture.stdout == spooled_capture.stderr == ""
+capture_spool = Path("/tmp/personal-agent-memory-plugin-data-ticket12/capture/spool")
+for malformed_index in range(270):
+    (capture_spool / f"event-{malformed_index:064x}.json").write_text("{}", encoding="utf-8")
+# Refresh the real record after the synthetic old backlog so the bounded policy retains it.
+spooled_capture_retry = run_capture_hook(
+    same_name_one / "src",
+    "UserPromptSubmit",
+    "InterruptedDockerCapture43 remains in the Inbox.",
+    api_key=key,
+    timestamp="2026-09-05T10:01:00Z",
+    url="http://127.0.0.1:1",
+)
+assert spooled_capture_retry.returncode == 0
+bounded_capture = run_capture_hook(
+    same_name_one / "src",
+    "UserPromptSubmit",
+    "BoundedDockerCapture45.",
+    api_key=key,
+    timestamp="2026-09-05T10:01:30Z",
+    url="http://127.0.0.1:1",
+)
+assert bounded_capture.returncode == 0
+assert len(list(capture_spool.glob("event-*.json"))) <= 256
+replay_capture = run_capture_hook(
+    same_name_one / "src",
+    "UserPromptSubmit",
+    "ReplayTriggerDockerCapture44.",
+    api_key=key,
+    timestamp="2026-09-05T10:02:00Z",
+)
+assert replay_capture.returncode == 0
+for _ in range(40):
+    if not list(capture_spool.glob("event-*.json")):
+        break
+    replay_batch = run_capture_hook(
+        same_name_one / "src",
+        "PreCompact",
+        "Continue bounded capture replay.",
+        api_key=key,
+    )
+    assert replay_batch.returncode == 0
+    assert json.loads(replay_batch.stdout) == {}
+capture_quarantine = Path(
+    "/tmp/personal-agent-memory-plugin-data-ticket12/capture/quarantine"
+)
+assert list(capture_quarantine.glob("event-*.json"))
+assert len(list(capture_quarantine.glob("event-*.json"))) <= 256
+assert not list(capture_spool.glob("event-*.json"))
+capture_deadline = time.monotonic() + 5
+captured_candidates: list[dict[str, object]] = []
+while time.monotonic() < capture_deadline:
+    capture_list_code, capture_list_payload = request(
+        "http://127.0.0.1:7331/api/v1/candidates", key
+    )
+    assert capture_list_code == 200
+    captured_candidates = cast(list[dict[str, object]], capture_list_payload)
+    if any(
+        candidate.get("creator") == "session-capture" for candidate in captured_candidates
+    ):
+        break
+    time.sleep(0.1)
+session_candidates = [
+    candidate
+    for candidate in captured_candidates
+    if candidate.get("creator") == "session-capture"
+]
+assert len(session_candidates) == 1
+assert len(session_candidates[0]["source_references"]) == 2
+capture_events_code, capture_events = request(
+    "http://127.0.0.1:7331/api/v1/capture/events?session_id=docker-ticket12", key
+)
+assert capture_events_code == 200
+contents = {str(event["content"]) for event in capture_events}
+assert "InterruptedDockerCapture43 remains in the Inbox." in contents
+assert "BoundedDockerCapture45." in contents
+serialized_contents = "\n".join(contents)
+for excluded in ("never-read.jsonl", "never captured"):
+    assert excluded not in serialized_contents
+assert all(str(event["occurred_at"]).endswith("Z") for event in capture_events)
+
+# A separate real daemon proves persisted extraction retry survives process restart.
+retry_state = Path("/tmp/ticket12-retry-state")
+retry_libraries = Path("/tmp/ticket12-retry-libraries")
+retry_projects = Path("/tmp/ticket12-retry-projects")
+retry_libraries.mkdir()
+retry_projects.mkdir()
+retry_project = retry_projects / "project"
+retry_project.mkdir()
+retry_command = [
+    "personal-agent-memory",
+    "serve",
+    "--state-dir",
+    str(retry_state),
+    "--library-root",
+    str(retry_libraries),
+    "--library-root",
+    str(retry_projects),
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "17331",
+    "--graph-url",
+    "http://127.0.0.1:18080",
+    "--graph-model",
+    "deterministic-graph",
+    "--model-timeout",
+    "0.2",
+    "--model-retries",
+    "0",
+]
+
+
+def start_retry_daemon() -> subprocess.Popen[bytes]:
+    process = subprocess.Popen(retry_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("retry daemon exited during startup")
+        if (retry_state / "api-key").is_file():
+            retry_key = (retry_state / "api-key").read_text().strip()
+            try:
+                if request("http://127.0.0.1:17331/health/live", retry_key)[0] == 200:
+                    return process
+            except OSError:
+                pass
+        time.sleep(0.05)
+    process.terminate()
+    process.wait(timeout=5)
+    raise RuntimeError("retry daemon did not become ready")
+
+
+retry_daemon = start_retry_daemon()
+retry_key = (retry_state / "api-key").read_text().strip()
+try:
+    retry_library_code, retry_library = request(
+        "http://127.0.0.1:17331/api/v1/libraries",
+        retry_key,
+        {"path": str(retry_libraries / "memory"), "kind": "project"},
+    )
+    assert retry_library_code == 201
+    assert request(
+        "http://127.0.0.1:17331/api/v1/project-bindings",
+        retry_key,
+        {"project_root": str(retry_project), "library_id": retry_library["id"]},
+    )[0] == 201
+    assert request("http://127.0.0.1:18080/control/graph/error", payload={})[0] == 200
+    retry_assistant = run_capture_hook(
+        retry_project,
+        "Stop",
+        "RestartRecoveryDecision46 is confirmed.",
+        api_key=retry_key,
+        url="http://127.0.0.1:17331",
+        session_id="docker-restart-recovery",
+        turn_id="restart-turn",
+    )
+    retry_user = run_capture_hook(
+        retry_project,
+        "UserPromptSubmit",
+        "Remember RestartRecoveryDecision46.",
+        api_key=retry_key,
+        url="http://127.0.0.1:17331",
+        session_id="docker-restart-recovery",
+        turn_id="restart-turn",
+    )
+    assert retry_assistant.returncode == retry_user.returncode == 0
+    retry_deadline = time.monotonic() + 3
+    retry_pending = False
+    while time.monotonic() < retry_deadline:
+        rounds_code, rounds = request(
+            "http://127.0.0.1:17331/api/v1/capture/rounds"
+            "?session_id=docker-restart-recovery",
+            retry_key,
+        )
+        assert rounds_code == 200
+        if rounds and rounds[0]["status"] == "pending" and rounds[0]["last_error"]:
+            retry_pending = True
+            break
+        time.sleep(0.02)
+    assert retry_pending
+finally:
+    retry_daemon.terminate()
+    retry_daemon.wait(timeout=5)
+
+assert request("http://127.0.0.1:18080/control/graph/ok", payload={})[0] == 200
+retry_daemon = start_retry_daemon()
+try:
+    retry_deadline = time.monotonic() + 5
+    retry_candidates: list[dict[str, object]] = []
+    while time.monotonic() < retry_deadline:
+        retry_candidates_code, retry_candidates_payload = request(
+            "http://127.0.0.1:17331/api/v1/candidates", retry_key
+        )
+        assert retry_candidates_code == 200
+        retry_candidates = cast(list[dict[str, object]], retry_candidates_payload)
+        if retry_candidates:
+            break
+        time.sleep(0.05)
+    assert len(retry_candidates) == 1
+    time.sleep(0.7)
+    assert len(
+        cast(
+            list[dict[str, object]],
+            request("http://127.0.0.1:17331/api/v1/candidates", retry_key)[1],
+        )
+    ) == 1
+finally:
+    retry_daemon.terminate()
+    retry_daemon.wait(timeout=5)
 
 one_hop_code, one_hop = request(
     "http://127.0.0.1:7331/api/v1/search",

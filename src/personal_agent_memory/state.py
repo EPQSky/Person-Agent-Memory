@@ -223,6 +223,8 @@ class PlatformState:
                     kind TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS memory_libraries (
@@ -354,6 +356,31 @@ class PlatformState:
                     body TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS capture_inbox (
+                    event_id TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    turn_id TEXT NOT NULL,
+                    event_kind TEXT NOT NULL CHECK(event_kind IN ('user', 'assistant')),
+                    content TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    consolidated_at TEXT,
+                    UNIQUE(session_id, turn_id, event_kind)
+                );
+                CREATE TABLE IF NOT EXISTS capture_rounds (
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'processing', 'done', 'error')),
+                    candidate_id TEXT REFERENCES candidate_memories(id),
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(session_id, turn_id)
+                );
                 """
             )
             columns = {
@@ -388,6 +415,25 @@ class PlatformState:
                 connection.execute(
                     "ALTER TABLE memory_operations ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''"
                 )
+            job_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(background_jobs)")
+            }
+            if "attempts" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE background_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "available_at" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE background_jobs ADD COLUMN available_at REAL NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                """UPDATE background_jobs SET status = 'pending'
+                   WHERE kind = 'capture_consolidation' AND status = 'running'"""
+            )
+            connection.execute(
+                """UPDATE capture_rounds SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+                   WHERE status = 'processing'"""
+            )
             previous_count = self._metadata("startup_count")
             previous_clean = self._metadata("clean_shutdown")
             self.startup_count = int(previous_count or "0") + 1
@@ -875,6 +921,132 @@ class PlatformState:
                 ) from None
             return self.candidate(str(existing[0]))
         return self.candidate(candidate_id)
+
+    def ingest_capture_event(
+        self,
+        event_id: str,
+        session_id: str,
+        turn_id: str,
+        event_kind: str,
+        content: str,
+        occurred_at: str,
+        cwd: str,
+    ) -> dict[str, object]:
+        for value, label, maximum in (
+            (event_id, "event_id", 200),
+            (session_id, "session_id", 1000),
+            (turn_id, "turn_id", 200),
+            (occurred_at, "occurred_at", 100),
+        ):
+            if not value.strip() or len(value) > maximum or "\x00" in value:
+                raise CandidateGovernanceError(f"invalid {label}")
+        if event_kind not in {"user", "assistant"}:
+            raise CandidateGovernanceError("invalid capture event kind")
+        if not content.strip() or len(content.encode()) > 64 * 1024 or "\x00" in content:
+            raise CandidateGovernanceError("invalid capture content")
+        binding = self.resolve_project_binding(cwd)
+        if binding["status"] != "bound":
+            return {"status": "unbound", "event_id": event_id}
+        library_id = str(binding["library_id"])
+        project_id = str(binding["project_id"])
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "event_kind": event_kind,
+                    "content": content,
+                    "project_id": project_id,
+                    "library_id": library_id,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        existing = self.connection_or_raise.execute(
+            "SELECT request_hash FROM capture_inbox WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if existing is not None:
+            if str(existing[0]) != request_hash:
+                raise CandidateGovernanceError("event_id was already used for another event")
+            return {"status": "accepted", "event_id": event_id, "duplicate": True}
+        try:
+            self.connection_or_raise.execute("BEGIN IMMEDIATE")
+            self.connection_or_raise.execute(
+                """INSERT INTO capture_inbox
+                   (event_id, request_hash, session_id, project_id, library_id, turn_id,
+                    event_kind, content, occurred_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_id,
+                    request_hash,
+                    session_id,
+                    project_id,
+                    library_id,
+                    turn_id,
+                    event_kind,
+                    content,
+                    occurred_at,
+                ),
+            )
+            self.connection_or_raise.execute(
+                """INSERT INTO capture_rounds (session_id, turn_id, library_id)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(session_id, turn_id) DO UPDATE SET
+                     status = CASE WHEN capture_rounds.status = 'done'
+                                   THEN 'done' ELSE 'pending' END,
+                     updated_at = CURRENT_TIMESTAMP""",
+                (session_id, turn_id, library_id),
+            )
+            self._queue_capture_consolidation(session_id, turn_id, True)
+            self.connection_or_raise.commit()
+        except sqlite3.IntegrityError as error:
+            self.connection_or_raise.rollback()
+            raise CandidateGovernanceError(
+                "capture event conflicts with an existing turn"
+            ) from error
+        return {"status": "accepted", "event_id": event_id, "duplicate": False}
+
+    def trigger_capture_consolidation(self, session_id: str | None = None) -> int:
+        rows = self.connection_or_raise.execute(
+            """SELECT session_id, turn_id FROM capture_rounds
+               WHERE status IN ('pending', 'error')
+                 AND (? IS NULL OR session_id = ?)
+               ORDER BY updated_at""",
+            (session_id, session_id),
+        ).fetchall()
+        queued = 0
+        for row in rows:
+            if self._queue_capture_consolidation(str(row[0]), str(row[1]), True):
+                queued += 1
+        self.connection_or_raise.commit()
+        return queued
+
+    def list_capture_events(self, session_id: str | None = None) -> list[dict[str, object]]:
+        rows = self.connection_or_raise.execute(
+            """SELECT event_id, session_id, project_id, library_id, turn_id, event_kind,
+                      content, occurred_at, received_at, consolidated_at
+               FROM capture_inbox WHERE (? IS NULL OR session_id = ?)
+               ORDER BY received_at, event_id""",
+            (session_id, session_id),
+        ).fetchall()
+        keys = (
+            "event_id", "session_id", "project_id", "library_id", "turn_id", "event_kind",
+            "content", "occurred_at", "received_at", "consolidated_at",
+        )
+        return [dict(zip(keys, row, strict=True)) for row in rows]
+
+    def list_capture_rounds(self, session_id: str | None = None) -> list[dict[str, object]]:
+        rows = self.connection_or_raise.execute(
+            """SELECT session_id, turn_id, library_id, status, candidate_id, last_error,
+                      updated_at FROM capture_rounds
+               WHERE (? IS NULL OR session_id = ?) ORDER BY updated_at, turn_id""",
+            (session_id, session_id),
+        ).fetchall()
+        keys = (
+            "session_id", "turn_id", "library_id", "status", "candidate_id", "last_error",
+            "updated_at",
+        )
+        return [dict(zip(keys, row, strict=True)) for row in rows]
 
     def list_candidates(
         self, library_id: str | None = None, candidate_status: str | None = None
@@ -3347,12 +3519,14 @@ class PlatformState:
     async def _execute_pending_jobs(self) -> None:
         assert self.connection is not None
         job = self.connection.execute(
-            "SELECT id, kind, payload FROM background_jobs "
-            "WHERE status = 'pending' ORDER BY id LIMIT 1"
+            "SELECT id, kind, payload, attempts FROM background_jobs "
+            "WHERE status = 'pending' "
+            "AND available_at <= (julianday('now') - 2440587.5) * 86400.0 "
+            "ORDER BY available_at, id LIMIT 1"
         ).fetchone()
         if job is None:
             return
-        job_id, kind, payload = job
+        job_id, kind, payload, attempts = job
         claimed = self.connection.execute(
             "UPDATE background_jobs SET status = 'running' "
             "WHERE id = ? AND status = 'pending'",
@@ -3368,10 +3542,16 @@ class PlatformState:
             elif str(kind) == "graph_rebuild":
                 parsed = json.loads(str(payload))
                 await self._rebuild_graph(str(parsed["library_id"]))
+            elif str(kind) == "capture_consolidation":
+                parsed = json.loads(str(payload))
+                await self._consolidate_capture_round(
+                    str(parsed["session_id"]), str(parsed["turn_id"])
+                )
             self.connection.execute(
                 "UPDATE background_jobs SET status = 'done' WHERE id = ?", (job_id,)
             )
         except (
+            CandidateGovernanceError,
             GraphAdapterError,
             ModelServiceError,
             KeyError,
@@ -3382,6 +3562,21 @@ class PlatformState:
             json.JSONDecodeError,
         ) as error:
             self.connection.rollback()
+            if str(kind) == "capture_consolidation":
+                with suppress(KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    parsed_capture = json.loads(str(payload))
+                    retry = int(attempts) < 5
+                    self.connection.execute(
+                        """UPDATE capture_rounds SET status = ?, last_error = ?,
+                           updated_at = CURRENT_TIMESTAMP
+                           WHERE session_id = ? AND turn_id = ?""",
+                        (
+                            "pending" if retry else "error",
+                            str(error)[:1000],
+                            str(parsed_capture["session_id"]),
+                            str(parsed_capture["turn_id"]),
+                        ),
+                    )
             if str(kind) == "graph_rebuild":
                 with suppress(KeyError, TypeError, ValueError, json.JSONDecodeError):
                     library_id = str(json.loads(str(payload))["library_id"])
@@ -3392,10 +3587,105 @@ class PlatformState:
                         "last_error = excluded.last_error, updated_at = CURRENT_TIMESTAMP",
                         (library_id, str(error)[:1000]),
                     )
-            self.connection.execute(
-                "UPDATE background_jobs SET status = 'error' WHERE id = ?", (job_id,)
-            )
+            if str(kind) == "capture_consolidation" and int(attempts) < 5:
+                retry_delay = min(0.5 * (2 ** int(attempts)), 8.0)
+                self.connection.execute(
+                    """UPDATE background_jobs
+                       SET status = 'pending', attempts = attempts + 1,
+                           available_at = (julianday('now') - 2440587.5) * 86400.0 + ?
+                       WHERE id = ?""",
+                    (retry_delay, job_id),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE background_jobs SET status = 'error' WHERE id = ?", (job_id,)
+                )
         self.connection.commit()
+
+    def _queue_capture_consolidation(
+        self, session_id: str, turn_id: str, participate_in_transaction: bool
+    ) -> int:
+        pending = self.connection_or_raise.execute(
+            """SELECT id FROM background_jobs WHERE kind = 'capture_consolidation'
+               AND status IN ('pending', 'running')
+               AND json_extract(payload, '$.session_id') = ?
+               AND json_extract(payload, '$.turn_id') = ? LIMIT 1""",
+            (session_id, turn_id),
+        ).fetchone()
+        if pending is not None:
+            return 0
+        cursor = self.connection_or_raise.execute(
+            "INSERT INTO background_jobs (kind, payload) VALUES ('capture_consolidation', ?)",
+            (json.dumps({"session_id": session_id, "turn_id": turn_id}),),
+        )
+        if not participate_in_transaction:
+            self.connection_or_raise.commit()
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
+    async def _consolidate_capture_round(self, session_id: str, turn_id: str) -> None:
+        rows = self.connection_or_raise.execute(
+            """SELECT event_id, library_id, event_kind, content, occurred_at
+               FROM capture_inbox WHERE session_id = ? AND turn_id = ?
+               ORDER BY CASE event_kind WHEN 'user' THEN 0 ELSE 1 END""",
+            (session_id, turn_id),
+        ).fetchall()
+        by_kind = {str(row[2]): row for row in rows}
+        if set(by_kind) != {"user", "assistant"}:
+            return
+        library_ids = {str(row[1]) for row in rows}
+        if len(library_ids) != 1:
+            raise CandidateGovernanceError("capture round crosses memory libraries")
+        library_id = library_ids.pop()
+        self.connection_or_raise.execute(
+            """UPDATE capture_rounds SET status = 'processing', last_error = '',
+               updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND turn_id = ?""",
+            (session_id, turn_id),
+        )
+        self.connection_or_raise.commit()
+        conversation = (
+            f"User:\n{by_kind['user'][3]}\n\n"
+            f"Assistant final reply:\n{by_kind['assistant'][3]}"
+        )
+        extracted = await asyncio.to_thread(self.model_client.extract_candidate, conversation)
+        allowed_types = {
+            "preference",
+            "decision",
+            "constraint",
+            "domain_fact",
+            "reusable_experience",
+            "external_reference",
+        }
+        candidate_id: str | None = None
+        if extracted.get("eligible") is True:
+            suggested_type = extracted.get("suggested_type")
+            body = extracted.get("body")
+            if suggested_type not in allowed_types or not isinstance(body, str):
+                raise ModelServiceError("candidate extraction returned malformed data")
+            source_references = tuple(
+                f"capture:{session_id}:{turn_id}:{str(row[0])}:{str(row[4])}" for row in rows
+            )
+            candidate = self.create_candidate(
+                library_id,
+                str(suggested_type),
+                body,
+                source_references,
+                "session-capture",
+                "capture-round:"
+                + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest(),
+            )
+            candidate_id = str(candidate["id"])
+        self.connection_or_raise.execute(
+            """UPDATE capture_rounds SET status = 'done', candidate_id = ?, last_error = '',
+               updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND turn_id = ?""",
+            (candidate_id, session_id, turn_id),
+        )
+        self.connection_or_raise.execute(
+            """UPDATE capture_inbox SET consolidated_at = CURRENT_TIMESTAMP
+               WHERE session_id = ? AND turn_id = ?""",
+            (session_id, turn_id),
+        )
+        self.connection_or_raise.commit()
 
     def _queue_vector_rebuild(self, library_id: str, participate_in_transaction: bool) -> int:
         if self.model_client.embedding is None:

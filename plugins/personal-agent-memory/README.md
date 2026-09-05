@@ -13,3 +13,8 @@ Set `PERSONAL_AGENT_MEMORY_API_KEY` to the daemon API key, or leave it unset to 
 
 The URL must use HTTP and a loopback host. Recall failures produce no context and always leave the
 Codex lifecycle event unblocked.
+
+Capture stores only the explicit user prompt and assistant final-message fields. It never reads the
+transcript path or captures hidden reasoning, raw tool output, complete files, subagent traces, or
+injected memory. Daemon outages use a private, bounded seven-day spool below `PLUGIN_DATA`; later
+Hook runs replay valid records and quarantine malformed records without blocking Codex.

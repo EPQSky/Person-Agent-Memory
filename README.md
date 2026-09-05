@@ -99,6 +99,12 @@ user and set `PERSONAL_AGENT_MEMORY_API_KEY` to the daemon key (or use the defau
 file). Codex then discovers lifecycle Hooks and the authenticated loopback MCP connection without
 writing files into individual projects. `UserPromptSubmit` recalls only the project memory library
 bound to the Hook event's `cwd`; unbound projects and daemon failures are silent and fail open.
+The same global plugin captures only the explicit user prompt and assistant final-message fields;
+it never reads transcript files, hidden reasoning, raw tool output, full file bodies, subagent traces,
+or recalled memory context. Events enter an idempotent SQLite Inbox and are consolidated by the
+daemon's background worker into governed candidates. During daemon outages the Hook uses a private,
+bounded seven-day spool below `PLUGIN_DATA`, then replays valid records and quarantines malformed
+records on a later Hook invocation without blocking Codex.
 
 ## Verify
 
