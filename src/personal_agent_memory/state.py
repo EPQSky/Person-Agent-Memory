@@ -12,7 +12,7 @@ import os
 import sqlite3
 import stat
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -107,6 +107,10 @@ class MemoryMutationError(ValueError):
     """Raised when an authoritative memory mutation cannot be completed safely."""
 
 
+class CandidateGovernanceError(ValueError):
+    """Raised when candidate memory governance cannot be completed safely."""
+
+
 @dataclass(frozen=True, slots=True)
 class BoundDocument:
     root_identity: tuple[int, int]
@@ -157,6 +161,26 @@ class ProjectBinding:
     availability: str
 
     def payload(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateMemory:
+    id: str
+    library_id: str
+    suggested_type: str
+    body: str
+    source_references: tuple[str, ...]
+    creator: str
+    created_at: str
+    status: str
+    operator: str | None
+    reason: str | None
+    reviewed_at: str | None
+    published_path: str | None
+    commit: str | None
+
+    def payload(self) -> dict[str, object]:
         return asdict(self)
 
 
@@ -295,6 +319,39 @@ class PlatformState:
                     request_hash TEXT NOT NULL,
                     commit_id TEXT NOT NULL,
                     response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS candidate_memories (
+                    id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    suggested_type TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    source_references_json TEXT NOT NULL,
+                    creator TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'approved', 'rejected')),
+                    operator TEXT,
+                    reason TEXT,
+                    reviewed_at TEXT,
+                    published_path TEXT,
+                    commit_id TEXT,
+                    decision_operation_id TEXT,
+                    decision_request_hash TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(library_id, idempotency_key),
+                    UNIQUE(decision_operation_id)
+                );
+                CREATE TABLE IF NOT EXISTS candidate_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    candidate_id TEXT NOT NULL REFERENCES candidate_memories(id) ON DELETE CASCADE,
+                    action TEXT NOT NULL
+                        CHECK(action IN ('created', 'edited', 'approved', 'rejected')),
+                    operator TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    body TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 """
@@ -751,6 +808,486 @@ class PlatformState:
             for row in rows
         ]
 
+    def create_candidate(
+        self,
+        library_id: str,
+        suggested_type: str,
+        body: str,
+        source_references: tuple[str, ...],
+        creator: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        self._require_available_library(library_id)
+        normalized_type = self._validate_candidate_content(
+            suggested_type, body, source_references, creator
+        )
+        self._validate_operation_identifier(idempotency_key, "idempotency_key")
+        request_hash = self._candidate_request_hash(
+            library_id, normalized_type, body, source_references, creator
+        )
+        existing = self.connection_or_raise.execute(
+            """SELECT id, request_hash FROM candidate_memories
+               WHERE library_id = ? AND idempotency_key = ?""",
+            (library_id, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            if str(existing[1]) != request_hash:
+                raise CandidateGovernanceError(
+                    "idempotency_key was already used for another candidate"
+                )
+            return self.candidate(str(existing[0]))
+        candidate_id = str(uuid.uuid4())
+        try:
+            self.connection_or_raise.execute("BEGIN IMMEDIATE")
+            self.connection_or_raise.execute(
+                """INSERT INTO candidate_memories
+                   (id, library_id, suggested_type, body, source_references_json,
+                    creator, idempotency_key, request_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    candidate_id,
+                    library_id,
+                    normalized_type,
+                    body,
+                    json.dumps(source_references, ensure_ascii=False),
+                    creator,
+                    idempotency_key,
+                    request_hash,
+                ),
+            )
+            self.connection_or_raise.execute(
+                """INSERT INTO candidate_audit
+                   (candidate_id, action, operator, reason, body)
+                   VALUES (?, 'created', ?, ?, ?)""",
+                (candidate_id, creator, "candidate submitted", body),
+            )
+            self.connection_or_raise.commit()
+        except sqlite3.IntegrityError:
+            self.connection_or_raise.rollback()
+            existing = self.connection_or_raise.execute(
+                """SELECT id, request_hash FROM candidate_memories
+                   WHERE library_id = ? AND idempotency_key = ?""",
+                (library_id, idempotency_key),
+            ).fetchone()
+            if existing is None or str(existing[1]) != request_hash:
+                raise CandidateGovernanceError(
+                    "idempotency_key was already used for another candidate"
+                ) from None
+            return self.candidate(str(existing[0]))
+        return self.candidate(candidate_id)
+
+    def list_candidates(
+        self, library_id: str | None = None, candidate_status: str | None = None
+    ) -> list[dict[str, object]]:
+        parameters: list[str] = []
+        predicates: list[str] = []
+        if library_id is not None:
+            self._require_available_library(library_id)
+            predicates.append("library_id = ?")
+            parameters.append(library_id)
+        if candidate_status is not None:
+            if candidate_status not in {"pending", "approved", "rejected"}:
+                raise CandidateGovernanceError("invalid candidate status")
+            predicates.append("status = ?")
+            parameters.append(candidate_status)
+        where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+        rows = self.connection_or_raise.execute(
+            "SELECT id FROM candidate_memories"
+            + where
+            + " ORDER BY created_at DESC, id DESC",
+            parameters,
+        ).fetchall()
+        return [self.candidate(str(row[0])) for row in rows]
+
+    def candidate(self, candidate_id: str) -> dict[str, object]:
+        row = self.connection_or_raise.execute(
+            """SELECT id, library_id, suggested_type, body, source_references_json,
+                      creator, created_at, status, operator, reason, reviewed_at,
+                      published_path, commit_id
+               FROM candidate_memories WHERE id = ?""",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            raise CandidateGovernanceError("candidate memory not found")
+        return CandidateMemory(
+            id=str(row[0]),
+            library_id=str(row[1]),
+            suggested_type=str(row[2]),
+            body=str(row[3]),
+            source_references=tuple(str(item) for item in json.loads(str(row[4]))),
+            creator=str(row[5]),
+            created_at=str(row[6]),
+            status=str(row[7]),
+            operator=None if row[8] is None else str(row[8]),
+            reason=None if row[9] is None else str(row[9]),
+            reviewed_at=None if row[10] is None else str(row[10]),
+            published_path=None if row[11] is None else str(row[11]),
+            commit=None if row[12] is None else str(row[12]),
+        ).payload()
+
+    def edit_candidate(
+        self, candidate_id: str, body: str, operator: str, reason: str
+    ) -> dict[str, object]:
+        current = self.candidate(candidate_id)
+        self._validate_governance_actor(operator, reason)
+        if current["status"] != "pending":
+            raise CandidateGovernanceError("only pending candidates can be edited")
+        if not body.strip() or "\x00" in body:
+            raise CandidateGovernanceError("candidate body must contain Markdown text")
+        if body == current["body"]:
+            return current
+        try:
+            self.connection_or_raise.execute("BEGIN IMMEDIATE")
+            updated = self.connection_or_raise.execute(
+                """UPDATE candidate_memories SET body = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND status = 'pending'""",
+                (body, candidate_id),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGovernanceError("candidate is no longer pending")
+            self.connection_or_raise.execute(
+                """INSERT INTO candidate_audit
+                   (candidate_id, action, operator, reason, body)
+                   VALUES (?, 'edited', ?, ?, ?)""",
+                (candidate_id, operator, reason, body),
+            )
+            self.connection_or_raise.commit()
+        except BaseException:
+            self.connection_or_raise.rollback()
+            raise
+        return self.candidate(candidate_id)
+
+    def approve_candidate(
+        self,
+        candidate_id: str,
+        operator: str,
+        reason: str,
+        operation_id: str,
+    ) -> dict[str, object]:
+        self._validate_governance_actor(operator, reason)
+        self._validate_operation_identifier(operation_id, "operation_id")
+        self._ensure_decision_operation_available(candidate_id, operation_id)
+        current = self.candidate(candidate_id)
+        decision_hash = self._decision_request_hash(
+            candidate_id, "approved", str(current["body"]), operator, reason
+        )
+        if current["status"] != "pending":
+            completed = self._completed_candidate_decision(
+                current, operation_id, decision_hash
+            )
+            persisted_content = self._published_candidate_markdown(
+                current, operator, reason
+            ).encode()
+            path = str(current["published_path"] or "")
+            commit = str(current["commit"] or "")
+            repository = self._git_repository(str(current["library_id"]))
+            request_hash = self._publication_request_hash(
+                str(current["library_id"]),
+                path,
+                persisted_content.decode(),
+                "candidate-approval",
+            )
+            persisted = self._persisted_publication(
+                str(current["library_id"]),
+                path,
+                persisted_content,
+                operation_id,
+                request_hash,
+                commit,
+                repository,
+            )
+            if persisted is None or not self._approved_candidate_decision_is_persisted(
+                current,
+                operator,
+                reason,
+                operation_id,
+                decision_hash,
+                {"path": path, "commit": commit},
+            ):
+                raise CandidateGovernanceError(
+                    "approved candidate publication is inconsistent"
+                )
+            return completed
+        path = f"memory-{candidate_id}.md"
+        content = self._published_candidate_markdown(current, operator, reason)
+
+        def record_approval(published: dict[str, str]) -> None:
+            updated = self.connection_or_raise.execute(
+                """UPDATE candidate_memories
+                   SET status = 'approved', operator = ?, reason = ?,
+                       reviewed_at = CURRENT_TIMESTAMP, published_path = ?, commit_id = ?,
+                       decision_operation_id = ?, decision_request_hash = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND status = 'pending'""",
+                (
+                    operator,
+                    reason,
+                    published["path"],
+                    published["commit"],
+                    operation_id,
+                    decision_hash,
+                    candidate_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGovernanceError("candidate is no longer pending")
+            self.connection_or_raise.execute(
+                """INSERT INTO candidate_audit
+                   (candidate_id, action, operator, reason, body)
+                   VALUES (?, 'approved', ?, ?, ?)""",
+                (candidate_id, operator, reason, current["body"]),
+            )
+
+        def approval_is_persisted(published: dict[str, str]) -> bool:
+            return self._approved_candidate_decision_is_persisted(
+                current,
+                operator,
+                reason,
+                operation_id,
+                decision_hash,
+                published,
+            )
+
+        def compensate_approval() -> None:
+            self.connection_or_raise.execute(
+                """UPDATE candidate_memories
+                   SET status = 'pending', operator = NULL, reason = NULL,
+                       reviewed_at = NULL, published_path = NULL, commit_id = NULL,
+                       decision_operation_id = NULL, decision_request_hash = NULL,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND decision_operation_id = ?""",
+                (candidate_id, operation_id),
+            )
+            self.connection_or_raise.execute(
+                """DELETE FROM candidate_audit
+                   WHERE candidate_id = ? AND action = 'approved' AND operator = ?
+                     AND reason = ? AND body = ?""",
+                (candidate_id, operator, reason, current["body"]),
+            )
+
+        self._publish_document(
+            str(current["library_id"]),
+            path,
+            content,
+            operation_id,
+            operator,
+            "candidate-approval",
+            f"Publish candidate memory {candidate_id}",
+            record_approval,
+            approval_is_persisted,
+            compensate_approval,
+        )
+        return self.candidate(candidate_id)
+
+    def reject_candidate(
+        self,
+        candidate_id: str,
+        operator: str,
+        reason: str,
+        operation_id: str,
+    ) -> dict[str, object]:
+        self._validate_governance_actor(operator, reason)
+        self._validate_operation_identifier(operation_id, "operation_id")
+        self._ensure_decision_operation_available(candidate_id, operation_id)
+        current = self.candidate(candidate_id)
+        decision_hash = self._decision_request_hash(
+            candidate_id, "rejected", str(current["body"]), operator, reason
+        )
+        if current["status"] != "pending":
+            return self._completed_candidate_decision(current, operation_id, decision_hash)
+        try:
+            self.connection_or_raise.execute("BEGIN IMMEDIATE")
+            updated = self.connection_or_raise.execute(
+                """UPDATE candidate_memories
+                   SET status = 'rejected', operator = ?, reason = ?,
+                       reviewed_at = CURRENT_TIMESTAMP, decision_operation_id = ?,
+                       decision_request_hash = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND status = 'pending'""",
+                (operator, reason, operation_id, decision_hash, candidate_id),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGovernanceError("candidate is no longer pending")
+            self.connection_or_raise.execute(
+                """INSERT INTO candidate_audit
+                   (candidate_id, action, operator, reason, body)
+                   VALUES (?, 'rejected', ?, ?, ?)""",
+                (candidate_id, operator, reason, current["body"]),
+            )
+            self.connection_or_raise.commit()
+        except sqlite3.IntegrityError as error:
+            self.connection_or_raise.rollback()
+            raise CandidateGovernanceError(
+                "operation_id was already used for another candidate decision"
+            ) from error
+        except BaseException:
+            self.connection_or_raise.rollback()
+            raise
+        return self.candidate(candidate_id)
+
+    @staticmethod
+    def _validate_candidate_content(
+        suggested_type: str,
+        body: str,
+        source_references: tuple[str, ...],
+        creator: str,
+    ) -> str:
+        normalized_type = suggested_type.strip().lower().replace("-", "_")
+        allowed = {
+            "preference",
+            "decision",
+            "constraint",
+            "domain_fact",
+            "reusable_experience",
+            "external_reference",
+        }
+        if normalized_type not in allowed:
+            raise CandidateGovernanceError("unsupported candidate memory type")
+        if not body.strip() or "\x00" in body:
+            raise CandidateGovernanceError("candidate body must contain Markdown text")
+        if not source_references or any(
+            not reference.strip() or len(reference) > 2_000 for reference in source_references
+        ):
+            raise CandidateGovernanceError(
+                "candidate must contain non-empty source references"
+            )
+        if not creator.strip() or len(creator) > 200:
+            raise CandidateGovernanceError("creator must be present and at most 200 characters")
+        return normalized_type
+
+    @staticmethod
+    def _validate_governance_actor(operator: str, reason: str) -> None:
+        if not operator.strip() or len(operator) > 200:
+            raise CandidateGovernanceError("operator must be present and at most 200 characters")
+        if not reason.strip() or len(reason) > 2_000:
+            raise CandidateGovernanceError("reason must be present and at most 2000 characters")
+
+    @staticmethod
+    def _validate_operation_identifier(value: str, field: str) -> None:
+        if not value.strip() or len(value) > 200:
+            raise CandidateGovernanceError(
+                f"{field} must be present and at most 200 characters"
+            )
+
+    @staticmethod
+    def _candidate_request_hash(
+        library_id: str,
+        suggested_type: str,
+        body: str,
+        source_references: tuple[str, ...],
+        creator: str,
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "library_id": library_id,
+                    "suggested_type": suggested_type,
+                    "body": body,
+                    "source_references": source_references,
+                    "creator": creator,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _decision_request_hash(
+        candidate_id: str, decision: str, body: str, operator: str, reason: str
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "candidate_id": candidate_id,
+                    "decision": decision,
+                    "body": body,
+                    "operator": operator,
+                    "reason": reason,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    def _completed_candidate_decision(
+        self, current: dict[str, object], operation_id: str, decision_hash: str
+    ) -> dict[str, object]:
+        row = self.connection_or_raise.execute(
+            """SELECT decision_operation_id, decision_request_hash
+               FROM candidate_memories WHERE id = ?""",
+            (current["id"],),
+        ).fetchone()
+        if row is not None and str(row[0]) == operation_id and str(row[1]) == decision_hash:
+            return current
+        raise CandidateGovernanceError("candidate has already received a final decision")
+
+    def _approved_candidate_decision_is_persisted(
+        self,
+        current: dict[str, object],
+        operator: str,
+        reason: str,
+        operation_id: str,
+        decision_hash: str,
+        published: dict[str, str],
+    ) -> bool:
+        row = self.connection_or_raise.execute(
+            """SELECT status, operator, reason, published_path, commit_id,
+                      decision_operation_id, decision_request_hash
+               FROM candidate_memories WHERE id = ?""",
+            (current["id"],),
+        ).fetchone()
+        audits = self.connection_or_raise.execute(
+            """SELECT operator, reason, body FROM candidate_audit
+               WHERE candidate_id = ? AND action = 'approved' ORDER BY id""",
+            (current["id"],),
+        ).fetchall()
+        return bool(
+            row
+            == (
+                "approved",
+                operator,
+                reason,
+                published["path"],
+                published["commit"],
+                operation_id,
+                decision_hash,
+            )
+            and audits == [(operator, reason, current["body"])]
+        )
+
+    def _ensure_decision_operation_available(
+        self, candidate_id: str, operation_id: str
+    ) -> None:
+        row = self.connection_or_raise.execute(
+            "SELECT id FROM candidate_memories WHERE decision_operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is not None and str(row[0]) != candidate_id:
+            raise CandidateGovernanceError(
+                "operation_id was already used for another candidate decision"
+            )
+
+    @staticmethod
+    def _published_candidate_markdown(
+        candidate: dict[str, object], operator: str, reason: str
+    ) -> str:
+        references = cast(tuple[str, ...], candidate["source_references"])
+        lines = [
+            "---",
+            f"memory_id: {json.dumps(candidate['id'])}",
+            f"memory_type: {json.dumps(candidate['suggested_type'])}",
+            f"candidate_id: {json.dumps(candidate['id'])}",
+            f"created_by: {json.dumps(candidate['creator'], ensure_ascii=False)}",
+            f"approved_by: {json.dumps(operator, ensure_ascii=False)}",
+            f"approval_reason: {json.dumps(reason, ensure_ascii=False)}",
+            "source_references:",
+            *(f"  - {json.dumps(reference, ensure_ascii=False)}" for reference in references),
+            "---",
+            "",
+            str(candidate["body"]).rstrip(),
+            "",
+        ]
+        return "\n".join(lines)
+
     def read_document(self, library_id: str, path: str) -> dict[str, str]:
         library = self._require_available_library(library_id)
         normalized, source_version = self._document_record(library_id, path)
@@ -850,6 +1387,21 @@ class PlatformState:
                 (library_id,),
             )
         }
+        operations.update(
+            {
+                str(row[0]): {
+                    "actor_type": "user",
+                    "source": "candidate-approval",
+                    "kind": "approval",
+                }
+                for row in self.connection_or_raise.execute(
+                    """SELECT commit_id FROM candidate_memories
+                       WHERE library_id = ? AND status = 'approved'""",
+                    (library_id,),
+                )
+                if row[0] is not None
+            }
+        )
         for entry in history:
             entry.update(operations.get(entry["commit"], {}))
         return history
@@ -1120,6 +1672,316 @@ class PlatformState:
                     ):
                         raise MemoryMutationError(str(error)) from error
                     raise
+
+    @staticmethod
+    def _publication_request_hash(
+        library_id: str, path: str, content: str, source: str
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "library_id": library_id,
+                    "path": path,
+                    "content": content,
+                    "actor_type": "user",
+                    "source": source,
+                    "kind": "edit",
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    def _publish_document(
+        self,
+        library_id: str,
+        path: str,
+        content: str,
+        operation_id: str,
+        operator: str,
+        source: str,
+        message: str,
+        before_commit: Callable[[dict[str, str]], None] | None = None,
+        committed_state_is_valid: Callable[[dict[str, str]], bool] | None = None,
+        compensate_committed_state: Callable[[], None] | None = None,
+    ) -> dict[str, str]:
+        normalized = PurePosixPath(path).as_posix()
+        if not allowed_markdown_path(normalized) or normalized != path.replace("\\", "/"):
+            raise MemoryMutationError("invalid Markdown document path")
+        if len(PurePosixPath(normalized).parts) != 1:
+            raise MemoryMutationError("published memory path must be at the library root")
+        if "\x00" in content:
+            raise MemoryMutationError("Markdown content cannot contain NUL bytes")
+        request_hash = self._publication_request_hash(
+            library_id, normalized, content, source
+        )
+        existing = self.connection_or_raise.execute(
+            "SELECT response_json, request_hash FROM memory_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing[1]) != request_hash:
+                raise MemoryMutationError("operation_id was already used for another mutation")
+            return {str(key): str(value) for key, value in json.loads(str(existing[0])).items()}
+        library = self._require_available_library(library_id)
+        root = Path(library.canonical_path)
+        platform_content = content.encode()
+        with self._library_lock(library_id):
+            existing = self.connection_or_raise.execute(
+                "SELECT response_json, request_hash FROM memory_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[1]) != request_hash:
+                    raise MemoryMutationError(
+                        "operation_id was already used for another mutation"
+                    )
+                return {
+                    str(key): str(value)
+                    for key, value in json.loads(str(existing[0])).items()
+                }
+            if self.connection_or_raise.execute(
+                "SELECT 1 FROM memory_documents WHERE library_id = ? AND path = ?",
+                (library_id, normalized),
+            ).fetchone() is not None:
+                raise MemoryMutationError("memory document already exists")
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            descriptor = -1
+            created = False
+            commit: str | None = None
+            response: dict[str, str] | None = None
+            repository = self._git_repository(library_id)
+            previous_head = repository.head()
+            assert previous_head is not None
+            index_snapshot = self._snapshot_library_index(library_id)
+            try:
+                root_metadata = os.fstat(root_fd)
+                trusted = scan_markdown_fd(
+                    root_fd,
+                    root,
+                    self.library_ignore_patterns(library_id),
+                    (self.database_path.parent,),
+                )
+                if not trusted.complete:
+                    raise MemoryMutationError(
+                        f"Markdown scan incomplete: {'; '.join(trusted.errors[:3])}"
+                    )
+                indexed = tuple(
+                    (str(row[0]), str(row[1]))
+                    for row in self.connection_or_raise.execute(
+                        """SELECT path, source_version FROM memory_documents
+                           WHERE library_id = ? ORDER BY path""",
+                        (library_id,),
+                    )
+                )
+                observed = tuple(
+                    (document.path, document.version) for document in trusted.documents
+                )
+                if observed != indexed:
+                    raise MemoryMutationError(
+                        "memory library changed outside the platform; rescan before publishing"
+                    )
+                repository.ensure_index_clean()
+                descriptor = os.open(
+                    normalized,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+                created = True
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = -1
+                    stream.write(platform_content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.fsync(root_fd)
+                current_root = os.fstat(root_fd)
+                if (current_root.st_dev, current_root.st_ino) != (
+                    root_metadata.st_dev,
+                    root_metadata.st_ino,
+                ):
+                    raise MemoryMutationError("memory library changed while publishing")
+                committed_bytes = self._read_relative_regular_file(root_fd, normalized)
+                if committed_bytes != platform_content:
+                    raise MemoryMutationError("published memory changed while saving")
+                scan = scan_markdown_fd(
+                    root_fd,
+                    root,
+                    self.library_ignore_patterns(library_id),
+                    (self.database_path.parent,),
+                )
+                expected_documents = tuple(
+                    sorted(
+                        (
+                            *trusted.documents,
+                            MarkdownDocument(
+                                normalized,
+                                content,
+                                hashlib.sha256(platform_content).hexdigest(),
+                            ),
+                        ),
+                        key=lambda document: document.path,
+                    )
+                )
+                if not scan.complete or scan.documents != expected_documents:
+                    raise MemoryMutationError(
+                        "memory library changed while the platform was publishing"
+                    )
+                commit = repository.commit({normalized: platform_content}, message)
+                self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                self.scan_library(
+                    library_id, participate_in_transaction=True, frozen_scan=scan
+                )
+                updated = self._document_record(library_id, normalized)[1]
+                response = {
+                    "library_id": library_id,
+                    "path": normalized,
+                    "source_version": updated,
+                    "commit": commit,
+                    "operation_id": operation_id,
+                }
+                self.connection_or_raise.execute(
+                    """INSERT INTO memory_operations
+                       (operation_id, library_id, kind, document_path, actor_type, source,
+                        request_hash, commit_id, response_json)
+                       VALUES (?, ?, 'edit', ?, 'user', ?, ?, ?, ?)""",
+                    (
+                        operation_id,
+                        library_id,
+                        normalized,
+                        f"{source}:{operator}",
+                        request_hash,
+                        commit,
+                        json.dumps(response, sort_keys=True),
+                    ),
+                )
+                if before_commit is not None:
+                    before_commit(response)
+                self.connection_or_raise.commit()
+                return response
+            except BaseException as error:
+                self.connection_or_raise.rollback()
+                if commit is not None and response is not None:
+                    persisted = self._persisted_publication(
+                        library_id,
+                        normalized,
+                        platform_content,
+                        operation_id,
+                        request_hash,
+                        commit,
+                        repository,
+                    )
+                    if persisted is not None and (
+                        committed_state_is_valid is None
+                        or committed_state_is_valid(persisted)
+                    ):
+                        return persisted
+                compensation_errors: list[str] = []
+                if commit is not None:
+                    try:
+                        repository.rollback_commit(commit, previous_head)
+                    except BaseException as compensation_error:
+                        compensation_errors.append(f"Git: {compensation_error}")
+                try:
+                    current = self._read_relative_regular_file(root_fd, normalized)
+                except (FileNotFoundError, MemoryMutationError):
+                    current = None
+                if created and current == platform_content:
+                    try:
+                        os.unlink(normalized, dir_fd=root_fd)
+                        os.fsync(root_fd)
+                    except OSError as compensation_error:
+                        compensation_errors.append(f"file: {compensation_error}")
+                if commit is not None:
+                    try:
+                        self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                        self.connection_or_raise.execute(
+                            "DELETE FROM memory_operations WHERE operation_id = ?",
+                            (operation_id,),
+                        )
+                        if compensate_committed_state is not None:
+                            compensate_committed_state()
+                        self._restore_library_index(library_id, index_snapshot)
+                        self.connection_or_raise.commit()
+                    except BaseException as compensation_error:
+                        self.connection_or_raise.rollback()
+                        compensation_errors.append(f"database: {compensation_error}")
+                if compensation_errors:
+                    raise MemoryMutationError(
+                        f"{error}; compensation failed: {'; '.join(compensation_errors)}"
+                    ) from error
+                if isinstance(
+                    error,
+                    (GitHistoryError, LibraryRegistrationError, MemoryMutationError),
+                ):
+                    raise MemoryMutationError(str(error)) from error
+                raise
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                os.close(root_fd)
+
+    def _persisted_publication(
+        self,
+        library_id: str,
+        path: str,
+        content: bytes,
+        operation_id: str,
+        request_hash: str,
+        commit: str,
+        repository: GitRepository,
+    ) -> dict[str, str] | None:
+        row = self.connection_or_raise.execute(
+            """SELECT response_json, request_hash, commit_id, document_path
+               FROM memory_operations WHERE operation_id = ?""",
+            (operation_id,),
+        ).fetchone()
+        if row is None or (str(row[1]), str(row[2]), str(row[3])) != (
+            request_hash,
+            commit,
+            path,
+        ):
+            return None
+        response = {str(key): str(value) for key, value in json.loads(str(row[0])).items()}
+        expected_version = hashlib.sha256(content).hexdigest()
+        if response != {
+            "library_id": library_id,
+            "path": path,
+            "source_version": expected_version,
+            "commit": commit,
+            "operation_id": operation_id,
+        }:
+            return None
+        try:
+            stored_path, stored_version = self._document_record(library_id, path)
+            file_content = self._read_document_bytes(repository.work_tree, path)
+            committed_content = repository.content_at(commit, path).encode()
+            document_id = stable_document_id(library_id, path)
+            indexed_chunks = self.connection_or_raise.execute(
+                """SELECT chunk.id, chunk.content, chunk.source_version,
+                          search.chunk_id
+                   FROM memory_chunks AS chunk
+                   LEFT JOIN memory_chunk_search AS search ON search.chunk_id = chunk.id
+                   WHERE chunk.document_id = ? ORDER BY chunk.start_line, chunk.id""",
+                (document_id,),
+            ).fetchall()
+        except (GitHistoryError, MemoryMutationError, OSError):
+            return None
+        expected_chunks = chunk_markdown(content.decode())
+        return (
+            response
+            if stored_path == path
+            and stored_version == expected_version
+            and file_content == content
+            and committed_content == content
+            and len(indexed_chunks) == len(expected_chunks)
+            and all(
+                str(row[1]) == expected.content
+                and str(row[2]) == expected_version
+                and str(row[3]) == str(row[0])
+                for row, expected in zip(indexed_chunks, expected_chunks, strict=True)
+            )
+            else None
+        )
 
     def _prepare_git_repository(
         self,

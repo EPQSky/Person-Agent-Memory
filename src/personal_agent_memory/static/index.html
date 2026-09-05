@@ -36,7 +36,12 @@
       .editor-tabs { display: flex; gap: 8px; margin: 12px 0; }
       .editor-tabs button { margin: 0; }
       .diff { max-height: 420px; overflow: auto; white-space: pre; font: 13px/1.5 monospace; background: #f4f6f5; padding: 12px; }
-      @media (max-width: 720px) { main { margin: 20px auto; } .editor-layout { grid-template-columns: 1fr; } .document-tree, .history { border-right: 0; max-height: 220px; } }
+      .candidate-layout { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr); gap: 18px; }
+      .candidate-list { max-height: 420px; overflow: auto; border-right: 1px solid #dbe2de; padding-right: 12px; }
+      .candidate-list button { display: block; width: 100%; margin: 0 0 6px; text-align: left; overflow-wrap: anywhere; }
+      .candidate-actions { display: flex; gap: 8px; }
+      .candidate-actions button { flex: 0 0 auto; }
+      @media (max-width: 720px) { main { margin: 20px auto; } .editor-layout, .candidate-layout { grid-template-columns: 1fr; } .document-tree, .history, .candidate-list { border-right: 0; max-height: 220px; } }
     </style>
   </head>
   <body>
@@ -79,6 +84,18 @@
         searchHeading.textContent = 'Search project memory';
         const searchForm = document.createElement('form');
         searchForm.innerHTML = '<div class="field"><label for="search-cwd">Project working directory</label><input id="search-cwd" required></div><div class="field"><label for="search-query">Keywords</label><input id="search-query" required></div><button type="submit">Search</button><p id="search-message"></p><div id="search-results"></div>';
+        const candidateHeading = document.createElement('h2');
+        candidateHeading.textContent = 'Candidate memories';
+        const candidateStatus = document.createElement('select');
+        candidateStatus.setAttribute('aria-label', 'Candidate status');
+        candidateStatus.innerHTML = '<option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option>';
+        const candidateLayout = document.createElement('div');
+        candidateLayout.className = 'candidate-layout';
+        const candidateList = document.createElement('nav');
+        candidateList.className = 'candidate-list';
+        const candidateDetail = document.createElement('div');
+        candidateDetail.innerHTML = '<strong id="candidate-title">Select a candidate</strong><p id="candidate-sources" class="source"></p><textarea id="candidate-body" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">Operator</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">Reason</label><input id="candidate-reason" disabled></div><div class="candidate-actions"><button type="button" id="candidate-save" disabled>Save</button><button type="button" id="candidate-approve" disabled>Approve</button><button type="button" id="candidate-reject" class="danger" disabled>Reject</button></div><p id="candidate-message"></p>';
+        candidateLayout.append(candidateList, candidateDetail);
         const editorHeading = document.createElement('h2');
         editorHeading.textContent = 'Memory documents';
         const editorLibrary = document.createElement('select');
@@ -97,12 +114,13 @@
         const restoreAction = document.createElement('div');
         const historyDiff = document.createElement('pre');
         historyDiff.className = 'diff';
-        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, editorHeading, editorLibrary, editorLayout, historyHeading, history, restoreAction, historyDiff);
+        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, candidateHeading, candidateStatus, candidateLayout, editorHeading, editorLibrary, editorLayout, historyHeading, history, restoreAction, historyDiff);
 
         let projectLibraries = [];
         let projectBindings = [];
         let allLibraries = [];
         let activeDocument = null;
+        let activeCandidate = null;
         const historySelection = PamHistory.selectionStore();
         const editorContext = PamHistory.contextStore();
 
@@ -139,7 +157,62 @@
             body.append(row);
           }
           await refreshBindings();
+          await refreshCandidates();
           await refreshDocuments();
+        }
+
+        async function refreshCandidates(selectedId = activeCandidate?.id) {
+          const statusQuery = candidateStatus.value ? `?candidate_status=${encodeURIComponent(candidateStatus.value)}` : '';
+          const response = await fetch(`/api/v1/candidates${statusQuery}`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) return;
+          const candidates = await response.json();
+          candidateList.replaceChildren();
+          for (const candidate of candidates) {
+            const button = candidateList.appendChild(document.createElement('button'));
+            button.type = 'button';
+            button.textContent = `${candidate.status} · ${candidate.suggested_type} · ${candidate.id}`;
+            button.addEventListener('click', () => showCandidate(candidate));
+          }
+          const selected = candidates.find((candidate) => candidate.id === selectedId);
+          if (selected) showCandidate(selected);
+          else if (activeCandidate && !selected) clearCandidate();
+        }
+
+        function clearCandidate() {
+          activeCandidate = null;
+          candidateDetail.querySelector('#candidate-title').textContent = 'Select a candidate';
+          candidateDetail.querySelector('#candidate-sources').textContent = '';
+          candidateDetail.querySelector('#candidate-body').value = '';
+          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-save', 'candidate-approve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = true;
+        }
+
+        function showCandidate(candidate) {
+          activeCandidate = candidate;
+          const pending = candidate.status === 'pending';
+          candidateDetail.querySelector('#candidate-title').textContent = `${candidate.suggested_type} · ${candidate.status}`;
+          candidateDetail.querySelector('#candidate-sources').textContent = `Created by ${candidate.creator} at ${candidate.created_at} · ${candidate.source_references.join(' · ')}`;
+          candidateDetail.querySelector('#candidate-body').value = candidate.body;
+          candidateDetail.querySelector('#candidate-operator').value = candidate.operator || '';
+          candidateDetail.querySelector('#candidate-reason').value = candidate.reason || '';
+          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-save', 'candidate-approve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = !pending;
+          candidateDetail.querySelector('#candidate-message').textContent = candidate.published_path ? `Published as ${candidate.published_path} in ${candidate.commit}` : '';
+        }
+
+        async function candidateAction(action) {
+          if (!activeCandidate) return;
+          const operator = candidateDetail.querySelector('#candidate-operator').value;
+          const reason = candidateDetail.querySelector('#candidate-reason').value;
+          const body = candidateDetail.querySelector('#candidate-body').value;
+          const url = action === 'edit' ? `/api/v1/candidates/${activeCandidate.id}` : `/api/v1/candidates/${activeCandidate.id}/${action}`;
+          const payload = action === 'edit' ? {body, operator, reason} : {operator, reason, operation_id: crypto.randomUUID()};
+          const response = await fetch(url, {method: action === 'edit' ? 'PUT' : 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          const message = candidateDetail.querySelector('#candidate-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          message.className = '';
+          activeCandidate = await response.json();
+          showCandidate(activeCandidate);
+          await refreshCandidates(activeCandidate.id);
+          if (action === 'approve') await refreshDocuments();
         }
 
         async function refreshDocuments() {
@@ -365,6 +438,10 @@
             results.append(article);
           }
         });
+        candidateStatus.addEventListener('change', () => refreshCandidates());
+        candidateDetail.querySelector('#candidate-save').addEventListener('click', () => candidateAction('edit'));
+        candidateDetail.querySelector('#candidate-approve').addEventListener('click', () => candidateAction('approve'));
+        candidateDetail.querySelector('#candidate-reject').addEventListener('click', () => candidateAction('reject'));
         editorLibrary.addEventListener('change', refreshDocuments);
         editor.querySelector('#source-tab').addEventListener('click', () => showEditorPanel('source'));
         editor.querySelector('#preview-tab').addEventListener('click', async () => { if (await previewChange()) showEditorPanel('preview'); });

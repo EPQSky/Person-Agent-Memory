@@ -13,12 +13,20 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+
 
 def request(
     url: str,
     key: str | None = None,
     payload: dict[str, object] | None = None,
     method: str | None = None,
+    *,
+    timeout: float = 10,
 ) -> tuple[int, dict[str, object]]:
     headers = {} if key is None else {"Authorization": f"Bearer {key}"}
     data = None
@@ -27,7 +35,7 @@ def request(
         data = json.dumps(payload).encode()
     try:
         request_value = urllib.request.Request(url, headers=headers, data=data, method=method)
-        with urllib.request.urlopen(request_value, timeout=2) as response:
+        with urllib.request.urlopen(request_value, timeout=timeout) as response:
             body = response.read()
             return response.status, {} if not body else json.loads(body)
     except urllib.error.HTTPError as error:
@@ -55,6 +63,7 @@ with urllib.request.urlopen("http://127.0.0.1:7331/", timeout=2) as response:
     assert response.status == 200
     login_shell = response.read()
     assert b"Personal Agent Memory" in login_shell
+    assert b"Candidate memories" in login_shell
     assert key.encode() not in login_shell
     fingerprint = f"sha256:{hashlib.sha256(key.encode()).hexdigest()[:12]}".encode()
     assert fingerprint not in login_shell
@@ -699,6 +708,7 @@ timeout_code, timeout_search = request(
     "http://127.0.0.1:7331/mcp/search",
     key,
     {"cwd": str(same_name_one / "src"), "query": "DockerNeedle42"},
+    timeout=2,
 )
 assert timeout_code == 200
 assert time.monotonic() - timeout_started < 1.5
@@ -1003,6 +1013,19 @@ try:
         {"path": str(restart_path), "kind": "project"},
     )
     assert restart_code == 201
+    restart_candidate_code, restart_candidate = request(
+        "http://127.0.0.1:17331/mcp/candidates",
+        restart_key,
+        {
+            "library_id": restart_library["id"],
+            "suggested_type": "constraint",
+            "body": "# Restart candidate\n\nCandidateRestartPersistence\n",
+            "source_references": ["docker-session:restart"],
+            "creator": "docker-mcp",
+            "idempotency_key": "docker-restart-candidate",
+        },
+    )
+    assert restart_candidate_code == 201
 finally:
     restart_process.send_signal(signal.SIGINT)
     assert restart_process.wait(timeout=10) == 0
@@ -1013,6 +1036,11 @@ try:
     assert restored_code == 200
     assert restored[0]["id"] == restart_library["id"]
     assert restored[0]["kind"] == "project"
+    restored_candidate_code, restored_candidate = request(
+        f"http://127.0.0.1:17331/mcp/candidates/{restart_candidate['id']}", restart_key
+    )
+    assert restored_candidate_code == 200
+    assert restored_candidate == restart_candidate
 finally:
     restart_process.send_signal(signal.SIGINT)
     assert restart_process.wait(timeout=10) == 0
@@ -1230,6 +1258,261 @@ assert history_document.read_text(encoding="utf-8") == history_original
 assert request(
     f"http://127.0.0.1:7331/mcp/libraries/{history_id}/document", key
 )[0] == 404
+assert project_git_fingerprint() == project_before
+
+# MCP can submit and inspect candidates, while only Web REST governance can
+# edit, approve, reject, and create authoritative Markdown.
+candidate_payload = {
+    "library_id": history_id,
+    "suggested_type": "decision",
+    "body": "# Candidate\n\nDockerCandidateOriginal\n",
+    "source_references": ["docker-session:governance#assistant-final"],
+    "creator": "docker-mcp",
+    "idempotency_key": "docker-candidate-create-1",
+}
+candidate_code, candidate = request(
+    "http://127.0.0.1:7331/mcp/candidates", key, candidate_payload
+)
+duplicate_candidate_code, duplicate_candidate = request(
+    "http://127.0.0.1:7331/mcp/candidates", key, candidate_payload
+)
+assert candidate_code == duplicate_candidate_code == 201
+assert duplicate_candidate == candidate
+assert candidate["status"] == "pending"
+candidate_list_code, candidate_list = request(
+    f"http://127.0.0.1:7331/mcp/candidates?library_id={history_id}", key
+)
+assert candidate_list_code == 200
+assert candidate_list[0]["id"] == candidate["id"]
+pending_search_code, pending_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"library_id": history_id, "query": "DockerCandidateOriginal"},
+)
+assert pending_search_code == 200
+assert pending_search["results"] == []
+
+candidate_edit_code, candidate_edited = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{candidate['id']}",
+    key,
+    {
+        "body": "# Approved candidate\n\nDockerCandidatePublished\n",
+        "operator": "docker-user",
+        "reason": "Corrected before approval",
+    },
+    method="PUT",
+)
+assert candidate_edit_code == 200
+assert candidate_edited["body"].endswith("DockerCandidatePublished\n")
+candidate_history_before = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)[1]
+approval_payload = {
+    "operator": "docker-user",
+    "reason": "Verified in browser acceptance",
+    "operation_id": "docker-candidate-approve-1",
+}
+approval_code, approved_candidate = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{candidate['id']}/approve",
+    key,
+    approval_payload,
+)
+approval_retry_code, approval_retry = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{candidate['id']}/approve",
+    key,
+    approval_payload,
+)
+assert approval_code == approval_retry_code == 200
+assert approval_retry == approved_candidate
+published_path = history_library / str(approved_candidate["published_path"])
+published_content = published_path.read_text(encoding="utf-8")
+assert "DockerCandidatePublished" in published_content
+assert "docker-session:governance#assistant-final" in published_content
+approved_search_code, approved_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"library_id": history_id, "query": "DockerCandidatePublished"},
+)
+assert approved_search_code == 200
+assert approved_search["results"][0]["path"] == approved_candidate["published_path"]
+candidate_history = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)[1]
+assert len(candidate_history) == len(candidate_history_before) + 1
+assert candidate_history[0]["commit"] == approved_candidate["commit"]
+candidate_diff = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history/"
+    f"{approved_candidate['commit']}/diff",
+    key,
+)[1]["diff"]
+assert "DockerCandidatePublished" in candidate_diff
+
+rejected_code, rejected_candidate = request(
+    "http://127.0.0.1:7331/mcp/candidates",
+    key,
+    {
+        **candidate_payload,
+        "body": "# Rejected\n\nDockerCandidateRejected\n",
+        "idempotency_key": "docker-candidate-reject-1",
+    },
+)
+assert rejected_code == 201
+rejection_history_before = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)[1]
+rejection_payload = {
+    "operator": "docker-user",
+    "reason": "Unverified guess",
+    "operation_id": "docker-candidate-rejection-1",
+}
+rejection_code, rejection = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{rejected_candidate['id']}/reject",
+    key,
+    rejection_payload,
+)
+rejection_retry_code, rejection_retry = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{rejected_candidate['id']}/reject",
+    key,
+    rejection_payload,
+)
+assert rejection_code == rejection_retry_code == 200
+assert rejection_retry == rejection
+assert rejection["published_path"] is None
+assert request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)[1] == rejection_history_before
+rejected_search = request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"library_id": history_id, "query": "DockerCandidateRejected"},
+)[1]
+assert rejected_search["results"] == []
+assert project_git_fingerprint() == project_before
+
+browser_approve_code, browser_approve_candidate = request(
+    "http://127.0.0.1:7331/mcp/candidates",
+    key,
+    {
+        **candidate_payload,
+        "body": "# Browser approval\n\nBrowserCandidateOriginal\n",
+        "idempotency_key": "docker-browser-approve",
+    },
+)
+browser_reject_code, browser_reject_candidate = request(
+    "http://127.0.0.1:7331/mcp/candidates",
+    key,
+    {
+        **candidate_payload,
+        "body": "# Browser rejection\n\nBrowserCandidateRejected\n",
+        "idempotency_key": "docker-browser-reject",
+    },
+)
+assert browser_approve_code == browser_reject_code == 201
+browser_history_before = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)[1]
+
+options = Options()
+options.binary_location = "/usr/bin/chromium"
+for argument in (
+    "--headless=new",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--window-size=1280,1000",
+):
+    options.add_argument(argument)
+browser = webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
+wait = WebDriverWait(browser, 15)
+try:
+    browser.get("http://127.0.0.1:7331/")
+    browser.find_element(By.ID, "key").send_keys(key)
+    browser.find_element(By.ID, "connect").click()
+    wait.until(lambda driver: driver.find_elements(By.ID, "candidate-title"))
+
+    approve_id = str(browser_approve_candidate["id"])
+    approve_button = wait.until(
+        lambda driver: driver.find_element(
+            By.XPATH,
+            f"//nav[contains(@class, 'candidate-list')]/button[contains(., '{approve_id}')]",
+        )
+    )
+    approve_button.click()
+    body_input = browser.find_element(By.ID, "candidate-body")
+    body_input.clear()
+    body_input.send_keys("# Browser approved\n\nBrowserCandidatePublished\n")
+    operator_input = browser.find_element(By.ID, "candidate-operator")
+    reason_input = browser.find_element(By.ID, "candidate-reason")
+    operator_input.send_keys("browser-user")
+    reason_input.send_keys("Edited through the Web page")
+    browser.find_element(By.ID, "candidate-save").click()
+    wait.until(
+        lambda _: request(
+            f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key
+        )[1]["body"].endswith("BrowserCandidatePublished\n")
+    )
+    operator_input = browser.find_element(By.ID, "candidate-operator")
+    reason_input = browser.find_element(By.ID, "candidate-reason")
+    operator_input.send_keys("browser-user")
+    reason_input.send_keys("Approved through the Web page")
+    browser.find_element(By.ID, "candidate-approve").click()
+    wait.until(
+        lambda _: request(
+            f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key
+        )[1]["status"]
+        == "approved"
+    )
+
+    reject_id = str(browser_reject_candidate["id"])
+    reject_button = wait.until(
+        lambda driver: driver.find_element(
+            By.XPATH,
+            f"//nav[contains(@class, 'candidate-list')]/button[contains(., '{reject_id}')]",
+        )
+    )
+    reject_button.click()
+    browser.find_element(By.ID, "candidate-operator").send_keys("browser-user")
+    browser.find_element(By.ID, "candidate-reason").send_keys(
+        "Rejected through the Web page"
+    )
+    browser.find_element(By.ID, "candidate-reject").click()
+    wait.until(
+        lambda _: request(
+            f"http://127.0.0.1:7331/api/v1/candidates/{reject_id}", key
+        )[1]["status"]
+        == "rejected"
+    )
+finally:
+    browser.quit()
+
+browser_approved = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{browser_approve_candidate['id']}", key
+)[1]
+browser_rejected = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{browser_reject_candidate['id']}", key
+)[1]
+assert browser_approved["operator"] == "browser-user"
+assert browser_approved["reason"] == "Approved through the Web page"
+assert browser_rejected["operator"] == "browser-user"
+assert browser_rejected["reason"] == "Rejected through the Web page"
+assert browser_rejected["published_path"] is None
+browser_published = history_library / str(browser_approved["published_path"])
+assert "BrowserCandidatePublished" in browser_published.read_text(encoding="utf-8")
+browser_history = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)[1]
+assert len(browser_history) == len(browser_history_before) + 1
+assert browser_history[0]["commit"] == browser_approved["commit"]
+assert request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"library_id": history_id, "query": "BrowserCandidatePublished"},
+)[1]["results"][0]["path"] == browser_approved["published_path"]
+assert request(
+    "http://127.0.0.1:7331/mcp/search",
+    key,
+    {"library_id": history_id, "query": "BrowserCandidateRejected"},
+)[1]["results"] == []
 assert project_git_fingerprint() == project_before
 
 assert request("http://127.0.0.1:18080/v1/models")[1]["data"]

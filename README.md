@@ -49,6 +49,15 @@ library manifest, and reserved tombstone paths, so a containing project reposito
 history, and unrelated working tree remain untouched. MCP exposes search and status but no direct
 document edit or history-restore operation.
 
+MCP clients can create candidate memories with `POST /mcp/candidates` and inspect them with
+`GET /mcp/candidates` or `GET /mcp/candidates/{candidate_id}`. A candidate carries a stable ID,
+allowed memory type, Markdown body, provenance references, creator, timestamp, and governance
+status, but it is excluded from text, vector, graph, and Codex retrieval. The Web interface is the
+only governance surface: it records an operator and reason when editing, approving, or rejecting.
+Approval publishes provenance-bearing Markdown through the same coordinator used for authoritative
+edits, refreshes direct search immediately, and creates one idempotent Git commit. Rejection keeps
+the SQLite audit record without creating any authoritative or derived projection.
+
 Embedding and reranking are independently optional OpenAI-compatible services configured with
 `--embedding-url` and `--reranker-url`. API keys are read only from the corresponding
 `--embedding-api-key-file` and `--reranker-api-key-file`; they are not stored in a library, Git, or

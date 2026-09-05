@@ -17,6 +17,7 @@ from personal_agent_memory.graph_adapter import JiuwenMilvusGraphAdapter
 from personal_agent_memory.model_client import OpenAICompatibleClient
 from personal_agent_memory.security import ApiKeyStore
 from personal_agent_memory.state import (
+    CandidateGovernanceError,
     DuplicateLibraryError,
     DuplicateProjectBindingError,
     LibraryKind,
@@ -90,6 +91,37 @@ class DocumentRestore(BaseModel):
     operation_id: str
     actor_type: Literal["user", "platform"] = "user"
     source: str = "web"
+
+
+CandidateType = Literal[
+    "preference",
+    "decision",
+    "constraint",
+    "domain_fact",
+    "reusable_experience",
+    "external_reference",
+]
+
+
+class CandidateCreate(BaseModel):
+    library_id: str
+    suggested_type: CandidateType
+    body: str = Field(min_length=1, max_length=200_000)
+    source_references: list[str] = Field(min_length=1, max_length=100)
+    creator: str = Field(min_length=1, max_length=200)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class CandidateEdit(BaseModel):
+    body: str = Field(min_length=1, max_length=200_000)
+    operator: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
+class CandidateDecision(BaseModel):
+    operator: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=2_000)
+    operation_id: str = Field(min_length=1, max_length=200)
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -421,6 +453,116 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/mcp/search", dependencies=[Depends(authenticate)])
     async def mcp_search(request: SearchRequest) -> dict[str, object]:
         return await search_payload(request)
+
+    def candidate_error(error: CandidateGovernanceError) -> HTTPException:
+        detail = str(error)
+        if detail in {"candidate memory not found", "memory library not found"}:
+            code = status.HTTP_404_NOT_FOUND
+        elif "already" in detail or "no longer pending" in detail:
+            code = status.HTTP_409_CONFLICT
+        else:
+            code = status.HTTP_422_UNPROCESSABLE_CONTENT
+        return HTTPException(status_code=code, detail=detail)
+
+    def create_candidate_payload(candidate: CandidateCreate) -> dict[str, object]:
+        try:
+            return platform_state.create_candidate(
+                candidate.library_id,
+                candidate.suggested_type,
+                candidate.body,
+                tuple(candidate.source_references),
+                candidate.creator,
+                candidate.idempotency_key,
+            )
+        except (CandidateGovernanceError, MemoryMutationError) as error:
+            if isinstance(error, MemoryMutationError):
+                raise mutation_error(error) from error
+            raise candidate_error(error) from error
+
+    @app.post(
+        "/mcp/candidates",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def mcp_create_candidate(candidate: CandidateCreate) -> dict[str, object]:
+        return create_candidate_payload(candidate)
+
+    @app.get("/mcp/candidates", dependencies=[Depends(authenticate)])
+    async def mcp_list_candidates(
+        library_id: str | None = None, candidate_status: str | None = None
+    ) -> list[dict[str, object]]:
+        try:
+            return platform_state.list_candidates(library_id, candidate_status)
+        except (CandidateGovernanceError, MemoryMutationError) as error:
+            if isinstance(error, MemoryMutationError):
+                raise mutation_error(error) from error
+            raise candidate_error(error) from error
+
+    @app.get("/mcp/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
+    async def mcp_get_candidate(candidate_id: str) -> dict[str, object]:
+        try:
+            return platform_state.candidate(candidate_id)
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
+
+    @app.get("/api/v1/candidates", dependencies=[Depends(authenticate)])
+    async def list_candidates(
+        library_id: str | None = None, candidate_status: str | None = None
+    ) -> list[dict[str, object]]:
+        try:
+            return platform_state.list_candidates(library_id, candidate_status)
+        except (CandidateGovernanceError, MemoryMutationError) as error:
+            if isinstance(error, MemoryMutationError):
+                raise mutation_error(error) from error
+            raise candidate_error(error) from error
+
+    @app.get("/api/v1/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
+    async def get_candidate(candidate_id: str) -> dict[str, object]:
+        try:
+            return platform_state.candidate(candidate_id)
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
+
+    @app.put("/api/v1/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
+    async def edit_candidate(
+        candidate_id: str, edit: CandidateEdit
+    ) -> dict[str, object]:
+        try:
+            return platform_state.edit_candidate(
+                candidate_id, edit.body, edit.operator, edit.reason
+            )
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
+
+    @app.post(
+        "/api/v1/candidates/{candidate_id}/approve",
+        dependencies=[Depends(authenticate)],
+    )
+    async def approve_candidate(
+        candidate_id: str, decision: CandidateDecision
+    ) -> dict[str, object]:
+        try:
+            return platform_state.approve_candidate(
+                candidate_id, decision.operator, decision.reason, decision.operation_id
+            )
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.post(
+        "/api/v1/candidates/{candidate_id}/reject",
+        dependencies=[Depends(authenticate)],
+    )
+    async def reject_candidate(
+        candidate_id: str, decision: CandidateDecision
+    ) -> dict[str, object]:
+        try:
+            return platform_state.reject_candidate(
+                candidate_id, decision.operator, decision.reason, decision.operation_id
+            )
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
 
     def mutation_error(error: MemoryMutationError) -> HTTPException:
         detail = str(error)

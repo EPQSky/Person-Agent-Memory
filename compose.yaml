@@ -1,6 +1,8 @@
 services:
   daemon:
-    build: .
+    build:
+      context: .
+      target: runtime
     command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--library-root", "/project-roots", "--host", "127.0.0.1", "--port", "7331", "--embedding-url", "http://127.0.0.1:18080", "--embedding-model", "deterministic-test-model", "--reranker-url", "http://127.0.0.1:18080", "--reranker-model", "deterministic-reranker", "--graph-url", "http://127.0.0.1:18080", "--graph-model", "deterministic-graph", "--model-timeout", "0.3", "--model-retries", "1"]
     volumes:
       - platform-state:/state
@@ -24,7 +26,9 @@ services:
       retries: 30
 
   fake-model:
-    build: .
+    build:
+      context: .
+      target: runtime
     network_mode: "service:daemon"
     entrypoint: ["python", "-m", "uvicorn"]
     command: ["personal_agent_memory.fake_model:app", "--host", "127.0.0.1", "--port", "18080"]
@@ -38,7 +42,9 @@ services:
         condition: service_started
 
   acceptance:
-    build: .
+    build:
+      context: .
+      target: acceptance
     network_mode: "service:daemon"
     entrypoint: ["python", "/app/tests/docker_acceptance.py"]
     environment:

@@ -24,6 +24,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+acceptance = [
+  "selenium>=4.35,<5",
+]
 dev = [
   "httpx>=0.28,<1",
   "mypy>=1.17,<2",
