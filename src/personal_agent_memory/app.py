@@ -72,6 +72,7 @@ class SearchRequest(BaseModel):
     graph_hops: int = Field(default=1, ge=1, le=2)
     token_budget: int = Field(default=10_000, ge=MIN_TOKEN_BUDGET)
     target_model: str = Field(default="gpt-4o-mini", min_length=1, max_length=200)
+    include_history: bool = False
 
     @model_validator(mode="after")
     def validate_scope(self) -> SearchRequest:
@@ -130,6 +131,13 @@ class CandidateDecision(BaseModel):
     operator: str = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=1, max_length=2_000)
     operation_id: str = Field(min_length=1, max_length=200)
+
+
+class CandidateResolution(CandidateDecision):
+    action: Literal["keep", "adopt", "merge", "scope"]
+    merged_body: str | None = Field(default=None, max_length=200_000)
+    effective_at: str | None = Field(default=None, max_length=100)
+    condition: str | None = Field(default=None, max_length=2_000)
 
 
 class CaptureEvent(BaseModel):
@@ -314,9 +322,7 @@ def create_app(settings: Settings) -> FastAPI:
         return {"library_id": library_id, "patterns": patterns}
 
     @app.put("/api/v1/libraries/{library_id}/ignore-rules", dependencies=[Depends(authenticate)])
-    async def update_ignore_rules(
-        library_id: str, update: IgnoreRulesUpdate
-    ) -> dict[str, object]:
+    async def update_ignore_rules(library_id: str, update: IgnoreRulesUpdate) -> dict[str, object]:
         try:
             patterns = platform_state.update_library_ignore_patterns(
                 library_id, tuple(update.patterns)
@@ -442,7 +448,11 @@ def create_app(settings: Settings) -> FastAPI:
         try:
             raw = (
                 await platform_state.search_project(
-                    request.cwd, request.query, request.limit, request.graph_hops
+                    request.cwd,
+                    request.query,
+                    request.limit,
+                    request.graph_hops,
+                    request.include_history,
                 )
                 if request.cwd is not None
                 else await platform_state.search_library(
@@ -450,6 +460,7 @@ def create_app(settings: Settings) -> FastAPI:
                     request.query,
                     request.limit,
                     request.graph_hops,
+                    request.include_history,
                 )
             )
             return build_context_package(
@@ -552,6 +563,48 @@ def create_app(settings: Settings) -> FastAPI:
     async def capture_rounds(session_id: str | None = None) -> list[dict[str, object]]:
         return platform_state.list_capture_rounds(session_id)
 
+    @app.get("/api/v1/candidate-governance", dependencies=[Depends(authenticate)])
+    async def candidate_governance_queue(
+        classification: str | None = None,
+    ) -> list[dict[str, object]]:
+        try:
+            return platform_state.list_candidate_governance(classification)
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
+
+    @app.get(
+        "/api/v1/candidates/{candidate_id}/governance",
+        dependencies=[Depends(authenticate)],
+    )
+    async def candidate_governance(candidate_id: str) -> dict[str, object]:
+        try:
+            return platform_state.candidate_governance(candidate_id)
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
+
+    @app.post(
+        "/api/v1/candidates/{candidate_id}/resolve",
+        dependencies=[Depends(authenticate)],
+    )
+    async def resolve_candidate(
+        candidate_id: str, resolution: CandidateResolution
+    ) -> dict[str, object]:
+        try:
+            return platform_state.resolve_candidate(
+                candidate_id,
+                resolution.action,
+                resolution.operator,
+                resolution.reason,
+                resolution.operation_id,
+                merged_body=resolution.merged_body,
+                effective_at=resolution.effective_at,
+                condition=resolution.condition,
+            )
+        except (CandidateGovernanceError, MemoryMutationError) as error:
+            if isinstance(error, MemoryMutationError):
+                raise mutation_error(error) from error
+            raise candidate_error(error) from error
+
     @app.post(
         "/api/v1/capture/consolidate",
         status_code=status.HTTP_202_ACCEPTED,
@@ -605,9 +658,7 @@ def create_app(settings: Settings) -> FastAPI:
             raise candidate_error(error) from error
 
     @app.put("/api/v1/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
-    async def edit_candidate(
-        candidate_id: str, edit: CandidateEdit
-    ) -> dict[str, object]:
+    async def edit_candidate(candidate_id: str, edit: CandidateEdit) -> dict[str, object]:
         try:
             return platform_state.edit_candidate(
                 candidate_id, edit.body, edit.operator, edit.reason
@@ -635,9 +686,7 @@ def create_app(settings: Settings) -> FastAPI:
         "/api/v1/candidates/{candidate_id}/reject",
         dependencies=[Depends(authenticate)],
     )
-    async def reject_candidate(
-        candidate_id: str, decision: CandidateDecision
-    ) -> dict[str, object]:
+    async def reject_candidate(candidate_id: str, decision: CandidateDecision) -> dict[str, object]:
         try:
             return platform_state.reject_candidate(
                 candidate_id, decision.operator, decision.reason, decision.operation_id
@@ -655,18 +704,14 @@ def create_app(settings: Settings) -> FastAPI:
             code = status.HTTP_422_UNPROCESSABLE_CONTENT
         return HTTPException(status_code=code, detail=detail)
 
-    @app.get(
-        "/api/v1/libraries/{library_id}/documents", dependencies=[Depends(authenticate)]
-    )
+    @app.get("/api/v1/libraries/{library_id}/documents", dependencies=[Depends(authenticate)])
     async def list_documents(library_id: str) -> list[dict[str, object]]:
         try:
             return platform_state.list_documents(library_id)
         except MemoryMutationError as error:
             raise mutation_error(error) from error
 
-    @app.get(
-        "/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)]
-    )
+    @app.get("/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)])
     async def read_document(library_id: str, path: str) -> dict[str, str]:
         try:
             return platform_state.read_document(library_id, path)
@@ -687,9 +732,7 @@ def create_app(settings: Settings) -> FastAPI:
         result["rendered_html"] = markdown.render(preview.content)
         return result
 
-    @app.put(
-        "/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)]
-    )
+    @app.put("/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)])
     async def edit_document(library_id: str, edit: DocumentEdit) -> dict[str, str]:
         try:
             return platform_state.edit_document(
@@ -704,9 +747,7 @@ def create_app(settings: Settings) -> FastAPI:
         except MemoryMutationError as error:
             raise mutation_error(error) from error
 
-    @app.get(
-        "/api/v1/libraries/{library_id}/history", dependencies=[Depends(authenticate)]
-    )
+    @app.get("/api/v1/libraries/{library_id}/history", dependencies=[Depends(authenticate)])
     async def library_history(library_id: str, limit: int = 50) -> list[dict[str, str]]:
         try:
             return platform_state.library_history(library_id, limit)
@@ -794,9 +835,7 @@ def create_app(settings: Settings) -> FastAPI:
         },
     ]
 
-    def mcp_rpc_error(
-        request_id: str | int | None, code: int, message: str
-    ) -> dict[str, object]:
+    def mcp_rpc_error(request_id: str | int | None, code: int, message: str) -> dict[str, object]:
         return {
             "jsonrpc": "2.0",
             "id": request_id,

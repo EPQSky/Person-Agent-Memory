@@ -149,6 +149,7 @@ def run_capture_hook(
         check=False,
     )
 
+
 key = Path(os.environ["API_KEY_FILE"]).read_text(encoding="utf-8").strip()
 assert request("http://127.0.0.1:7331/health/live", key)[0] == 200
 
@@ -404,9 +405,7 @@ worktree_git_dir.mkdir(parents=True)
 (worktree_git_dir / "HEAD").write_text("ref: refs/heads/feature\n", encoding="utf-8")
 fake_marker_root = same_name_one / "ordinary-marker"
 (fake_marker_root / "src").mkdir(parents=True)
-(fake_marker_root / ".git").write_text(
-    "gitdir: /untrusted/content/is/not-read\n", encoding="utf-8"
-)
+(fake_marker_root / ".git").write_text("gitdir: /untrusted/content/is/not-read\n", encoding="utf-8")
 
 user_binding_code, user_binding = request(
     "http://127.0.0.1:7331/api/v1/project-bindings",
@@ -547,11 +546,14 @@ replacement_path = Path(str(replacement_library["canonical_path"]))
     "# Other service\n\nSameNameSecondNeedle belongs only to the second service.\n",
     encoding="utf-8",
 )
-assert request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{replacement_library['id']}/scan",
-    key,
-    {},
-)[0] == 200
+assert (
+    request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{replacement_library['id']}/scan",
+        key,
+        {},
+    )[0]
+    == 200
+)
 
 
 def hook_context(result: subprocess.CompletedProcess[str], event_name: str) -> str:
@@ -731,9 +733,7 @@ for _ in range(40):
     )
     assert replay_batch.returncode == 0
     assert json.loads(replay_batch.stdout) == {}
-capture_quarantine = Path(
-    "/tmp/personal-agent-memory-plugin-data-ticket12/capture/quarantine"
-)
+capture_quarantine = Path("/tmp/personal-agent-memory-plugin-data-ticket12/capture/quarantine")
 assert list(capture_quarantine.glob("event-*.json"))
 assert len(list(capture_quarantine.glob("event-*.json"))) <= 256
 assert not list(capture_spool.glob("event-*.json"))
@@ -745,15 +745,11 @@ while time.monotonic() < capture_deadline:
     )
     assert capture_list_code == 200
     captured_candidates = cast(list[dict[str, object]], capture_list_payload)
-    if any(
-        candidate.get("creator") == "session-capture" for candidate in captured_candidates
-    ):
+    if any(candidate.get("creator") == "session-capture" for candidate in captured_candidates):
         break
     time.sleep(0.1)
 session_candidates = [
-    candidate
-    for candidate in captured_candidates
-    if candidate.get("creator") == "session-capture"
+    candidate for candidate in captured_candidates if candidate.get("creator") == "session-capture"
 ]
 assert len(session_candidates) == 1
 assert len(session_candidates[0]["source_references"]) == 2
@@ -965,11 +961,14 @@ try:
         {"path": str(retry_libraries / "memory"), "kind": "project"},
     )
     assert retry_library_code == 201
-    assert request(
-        "http://127.0.0.1:17331/api/v1/project-bindings",
-        retry_key,
-        {"project_root": str(retry_project), "library_id": retry_library["id"]},
-    )[0] == 201
+    assert (
+        request(
+            "http://127.0.0.1:17331/api/v1/project-bindings",
+            retry_key,
+            {"project_root": str(retry_project), "library_id": retry_library["id"]},
+        )[0]
+        == 201
+    )
     assert request("http://127.0.0.1:18080/control/graph/error", payload={})[0] == 200
     retry_assistant = run_capture_hook(
         retry_project,
@@ -994,8 +993,7 @@ try:
     retry_pending = False
     while time.monotonic() < retry_deadline:
         rounds_code, rounds = request(
-            "http://127.0.0.1:17331/api/v1/capture/rounds"
-            "?session_id=docker-restart-recovery",
+            "http://127.0.0.1:17331/api/v1/capture/rounds?session_id=docker-restart-recovery",
             retry_key,
         )
         assert rounds_code == 200
@@ -1024,12 +1022,15 @@ try:
         time.sleep(0.05)
     assert len(retry_candidates) == 1
     time.sleep(0.7)
-    assert len(
-        cast(
-            list[dict[str, object]],
-            request("http://127.0.0.1:17331/api/v1/candidates", retry_key)[1],
+    assert (
+        len(
+            cast(
+                list[dict[str, object]],
+                request("http://127.0.0.1:17331/api/v1/candidates", retry_key)[1],
+            )
         )
-    ) == 1
+        == 1
+    )
 finally:
     retry_daemon.terminate()
     retry_daemon.wait(timeout=20)
@@ -1217,9 +1218,7 @@ assert [item["path"] for item in restored_graph["results"]] == [
     "graph-seed.md",
     "graph-one.md",
 ]
-assert restored_graph["results"][1]["content"] == (
-    "Entity: Beta: One-hop authoritative source."
-)
+assert restored_graph["results"][1]["content"] == ("Entity: Beta: One-hop authoritative source.")
 
 # Removing a real source file and scanning it out immediately prevents the old
 # graph projection from returning it, then clears it from the durable projection.
@@ -1838,9 +1837,7 @@ retry_code, retry = request(
 )
 assert retry_code == 200
 assert retry == edited
-history_code, commits = request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
-)
+history_code, commits = request(f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key)
 assert history_code == 200
 assert len(commits) == 2
 assert commits[0]["author_name"] == "Personal Agent Memory"
@@ -1867,9 +1864,7 @@ restore_code, restored = request(
 assert restore_code == 200
 assert restored["commit"] != edited["commit"]
 assert history_document.read_text(encoding="utf-8") == history_original
-assert request(
-    f"http://127.0.0.1:7331/mcp/libraries/{history_id}/document", key
-)[0] == 404
+assert request(f"http://127.0.0.1:7331/mcp/libraries/{history_id}/document", key)[0] == 404
 assert project_git_fingerprint() == project_before
 
 # MCP can submit and inspect candidates, while only Web REST governance can
@@ -1882,9 +1877,7 @@ candidate_payload = {
     "creator": "docker-mcp",
     "idempotency_key": "docker-candidate-create-1",
 }
-candidate_code, candidate = request(
-    "http://127.0.0.1:7331/mcp/candidates", key, candidate_payload
-)
+candidate_code, candidate = request("http://127.0.0.1:7331/mcp/candidates", key, candidate_payload)
 duplicate_candidate_code, duplicate_candidate = request(
     "http://127.0.0.1:7331/mcp/candidates", key, candidate_payload
 )
@@ -1947,9 +1940,7 @@ approved_search_code, approved_search = request(
 )
 assert approved_search_code == 200
 assert approved_search["results"][0]["path"] == approved_candidate["published_path"]
-candidate_history = request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
-)[1]
+candidate_history = request(f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key)[1]
 assert len(candidate_history) == len(candidate_history_before) + 1
 assert candidate_history[0]["commit"] == approved_candidate["commit"]
 candidate_diff = request(
@@ -1990,9 +1981,10 @@ rejection_retry_code, rejection_retry = request(
 assert rejection_code == rejection_retry_code == 200
 assert rejection_retry == rejection
 assert rejection["published_path"] is None
-assert request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
-)[1] == rejection_history_before
+assert (
+    request(f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key)[1]
+    == rejection_history_before
+)
 rejected_search = request(
     "http://127.0.0.1:7331/mcp/search",
     key,
@@ -2000,6 +1992,342 @@ rejected_search = request(
 )[1]
 assert rejected_search["results"] == []
 assert project_git_fingerprint() == project_before
+
+# Ticket 14 governance covers exact and semantic duplicates, false-positive
+# protection, conflicts, conditional coexistence, and supersession history.
+supersession_root = Path("/project-roots/supersession-memory")
+supersession_root.mkdir()
+(supersession_root / "database.md").write_text(
+    "# Database\n\nThe application database is Microsoft SQL Server.\n",
+    encoding="utf-8",
+)
+supersession_code, supersession_library = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(supersession_root), "kind": "project"},
+)
+assert supersession_code == 201
+supersession_id = str(supersession_library["id"])
+
+
+def governance_candidate(identifier: str, body: str) -> dict[str, object]:
+    code, value = request(
+        "http://127.0.0.1:7331/mcp/candidates",
+        key,
+        {
+            "library_id": supersession_id,
+            "suggested_type": "decision",
+            "body": body,
+            "source_references": [f"docker-session:{identifier}#assistant-final"],
+            "creator": "docker-ticket14",
+            "idempotency_key": identifier,
+        },
+    )
+    assert code == 201
+    return value
+
+
+exact = governance_candidate(
+    "ticket14-exact",
+    "# Database\n\nThe application database is Microsoft SQL Server.\n",
+)
+exact_case = request(f"http://127.0.0.1:7331/api/v1/candidates/{exact['id']}/governance", key)[1]
+assert exact_case["classification"] == "exact_duplicate"
+exact_history = request(f"http://127.0.0.1:7331/api/v1/libraries/{supersession_id}/history", key)[1]
+exact_code, exact_result = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{exact['id']}/approve",
+    key,
+    {"operator": "docker-user", "reason": "Equivalent fact", "operation_id": "ticket14-augment"},
+)
+assert exact_code == 200
+assert exact_result["published_path"] == "database.md"
+assert len(list(supersession_root.glob("*.md"))) == 1
+assert "ticket14-exact" in (supersession_root / "database.md").read_text()
+assert (
+    len(request(f"http://127.0.0.1:7331/api/v1/libraries/{supersession_id}/history", key)[1])
+    == len(exact_history) + 1
+)
+
+possible = governance_candidate(
+    "ticket14-possible",
+    "# Database platform\n\nThe application uses Microsoft SQL Server as its database.\n",
+)
+possible_queue = request(
+    "http://127.0.0.1:7331/api/v1/candidate-governance?classification=possible_duplicate", key
+)[1]
+assert possible["id"] in [item["candidate"]["id"] for item in possible_queue]
+assert (
+    request(
+        f"http://127.0.0.1:7331/api/v1/candidates/{possible['id']}/approve",
+        key,
+        {
+            "operator": "docker-user",
+            "reason": "Must not auto merge",
+            "operation_id": "ticket14-no-auto-merge",
+        },
+    )[0]
+    == 422
+)
+
+unrelated = governance_candidate(
+    "ticket14-unrelated",
+    "# Interface\n\nKeyboard shortcuts use Ctrl+K for search.\n",
+)
+assert (
+    request(f"http://127.0.0.1:7331/api/v1/candidates/{unrelated['id']}/governance", key)[1][
+        "classification"
+    ]
+    == "new"
+)
+
+postgres = governance_candidate(
+    "ticket14-postgres",
+    "# Database\n\nThe application database is PostgreSQL.\n",
+)
+postgres_case = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{postgres['id']}/governance", key
+)[1]
+assert postgres_case["classification"] == "conflict"
+assert "Microsoft SQL Server" in postgres_case["current"]["content"]
+assert "PostgreSQL" in postgres_case["candidate"]["body"]
+assert postgres_case["diff"]
+scoped_code, scoped = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{postgres['id']}/resolve",
+    key,
+    {
+        "action": "scope",
+        "operator": "docker-user",
+        "reason": "Analytics has a separate deployment",
+        "operation_id": "ticket14-scope-postgres",
+        "condition": "PostgreSQL applies only to analytics deployments.",
+    },
+)
+assert scoped_code == 200
+assert scoped["resolution"] == "scope"
+assert len(list(supersession_root.glob("*.md"))) == 2
+
+replacement = governance_candidate(
+    "ticket14-replace",
+    "# Database\n\nThe application database is Oracle Database.\n",
+)
+replace_code, replaced = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{replacement['id']}/resolve",
+    key,
+    {
+        "action": "adopt",
+        "operator": "docker-user",
+        "reason": "Production migration",
+        "operation_id": "ticket14-adopt-oracle",
+        "effective_at": "2026-09-05T08:00:00+08:00",
+    },
+)
+assert replace_code == 200
+assert replaced["resolution"] == "adopt"
+maria = governance_candidate(
+    "ticket14-merge",
+    "# Database\n\nThe application database is MySQL.\n",
+)
+merge_code, merged = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{maria['id']}/resolve",
+    key,
+    {
+        "action": "merge",
+        "operator": "docker-user",
+        "reason": "Final migration",
+        "operation_id": "ticket14-merge-mariadb",
+        "merged_body": "# Database\n\nThe application database is MariaDB.\n",
+        "effective_at": "2026-09-05T09:00:00+08:00",
+    },
+)
+assert merge_code == 200
+assert merged["resolution"] == "merge"
+assert (
+    request(
+        "http://127.0.0.1:7331/api/v1/search",
+        key,
+        {"library_id": supersession_id, "query": "Oracle Database"},
+    )[1]["results"]
+    == []
+)
+historical = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"library_id": supersession_id, "query": "Oracle Database", "include_history": True},
+)[1]
+assert any(item["classification"] == "historical" for item in historical["results"])
+
+# A second daemon process must recover the same supersession chain from the
+# persistent state, Markdown library, and managed Git repository.
+supersession_restart_state = Path("/tmp/pam-ticket14-restart-state")
+shutil.rmtree(supersession_restart_state, ignore_errors=True)
+supersession_restart_root = Path("/project-roots/ticket14-restart-memory")
+supersession_restart_root.mkdir()
+(supersession_restart_root / "database.md").write_text(
+    "# Database\n\nThe application database is Microsoft SQL Server.\n",
+    encoding="utf-8",
+)
+supersession_restart_command = [
+    "personal-agent-memory",
+    "serve",
+    "--state-dir",
+    str(supersession_restart_state),
+    "--library-root",
+    "/project-roots",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "27331",
+]
+
+
+def start_supersession_restart_daemon() -> subprocess.Popen[bytes]:
+    process = subprocess.Popen(
+        supersession_restart_command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Ticket 14 restart daemon exited during startup")
+        if (supersession_restart_state / "api-key").exists():
+            restart_key = (supersession_restart_state / "api-key").read_text(
+                encoding="utf-8"
+            ).strip()
+            try:
+                if request("http://127.0.0.1:27331/health/live", restart_key)[0] == 200:
+                    return process
+            except OSError:
+                pass
+        time.sleep(0.1)
+    process.terminate()
+    process.wait(timeout=10)
+    raise RuntimeError("Ticket 14 restart daemon did not become ready")
+
+
+supersession_restart_process = start_supersession_restart_daemon()
+first_supersession_process = supersession_restart_process
+supersession_restart_key = (supersession_restart_state / "api-key").read_text(
+    encoding="utf-8"
+).strip()
+try:
+    restart_library_code, restart_library = request(
+        "http://127.0.0.1:27331/api/v1/libraries",
+        supersession_restart_key,
+        {"path": str(supersession_restart_root), "kind": "project"},
+    )
+    assert restart_library_code == 201
+    restart_library_id = str(restart_library["id"])
+
+    def restart_governance_candidate(identifier: str, body: str) -> dict[str, object]:
+        code, value = request(
+            "http://127.0.0.1:27331/mcp/candidates",
+            supersession_restart_key,
+            {
+                "library_id": restart_library_id,
+                "suggested_type": "decision",
+                "body": body,
+                "source_references": [f"docker-session:{identifier}#assistant-final"],
+                "creator": "docker-ticket14-restart",
+                "idempotency_key": identifier,
+            },
+        )
+        assert code == 201
+        return value
+
+    restart_oracle = restart_governance_candidate(
+        "ticket14-restart-oracle",
+        "# Database\n\nThe application database is Oracle Database.\n",
+    )
+    assert request(
+        f"http://127.0.0.1:27331/api/v1/candidates/{restart_oracle['id']}/resolve",
+        supersession_restart_key,
+        {
+            "action": "adopt",
+            "operator": "docker-user",
+            "reason": "First persisted migration",
+            "operation_id": "ticket14-restart-adopt-oracle",
+            "effective_at": "2020-01-01T00:00:00Z",
+        },
+    )[0] == 200
+    restart_maria = restart_governance_candidate(
+        "ticket14-restart-maria",
+        "# Database\n\nThe application database is MySQL.\n",
+    )
+    assert request(
+        f"http://127.0.0.1:27331/api/v1/candidates/{restart_maria['id']}/resolve",
+        supersession_restart_key,
+        {
+            "action": "merge",
+            "operator": "docker-user",
+            "reason": "Second persisted migration",
+            "operation_id": "ticket14-restart-merge-maria",
+            "merged_body": "# Database\n\nThe application database is MariaDB.\n",
+            "effective_at": "2020-02-01T00:00:00Z",
+        },
+    )[0] == 200
+finally:
+    supersession_restart_process.send_signal(signal.SIGINT)
+    assert supersession_restart_process.wait(timeout=20) == 0
+
+supersession_restart_process = start_supersession_restart_daemon()
+assert supersession_restart_process is not first_supersession_process
+assert first_supersession_process.returncode == 0
+assert supersession_restart_process.poll() is None
+try:
+    restored_chain_code, restored_chain_response = request(
+        "http://127.0.0.1:27331/api/v1/search",
+        supersession_restart_key,
+        {
+            "library_id": restart_library_id,
+            "query": "Microsoft SQL Server",
+            "include_history": True,
+            "token_budget": 10_000,
+        },
+    )
+    assert restored_chain_code == 200
+    restored_chain = [
+        item
+        for item in restored_chain_response["results"]
+        if item["source_type"] == "markdown_history"
+    ]
+    assert [item["chain_depth"] for item in restored_chain] == [0, 1, 2]
+    assert [item["history_relation"] for item in restored_chain] == [
+        "matched",
+        "successor",
+        "successor",
+    ]
+    assert [item["memory_state"] for item in restored_chain] == [
+        "superseded",
+        "superseded",
+        "current",
+    ]
+    assert [
+        next(
+            database
+            for database in ("Microsoft SQL Server", "Oracle Database", "MariaDB")
+            if database in item["content"]
+        )
+        for item in restored_chain
+    ] == ["Microsoft SQL Server", "Oracle Database", "MariaDB"]
+    assert restored_chain[0]["superseded_by_version_ids"] == [
+        restored_chain[1]["version_id"]
+    ]
+    assert restored_chain[1]["supersedes_version_id"] == restored_chain[0]["version_id"]
+    assert restored_chain[1]["superseded_by_version_ids"] == [
+        restored_chain[2]["version_id"]
+    ]
+    assert restored_chain[2]["supersedes_version_id"] == restored_chain[1]["version_id"]
+    assert restored_chain[2]["classification"] == "history_current"
+    current_after_restart = request(
+        "http://127.0.0.1:27331/api/v1/search",
+        supersession_restart_key,
+        {"library_id": restart_library_id, "query": "MariaDB"},
+    )[1]
+    assert any("MariaDB" in item["content"] for item in current_after_restart["results"])
+finally:
+    supersession_restart_process.send_signal(signal.SIGINT)
+    assert supersession_restart_process.wait(timeout=20) == 0
 
 browser_approve_code, browser_approve_candidate = request(
     "http://127.0.0.1:7331/mcp/candidates",
@@ -2018,6 +2346,10 @@ browser_reject_code, browser_reject_candidate = request(
         "body": "# Browser rejection\n\nBrowserCandidateRejected\n",
         "idempotency_key": "docker-browser-reject",
     },
+)
+browser_conflict_candidate = governance_candidate(
+    "ticket14-browser-conflict",
+    "# Database\n\nThe application database is CockroachDB.\n",
 )
 assert browser_approve_code == browser_reject_code == 201
 browser_history_before = request(
@@ -2053,10 +2385,7 @@ try:
     )
 
     def click_sensitive_record(record: dict[str, object]) -> bool:
-        selector = (
-            '#sensitive-quarantine-list [data-record-id="'
-            f'{record["id"]}"]'
-        )
+        selector = f'#sensitive-quarantine-list [data-record-id="{record["id"]}"]'
         return bool(
             browser.execute_script(
                 "const item = document.querySelector(arguments[0]); "
@@ -2071,20 +2400,21 @@ try:
     assert "Sensitive content withheld" in sensitive_detail.text
     browser.find_element(By.ID, "sensitive-acknowledge").click()
     wait.until(
-        lambda _: next(
-            record
-            for record in cast(
-                list[dict[str, object]],
-                request("http://127.0.0.1:7331/api/v1/sensitive-quarantine", key)[1],
-            )
-            if record["id"] == acknowledge_record["id"]
-        )["resolution"]
-        == "acknowledge"
+        lambda _: (
+            next(
+                record
+                for record in cast(
+                    list[dict[str, object]],
+                    request("http://127.0.0.1:7331/api/v1/sensitive-quarantine", key)[1],
+                )
+                if record["id"] == acknowledge_record["id"]
+            )["resolution"]
+            == "acknowledge"
+        )
     )
 
     acknowledge_selector = (
-        '#sensitive-quarantine-list [data-record-id="'
-        f'{acknowledge_record["id"]}"]'
+        f'#sensitive-quarantine-list [data-record-id="{acknowledge_record["id"]}"]'
     )
     wait.until(
         lambda driver: bool(
@@ -2098,20 +2428,23 @@ try:
 
     wait.until(lambda _: click_sensitive_record(discard_record))
     wait.until(
-        lambda driver: "discarded \u00b7 unresolved"
-        in driver.find_element(By.ID, "sensitive-title").text
+        lambda driver: (
+            "discarded \u00b7 unresolved" in driver.find_element(By.ID, "sensitive-title").text
+        )
     )
     browser.find_element(By.ID, "sensitive-discard").click()
     wait.until(
-        lambda _: next(
-            record
-            for record in cast(
-                list[dict[str, object]],
-                request("http://127.0.0.1:7331/api/v1/sensitive-quarantine", key)[1],
-            )
-            if record["id"] == discard_record["id"]
-        )["resolution"]
-        == "discard"
+        lambda _: (
+            next(
+                record
+                for record in cast(
+                    list[dict[str, object]],
+                    request("http://127.0.0.1:7331/api/v1/sensitive-quarantine", key)[1],
+                )
+                if record["id"] == discard_record["id"]
+            )["resolution"]
+            == "discard"
+        )
     )
 
     def submit_candidate(
@@ -2146,16 +2479,16 @@ try:
     wait.until(
         lambda _: submit_candidate(
             approve_id,
-            "# Browser approved\n\nBrowserCandidatePublished\n",
+            "# Browser approved\n\nThe Web approval fixture uses Cobalt Canary.\n",
             "browser-user",
             "Edited through the Web page",
             "save",
         )
     )
     wait.until(
-        lambda _: request(
-            f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key
-        )[1]["body"].endswith("BrowserCandidatePublished\n")
+        lambda _: request(f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key)[1][
+            "body"
+        ].endswith("The Web approval fixture uses Cobalt Canary.\n")
     )
     wait.until(
         lambda _: submit_candidate(
@@ -2167,10 +2500,10 @@ try:
         )
     )
     wait.until(
-        lambda _: request(
-            f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key
-        )[1]["status"]
-        == "approved"
+        lambda _: (
+            request(f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key)[1]["status"]
+            == "approved"
+        )
     )
 
     reject_id = str(browser_reject_candidate["id"])
@@ -2184,10 +2517,38 @@ try:
         )
     )
     wait.until(
-        lambda _: request(
-            f"http://127.0.0.1:7331/api/v1/candidates/{reject_id}", key
-        )[1]["status"]
-        == "rejected"
+        lambda _: (
+            request(f"http://127.0.0.1:7331/api/v1/candidates/{reject_id}", key)[1]["status"]
+            == "rejected"
+        )
+    )
+
+    browser_conflict_id = str(browser_conflict_candidate["id"])
+
+    def resolve_browser_conflict() -> bool:
+        return bool(
+            browser.execute_script(
+                "const item = [...document.querySelectorAll('nav.candidate-list button')]"
+                ".find((button) => button.textContent.includes(arguments[0])); "
+                "if (!item) return false; item.click(); "
+                "const action = document.querySelector('#candidate-resolve'); "
+                "if (!action || action.disabled) return false; "
+                "document.querySelector('#candidate-operator').value = 'browser-user'; "
+                "document.querySelector('#candidate-reason').value = 'Keep current through Web'; "
+                "document.querySelector('#candidate-resolution').value = 'keep'; "
+                "action.click(); return true;",
+                browser_conflict_id,
+            )
+        )
+
+    wait.until(lambda _: resolve_browser_conflict())
+    wait.until(
+        lambda _: (
+            request(f"http://127.0.0.1:7331/api/v1/candidates/{browser_conflict_id}", key)[1][
+                "status"
+            ]
+            == "rejected"
+        )
     )
 finally:
     browser.quit()
@@ -2204,22 +2565,28 @@ assert browser_rejected["operator"] == "browser-user"
 assert browser_rejected["reason"] == "Rejected through the Web page"
 assert browser_rejected["published_path"] is None
 browser_published = history_library / str(browser_approved["published_path"])
-assert "BrowserCandidatePublished" in browser_published.read_text(encoding="utf-8")
-browser_history = request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
-)[1]
+assert "The Web approval fixture uses Cobalt Canary." in browser_published.read_text(
+    encoding="utf-8"
+)
+browser_history = request(f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key)[1]
 assert len(browser_history) == len(browser_history_before) + 1
 assert browser_history[0]["commit"] == browser_approved["commit"]
-assert request(
-    "http://127.0.0.1:7331/mcp/search",
-    key,
-    {"library_id": history_id, "query": "BrowserCandidatePublished"},
-)[1]["results"][0]["path"] == browser_approved["published_path"]
-assert request(
-    "http://127.0.0.1:7331/mcp/search",
-    key,
-    {"library_id": history_id, "query": "BrowserCandidateRejected"},
-)[1]["results"] == []
+assert (
+    request(
+        "http://127.0.0.1:7331/mcp/search",
+        key,
+        {"library_id": history_id, "query": "Cobalt Canary"},
+    )[1]["results"][0]["path"]
+    == browser_approved["published_path"]
+)
+assert (
+    request(
+        "http://127.0.0.1:7331/mcp/search",
+        key,
+        {"library_id": history_id, "query": "BrowserCandidateRejected"},
+    )[1]["results"]
+    == []
+)
 assert project_git_fingerprint() == project_before
 
 assert request("http://127.0.0.1:18080/v1/models")[1]["data"]

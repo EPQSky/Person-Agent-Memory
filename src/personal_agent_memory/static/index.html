@@ -94,7 +94,7 @@
         const candidateList = document.createElement('nav');
         candidateList.className = 'candidate-list';
         const candidateDetail = document.createElement('div');
-        candidateDetail.innerHTML = '<strong id="candidate-title">Select a candidate</strong><p id="candidate-sources" class="source"></p><textarea id="candidate-body" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">Operator</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">Reason</label><input id="candidate-reason" disabled></div><div class="candidate-actions"><button type="button" id="candidate-save" disabled>Save</button><button type="button" id="candidate-approve" disabled>Approve</button><button type="button" id="candidate-reject" class="danger" disabled>Reject</button></div><p id="candidate-message"></p>';
+        candidateDetail.innerHTML = '<strong id="candidate-title">Select a candidate</strong><p id="candidate-sources" class="source"></p><p id="candidate-governance" class="source"></p><pre id="candidate-current" class="diff" hidden></pre><pre id="candidate-conflict-diff" class="diff" hidden></pre><textarea id="candidate-body" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">Operator</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">Reason</label><input id="candidate-reason" disabled></div><div class="field"><label for="candidate-resolution">Resolution</label><select id="candidate-resolution" disabled><option value="keep">Keep current</option><option value="adopt">Adopt candidate</option><option value="merge">Merge as new version</option><option value="scope">Different conditions</option></select></div><div class="field"><label for="candidate-effective">Effective at</label><input id="candidate-effective" type="datetime-local" disabled></div><div class="field"><label for="candidate-condition">Condition</label><input id="candidate-condition" disabled></div><div class="candidate-actions"><button type="button" id="candidate-save" disabled>Save</button><button type="button" id="candidate-approve" disabled>Approve</button><button type="button" id="candidate-resolve" disabled>Resolve</button><button type="button" id="candidate-reject" class="danger" disabled>Reject</button></div><p id="candidate-message"></p>';
         candidateLayout.append(candidateList, candidateDetail);
         const sensitiveHeading = document.createElement('h2');
         sensitiveHeading.textContent = 'Sensitive quarantine';
@@ -202,19 +202,30 @@
           candidateDetail.querySelector('#candidate-title').textContent = 'Select a candidate';
           candidateDetail.querySelector('#candidate-sources').textContent = '';
           candidateDetail.querySelector('#candidate-body').value = '';
-          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-save', 'candidate-approve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = true;
+          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = true;
         }
 
-        function showCandidate(candidate) {
+        async function showCandidate(candidate) {
           activeCandidate = candidate;
           const pending = candidate.status === 'pending';
           candidateDetail.querySelector('#candidate-title').textContent = `${candidate.suggested_type} · ${candidate.status}`;
-          candidateDetail.querySelector('#candidate-sources').textContent = `Created by ${candidate.creator} at ${candidate.created_at} · ${candidate.source_references.join(' · ')}`;
+          candidateDetail.querySelector('#candidate-sources').textContent = `Candidate sources · created by ${candidate.creator} at ${candidate.created_at} · ${candidate.source_references.join(' · ')}`;
           candidateDetail.querySelector('#candidate-body').value = candidate.body;
           candidateDetail.querySelector('#candidate-operator').value = candidate.operator || '';
           candidateDetail.querySelector('#candidate-reason').value = candidate.reason || '';
-          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-save', 'candidate-approve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = !pending;
+          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = !pending;
           candidateDetail.querySelector('#candidate-message').textContent = candidate.published_path ? `Published as ${candidate.published_path} in ${candidate.commit}` : '';
+          const response = await fetch(`/api/v1/candidates/${candidate.id}/governance`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok || activeCandidate?.id !== candidate.id) return;
+          const governance = await response.json();
+          candidateDetail.querySelector('#candidate-governance').textContent = `${governance.classification}${governance.target_path ? ` · ${governance.target_path}` : ''}${governance.effective_at ? ` · effective ${governance.effective_at}` : ''}`;
+          const current = candidateDetail.querySelector('#candidate-current');
+          current.hidden = !governance.current;
+          current.textContent = governance.current ? `Current (${governance.current.path})\nSources: ${governance.current.source_references.join(' · ')}\nSource created: ${governance.current.source_created_at || 'not available'}\nRecorded: ${governance.current.recorded_at}\nEffective: ${governance.current.effective_at || 'initial version'}\n\n${governance.current.content}` : '';
+          const diff = candidateDetail.querySelector('#candidate-conflict-diff');
+          diff.hidden = !governance.diff;
+          diff.textContent = governance.diff || '';
+          candidateDetail.querySelector('#candidate-resolve').disabled = !pending || !['possible_duplicate', 'conflict'].includes(governance.classification);
         }
 
         async function candidateAction(action) {
@@ -232,6 +243,28 @@
           showCandidate(activeCandidate);
           await refreshCandidates(activeCandidate.id);
           if (action === 'approve') await refreshDocuments();
+        }
+
+        async function resolveCandidate() {
+          if (!activeCandidate) return;
+          const action = candidateDetail.querySelector('#candidate-resolution').value;
+          const effective = candidateDetail.querySelector('#candidate-effective').value;
+          const payload = {
+            action,
+            operator: candidateDetail.querySelector('#candidate-operator').value,
+            reason: candidateDetail.querySelector('#candidate-reason').value,
+            operation_id: crypto.randomUUID(),
+            merged_body: action === 'merge' ? candidateDetail.querySelector('#candidate-body').value : null,
+            effective_at: effective ? new Date(effective).toISOString() : null,
+            condition: action === 'scope' ? candidateDetail.querySelector('#candidate-condition').value : null,
+          };
+          const response = await fetch(`/api/v1/candidates/${activeCandidate.id}/resolve`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          const message = candidateDetail.querySelector('#candidate-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          const result = await response.json();
+          activeCandidate = result.candidate;
+          await refreshCandidates(activeCandidate.id);
+          await refreshDocuments();
         }
 
         async function refreshSensitiveQuarantine(selectedId = activeSensitiveRecord?.id) {
@@ -516,6 +549,7 @@
         candidateStatus.addEventListener('change', () => refreshCandidates());
         candidateDetail.querySelector('#candidate-save').addEventListener('click', () => candidateAction('edit'));
         candidateDetail.querySelector('#candidate-approve').addEventListener('click', () => candidateAction('approve'));
+        candidateDetail.querySelector('#candidate-resolve').addEventListener('click', resolveCandidate);
         candidateDetail.querySelector('#candidate-reject').addEventListener('click', () => candidateAction('reject'));
         sensitiveDetail.querySelector('#sensitive-acknowledge').addEventListener('click', () => resolveSensitiveRecord('acknowledge'));
         sensitiveDetail.querySelector('#sensitive-discard').addEventListener('click', () => resolveSensitiveRecord('discard'));

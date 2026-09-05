@@ -18,6 +18,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
@@ -146,6 +147,18 @@ class LibraryIndexSnapshot:
     chunks: tuple[tuple[object, ...], ...]
     searches: tuple[tuple[object, ...], ...]
     vectors: tuple[tuple[object, ...], ...]
+    versions: tuple[tuple[object, ...], ...]
+    vector_indexes: tuple[tuple[object, ...], ...]
+    graph_indexes: tuple[tuple[object, ...], ...]
+    graph_documents: tuple[tuple[object, ...], ...]
+    rebuild_jobs: tuple[tuple[object, ...], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateResolutionSnapshot:
+    candidate: tuple[object, ...]
+    governance: tuple[object, ...]
+    audit: tuple[tuple[object, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +390,36 @@ class PlatformState:
                     body TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS candidate_governance (
+                    candidate_id TEXT PRIMARY KEY
+                        REFERENCES candidate_memories(id) ON DELETE CASCADE,
+                    classification TEXT NOT NULL
+                        CHECK(classification IN ('new', 'exact_duplicate',
+                              'possible_duplicate', 'conflict')),
+                    target_path TEXT,
+                    similarity REAL NOT NULL DEFAULT 0,
+                    resolution TEXT,
+                    effective_at TEXT,
+                    condition_text TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_versions (
+                    version_id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL
+                        REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL,
+                    source_version TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'current'
+                        CHECK(state IN ('current', 'superseded', 'conditional')),
+                    supersedes_version_id TEXT REFERENCES memory_versions(version_id),
+                    commit_id TEXT,
+                    effective_at TEXT,
+                    condition_text TEXT,
+                    candidate_id TEXT REFERENCES candidate_memories(id),
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(library_id, path, source_version)
+                );
                 CREATE TABLE IF NOT EXISTS capture_inbox (
                     event_id TEXT PRIMARY KEY,
                     request_hash TEXT NOT NULL,
@@ -421,13 +464,10 @@ class PlatformState:
                 """
             )
             quarantine_columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(sensitive_quarantine)")
+                str(row[1]) for row in connection.execute("PRAGMA table_info(sensitive_quarantine)")
             }
             if "dedupe_key" not in quarantine_columns:
-                connection.execute(
-                    "ALTER TABLE sensitive_quarantine ADD COLUMN dedupe_key TEXT"
-                )
+                connection.execute("ALTER TABLE sensitive_quarantine ADD COLUMN dedupe_key TEXT")
             if "stored_bytes" not in quarantine_columns:
                 connection.execute(
                     "ALTER TABLE sensitive_quarantine "
@@ -464,10 +504,7 @@ class PlatformState:
                 ).fetchall()
                 connection.executemany(
                     "UPDATE memory_chunks SET kind = ? WHERE id = ?",
-                    [
-                        (infer_legacy_chunk_kind(str(row[1])), str(row[0]))
-                        for row in legacy_chunks
-                    ],
+                    [(infer_legacy_chunk_kind(str(row[1])), str(row[0])) for row in legacy_chunks],
                 )
             operation_columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(memory_operations)")
@@ -624,15 +661,9 @@ class PlatformState:
             root_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             root_metadata = os.fstat(root_fd)
             root_identity = root_metadata.st_dev, root_metadata.st_ino
-            registration_scan = scan_markdown_fd(
-                root_fd, path, (), (self.database_path.parent,)
-            )
-            self._ensure_scan_has_no_sensitive_content(
-                registration_scan, LibraryRegistrationError
-            )
-            self._verify_registration_tree(
-                path, root_fd, root_identity, registration_scan, None
-            )
+            registration_scan = scan_markdown_fd(root_fd, path, (), (self.database_path.parent,))
+            self._ensure_scan_has_no_sensitive_content(registration_scan, LibraryRegistrationError)
+            self._verify_registration_tree(path, root_fd, root_identity, registration_scan, None)
             self.connection.execute("BEGIN IMMEDIATE")
             self.connection.execute(
                 "INSERT INTO memory_libraries (id, kind, canonical_path) VALUES (?, ?, ?)",
@@ -653,11 +684,7 @@ class PlatformState:
                 root_identity,
                 registration_scan,
             )
-            manifest = (
-                initialization.manifest_content
-                if mode == "authorized_existing"
-                else None
-            )
+            manifest = initialization.manifest_content if mode == "authorized_existing" else None
             self._verify_registration_tree(
                 path, root_fd, root_identity, registration_scan, manifest
             )
@@ -692,8 +719,7 @@ class PlatformState:
                     if chunk_ids:
                         placeholders = ",".join("?" for _ in chunk_ids)
                         self.connection.execute(
-                            f"DELETE FROM memory_chunk_search "
-                            f"WHERE chunk_id IN ({placeholders})",  # noqa: S608
+                            f"DELETE FROM memory_chunk_search WHERE chunk_id IN ({placeholders})",  # noqa: S608
                             chunk_ids,
                         )
                     self.connection.execute(
@@ -800,9 +826,7 @@ class PlatformState:
         }
         changed = 0
         unchanged = 0
-        scan = frozen_scan or scan_markdown(
-            root, patterns, (self.database_path.parent,)
-        )
+        scan = frozen_scan or scan_markdown(root, patterns, (self.database_path.parent,))
         if not scan.complete:
             self.connection_or_raise.execute(
                 "UPDATE memory_libraries SET sync_status = 'error' WHERE id = ?", (library_id,)
@@ -851,6 +875,22 @@ class PlatformState:
                        VALUES (?, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET source_version = excluded.source_version""",
                     (document_id, library_id, document.path, document.version),
+                )
+                version_id = hashlib.sha256(
+                    f"{library_id}\0{document.path}\0{document.version}".encode()
+                ).hexdigest()
+                self.connection_or_raise.execute(
+                    """UPDATE memory_versions SET state = 'superseded',
+                              updated_at = CURRENT_TIMESTAMP
+                       WHERE library_id = ? AND path = ? AND state = 'current'
+                         AND source_version != ?""",
+                    (library_id, document.path, document.version),
+                )
+                self.connection_or_raise.execute(
+                    """INSERT OR IGNORE INTO memory_versions
+                       (version_id, library_id, path, source_version, content)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (version_id, library_id, document.path, document.version, document.content),
                 )
                 chunks = chunk_markdown(document.content)
                 chunk_ids = match_chunk_ids(
@@ -954,9 +994,7 @@ class PlatformState:
         persisted_input = "\n".join((body, *source_references, creator, idempotency_key))
         finding = inspect_sensitive_text(persisted_input)
         if finding is not None:
-            disposition = (
-                "discarded" if finding.disposition == "discard" else "quarantined"
-            )
+            disposition = "discarded" if finding.disposition == "discard" else "quarantined"
             self._record_sensitive_quarantine(
                 "candidate",
                 str(uuid.uuid4()),
@@ -1015,6 +1053,13 @@ class PlatformState:
                    VALUES (?, 'created', ?, ?, ?)""",
                 (candidate_id, creator, "candidate submitted", body),
             )
+            classification, target_path, similarity = self._classify_candidate(library_id, body)
+            self.connection_or_raise.execute(
+                """INSERT INTO candidate_governance
+                   (candidate_id, classification, target_path, similarity)
+                   VALUES (?, ?, ?, ?)""",
+                (candidate_id, classification, target_path, similarity),
+            )
             self.connection_or_raise.commit()
         except sqlite3.IntegrityError:
             self.connection_or_raise.rollback()
@@ -1029,6 +1074,45 @@ class PlatformState:
                 ) from None
             return self.candidate(str(existing[0]))
         return self.candidate(candidate_id)
+
+    def _classify_candidate(self, library_id: str, body: str) -> tuple[str, str | None, float]:
+        proposed = self._governance_text(body)
+        proposed_terms = set(re.findall(r"[a-z0-9_+#.-]+|[\u4e00-\u9fff]", proposed))
+        best_path: str | None = None
+        best_similarity = 0.0
+        similarities: dict[str, float] = {}
+        exact = self.connection_or_raise.execute(
+            "SELECT path, content FROM memory_chunks WHERE library_id = ? ORDER BY path",
+            (library_id,),
+        ).fetchall()
+        for row in exact:
+            if proposed == self._governance_text(str(row[1])):
+                return "exact_duplicate", str(row[0]), 1.0
+        documents = self.connection_or_raise.execute(
+            """SELECT path, GROUP_CONCAT(content, '\n')
+               FROM memory_chunks WHERE library_id = ? GROUP BY path ORDER BY path""",
+            (library_id,),
+        ).fetchall()
+        for row in documents:
+            path, current = str(row[0]), self._governance_text(str(row[1]))
+            if proposed == current:
+                return "exact_duplicate", path, 1.0
+            current_terms = set(re.findall(r"[a-z0-9_+#.-]+|[\u4e00-\u9fff]", current))
+            union = proposed_terms | current_terms
+            token_similarity = len(proposed_terms & current_terms) / len(union) if union else 0.0
+            similarity = max(
+                token_similarity,
+                difflib.SequenceMatcher(None, proposed, current).ratio(),
+            )
+            similarities[path] = similarity
+            if similarity > best_similarity:
+                best_path, best_similarity = path, similarity
+        conflict_path = self._candidate_conflict_path(library_id, body)
+        if conflict_path is not None:
+            return "conflict", conflict_path, similarities.get(conflict_path, 0.0)
+        if best_similarity >= 0.55:
+            return "possible_duplicate", best_path, best_similarity
+        return "new", None, best_similarity
 
     def ingest_capture_event(
         self,
@@ -1177,8 +1261,16 @@ class PlatformState:
             (session_id, session_id),
         ).fetchall()
         keys = (
-            "event_id", "session_id", "project_id", "library_id", "turn_id", "event_kind",
-            "content", "occurred_at", "received_at", "consolidated_at",
+            "event_id",
+            "session_id",
+            "project_id",
+            "library_id",
+            "turn_id",
+            "event_kind",
+            "content",
+            "occurred_at",
+            "received_at",
+            "consolidated_at",
         )
         return [dict(zip(keys, row, strict=True)) for row in rows]
 
@@ -1195,17 +1287,24 @@ class PlatformState:
             (limit, offset),
         ).fetchall()
         keys = (
-            "id", "source_kind", "source_id", "library_id", "disposition", "categories",
-            "summary", "fingerprint", "created_at", "resolved_at", "resolution",
+            "id",
+            "source_kind",
+            "source_id",
+            "library_id",
+            "disposition",
+            "categories",
+            "summary",
+            "fingerprint",
+            "created_at",
+            "resolved_at",
+            "resolution",
         )
         return [
             dict(zip(keys, (*row[:5], json.loads(str(row[5])), *row[6:]), strict=True))
             for row in rows
         ]
 
-    def resolve_sensitive_quarantine(
-        self, record_id: str, resolution: str
-    ) -> dict[str, object]:
+    def resolve_sensitive_quarantine(self, record_id: str, resolution: str) -> dict[str, object]:
         if resolution not in {"discard", "acknowledge"}:
             raise CandidateGovernanceError("invalid sensitive-content resolution")
         updated = self.connection_or_raise.execute(
@@ -1224,8 +1323,17 @@ class PlatformState:
         ).fetchone()
         assert row is not None
         keys = (
-            "id", "source_kind", "source_id", "library_id", "disposition", "categories",
-            "summary", "fingerprint", "created_at", "resolved_at", "resolution",
+            "id",
+            "source_kind",
+            "source_id",
+            "library_id",
+            "disposition",
+            "categories",
+            "summary",
+            "fingerprint",
+            "created_at",
+            "resolved_at",
+            "resolution",
         )
         return dict(zip(keys, (*row[:5], json.loads(str(row[5])), *row[6:]), strict=True))
 
@@ -1257,13 +1365,26 @@ class PlatformState:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT DO NOTHING""",
                 (
-                    str(uuid.uuid4()), source_kind, source_id, library_id, disposition,
-                    json.dumps(categories), bounded_summary, fingerprint, dedupe_key,
+                    str(uuid.uuid4()),
+                    source_kind,
+                    source_id,
+                    library_id,
+                    disposition,
+                    json.dumps(categories),
+                    bounded_summary,
+                    fingerprint,
+                    dedupe_key,
                     sum(
                         len(str(value).encode())
                         for value in (
-                            source_kind, source_id, library_id or "", disposition,
-                            json.dumps(categories), bounded_summary, fingerprint, dedupe_key,
+                            source_kind,
+                            source_id,
+                            library_id or "",
+                            disposition,
+                            json.dumps(categories),
+                            bounded_summary,
+                            fingerprint,
+                            dedupe_key,
                         )
                     ),
                 ),
@@ -1313,7 +1434,12 @@ class PlatformState:
             (session_id, session_id),
         ).fetchall()
         keys = (
-            "session_id", "turn_id", "library_id", "status", "candidate_id", "last_error",
+            "session_id",
+            "turn_id",
+            "library_id",
+            "status",
+            "candidate_id",
+            "last_error",
             "updated_at",
         )
         return [dict(zip(keys, row, strict=True)) for row in rows]
@@ -1334,9 +1460,7 @@ class PlatformState:
             parameters.append(candidate_status)
         where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
         rows = self.connection_or_raise.execute(
-            "SELECT id FROM candidate_memories"
-            + where
-            + " ORDER BY created_at DESC, id DESC",
+            "SELECT id FROM candidate_memories" + where + " ORDER BY created_at DESC, id DESC",
             parameters,
         ).fetchall()
         return [self.candidate(str(row[0])) for row in rows]
@@ -1367,6 +1491,104 @@ class PlatformState:
             commit=None if row[12] is None else str(row[12]),
         ).payload()
 
+    def candidate_governance(self, candidate_id: str) -> dict[str, object]:
+        candidate = self.candidate(candidate_id)
+        row = self.connection_or_raise.execute(
+            """SELECT classification, target_path, similarity, resolution,
+                      effective_at, condition_text
+               FROM candidate_governance WHERE candidate_id = ?""",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            classification, target_path, similarity = self._classify_candidate(
+                str(candidate["library_id"]), str(candidate["body"])
+            )
+            row = (classification, target_path, similarity, None, None, None)
+        target: dict[str, object] | None = None
+        if row[1] is not None:
+            try:
+                target = cast(
+                    dict[str, object],
+                    self.read_document(str(candidate["library_id"]), str(row[1])),
+                )
+                version = self.connection_or_raise.execute(
+                    """SELECT version_id, commit_id, effective_at, updated_at, candidate_id
+                       FROM memory_versions
+                       WHERE library_id = ? AND path = ? AND source_version = ?""",
+                    (
+                        candidate["library_id"],
+                        target["path"],
+                        target["source_version"],
+                    ),
+                ).fetchone()
+                if version is not None:
+                    source_references = [
+                        f"markdown:{target['path']}@{target['source_version']}"
+                    ]
+                    source_created_at = None
+                    if version[4] is not None:
+                        source = self.connection_or_raise.execute(
+                            """SELECT source_references_json, created_at
+                               FROM candidate_memories WHERE id = ?""",
+                            (str(version[4]),),
+                        ).fetchone()
+                        if source is not None:
+                            source_references = [
+                                str(item) for item in json.loads(str(source[0]))
+                            ]
+                            source_created_at = str(source[1])
+                    target.update(
+                        {
+                            "version_id": str(version[0]),
+                            "commit": None if version[1] is None else str(version[1]),
+                            "effective_at": None if version[2] is None else str(version[2]),
+                            "recorded_at": str(version[3]),
+                            "source_references": source_references,
+                            "source_created_at": source_created_at,
+                        }
+                    )
+            except MemoryMutationError:
+                target = None
+        return {
+            "candidate": candidate,
+            "classification": str(row[0]),
+            "target_path": None if row[1] is None else str(row[1]),
+            "similarity": float(row[2]),
+            "resolution": None if row[3] is None else str(row[3]),
+            "effective_at": None if row[4] is None else str(row[4]),
+            "condition": None if row[5] is None else str(row[5]),
+            "current": target,
+            "diff": ""
+            if target is None
+            else "".join(
+                difflib.unified_diff(
+                    str(target["content"]).splitlines(keepends=True),
+                    str(candidate["body"]).splitlines(keepends=True),
+                    fromfile=f"current/{target['path']}",
+                    tofile=f"candidate/{candidate_id}",
+                )
+            ),
+        }
+
+    def list_candidate_governance(
+        self, classification: str | None = None
+    ) -> list[dict[str, object]]:
+        allowed = {"new", "exact_duplicate", "possible_duplicate", "conflict"}
+        if classification is not None and classification not in allowed:
+            raise CandidateGovernanceError("invalid governance classification")
+        sql = """SELECT governance.candidate_id FROM candidate_governance AS governance
+                 JOIN candidate_memories AS candidate ON candidate.id = governance.candidate_id
+                 WHERE candidate.status = 'pending'"""
+        parameters: tuple[str, ...] = ()
+        if classification is not None:
+            sql += " AND governance.classification = ?"
+            parameters = (classification,)
+        sql += " ORDER BY candidate.created_at, candidate.id"
+        return [
+            self.candidate_governance(str(row[0]))
+            for row in self.connection_or_raise.execute(sql, parameters)
+        ]
+
     def edit_candidate(
         self, candidate_id: str, body: str, operator: str, reason: str
     ) -> dict[str, object]:
@@ -1395,6 +1617,15 @@ class PlatformState:
                    VALUES (?, 'edited', ?, ?, ?)""",
                 (candidate_id, operator, reason, body),
             )
+            classification, target_path, similarity = self._classify_candidate(
+                str(current["library_id"]), body
+            )
+            self.connection_or_raise.execute(
+                """UPDATE candidate_governance SET classification = ?, target_path = ?,
+                          similarity = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE candidate_id = ?""",
+                (classification, target_path, similarity, candidate_id),
+            )
             self.connection_or_raise.commit()
         except BaseException:
             self.connection_or_raise.rollback()
@@ -1415,17 +1646,38 @@ class PlatformState:
         self._validate_operation_identifier(operation_id, "operation_id")
         self._ensure_decision_operation_available(candidate_id, operation_id)
         current = self.candidate(candidate_id)
-        if inspect_sensitive_text(
-            "\n".join((str(current["body"]), operator, reason, operation_id))
-        ) is not None:
+        if (
+            inspect_sensitive_text(
+                "\n".join((str(current["body"]), operator, reason, operation_id))
+            )
+            is not None
+        ):
             raise CandidateGovernanceError("candidate content requires sensitive review")
+        governance = self.candidate_governance(candidate_id)
+        if current["status"] != "pending" and governance["resolution"] == "augment":
+            row = self.connection_or_raise.execute(
+                """SELECT decision_operation_id FROM candidate_memories WHERE id = ?""",
+                (candidate_id,),
+            ).fetchone()
+            if row == (operation_id,):
+                return current
+            raise CandidateGovernanceError("candidate has already received a final decision")
+        if current["status"] == "pending" and governance["classification"] == "exact_duplicate":
+            return self._augment_duplicate_candidate(
+                current, governance, operator, reason, operation_id
+            )
+        if current["status"] == "pending" and governance["classification"] in {
+            "possible_duplicate",
+            "conflict",
+        }:
+            raise CandidateGovernanceError(
+                "candidate requires an explicit duplicate or conflict resolution"
+            )
         decision_hash = self._decision_request_hash(
             candidate_id, "approved", str(current["body"]), operator, reason
         )
         if current["status"] != "pending":
-            completed = self._completed_candidate_decision(
-                current, operation_id, decision_hash
-            )
+            completed = self._completed_candidate_decision(current, operation_id, decision_hash)
             persisted_content = self._published_candidate_markdown(
                 current, operator, reason
             ).encode()
@@ -1455,9 +1707,7 @@ class PlatformState:
                 decision_hash,
                 {"path": path, "commit": commit},
             ):
-                raise CandidateGovernanceError(
-                    "approved candidate publication is inconsistent"
-                )
+                raise CandidateGovernanceError("approved candidate publication is inconsistent")
             return completed
         path = f"memory-{candidate_id}.md"
         content = self._published_candidate_markdown(current, operator, reason)
@@ -1530,6 +1780,340 @@ class PlatformState:
         )
         return self.candidate(candidate_id)
 
+    def _augment_duplicate_candidate(
+        self,
+        candidate: dict[str, object],
+        governance: dict[str, object],
+        operator: str,
+        reason: str,
+        operation_id: str,
+    ) -> dict[str, object]:
+        path = str(governance["target_path"] or "")
+        if not path:
+            raise CandidateGovernanceError("equivalent memory target is unavailable")
+        current = self.read_document(str(candidate["library_id"]), path)
+        references = cast(tuple[str, ...], candidate["source_references"])
+        additions = "\n".join(f"- {reference}" for reference in references)
+        marker = "\n## Additional provenance\n"
+        content = str(current["content"]).rstrip() + marker + additions + "\n"
+        decision_hash = self._governance_resolution_hash(
+            str(candidate["id"]), "augment", content, operator, reason, None, None
+        )
+        resolution_snapshot = self._snapshot_candidate_resolution(str(candidate["id"]))
+
+        def record(response: dict[str, str]) -> None:
+            self._record_candidate_resolution(
+                candidate,
+                operator,
+                reason,
+                operation_id,
+                decision_hash,
+                "approved",
+                "augment",
+                response["path"],
+                response["commit"],
+                None,
+                None,
+            )
+
+        self._mutate_document(
+            str(candidate["library_id"]),
+            path,
+            content,
+            str(current["source_version"]),
+            operation_id,
+            "user",
+            f"candidate-duplicate:{operator}",
+            "edit",
+            f"Add provenance from equivalent candidate {candidate['id']}",
+            record,
+            lambda: self._restore_candidate_resolution(resolution_snapshot),
+        )
+        return self.candidate(str(candidate["id"]))
+
+    def resolve_candidate(
+        self,
+        candidate_id: str,
+        action: str,
+        operator: str,
+        reason: str,
+        operation_id: str,
+        *,
+        merged_body: str | None = None,
+        effective_at: str | None = None,
+        condition: str | None = None,
+    ) -> dict[str, object]:
+        if action not in {"keep", "adopt", "merge", "scope"}:
+            raise CandidateGovernanceError("invalid candidate resolution")
+        self._validate_governance_actor(operator, reason)
+        self._validate_operation_identifier(operation_id, "operation_id")
+        candidate = self.candidate(candidate_id)
+        persisted_input = "\n".join(
+            (
+                str(candidate["body"]),
+                action,
+                operator,
+                reason,
+                operation_id,
+                merged_body or "",
+                effective_at or "",
+                condition or "",
+            )
+        )
+        if inspect_sensitive_text(persisted_input) is not None:
+            raise CandidateGovernanceError("candidate content requires sensitive review")
+        governance = self.candidate_governance(candidate_id)
+        if governance["classification"] not in {"possible_duplicate", "conflict"}:
+            raise CandidateGovernanceError("candidate does not require manual resolution")
+        target_path = str(governance["target_path"] or "")
+        if not target_path:
+            raise CandidateGovernanceError("candidate resolution target is unavailable")
+        if action in {"adopt", "merge"}:
+            effective_at = self._validated_effective_at(effective_at)
+        if action == "scope" and not (condition or "").strip():
+            raise CandidateGovernanceError("condition is required for scoped coexistence")
+        body = str(candidate["body"])
+        if action == "merge":
+            if not (merged_body or "").strip():
+                raise CandidateGovernanceError("merged_body is required for merge resolution")
+            body = str(merged_body)
+        decision_hash = self._governance_resolution_hash(
+            candidate_id, action, body, operator, reason, effective_at, condition
+        )
+        if candidate["status"] != "pending":
+            row = self.connection_or_raise.execute(
+                """SELECT decision_operation_id, decision_request_hash
+                   FROM candidate_memories WHERE id = ?""",
+                (candidate_id,),
+            ).fetchone()
+            if row == (operation_id, decision_hash):
+                return self.candidate_governance(candidate_id)
+            raise CandidateGovernanceError("candidate has already received a final decision")
+        current = self.read_document(str(candidate["library_id"]), target_path)
+        resolution_snapshot = self._snapshot_candidate_resolution(candidate_id)
+        if action == "keep":
+            note = (
+                str(current["content"]).rstrip()
+                + "\n\n## Conflict decision\n"
+                + f"- Kept current memory; candidate {candidate_id} was rejected: {reason}\n"
+            )
+
+            def record_keep(response: dict[str, str]) -> None:
+                self._record_candidate_resolution(
+                    candidate,
+                    operator,
+                    reason,
+                    operation_id,
+                    decision_hash,
+                    "rejected",
+                    action,
+                    response["path"],
+                    response["commit"],
+                    None,
+                    None,
+                )
+
+            self._mutate_document(
+                str(candidate["library_id"]),
+                target_path,
+                note,
+                str(current["source_version"]),
+                operation_id,
+                "user",
+                f"candidate-resolution:{operator}",
+                "edit",
+                f"Keep current memory over candidate {candidate_id}",
+                record_keep,
+                lambda: self._restore_candidate_resolution(resolution_snapshot),
+            )
+            return self.candidate_governance(candidate_id)
+
+        path = f"memory-{candidate_id}.md" if action == "scope" else target_path
+        publication = dict(candidate)
+        publication["body"] = body
+        content = self._published_candidate_markdown(publication, operator, reason)
+        old_version_id = hashlib.sha256(
+            f"{candidate['library_id']}\0{target_path}\0{current['source_version']}".encode()
+        ).hexdigest()
+        governance_metadata: list[str] = []
+        if action in {"adopt", "merge"}:
+            governance_metadata.extend(
+                (
+                    f"supersedes: {json.dumps(old_version_id)}",
+                    f"effective_at: {json.dumps(effective_at)}",
+                )
+            )
+        if action == "scope":
+            governance_metadata.append(
+                f"applicability_condition: {json.dumps(condition, ensure_ascii=False)}"
+            )
+        content = content.replace(
+            "---\n", "---\n" + "\n".join(governance_metadata) + "\n", 1
+        )
+
+        def record_publication(response: dict[str, str]) -> None:
+            self._record_candidate_resolution(
+                candidate,
+                operator,
+                reason,
+                operation_id,
+                decision_hash,
+                "approved",
+                action,
+                response["path"],
+                response["commit"],
+                effective_at,
+                condition,
+            )
+            new_version = self.connection_or_raise.execute(
+                """SELECT version_id FROM memory_versions
+                   WHERE library_id = ? AND path = ? AND source_version = ?""",
+                (candidate["library_id"], response["path"], response["source_version"]),
+            ).fetchone()
+            old_version = self.connection_or_raise.execute(
+                """SELECT version_id FROM memory_versions
+                   WHERE library_id = ? AND path = ? AND source_version = ?""",
+                (candidate["library_id"], target_path, current["source_version"]),
+            ).fetchone()
+            if new_version is None or old_version is None:
+                raise CandidateGovernanceError("memory version chain could not be recorded")
+            if action == "scope":
+                assert condition is not None
+                self.connection_or_raise.execute(
+                    """UPDATE memory_versions SET state = 'conditional', condition_text = ?,
+                              candidate_id = ?, commit_id = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE version_id = ?""",
+                    (condition.strip(), candidate_id, response["commit"], str(new_version[0])),
+                )
+            else:
+                self.connection_or_raise.execute(
+                    """UPDATE memory_versions SET state = 'superseded',
+                              updated_at = CURRENT_TIMESTAMP WHERE version_id = ?""",
+                    (str(old_version[0]),),
+                )
+                self.connection_or_raise.execute(
+                    """UPDATE memory_versions SET supersedes_version_id = ?, effective_at = ?,
+                              candidate_id = ?, commit_id = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE version_id = ?""",
+                    (
+                        str(old_version[0]),
+                        effective_at,
+                        candidate_id,
+                        response["commit"],
+                        str(new_version[0]),
+                    ),
+                )
+
+        if action == "scope":
+            self._publish_document(
+                str(candidate["library_id"]),
+                path,
+                content,
+                operation_id,
+                operator,
+                f"candidate-resolution:{action}",
+                f"Resolve candidate {candidate_id} by {action}",
+                record_publication,
+                compensate_committed_state=lambda: self._restore_candidate_resolution(
+                    resolution_snapshot
+                ),
+            )
+        else:
+            self._mutate_document(
+                str(candidate["library_id"]),
+                path,
+                content,
+                str(current["source_version"]),
+                operation_id,
+                "user",
+                f"candidate-resolution:{operator}",
+                "edit",
+                f"Resolve candidate {candidate_id} by {action}",
+                record_publication,
+                lambda: self._restore_candidate_resolution(resolution_snapshot),
+            )
+        return self.candidate_governance(candidate_id)
+
+    def _record_candidate_resolution(
+        self,
+        candidate: dict[str, object],
+        operator: str,
+        reason: str,
+        operation_id: str,
+        decision_hash: str,
+        status: str,
+        resolution: str,
+        path: str,
+        commit: str,
+        effective_at: str | None,
+        condition: str | None,
+    ) -> None:
+        updated = self.connection_or_raise.execute(
+            """UPDATE candidate_memories SET status = ?, operator = ?, reason = ?,
+                      reviewed_at = CURRENT_TIMESTAMP, published_path = ?, commit_id = ?,
+                      decision_operation_id = ?, decision_request_hash = ?,
+                      updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'""",
+            (status, operator, reason, path, commit, operation_id, decision_hash, candidate["id"]),
+        )
+        if updated.rowcount != 1:
+            raise CandidateGovernanceError("candidate is no longer pending")
+        self.connection_or_raise.execute(
+            """UPDATE candidate_governance SET resolution = ?, effective_at = ?,
+                      condition_text = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE candidate_id = ?""",
+            (resolution, effective_at, condition, candidate["id"]),
+        )
+        self.connection_or_raise.execute(
+            """INSERT INTO candidate_audit
+               (candidate_id, action, operator, reason, body) VALUES (?, ?, ?, ?, ?)""",
+            (
+                candidate["id"],
+                "approved" if status == "approved" else "rejected",
+                operator,
+                reason,
+                candidate["body"],
+            ),
+        )
+
+    @staticmethod
+    def _governance_resolution_hash(
+        candidate_id: str,
+        action: str,
+        body: str,
+        operator: str,
+        reason: str,
+        effective_at: str | None,
+        condition: str | None,
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "candidate_id": candidate_id,
+                    "action": action,
+                    "body": body,
+                    "operator": operator,
+                    "reason": reason,
+                    "effective_at": effective_at,
+                    "condition": condition,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _validated_effective_at(value: str | None) -> str:
+        if value is None:
+            return datetime.now(UTC).isoformat()
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise CandidateGovernanceError("effective_at must be an ISO-8601 timestamp") from error
+        if parsed.tzinfo is None:
+            raise CandidateGovernanceError("effective_at must include a timezone")
+        if parsed.astimezone(UTC) > datetime.now(UTC):
+            raise CandidateGovernanceError("effective_at cannot be in the future")
+        return parsed.isoformat()
+
     def _auto_promotion_blockers(
         self,
         candidate: dict[str, object],
@@ -1540,8 +2124,12 @@ class PlatformState:
     ) -> tuple[str, ...]:
         blockers: list[str] = []
         if candidate["suggested_type"] not in {
-            "preference", "decision", "constraint", "domain_fact",
-            "reusable_experience", "external_reference",
+            "preference",
+            "decision",
+            "constraint",
+            "domain_fact",
+            "reusable_experience",
+            "external_reference",
         }:
             blockers.append("type")
         if extracted.get("evidence_kind") != "user_confirmed" or not self._user_confirms_fact(
@@ -1586,9 +2174,7 @@ class PlatformState:
         return tuple(blockers)
 
     @staticmethod
-    def _valid_capture_sources(
-        candidate: dict[str, object], session_id: str, turn_id: str
-    ) -> bool:
+    def _valid_capture_sources(candidate: dict[str, object], session_id: str, turn_id: str) -> bool:
         references = cast(tuple[str, ...], candidate["source_references"])
         prefix = f"capture:{session_id}:{turn_id}:"
         return len(references) == 2 and all(
@@ -1597,48 +2183,63 @@ class PlatformState:
 
     @staticmethod
     def _governance_text(content: str) -> str:
-        meaningful = " ".join(
-            line for line in content.casefold().splitlines() if not line.lstrip().startswith("#")
-        )
+        lines = content.casefold().splitlines()
+        if lines and lines[0].strip() == "---":
+            with suppress(ValueError):
+                lines = lines[lines.index("---", 1) + 1 :]
+        meaningful_lines: list[str] = []
+        for line in lines:
+            if line.strip() in {"## additional provenance", "## conflict decision"}:
+                break
+            if not line.lstrip().startswith("#"):
+                meaningful_lines.append(line)
+        meaningful = " ".join(meaningful_lines)
         return " ".join(meaningful.split())
 
-    def _candidate_conflicts_with_library(self, candidate: dict[str, object]) -> bool:
-        proposed = self._governance_text(str(candidate["body"]))
+    def _candidate_conflict_path(self, library_id: str, body: str) -> str | None:
+        proposed = self._governance_text(body)
         current_documents = tuple(
-            self._governance_text(str(row[0]))
+            (str(row[0]), self._governance_text(str(row[1])))
             for row in self.connection_or_raise.execute(
-                "SELECT content FROM memory_chunks WHERE library_id = ?",
-                (candidate["library_id"],),
+                """SELECT path, GROUP_CONCAT(content, '\n')
+                   FROM memory_chunks WHERE library_id = ? GROUP BY path ORDER BY path""",
+                (library_id,),
             )
         )
         instead = proposed.partition(" instead of ")
-        if instead[1] and instead[2] and any(
-            instead[2] in current for current in current_documents
-        ):
-            return True
+        if instead[1] and instead[2]:
+            for path, current in current_documents:
+                if instead[2] in current:
+                    return path
         proposed_facts = self._governance_facts(proposed)
-        for current in current_documents:
+        for path, current in current_documents:
             for proposed_fact in proposed_facts:
                 if any(
                     proposed_fact.relation == current_fact.relation
                     and proposed_fact.value != current_fact.value
-                    and self._scopes_may_conflict(
-                        proposed_fact.scope, current_fact.scope
-                    )
+                    and self._scopes_may_conflict(proposed_fact.scope, current_fact.scope)
                     for current_fact in self._governance_facts(current)
                 ):
-                    return True
+                    return path
         for marker in ("must not ", "never ", "禁止", "不得"):
             if marker in proposed:
                 remainder = proposed.partition(marker)[2].strip(" .")
                 positive = marker.strip() in {"must not", "never"}
-                if remainder and any(
-                    (positive and f"must {remainder}" in current)
-                    or (not positive and remainder in current)
-                    for current in current_documents
-                ):
-                    return True
-        return False
+                if remainder:
+                    for path, current in current_documents:
+                        if (positive and f"must {remainder}" in current) or (
+                            not positive and remainder in current
+                        ):
+                            return path
+        return None
+
+    def _candidate_conflicts_with_library(self, candidate: dict[str, object]) -> bool:
+        return (
+            self._candidate_conflict_path(
+                str(candidate["library_id"]), str(candidate["body"])
+            )
+            is not None
+        )
 
     @classmethod
     def _governance_facts(cls, content: str) -> tuple[GovernanceFact, ...]:
@@ -1687,8 +2288,17 @@ class PlatformState:
             "fixtures": "fixture",
         }
         ignored = {
-            "a", "an", "the", "our", "we", "remember", "confirmed", "decided",
-            "decision", "to", "that",
+            "a",
+            "an",
+            "the",
+            "our",
+            "we",
+            "remember",
+            "confirmed",
+            "decided",
+            "decision",
+            "to",
+            "that",
         }
         return frozenset(
             aliases.get(token, token)
@@ -1703,23 +2313,27 @@ class PlatformState:
         if left == right:
             return True
         generic_scopes = {"broker", "cache", "database", "queue", "service", "store"}
-        return (
-            len(left) == 1
-            and left <= generic_scopes
-            and left <= right
-        ) or (
-            len(right) == 1
-            and right <= generic_scopes
-            and right <= left
+        return (len(left) == 1 and left <= generic_scopes and left <= right) or (
+            len(right) == 1 and right <= generic_scopes and right <= left
         )
 
     @staticmethod
     def _library_policy_allows(candidate: dict[str, object]) -> bool:
         content = str(candidate["body"]).casefold()
         transient_markers = (
-            "task progress", "temporary plan", "one-off output", "unverified",
-            "speculation", "guess", "todo", "work in progress", "任务进度",
-            "临时计划", "一次性输出", "未验证", "猜测",
+            "task progress",
+            "temporary plan",
+            "one-off output",
+            "unverified",
+            "speculation",
+            "guess",
+            "todo",
+            "work in progress",
+            "任务进度",
+            "临时计划",
+            "一次性输出",
+            "未验证",
+            "猜测",
         )
         number_unit = r"(?:one|two|three|four|five|six|seven|eight|nine)"
         number_small = (
@@ -1815,8 +2429,20 @@ class PlatformState:
         if "?" in normalized or "？" in normalized:
             return False
         indicators = (
-            "remember", "confirmed", "we decided", "i decided", "must ", "always ",
-            "prefer", "记住", "确认", "决定", "必须", "始终", "偏好", "采用",
+            "remember",
+            "confirmed",
+            "we decided",
+            "i decided",
+            "must ",
+            "always ",
+            "prefer",
+            "记住",
+            "确认",
+            "决定",
+            "必须",
+            "始终",
+            "偏好",
+            "采用",
         )
         confirmation_segments = tuple(
             segment
@@ -1826,12 +2452,48 @@ class PlatformState:
         if not confirmation_segments:
             return False
         ignored = {
-            "adopt", "always", "captured", "confirmed", "decided", "decision", "remember", "must",
-            "prefer", "preference", "should", "this", "that", "with", "from", "into",
-            "have", "will", "would", "could", "about", "using", "use", "used", "user",
-            "project", "system", "application", "memory", "fact", "constraint", "external",
-            "database", "service", "technology", "tool", "framework", "option", "recommend",
-            "suggest", "assistant", "please",
+            "adopt",
+            "always",
+            "captured",
+            "confirmed",
+            "decided",
+            "decision",
+            "remember",
+            "must",
+            "prefer",
+            "preference",
+            "should",
+            "this",
+            "that",
+            "with",
+            "from",
+            "into",
+            "have",
+            "will",
+            "would",
+            "could",
+            "about",
+            "using",
+            "use",
+            "used",
+            "user",
+            "project",
+            "system",
+            "application",
+            "memory",
+            "fact",
+            "constraint",
+            "external",
+            "database",
+            "service",
+            "technology",
+            "tool",
+            "framework",
+            "option",
+            "recommend",
+            "suggest",
+            "assistant",
+            "please",
         }
 
         def terms(value: str) -> set[str]:
@@ -1860,9 +2522,7 @@ class PlatformState:
             if (segment_terms := terms(segment))
         )
 
-        def proposition_is_confirmed(
-            proposition: str, proposition_terms: set[str]
-        ) -> bool:
+        def proposition_is_confirmed(proposition: str, proposition_terms: set[str]) -> bool:
             candidate_facts = PlatformState._governance_facts(proposition)
             if not candidate_facts:
                 return any(
@@ -1877,9 +2537,7 @@ class PlatformState:
                         candidate_fact.scope, confirmation_fact.scope
                     )
                     for confirmation in confirmation_segments
-                    for confirmation_fact in PlatformState._governance_facts(
-                        confirmation
-                    )
+                    for confirmation_fact in PlatformState._governance_facts(confirmation)
                 )
                 for candidate_fact in candidate_facts
             ):
@@ -1892,8 +2550,7 @@ class PlatformState:
             )
             unconsumed_terms = proposition_terms - represented_terms
             return not unconsumed_terms or any(
-                unconsumed_terms <= terms(confirmation)
-                for confirmation in confirmation_segments
+                unconsumed_terms <= terms(confirmation) for confirmation in confirmation_segments
             )
 
         return bool(candidate_propositions) and all(
@@ -1912,9 +2569,12 @@ class PlatformState:
         self._validate_operation_identifier(operation_id, "operation_id")
         self._ensure_decision_operation_available(candidate_id, operation_id)
         current = self.candidate(candidate_id)
-        if inspect_sensitive_text(
-            "\n".join((str(current["body"]), operator, reason, operation_id))
-        ) is not None:
+        if (
+            inspect_sensitive_text(
+                "\n".join((str(current["body"]), operator, reason, operation_id))
+            )
+            is not None
+        ):
             raise CandidateGovernanceError("candidate content requires sensitive review")
         decision_hash = self._decision_request_hash(
             candidate_id, "rejected", str(current["body"]), operator, reason
@@ -1973,9 +2633,7 @@ class PlatformState:
         if not source_references or any(
             not reference.strip() or len(reference) > 2_000 for reference in source_references
         ):
-            raise CandidateGovernanceError(
-                "candidate must contain non-empty source references"
-            )
+            raise CandidateGovernanceError("candidate must contain non-empty source references")
         if not creator.strip() or len(creator) > 200:
             raise CandidateGovernanceError("creator must be present and at most 200 characters")
         return normalized_type
@@ -1990,9 +2648,7 @@ class PlatformState:
     @staticmethod
     def _validate_operation_identifier(value: str, field: str) -> None:
         if not value.strip() or len(value) > 200:
-            raise CandidateGovernanceError(
-                f"{field} must be present and at most 200 characters"
-            )
+            raise CandidateGovernanceError(f"{field} must be present and at most 200 characters")
 
     @staticmethod
     def _candidate_request_hash(
@@ -2080,9 +2736,7 @@ class PlatformState:
             and audits == [(operator, reason, current["body"])]
         )
 
-    def _ensure_decision_operation_available(
-        self, candidate_id: str, operation_id: str
-    ) -> None:
+    def _ensure_decision_operation_available(self, candidate_id: str, operation_id: str) -> None:
         row = self.connection_or_raise.execute(
             "SELECT id FROM candidate_memories WHERE decision_operation_id = ?",
             (operation_id,),
@@ -2256,6 +2910,8 @@ class PlatformState:
         source: str,
         kind: str,
         message: str,
+        before_commit: Callable[[dict[str, str]], None] | None = None,
+        compensate_committed_state: Callable[[], None] | None = None,
     ) -> dict[str, str]:
         if not operation_id.strip() or len(operation_id) > 200:
             raise MemoryMutationError("operation_id must be present and at most 200 characters")
@@ -2298,9 +2954,7 @@ class PlatformState:
             ).fetchone()
             if existing is not None:
                 if str(existing[1]) != request_hash:
-                    raise MemoryMutationError(
-                        "operation_id was already used for another mutation"
-                    )
+                    raise MemoryMutationError("operation_id was already used for another mutation")
                 return {str(key): str(value) for key, value in json.loads(str(existing[0])).items()}
             normalized, indexed_version = self._document_record(library_id, path)
             if indexed_version != expected_source_version:
@@ -2311,9 +2965,7 @@ class PlatformState:
                 try:
                     original = original_bytes.decode("utf-8")
                 except UnicodeError as error:
-                    raise MemoryMutationError(
-                        f"memory document cannot be read: {error}"
-                    ) from error
+                    raise MemoryMutationError(f"memory document cannot be read: {error}") from error
                 actual_version = hashlib.sha256(original_bytes).hexdigest()
                 if actual_version != indexed_version:
                     raise MemoryMutationError(
@@ -2351,18 +3003,14 @@ class PlatformState:
                     )
                     replacement_identity = replacement.identity
                     if replacement_identity is None:
-                        raise MemoryMutationError(
-                            "document replacement identity is unavailable"
-                        )
+                        raise MemoryMutationError("document replacement identity is unavailable")
                     expected_scan = self._updated_library_scan(
                         trusted_scan,
                         normalized,
                         content,
                         replacement_identity,
                     )
-                    self._verify_bound_document(
-                        root, normalized, bound, replacement_identity
-                    )
+                    self._verify_bound_document(root, normalized, bound, replacement_identity)
                     observed_content, read_identity = self._read_bound_document(bound)
                     if (
                         read_identity != replacement_identity
@@ -2372,22 +3020,27 @@ class PlatformState:
                             "document changed while the platform was saving it"
                         )
                     commit = repository.commit({normalized: platform_content}, message)
-                    self._verify_bound_document(
-                        root, normalized, bound, replacement_identity
-                    )
+                    self._verify_bound_document(root, normalized, bound, replacement_identity)
                     scan = self._scan_bound_library(root, bound, library_id)
                     self._require_matching_scan(scan, expected_scan)
                     self._verify_bound_library_scan(root, bound, library_id, scan)
                     self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                    original_version_id = hashlib.sha256(
+                        f"{library_id}\0{normalized}\0{indexed_version}".encode()
+                    ).hexdigest()
+                    self.connection_or_raise.execute(
+                        """INSERT OR IGNORE INTO memory_versions
+                           (version_id, library_id, path, source_version, content)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (original_version_id, library_id, normalized, indexed_version, original),
+                    )
                     self.scan_library(
                         library_id,
                         participate_in_transaction=True,
                         frozen_scan=scan,
                     )
                     self._verify_bound_library_scan(root, bound, library_id, scan)
-                    self._verify_bound_document(
-                        root, normalized, bound, replacement_identity
-                    )
+                    self._verify_bound_document(root, normalized, bound, replacement_identity)
                     updated = self._document_record(library_id, normalized)[1]
                     expected_updated = hashlib.sha256(platform_content).hexdigest()
                     if updated != expected_updated:
@@ -2418,16 +3071,14 @@ class PlatformState:
                             json.dumps(response, sort_keys=True),
                         ),
                     )
-                    self._verify_bound_document(
-                        root, normalized, bound, replacement_identity
-                    )
+                    if before_commit is not None:
+                        before_commit(response)
+                    self._verify_bound_document(root, normalized, bound, replacement_identity)
                     self._verify_bound_library_scan(root, bound, library_id, scan)
                     self.connection_or_raise.commit()
                     database_committed = True
                     self._verify_bound_library_scan(root, bound, library_id, scan)
-                    self._verify_bound_document(
-                        root, normalized, bound, replacement_identity
-                    )
+                    self._verify_bound_document(root, normalized, bound, replacement_identity)
                     return response
                 except BaseException as error:
                     self.connection_or_raise.rollback()
@@ -2441,6 +3092,8 @@ class PlatformState:
                                 (operation_id,),
                             )
                             self._restore_library_index(library_id, index_snapshot)
+                            if compensate_committed_state is not None:
+                                compensate_committed_state()
                             self.connection_or_raise.commit()
                         except BaseException as compensation_error:
                             self.connection_or_raise.rollback()
@@ -2478,19 +3131,15 @@ class PlatformState:
                             )
                     except (MemoryMutationError, OSError) as compensation_error:
                         compensation_conflicts.append(
-                            "concurrent external file state preserved: "
-                            f"{compensation_error}"
+                            f"concurrent external file state preserved: {compensation_error}"
                         )
                     if compensation_errors or compensation_conflicts:
                         details = []
                         if compensation_errors:
-                            details.append(
-                                "compensation failed: " + "; ".join(compensation_errors)
-                            )
+                            details.append("compensation failed: " + "; ".join(compensation_errors))
                         if compensation_conflicts:
                             details.append(
-                                "compensation conflict: "
-                                + "; ".join(compensation_conflicts)
+                                "compensation conflict: " + "; ".join(compensation_conflicts)
                             )
                         raise MemoryMutationError(f"{error}; {'; '.join(details)}") from error
                     if isinstance(
@@ -2501,9 +3150,7 @@ class PlatformState:
                     raise
 
     @staticmethod
-    def _publication_request_hash(
-        library_id: str, path: str, content: str, source: str
-    ) -> str:
+    def _publication_request_hash(library_id: str, path: str, content: str, source: str) -> str:
         return hashlib.sha256(
             json.dumps(
                 {
@@ -2539,9 +3186,7 @@ class PlatformState:
         if "\x00" in content:
             raise MemoryMutationError("Markdown content cannot contain NUL bytes")
         self._ensure_markdown_has_no_sensitive_content(content)
-        request_hash = self._publication_request_hash(
-            library_id, normalized, content, source
-        )
+        request_hash = self._publication_request_hash(library_id, normalized, content, source)
         existing = self.connection_or_raise.execute(
             "SELECT response_json, request_hash FROM memory_operations WHERE operation_id = ?",
             (operation_id,),
@@ -2560,17 +3205,15 @@ class PlatformState:
             ).fetchone()
             if existing is not None:
                 if str(existing[1]) != request_hash:
-                    raise MemoryMutationError(
-                        "operation_id was already used for another mutation"
-                    )
-                return {
-                    str(key): str(value)
-                    for key, value in json.loads(str(existing[0])).items()
-                }
-            if self.connection_or_raise.execute(
-                "SELECT 1 FROM memory_documents WHERE library_id = ? AND path = ?",
-                (library_id, normalized),
-            ).fetchone() is not None:
+                    raise MemoryMutationError("operation_id was already used for another mutation")
+                return {str(key): str(value) for key, value in json.loads(str(existing[0])).items()}
+            if (
+                self.connection_or_raise.execute(
+                    "SELECT 1 FROM memory_documents WHERE library_id = ? AND path = ?",
+                    (library_id, normalized),
+                ).fetchone()
+                is not None
+            ):
                 raise MemoryMutationError("memory document already exists")
             root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             descriptor = -1
@@ -2656,9 +3299,7 @@ class PlatformState:
                     )
                 commit = repository.commit({normalized: platform_content}, message)
                 self.connection_or_raise.execute("BEGIN IMMEDIATE")
-                self.scan_library(
-                    library_id, participate_in_transaction=True, frozen_scan=scan
-                )
+                self.scan_library(library_id, participate_in_transaction=True, frozen_scan=scan)
                 updated = self._document_record(library_id, normalized)[1]
                 response = {
                     "library_id": library_id,
@@ -2699,8 +3340,7 @@ class PlatformState:
                         repository,
                     )
                     if persisted is not None and (
-                        committed_state_is_valid is None
-                        or committed_state_is_valid(persisted)
+                        committed_state_is_valid is None or committed_state_is_valid(persisted)
                     ):
                         return persisted
                 compensation_errors: list[str] = []
@@ -2726,9 +3366,9 @@ class PlatformState:
                             "DELETE FROM memory_operations WHERE operation_id = ?",
                             (operation_id,),
                         )
+                        self._restore_library_index(library_id, index_snapshot)
                         if compensate_committed_state is not None:
                             compensate_committed_state()
-                        self._restore_library_index(library_id, index_snapshot)
                         self.connection_or_raise.commit()
                     except BaseException as compensation_error:
                         self.connection_or_raise.rollback()
@@ -2847,9 +3487,7 @@ class PlatformState:
             )
 
         repository = GitRepository(git_dir=git_dir, work_tree=root)
-        initialization = repository.initialize(
-            library_id, documents, verify_frozen_documents
-        )
+        initialization = repository.initialize(library_id, documents, verify_frozen_documents)
         return repository, initialization, mode
 
     def _verify_registration_tree(
@@ -2867,18 +3505,12 @@ class PlatformState:
                 raise GitHistoryError("memory library changed during registration")
         finally:
             os.close(descriptor)
-        current = scan_markdown_fd(
-            root_fd, root, (), (self.database_path.parent,)
-        )
+        current = scan_markdown_fd(root_fd, root, (), (self.database_path.parent,))
         expected_identities = expected.identities
         current_identities = current.identities
         manifest_path = ".personal-agent-memory.json"
-        expected_manifest = tuple(
-            item for item in expected_identities if item[0] == manifest_path
-        )
-        current_manifest = tuple(
-            item for item in current_identities if item[0] == manifest_path
-        )
+        expected_manifest = tuple(item for item in expected_identities if item[0] == manifest_path)
+        current_manifest = tuple(item for item in current_identities if item[0] == manifest_path)
         if allowed_manifest is None or expected_manifest:
             manifest_matches = current_manifest == expected_manifest
         else:
@@ -2919,9 +3551,7 @@ class PlatformState:
                 )
                 os.close(parent_fd)
                 parent_fd = child
-            descriptor = os.open(
-                parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd
-            )
+            descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
             try:
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISREG(metadata.st_mode):
@@ -2933,9 +3563,7 @@ class PlatformState:
             finally:
                 os.close(descriptor)
         except OSError as error:
-            raise MemoryMutationError(
-                f"memory library entry cannot be read: {error}"
-            ) from error
+            raise MemoryMutationError(f"memory library entry cannot be read: {error}") from error
         finally:
             os.close(parent_fd)
 
@@ -3150,12 +3778,8 @@ class PlatformState:
             raise MemoryMutationError("memory library changed while the platform was saving it")
 
     @staticmethod
-    def _read_bound_name(
-        bound: BoundDocument, name: str
-    ) -> tuple[bytes, tuple[int, int]]:
-        descriptor = os.open(
-            name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=bound.parent_fd
-        )
+    def _read_bound_name(bound: BoundDocument, name: str) -> tuple[bytes, tuple[int, int]]:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=bound.parent_fd)
         try:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
@@ -3210,9 +3834,7 @@ class PlatformState:
                 nonlocal remove_temporary
                 remove_temporary = False
                 try:
-                    _rename_exchange(
-                        bound.parent_fd, temporary, bound.parent_fd, bound.name
-                    )
+                    _rename_exchange(bound.parent_fd, temporary, bound.parent_fd, bound.name)
                 except OSError as error:
                     raise MemoryMutationError(
                         "compensation conflict: atomic replacement rollback failed; "
@@ -3232,30 +3854,20 @@ class PlatformState:
                 )
             except (MemoryMutationError, OSError):
                 roll_back_exchange()
-            if (
-                exchanged_identity != expected_identity
-                or exchanged_content != expected_content
-            ):
+            if exchanged_identity != expected_identity or exchanged_content != expected_content:
                 roll_back_exchange()
             replacement.expected_target_exchanged = True
             os.unlink(temporary, dir_fd=bound.parent_fd)
             remove_temporary = False
             os.fsync(bound.parent_fd)
-            replaced_metadata = os.stat(
-                bound.name, dir_fd=bound.parent_fd, follow_symlinks=False
-            )
+            replaced_metadata = os.stat(bound.name, dir_fd=bound.parent_fd, follow_symlinks=False)
             if (
                 not stat.S_ISREG(replaced_metadata.st_mode)
-                or (replaced_metadata.st_dev, replaced_metadata.st_ino)
-                != temporary_identity
+                or (replaced_metadata.st_dev, replaced_metadata.st_ino) != temporary_identity
             ):
-                raise MemoryMutationError(
-                    "document changed while the platform was saving it"
-                )
+                raise MemoryMutationError("document changed while the platform was saving it")
         except OSError as error:
-            raise MemoryMutationError(
-                f"memory document cannot be replaced: {error}"
-            ) from error
+            raise MemoryMutationError(f"memory document cannot be replaced: {error}") from error
         finally:
             if remove_temporary:
                 with suppress(FileNotFoundError):
@@ -3286,13 +3898,10 @@ class PlatformState:
             parent_metadata = os.fstat(parent_fd)
             if (parent_metadata.st_dev, parent_metadata.st_ino) != bound.parent_identity:
                 raise MemoryMutationError("document parent changed while saving")
-            document_metadata = os.stat(
-                bound.name, dir_fd=parent_fd, follow_symlinks=False
-            )
+            document_metadata = os.stat(bound.name, dir_fd=parent_fd, follow_symlinks=False)
             if (
                 not stat.S_ISREG(document_metadata.st_mode)
-                or (document_metadata.st_dev, document_metadata.st_ino)
-                != expected_identity
+                or (document_metadata.st_dev, document_metadata.st_ino) != expected_identity
             ):
                 raise MemoryMutationError("document changed while the platform was saving it")
         except OSError as error:
@@ -3344,11 +3953,58 @@ class PlatformState:
                 (library_id,),
             )
         )
-        return LibraryIndexSnapshot(sync_status, documents, chunks, searches, vectors)
+        versions = tuple(
+            connection.execute(
+                """SELECT version_id, library_id, path, source_version, content, state,
+                          supersedes_version_id, commit_id, effective_at, condition_text,
+                          candidate_id, updated_at
+                   FROM memory_versions WHERE library_id = ? ORDER BY version_id""",
+                (library_id,),
+            )
+        )
+        vector_indexes = tuple(
+            connection.execute(
+                "SELECT library_id, model, dimension, updated_at "
+                "FROM memory_vector_indexes WHERE library_id = ?",
+                (library_id,),
+            )
+        )
+        graph_indexes = tuple(
+            connection.execute(
+                "SELECT library_id, status, total_documents, projected_documents, "
+                "last_error, updated_at FROM memory_graph_indexes WHERE library_id = ?",
+                (library_id,),
+            )
+        )
+        graph_documents = tuple(
+            connection.execute(
+                "SELECT library_id, document_id, path, source_version "
+                "FROM memory_graph_documents WHERE library_id = ? ORDER BY document_id",
+                (library_id,),
+            )
+        )
+        rebuild_jobs = tuple(
+            connection.execute(
+                "SELECT id, kind, payload, status, attempts, available_at, created_at "
+                "FROM background_jobs WHERE kind IN ('vector_rebuild', 'graph_rebuild') "
+                "AND json_extract(payload, '$.library_id') = ? ORDER BY id",
+                (library_id,),
+            )
+        )
+        return LibraryIndexSnapshot(
+            sync_status,
+            documents,
+            chunks,
+            searches,
+            vectors,
+            versions,
+            vector_indexes,
+            graph_indexes,
+            graph_documents,
+            rebuild_jobs,
+        )
 
-    def _restore_library_index(
-        self, library_id: str, snapshot: LibraryIndexSnapshot
-    ) -> None:
+    def _restore_library_index(self, library_id: str, snapshot: LibraryIndexSnapshot) -> None:
         connection = self.connection_or_raise
         chunk_ids = tuple(
             str(row[0])
@@ -3384,9 +4040,98 @@ class PlatformState:
             "VALUES (?, ?, ?, ?, ?, ?)",
             snapshot.vectors,
         )
+        connection.execute("DELETE FROM memory_versions WHERE library_id = ?", (library_id,))
+        connection.executemany(
+            """INSERT INTO memory_versions
+               (version_id, library_id, path, source_version, content, state,
+                supersedes_version_id, commit_id, effective_at, condition_text,
+                candidate_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            snapshot.versions,
+        )
+        connection.execute("DELETE FROM memory_vector_indexes WHERE library_id = ?", (library_id,))
+        connection.executemany(
+            "INSERT INTO memory_vector_indexes (library_id, model, dimension, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            snapshot.vector_indexes,
+        )
+        connection.execute("DELETE FROM memory_graph_documents WHERE library_id = ?", (library_id,))
+        connection.executemany(
+            "INSERT INTO memory_graph_documents (library_id, document_id, path, source_version) "
+            "VALUES (?, ?, ?, ?)",
+            snapshot.graph_documents,
+        )
+        connection.execute("DELETE FROM memory_graph_indexes WHERE library_id = ?", (library_id,))
+        connection.executemany(
+            "INSERT INTO memory_graph_indexes "
+            "(library_id, status, total_documents, projected_documents, last_error, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            snapshot.graph_indexes,
+        )
+        connection.execute(
+            "DELETE FROM background_jobs WHERE kind IN ('vector_rebuild', 'graph_rebuild') "
+            "AND json_extract(payload, '$.library_id') = ?",
+            (library_id,),
+        )
+        connection.executemany(
+            "INSERT INTO background_jobs "
+            "(id, kind, payload, status, attempts, available_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            snapshot.rebuild_jobs,
+        )
         connection.execute(
             "UPDATE memory_libraries SET sync_status = ? WHERE id = ?",
             (snapshot.sync_status, library_id),
+        )
+
+    def _snapshot_candidate_resolution(self, candidate_id: str) -> CandidateResolutionSnapshot:
+        candidate = self.connection_or_raise.execute(
+            "SELECT * FROM candidate_memories WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        governance = self.connection_or_raise.execute(
+            "SELECT * FROM candidate_governance WHERE candidate_id = ?", (candidate_id,)
+        ).fetchone()
+        if candidate is None or governance is None:
+            raise CandidateGovernanceError("candidate governance case not found")
+        audit = tuple(
+            self.connection_or_raise.execute(
+                "SELECT * FROM candidate_audit WHERE candidate_id = ? ORDER BY id",
+                (candidate_id,),
+            )
+        )
+        return CandidateResolutionSnapshot(tuple(candidate), tuple(governance), audit)
+
+    def _restore_candidate_resolution(self, snapshot: CandidateResolutionSnapshot) -> None:
+        connection = self.connection_or_raise
+        candidate_columns = tuple(
+            str(row[1]) for row in connection.execute("PRAGMA table_info(candidate_memories)")
+        )
+        governance_columns = tuple(
+            str(row[1]) for row in connection.execute("PRAGMA table_info(candidate_governance)")
+        )
+        audit_columns = tuple(
+            str(row[1]) for row in connection.execute("PRAGMA table_info(candidate_audit)")
+        )
+        candidate_id = str(snapshot.candidate[0])
+        connection.execute("DELETE FROM candidate_audit WHERE candidate_id = ?", (candidate_id,))
+        connection.execute(
+            "DELETE FROM candidate_governance WHERE candidate_id = ?", (candidate_id,)
+        )
+        connection.execute("DELETE FROM candidate_memories WHERE id = ?", (candidate_id,))
+        connection.execute(
+            f"INSERT INTO candidate_memories ({', '.join(candidate_columns)}) "
+            f"VALUES ({', '.join('?' for _ in candidate_columns)})",  # noqa: S608
+            snapshot.candidate,
+        )
+        connection.execute(
+            f"INSERT INTO candidate_governance ({', '.join(governance_columns)}) "
+            f"VALUES ({', '.join('?' for _ in governance_columns)})",  # noqa: S608
+            snapshot.governance,
+        )
+        connection.executemany(
+            f"INSERT INTO candidate_audit ({', '.join(audit_columns)}) "
+            f"VALUES ({', '.join('?' for _ in audit_columns)})",  # noqa: S608
+            snapshot.audit,
         )
 
     @staticmethod
@@ -3442,12 +4187,14 @@ class PlatformState:
                 yield
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
     async def search_project(
         self,
         requested_cwd: str,
         query: str,
         limit: int = 10,
         max_graph_hops: int = 1,
+        include_history: bool = False,
     ) -> dict[str, object]:
         if not query.strip():
             raise ValueError("search query must not be empty")
@@ -3464,6 +4211,7 @@ class PlatformState:
             query,
             limit,
             max_graph_hops,
+            include_history,
             scope={
                 "kind": "project_cwd",
                 "cwd": requested_cwd,
@@ -3478,6 +4226,7 @@ class PlatformState:
         query: str,
         limit: int = 10,
         max_graph_hops: int = 1,
+        include_history: bool = False,
     ) -> dict[str, object]:
         if not query.strip():
             raise ValueError("search query must not be empty")
@@ -3489,6 +4238,7 @@ class PlatformState:
             query,
             limit,
             max_graph_hops,
+            include_history,
             scope={"kind": "explicit_library", "library_id": library.id},
         )
 
@@ -3498,6 +4248,7 @@ class PlatformState:
         query: str,
         limit: int,
         max_graph_hops: int,
+        include_history: bool,
         *,
         scope: dict[str, object],
     ) -> dict[str, object]:
@@ -3522,11 +4273,14 @@ class PlatformState:
         keyword = query.strip().casefold()
         if len(rows) < candidate_limit:
             fallback_rows = self.connection_or_raise.execute(
-                """SELECT id, document_id, content, library_id, path, heading,
-                          start_line, end_line, source_version, 0.0 AS rank
+                """SELECT memory_chunks.id, memory_chunks.document_id,
+                          memory_chunks.content, memory_chunks.library_id,
+                          memory_chunks.path, memory_chunks.heading,
+                          memory_chunks.start_line, memory_chunks.end_line,
+                          memory_chunks.source_version, 0.0 AS rank
                    FROM memory_chunks
-                   WHERE library_id = ?
-                   ORDER BY path, start_line""",
+                   WHERE memory_chunks.library_id = ?
+                   ORDER BY memory_chunks.path, memory_chunks.start_line""",
                 (library_id,),
             ).fetchall()
             rows.extend(
@@ -3582,9 +4336,7 @@ class PlatformState:
             elif int(index_row[1]) > 0:
                 index_dimension = int(index_row[1])
                 try:
-                    query_vector = (
-                        await asyncio.to_thread(self.model_client.embed, [query])
-                    )[0]
+                    query_vector = (await asyncio.to_thread(self.model_client.embed, [query]))[0]
                     if len(query_vector) != index_dimension:
                         raise ModelServiceError("embedding dimension changed")
                     vector_rows = self.connection_or_raise.execute(
@@ -3688,9 +4440,7 @@ class PlatformState:
             and self.graph_adapter is not None
             and graph_status["status"] == "ready"
         ):
-            seed_document_ids = tuple(
-                dict.fromkeys(str(item["document_id"]) for item in results)
-            )
+            seed_document_ids = tuple(dict.fromkeys(str(item["document_id"]) for item in results))
             try:
                 expanded = await self.graph_adapter.expand(
                     library_id,
@@ -3734,9 +4484,7 @@ class PlatformState:
                         (
                             item
                             for item in document_sources
-                            if anchor
-                            and anchor
-                            in "\n".join((item[3], item[4] or "")).casefold()
+                            if anchor and anchor in "\n".join((item[3], item[4] or "")).casefold()
                         ),
                         document_sources[0],
                     )
@@ -3785,6 +4533,119 @@ class PlatformState:
         for item in results:
             item["degraded"] = bool(degradation)
             item["degradation"] = list(degradation)
+        if include_history:
+            history_rows = self.connection_or_raise.execute(
+                """SELECT version_id, path, source_version, content, state,
+                          supersedes_version_id, effective_at, condition_text, updated_at
+                   FROM memory_versions WHERE library_id = ?""",
+                (library_id,),
+            ).fetchall()
+            by_version = {str(row[0]): row for row in history_rows}
+            with sqlite3.connect(":memory:") as history_search:
+                history_search.execute(
+                    "CREATE VIRTUAL TABLE version_search USING fts5("
+                    "version_id UNINDEXED, content, tokenize='unicode61')"
+                )
+                history_search.executemany(
+                    "INSERT INTO version_search (version_id, content) VALUES (?, ?)",
+                    ((version_id, str(row[3])) for version_id, row in by_version.items()),
+                )
+                matched_versions = {
+                    str(row[0])
+                    for row in history_search.execute(
+                        "SELECT version_id FROM version_search WHERE version_search MATCH ?",
+                        (expression,),
+                    )
+                }
+            predecessors: set[str] = set()
+            frontier = list(matched_versions)
+            while frontier:
+                current_version = frontier.pop()
+                parent = by_version[current_version][5]
+                if parent is None or str(parent) not in by_version:
+                    continue
+                parent_id = str(parent)
+                if parent_id not in predecessors and parent_id not in matched_versions:
+                    predecessors.add(parent_id)
+                    frontier.append(parent_id)
+            children: dict[str, set[str]] = {}
+            for version_id, row in by_version.items():
+                if row[5] is not None:
+                    children.setdefault(str(row[5]), set()).add(version_id)
+            successors: set[str] = set()
+            frontier = list(matched_versions)
+            while frontier:
+                current_version = frontier.pop()
+                for child_id in children.get(current_version, set()):
+                    if child_id not in successors and child_id not in matched_versions:
+                        successors.add(child_id)
+                        frontier.append(child_id)
+            connected_versions = matched_versions | predecessors | successors
+
+            def chain_depth(version_id: str) -> int:
+                depth = 0
+                visited = {version_id}
+                parent = by_version[version_id][5]
+                while parent is not None and str(parent) in connected_versions:
+                    parent_id = str(parent)
+                    if parent_id in visited:
+                        break
+                    visited.add(parent_id)
+                    depth += 1
+                    parent = by_version[parent_id][5]
+                return depth
+
+            ordered_history = sorted(
+                connected_versions,
+                key=lambda version_id: (chain_depth(version_id), version_id),
+            )
+            for version_id in ordered_history:
+                row = by_version[version_id]
+                root_version_id = version_id
+                while by_version[root_version_id][5] is not None:
+                    parent_id = str(by_version[root_version_id][5])
+                    if parent_id not in connected_versions:
+                        break
+                    root_version_id = parent_id
+                relation = (
+                    "matched"
+                    if version_id in matched_versions
+                    else "predecessor"
+                    if version_id in predecessors
+                    else "successor"
+                )
+                results.append(
+                    {
+                        "chunk_id": f"history:{row[0]}",
+                        "document_id": f"history:{row[0]}",
+                        "content": str(row[3]),
+                        "library_id": library_id,
+                        "path": str(row[1]),
+                        "heading": None,
+                        "start_line": 1,
+                        "end_line": max(1, str(row[3]).count("\n") + 1),
+                        "source_version": str(row[2]),
+                        "source_type": "markdown_history",
+                        "classification": (
+                            "history_current" if str(row[4]) == "current" else "historical"
+                        ),
+                        "score": 0.0,
+                        "retrieval_sources": ["history"],
+                        "version_id": version_id,
+                        "history_chain_id": root_version_id,
+                        "memory_state": str(row[4]),
+                        "supersedes_version_id": None if row[5] is None else str(row[5]),
+                        "superseded_by_version_ids": sorted(children.get(version_id, set())),
+                        "history_relation": relation,
+                        "chain_depth": chain_depth(version_id),
+                        "matched_query": version_id in matched_versions,
+                        "effective_at": None if row[6] is None else str(row[6]),
+                        "condition": None if row[7] is None else str(row[7]),
+                        "recorded_at": str(row[8]),
+                        "degraded": bool(degradation),
+                        "degradation": list(degradation),
+                    }
+                )
         response: dict[str, object] = {
             "status": "bound",
             "scope": scope,
@@ -4201,8 +5062,7 @@ class PlatformState:
             return
         job_id, kind, payload, attempts = job
         claimed = self.connection.execute(
-            "UPDATE background_jobs SET status = 'running' "
-            "WHERE id = ? AND status = 'pending'",
+            "UPDATE background_jobs SET status = 'running' WHERE id = ? AND status = 'pending'",
             (job_id,),
         )
         self.connection.commit()
@@ -4317,8 +5177,7 @@ class PlatformState:
         )
         self.connection_or_raise.commit()
         conversation = (
-            f"User:\n{by_kind['user'][3]}\n\n"
-            f"Assistant final reply:\n{by_kind['assistant'][3]}"
+            f"User:\n{by_kind['user'][3]}\n\nAssistant final reply:\n{by_kind['assistant'][3]}"
         )
         extracted = await asyncio.to_thread(self.model_client.extract_candidate, conversation)
         allowed_types = {
@@ -4344,8 +5203,7 @@ class PlatformState:
                 body,
                 source_references,
                 "session-capture",
-                "capture-round:"
-                + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest(),
+                "capture-round:" + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest(),
             )
             candidate_id = str(candidate["id"])
             blockers = self._auto_promotion_blockers(
@@ -4478,10 +5336,7 @@ class PlatformState:
         self.connection_or_raise.executemany(
             "INSERT INTO memory_graph_documents "
             "(library_id, document_id, path, source_version) VALUES (?, ?, ?, ?)",
-            [
-                (library_id, item.document_id, item.path, item.source_version)
-                for item in documents
-            ],
+            [(library_id, item.document_id, item.path, item.source_version) for item in documents],
         )
         self.connection_or_raise.execute(
             "UPDATE memory_graph_indexes SET status = 'ready', total_documents = ?, "
