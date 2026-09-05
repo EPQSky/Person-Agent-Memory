@@ -92,6 +92,14 @@ most 30%, and source/structure metadata receives at most 10%; unused graph capac
 direct hits. Every result carries source and degradation metadata, and the package marks recalled
 content as untrusted data with no policy, tool-authorization, or command semantics.
 
+## Codex plugin
+
+The globally installable plugin lives at `plugins/personal-agent-memory`. Install it once for the
+user and set `PERSONAL_AGENT_MEMORY_API_KEY` to the daemon key (or use the default protected key
+file). Codex then discovers lifecycle Hooks and the authenticated loopback MCP connection without
+writing files into individual projects. `UserPromptSubmit` recalls only the project memory library
+bound to the Hook event's `cwd`; unbound projects and daemon failures are silent and fail open.
+
 ## Verify
 
 ```bash

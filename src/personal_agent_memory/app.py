@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import hmac
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from markdown_it import MarkdownIt
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from personal_agent_memory.config import Settings
 from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
@@ -50,6 +51,13 @@ class WorktreeAssociation(BaseModel):
 
 class CwdResolution(BaseModel):
     cwd: str
+
+
+class McpRpcRequest(BaseModel):
+    jsonrpc: Literal["2.0"]
+    id: str | int | None = None
+    method: str
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 class IgnoreRulesUpdate(BaseModel):
@@ -659,6 +667,166 @@ def create_app(settings: Settings) -> FastAPI:
             )
         except MemoryMutationError as error:
             raise mutation_error(error) from error
+
+    mcp_tools: list[dict[str, object]] = [
+        {
+            "name": "memory_search",
+            "description": "Search one project-bound or explicitly selected memory library.",
+            "inputSchema": SearchRequest.model_json_schema(),
+        },
+        {
+            "name": "memory_get",
+            "description": "Read one authoritative Markdown document by library and relative path.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "library_id": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["library_id", "path"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "candidate_create",
+            "description": "Create an unapproved candidate memory.",
+            "inputSchema": CandidateCreate.model_json_schema(),
+        },
+        {
+            "name": "candidate_list",
+            "description": "List candidate memories, optionally filtered by library and status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "library_id": {"type": "string"},
+                    "candidate_status": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "library_list",
+            "description": "List registered memory libraries.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "sync_status",
+            "description": "Read availability and synchronization status for one memory library.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"library_id": {"type": "string"}},
+                "required": ["library_id"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+    def mcp_rpc_error(
+        request_id: str | int | None, code: int, message: str
+    ) -> dict[str, object]:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": code, "message": message},
+        }
+
+    def mcp_tool_result(payload: object) -> dict[str, object]:
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        result: dict[str, object] = {
+            "content": [{"type": "text", "text": serialized}],
+            "isError": False,
+        }
+        if isinstance(payload, dict):
+            result["structuredContent"] = payload
+        return result
+
+    async def call_mcp_tool(name: str, arguments: dict[str, Any]) -> object:
+        if name == "memory_search":
+            return await search_payload(SearchRequest.model_validate(arguments))
+        if name == "memory_get":
+            library_id = str(arguments.get("library_id", ""))
+            path = str(arguments.get("path", ""))
+            return platform_state.read_document(library_id, path)
+        if name == "candidate_create":
+            return create_candidate_payload(CandidateCreate.model_validate(arguments))
+        if name == "candidate_list":
+            filter_library_id = arguments.get("library_id")
+            candidate_status = arguments.get("candidate_status")
+            return platform_state.list_candidates(
+                None if filter_library_id is None else str(filter_library_id),
+                None if candidate_status is None else str(candidate_status),
+            )
+        if name == "library_list":
+            return libraries_payload()
+        if name == "sync_status":
+            library = platform_state.library(str(arguments.get("library_id", "")))
+            if library is None:
+                raise LibraryRegistrationError("memory library not found")
+            return {
+                "library_id": library.id,
+                "availability": library.availability,
+                "sync_status": library.sync_status,
+            }
+        raise ValueError("unknown MCP tool")
+
+    @app.post("/mcp", dependencies=[Depends(authenticate)], response_model=None)
+    async def mcp_streamable_http(payload: dict[str, Any]) -> Response | dict[str, object]:
+        try:
+            rpc = McpRpcRequest.model_validate(payload)
+        except ValidationError:
+            return mcp_rpc_error(None, -32600, "Invalid Request")
+        if rpc.method == "notifications/initialized":
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        if rpc.method == "ping":
+            return {"jsonrpc": "2.0", "id": rpc.id, "result": {}}
+        if rpc.method == "initialize":
+            requested = rpc.params.get("protocolVersion")
+            protocol_version = requested if isinstance(requested, str) else "2025-06-18"
+            return {
+                "jsonrpc": "2.0",
+                "id": rpc.id,
+                "result": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "personal-agent-memory", "version": "0.1.0"},
+                },
+            }
+        if rpc.method == "tools/list":
+            return {"jsonrpc": "2.0", "id": rpc.id, "result": {"tools": mcp_tools}}
+        if rpc.method != "tools/call":
+            return mcp_rpc_error(rpc.id, -32601, "Method not found")
+        name = rpc.params.get("name")
+        arguments = rpc.params.get("arguments", {})
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return mcp_rpc_error(rpc.id, -32602, "Invalid params")
+        try:
+            result = await call_mcp_tool(name, arguments)
+        except HTTPException as error:
+            return {
+                "jsonrpc": "2.0",
+                "id": rpc.id,
+                "result": {
+                    "content": [{"type": "text", "text": str(error.detail)}],
+                    "isError": True,
+                },
+            }
+        except (
+            CandidateGovernanceError,
+            LibraryRegistrationError,
+            MemoryMutationError,
+            ProjectBindingError,
+            ValidationError,
+            ValueError,
+        ) as error:
+            return {
+                "jsonrpc": "2.0",
+                "id": rpc.id,
+                "result": {
+                    "content": [{"type": "text", "text": str(error)}],
+                    "isError": True,
+                },
+            }
+        return {"jsonrpc": "2.0", "id": rpc.id, "result": mcp_tool_result(result)}
 
     frontend = Path(__file__).parent / "static" / "index.html"
     editor_history = Path(__file__).parent / "static" / "editor_history.js"

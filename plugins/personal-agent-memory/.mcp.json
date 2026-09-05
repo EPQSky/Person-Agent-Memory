@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "personal-agent-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:7331/mcp",
+      "bearer_token_env_var": "PERSONAL_AGENT_MEMORY_API_KEY"
+    }
+  }
+}

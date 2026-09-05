@@ -7,10 +7,12 @@ import shutil
 import signal
 import stat
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from selenium import webdriver
@@ -56,6 +58,49 @@ def wait_for(url: str) -> None:
 
 wait_for("http://127.0.0.1:18080/health")
 
+hook_script = Path("/app/plugins/personal-agent-memory/scripts/recall.mjs")
+assert hook_script.is_file()
+assert subprocess.run(["node", "--version"], capture_output=True, check=False).returncode == 0
+
+
+def run_recall_hook(
+    cwd: Path,
+    prompt: str,
+    *,
+    api_key: str,
+    url: str = "http://127.0.0.1:7331",
+    timeout_ms: int = 2000,
+    event_name: str = "UserPromptSubmit",
+) -> subprocess.CompletedProcess[str]:
+    event: dict[str, object] = {
+        "session_id": "docker-ticket11",
+        "transcript_path": "/private/docker-transcript.jsonl",
+        "cwd": str(cwd),
+        "hook_event_name": event_name,
+    }
+    if event_name == "UserPromptSubmit":
+        event["prompt"] = prompt
+    elif event_name == "SessionStart":
+        event["source"] = "compact"
+    else:
+        event["trigger"] = "manual"
+    return subprocess.run(
+        ["node", str(hook_script)],
+        input=json.dumps(event),
+        text=True,
+        capture_output=True,
+        timeout=4,
+        env={
+            **os.environ,
+            "PERSONAL_AGENT_MEMORY_API_KEY": api_key,
+            "PLUGIN_DATA": "/tmp/personal-agent-memory-plugin-data",
+            "PERSONAL_AGENT_MEMORY_PRECOMPACT_QUERY": prompt,
+            "PERSONAL_AGENT_MEMORY_URL": url,
+            "PERSONAL_AGENT_MEMORY_TIMEOUT_MS": str(timeout_ms),
+        },
+        check=False,
+    )
+
 key = Path(os.environ["API_KEY_FILE"]).read_text(encoding="utf-8").strip()
 assert request("http://127.0.0.1:7331/health/live", key)[0] == 200
 
@@ -76,6 +121,32 @@ assert status_code == 200
 assert status["database"] == "ok"
 assert status["background_worker"] == "running"
 assert request("http://127.0.0.1:7331/mcp/health", key)[0] == 200
+mcp_initialize_code, mcp_initialize = request(
+    "http://127.0.0.1:7331/mcp",
+    key,
+    {
+        "jsonrpc": "2.0",
+        "id": "docker-initialize",
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}},
+    },
+)
+assert mcp_initialize_code == 200
+assert mcp_initialize["result"]["protocolVersion"] == "2025-06-18"
+mcp_tools_code, mcp_tools = request(
+    "http://127.0.0.1:7331/mcp",
+    key,
+    {"jsonrpc": "2.0", "id": "docker-tools", "method": "tools/list", "params": {}},
+)
+assert mcp_tools_code == 200
+assert {tool["name"] for tool in mcp_tools["result"]["tools"]} == {
+    "memory_search",
+    "memory_get",
+    "candidate_create",
+    "candidate_list",
+    "library_list",
+    "sync_status",
+}
 
 memory_root = Path("/memory-libraries")
 existing = memory_root / "existing"
@@ -421,6 +492,114 @@ graph_status_code, graph_status = request(
 assert graph_status_code == 200
 assert graph_status["status"] == "ready"
 assert graph_status["projected_documents"] == graph_status["total_documents"]
+
+# The globally installable Codex plugin executes the real Node Hook over stdin/stdout.
+replacement_path = Path(str(replacement_library["canonical_path"]))
+(replacement_path / "same-name.md").write_text(
+    "# Other service\n\nSameNameSecondNeedle belongs only to the second service.\n",
+    encoding="utf-8",
+)
+assert request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{replacement_library['id']}/scan",
+    key,
+    {},
+)[0] == 200
+
+
+def hook_context(result: subprocess.CompletedProcess[str], event_name: str) -> str:
+    assert result.returncode == 0
+    assert result.stderr == ""
+    output = json.loads(result.stdout)
+    hook_output = output["hookSpecificOutput"]
+    assert hook_output["hookEventName"] == event_name
+    return str(hook_output["additionalContext"])
+
+
+warm_hook_code, warm_hook_search = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_one / "src"), "query": "DockerNeedle42"},
+)
+assert warm_hook_code == 200
+assert warm_hook_search["results"]
+first_hook = run_recall_hook(same_name_one / "src", "DockerNeedle42", api_key=key)
+first_context = hook_context(first_hook, "UserPromptSubmit")
+assert "DockerNeedle42" in first_context
+assert "SameNameSecondNeedle" not in first_context
+assert str(same_name_one) not in first_context
+assert key not in first_context
+first_payload = json.loads(first_context.split("\n", 2)[2].rsplit("\n", 1)[0])
+assert first_payload["library_id"] == project_library["id"]
+assert first_payload["budget"]["effective_tokens"] == 10_000
+assert first_payload["budget"]["used_tokens"] <= 10_000
+assert len(first_hook.stdout.encode()) <= 96 * 1024 + 1
+
+second_hook = run_recall_hook(same_name_two / "src", "SameNameSecondNeedle", api_key=key)
+second_context = hook_context(second_hook, "UserPromptSubmit")
+assert "SameNameSecondNeedle" in second_context
+assert "DockerNeedle42" not in second_context
+second_payload = json.loads(second_context.split("\n", 2)[2].rsplit("\n", 1)[0])
+assert second_payload["library_id"] == replacement_library["id"]
+
+unbound_hook = run_recall_hook(unbound_same_name / "src", "DockerNeedle42", api_key=key)
+wrong_key_hook = run_recall_hook(same_name_one / "src", "DockerNeedle42", api_key="wrong")
+stopped_hook = run_recall_hook(
+    same_name_one / "src", "DockerNeedle42", api_key=key, url="http://127.0.0.1:1"
+)
+for silent_hook in (unbound_hook, wrong_key_hook, stopped_hook):
+    assert silent_hook.returncode == 0
+    assert silent_hook.stdout == ""
+    assert silent_hook.stderr == ""
+
+
+class SlowHookHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802
+        time.sleep(1)
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+slow_server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHookHandler)
+slow_thread = threading.Thread(target=slow_server.serve_forever, daemon=True)
+slow_thread.start()
+try:
+    hook_started = time.monotonic()
+    timeout_hook = run_recall_hook(
+        same_name_one / "src",
+        "DockerNeedle42",
+        api_key=key,
+        url=f"http://127.0.0.1:{slow_server.server_port}",
+        timeout_ms=100,
+    )
+    assert time.monotonic() - hook_started < 1
+    assert timeout_hook.returncode == 0
+    assert timeout_hook.stdout == ""
+    assert timeout_hook.stderr == ""
+finally:
+    slow_server.shutdown()
+    slow_server.server_close()
+    slow_thread.join()
+
+compact_hook = run_recall_hook(
+    same_name_one / "src",
+    "DockerNeedle42",
+    api_key=key,
+    event_name="PreCompact",
+)
+assert compact_hook.returncode == 0
+assert json.loads(compact_hook.stdout) == {}
+restore_hook = run_recall_hook(
+    same_name_one / "src",
+    "DockerNeedle42",
+    api_key=key,
+    event_name="SessionStart",
+)
+compact_context = hook_context(restore_hook, "SessionStart")
+assert "personal-agent-memory-context" in compact_context
+assert "DockerNeedle42" in compact_context
 
 one_hop_code, one_hop = request(
     "http://127.0.0.1:7331/api/v1/search",

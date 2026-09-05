@@ -13,8 +13,9 @@ ENTRYPOINT ["personal-agent-memory"]
 FROM runtime AS acceptance
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y chromium chromium-driver \
+    && apt-get install --no-install-recommends -y chromium chromium-driver nodejs \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir '.[acceptance]'
+COPY plugins ./plugins
 
 ENTRYPOINT ["python"]

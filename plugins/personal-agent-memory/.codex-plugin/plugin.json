@@ -1,0 +1,19 @@
+{
+  "name": "personal-agent-memory",
+  "version": "0.1.0",
+  "description": "Project-scoped memory recall for local Codex sessions.",
+  "author": {"name": "Personal Agent Memory contributors"},
+  "license": "Apache-2.0",
+  "keywords": ["codex", "local-first", "memory"],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Personal Agent Memory",
+    "shortDescription": "Recall bounded project memory",
+    "longDescription": "Injects source-attributed, project-scoped memory from a local Personal Agent Memory daemon while keeping Codex fail-open.",
+    "developerName": "Personal Agent Memory contributors",
+    "category": "Productivity",
+    "capabilities": ["Read"],
+    "defaultPrompt": ["Search this project's memory"],
+    "brandColor": "#176B55"
+  }
+}
