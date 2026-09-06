@@ -2,17 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
+import shutil
+import tarfile
+import tempfile
+import threading
+import uuid
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 
 from personal_agent_memory.model_client import ModelServiceError, OpenAICompatibleClient
 
 
 class GraphAdapterError(RuntimeError):
     """The optional graph projection is unavailable or returned invalid data."""
+
+
+class GraphAdapterBusyError(GraphAdapterError):
+    """Milvus Lite is busy mutating another local graph projection."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +46,33 @@ class GraphExpansion:
     source_anchor: str = ""
 
 
+class GraphPurge(Protocol):
+    def commit(self) -> None: ...
+
+    def rollback(self) -> None: ...
+
+
+class PreparedGraphRebuild(Protocol):
+    def activate(self) -> GraphPurge: ...
+
+    def discard(self) -> None: ...
+
+
 class GraphAdapter(Protocol):
+    def stage_purge(self, library_id: str, *, cleanup_id: str | None = None) -> GraphPurge: ...
+
+    def stage_rebuild(
+        self,
+        library_id: str,
+        documents: tuple[GraphSourceDocument, ...],
+        *,
+        cleanup_id: str | None = None,
+    ) -> GraphPurge: ...
+
+    def reconcile_staged_purge(
+        self, library_id: str, cleanup_id: str, *, committed: bool
+    ) -> None: ...
+
     async def rebuild(
         self, library_id: str, documents: tuple[GraphSourceDocument, ...]
     ) -> None: ...
@@ -47,6 +85,247 @@ class GraphAdapter(Protocol):
         max_hops: int,
         limit: int,
     ) -> list[GraphExpansion]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _TreeEntry:
+    path: str
+    kind: str
+    mode: int
+    size: int
+    digest: str
+
+
+def _tree_manifest(root: Path) -> tuple[_TreeEntry, ...]:
+    entries: list[_TreeEntry] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        metadata = path.lstat()
+        if path.is_symlink():
+            raise GraphAdapterError("Milvus Lite graph projection contains a symlink")
+        if path.is_dir():
+            entries.append(_TreeEntry(relative, "directory", metadata.st_mode & 0o777, 0, ""))
+            continue
+        if not path.is_file():
+            raise GraphAdapterError("Milvus Lite graph projection contains an unsupported entry")
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        entries.append(
+            _TreeEntry(
+                relative,
+                "file",
+                metadata.st_mode & 0o777,
+                metadata.st_size,
+                digest.hexdigest(),
+            )
+        )
+    return tuple(entries)
+
+
+@contextmanager
+def _recoverable_tree_snapshot(root: Path) -> Iterator[tuple[BinaryIO, tuple[_TreeEntry, ...]]]:
+    resources = ExitStack()
+    try:
+        manifest = _tree_manifest(root)
+        archive = resources.enter_context(
+            tempfile.TemporaryFile(prefix="personal-agent-memory-graph-")  # noqa: SIM115
+        )
+        with tarfile.open(fileobj=archive, mode="w") as bundle:
+            bundle.dereference = True
+            bundle.add(root, arcname=".", recursive=True)
+        archive.flush()
+        archive.seek(0)
+    except (OSError, tarfile.TarError) as error:
+        resources.close()
+        raise GraphAdapterError("Milvus Lite graph cleanup snapshot failed") from error
+    try:
+        yield archive, manifest
+    finally:
+        resources.close()
+
+
+def _restore_tree_snapshot(root: Path, archive: BinaryIO, manifest: tuple[_TreeEntry, ...]) -> None:
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    archive.seek(0)
+    try:
+        with tarfile.open(fileobj=archive, mode="r:") as bundle:
+            members = bundle.getmembers()
+            for member in members:
+                relative = member.name.removeprefix("./")
+                if relative in {"", "."}:
+                    continue
+                path = Path(relative)
+                if path.is_absolute() or ".." in path.parts or member.issym() or member.islnk():
+                    raise GraphAdapterError("Milvus Lite graph snapshot contains an unsafe entry")
+                target = root / path
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True, mode=member.mode)
+                    os.chmod(target, member.mode)
+                    continue
+                if not member.isfile():
+                    raise GraphAdapterError(
+                        "Milvus Lite graph snapshot contains an unsupported entry"
+                    )
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                source = bundle.extractfile(member)
+                if source is None:
+                    raise GraphAdapterError("Milvus Lite graph snapshot cannot be read")
+                temporary = target.with_name(f".{target.name}.restore-{uuid.uuid4().hex}")
+                try:
+                    with temporary.open("xb") as destination:
+                        shutil.copyfileobj(source, destination)
+                        destination.flush()
+                        os.fsync(destination.fileno())
+                    os.chmod(temporary, member.mode)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+    except (OSError, tarfile.TarError) as error:
+        raise GraphAdapterError("Milvus Lite graph cleanup snapshot restore failed") from error
+    try:
+        restored_manifest = _tree_manifest(root)
+    except OSError as error:
+        raise GraphAdapterError("Milvus Lite graph cleanup snapshot verification failed") from error
+    if restored_manifest != manifest:
+        raise GraphAdapterError("Milvus Lite graph cleanup snapshot restore was incomplete")
+
+
+def _remove_tree_recoverably(path: Path) -> None:
+    if not path.exists():
+        return
+    with _recoverable_tree_snapshot(path) as (archive, manifest):
+        try:
+            shutil.rmtree(path)
+            if path.exists():
+                raise OSError("graph projection cleanup left the directory present")
+        except OSError as error:
+            _restore_tree_snapshot(path, archive, manifest)
+            raise GraphAdapterError("Milvus Lite graph projection cleanup failed") from error
+
+
+@dataclass(slots=True)
+class _FilesystemGraphPurge:
+    original: Path
+    quarantine: Path | None
+
+    def commit(self) -> None:
+        if self.quarantine is None:
+            return
+        quarantine = self.quarantine
+        _remove_tree_recoverably(quarantine)
+        self.quarantine = None
+
+    def rollback(self) -> None:
+        if self.quarantine is None:
+            return
+        if not self.quarantine.exists():
+            raise GraphAdapterError("Milvus Lite graph purge rollback source is missing")
+        if self.original.exists():
+            raise GraphAdapterError("Milvus Lite graph purge rollback destination exists")
+        try:
+            os.replace(self.quarantine, self.original)
+        except OSError as error:
+            raise GraphAdapterError("Milvus Lite graph purge rollback failed") from error
+        self.quarantine = None
+
+
+@dataclass(slots=True)
+class _CompositeGraphPurge:
+    disposable: tuple[GraphPurge, ...]
+    rollback_critical: tuple[GraphPurge, ...] = ()
+
+    def commit(self) -> None:
+        for purge in (*self.disposable, *self.rollback_critical):
+            purge.commit()
+
+    def rollback(self) -> None:
+        errors: list[str] = []
+        purges = (*reversed(self.rollback_critical), *reversed(self.disposable))
+        for purge in purges:
+            try:
+                purge.rollback()
+            except GraphAdapterError as error:
+                errors.append(str(error))
+        if errors:
+            raise GraphAdapterError("; ".join(errors))
+
+
+@dataclass(slots=True)
+class _LockedGraphPurge:
+    locks: tuple[Any, ...]
+    purge: GraphPurge
+
+    def commit(self) -> None:
+        with ExitStack() as stack:
+            for lock in self.locks:
+                stack.enter_context(lock)
+            self.purge.commit()
+
+    def rollback(self) -> None:
+        with ExitStack() as stack:
+            for lock in self.locks:
+                stack.enter_context(lock)
+            self.purge.rollback()
+
+
+@dataclass(slots=True)
+class _FilesystemGraphReplacement:
+    replacement: Path
+    previous: _FilesystemGraphPurge
+    detached_replacement: Path | None = None
+
+    def commit(self) -> None:
+        self.previous.commit()
+
+    def rollback(self) -> None:
+        if self.previous.quarantine is not None:
+            if self.detached_replacement is not None:
+                raise GraphAdapterError("Milvus Lite graph replacement rollback is inconsistent")
+            if not self.replacement.exists():
+                self.previous.rollback()
+                return
+            detached = self.replacement.parent / (
+                f".{self.replacement.name}.rollback-{uuid.uuid4().hex}"
+            )
+            try:
+                os.replace(self.replacement, detached)
+            except OSError as error:
+                raise GraphAdapterError(
+                    "Milvus Lite graph replacement could not be detached"
+                ) from error
+            self.detached_replacement = detached
+            try:
+                self.previous.rollback()
+            except BaseException:
+                with suppress(OSError):
+                    if not self.replacement.exists() and detached.exists():
+                        os.replace(detached, self.replacement)
+                        self.detached_replacement = None
+                raise
+        if self.detached_replacement is None:
+            return
+        detached = self.detached_replacement
+        _remove_tree_recoverably(detached)
+        self.detached_replacement = None
+
+
+@dataclass(slots=True)
+class _PreparedFilesystemGraphRebuild:
+    adapter: JiuwenMilvusGraphAdapter
+    library_id: str
+    extracted: list[tuple[GraphSourceDocument, dict[str, object]]] | None
+
+    def activate(self) -> GraphPurge:
+        if self.extracted is None:
+            raise GraphAdapterError("prepared graph rebuild is no longer available")
+        extracted = self.extracted
+        self.extracted = None
+        return self.adapter._activate_prepared_rebuild(self.library_id, extracted)
+
+    def discard(self) -> None:
+        self.extracted = None
 
 
 class JiuwenMilvusGraphAdapter:
@@ -63,27 +342,205 @@ class JiuwenMilvusGraphAdapter:
     def __init__(self, root: Path, model_client: OpenAICompatibleClient) -> None:
         self.root = root
         self.model_client = model_client
+        self._operation_lock = threading.RLock()
+        self._mutation_locks: dict[str, Any] = {}
+        self._mutation_locks_guard = threading.Lock()
 
-    async def rebuild(
-        self, library_id: str, documents: tuple[GraphSourceDocument, ...]
-    ) -> None:
-        if self.model_client.graph is None:
-            raise GraphAdapterError("graph LLM is not configured")
-        extracted: list[tuple[GraphSourceDocument, dict[str, object]]] = []
-        for document in documents:
+    def _mutation_lock(self, library_id: str) -> Any:
+        with self._mutation_locks_guard:
+            return self._mutation_locks.setdefault(library_id, threading.RLock())
+
+    def stage_purge(self, library_id: str, *, cleanup_id: str | None = None) -> GraphPurge:
+        lock = self._mutation_lock(library_id)
+        with self._operation_lock, lock:
+            return _LockedGraphPurge(
+                (self._operation_lock, lock), self._stage_purge(library_id, cleanup_id=cleanup_id)
+            )
+
+    def _stage_purge(
+        self, library_id: str, *excluded: Path, cleanup_id: str | None = None
+    ) -> GraphPurge:
+        excluded_paths = set(excluded)
+        roots = sorted(self.root.glob(f".{library_id}.replacement-*"))
+        roots.append(self.root / library_id)
+        disposable: list[GraphPurge] = []
+        rollback_critical: list[GraphPurge] = []
+        try:
+            for library_root in roots:
+                if library_root in excluded_paths or not library_root.exists():
+                    continue
+                role = "official" if library_root == self.root / library_id else "disposable"
+                quarantine = self._purge_path(library_id, cleanup_id, role)
+                os.replace(library_root, quarantine)
+                purge = _FilesystemGraphPurge(library_root, quarantine)
+                if library_root == self.root / library_id:
+                    rollback_critical.append(purge)
+                else:
+                    disposable.append(purge)
+        except OSError as error:
+            purges = (*reversed(rollback_critical), *reversed(disposable))
+            for staged_purge in purges:
+                staged_purge.rollback()
+            raise GraphAdapterError("Milvus Lite graph purge could not be staged") from error
+        return _CompositeGraphPurge(tuple(disposable), tuple(rollback_critical))
+
+    def _stage_single_purge(
+        self, library_root: Path, *, cleanup_id: str | None = None
+    ) -> _FilesystemGraphPurge:
+        if not library_root.exists():
+            return _FilesystemGraphPurge(library_root, None)
+        quarantine = self._purge_path(library_root.name, cleanup_id, "official")
+        try:
+            os.replace(library_root, quarantine)
+        except OSError as error:
+            raise GraphAdapterError("Milvus Lite graph purge could not be staged") from error
+        return _FilesystemGraphPurge(library_root, quarantine)
+
+    def stage_rebuild(
+        self,
+        library_id: str,
+        documents: tuple[GraphSourceDocument, ...],
+        *,
+        cleanup_id: str | None = None,
+    ) -> GraphPurge:
+        extracted = self._extract_documents(documents)
+        return self._activate_prepared_rebuild(library_id, extracted, cleanup_id=cleanup_id)
+
+    def _activate_prepared_rebuild(
+        self,
+        library_id: str,
+        extracted: list[tuple[GraphSourceDocument, dict[str, object]]],
+        *,
+        cleanup_id: str | None = None,
+    ) -> GraphPurge:
+        lock = self._mutation_lock(library_id)
+        with self._operation_lock, lock:
+            temporary_id = f".{library_id}.replacement-{uuid.uuid4().hex}"
+            temporary = self.root / temporary_id
             try:
-                payload = await asyncio.to_thread(
-                    self.model_client.extract_graph, document.content
-                )
-            except ModelServiceError as error:
-                raise GraphAdapterError("graph LLM extraction failed") from error
-            extracted.append((document, payload))
+                self._replace_projection(temporary_id, extracted, library_id)
+            except BaseException:
+                if temporary.exists():
+                    with suppress(OSError):
+                        shutil.rmtree(temporary)
+                raise
+            stale_replacements = self._stage_purge(
+                library_id,
+                self.root / library_id,
+                temporary,
+                cleanup_id=cleanup_id,
+            )
+            previous = self._stage_single_purge(
+                self.root / library_id, cleanup_id=cleanup_id
+            )
+            replacement = self.root / library_id
+            try:
+                if temporary.exists():
+                    os.replace(temporary, replacement)
+            except OSError as error:
+                previous.rollback()
+                stale_replacements.rollback()
+                raise GraphAdapterError(
+                    "Milvus Lite graph replacement could not be staged"
+                ) from error
+            return _LockedGraphPurge(
+                (self._operation_lock, lock),
+                _CompositeGraphPurge(
+                    (stale_replacements,),
+                    (_FilesystemGraphReplacement(replacement, previous),),
+                ),
+            )
+
+    @staticmethod
+    def _validate_cleanup_id(cleanup_id: str) -> None:
+        if re.fullmatch(r"[0-9a-f]{32}", cleanup_id) is None:
+            raise GraphAdapterError("invalid graph cleanup identifier")
+
+    def _purge_path(self, library_id: str, cleanup_id: str | None, role: str) -> Path:
+        suffix = uuid.uuid4().hex
+        if cleanup_id is None:
+            return self.root / f".{library_id}.purge-{suffix}"
+        self._validate_cleanup_id(cleanup_id)
+        return self.root / f".{library_id}.purge-{cleanup_id}-{role}-{suffix}"
+
+    def reconcile_staged_purge(
+        self, library_id: str, cleanup_id: str, *, committed: bool
+    ) -> None:
+        self._validate_cleanup_id(cleanup_id)
+        prefix = f".{library_id}.purge-{cleanup_id}-"
+        lock = self._mutation_lock(library_id)
+        with self._operation_lock, lock:
+            try:
+                candidates = tuple(self.root.iterdir()) if self.root.exists() else ()
+            except OSError as error:
+                raise GraphAdapterError("Milvus Lite graph cleanup scan failed") from error
+            staged = tuple(
+                candidate for candidate in candidates if candidate.name.startswith(prefix)
+            )
+            for candidate in staged:
+                if candidate.is_symlink() or not candidate.is_dir():
+                    raise GraphAdapterError("Milvus Lite graph cleanup target is unsafe")
+            if committed:
+                for candidate in staged:
+                    _remove_tree_recoverably(candidate)
+                return
+            official = tuple(
+                candidate for candidate in staged if candidate.name.startswith(prefix + "official-")
+            )
+            disposable = tuple(
+                candidate
+                for candidate in staged
+                if candidate.name.startswith(prefix + "disposable-")
+            )
+            if len(official) > 1 or len(official) + len(disposable) != len(staged):
+                raise GraphAdapterError("Milvus Lite graph cleanup state is inconsistent")
+            live = self.root / library_id
+            if official:
+                if live.exists():
+                    _remove_tree_recoverably(live)
+                try:
+                    os.replace(official[0], live)
+                except OSError as error:
+                    raise GraphAdapterError(
+                        "Milvus Lite graph cleanup recovery failed"
+                    ) from error
+            for candidate in disposable:
+                restored = self.root / f".{library_id}.replacement-recovered-{uuid.uuid4().hex}"
+                try:
+                    os.replace(candidate, restored)
+                except OSError as error:
+                    raise GraphAdapterError(
+                        "Milvus Lite graph cleanup recovery failed"
+                    ) from error
+
+    async def prepare_rebuild(
+        self, library_id: str, documents: tuple[GraphSourceDocument, ...]
+    ) -> PreparedGraphRebuild:
+        extracted = await asyncio.to_thread(self._extract_documents, documents)
+        return _PreparedFilesystemGraphRebuild(self, library_id, extracted)
+
+    async def rebuild(self, library_id: str, documents: tuple[GraphSourceDocument, ...]) -> None:
+        extracted = await asyncio.to_thread(self._extract_documents, documents)
         try:
             await asyncio.to_thread(self._replace_projection, library_id, extracted)
         except GraphAdapterError:
             raise
         except Exception as error:
             raise GraphAdapterError("Milvus Lite graph rebuild failed") from error
+
+    def _extract_documents(
+        self, documents: tuple[GraphSourceDocument, ...]
+    ) -> list[tuple[GraphSourceDocument, dict[str, object]]]:
+        extracted: list[tuple[GraphSourceDocument, dict[str, object]]] = []
+        if documents and self.model_client.graph is None:
+            raise GraphAdapterError("graph LLM is not configured")
+        for document in documents:
+            try:
+                payload = self.model_client.extract_graph(document.content)
+            except ModelServiceError as error:
+                raise GraphAdapterError("graph LLM extraction failed") from error
+            extracted.append((document, payload))
+        return extracted
 
     async def expand(
         self,
@@ -104,6 +561,8 @@ class JiuwenMilvusGraphAdapter:
                 bounded_hops,
                 limit,
             )
+        except GraphAdapterBusyError:
+            raise
         except Exception as error:
             raise GraphAdapterError("Milvus Lite graph query failed") from error
 
@@ -111,6 +570,16 @@ class JiuwenMilvusGraphAdapter:
         self,
         library_id: str,
         extracted: list[tuple[GraphSourceDocument, dict[str, object]]],
+        graph_library_id: str | None = None,
+    ) -> None:
+        with self._operation_lock, self._mutation_lock(graph_library_id or library_id):
+            self._replace_projection_locked(library_id, extracted, graph_library_id)
+
+    def _replace_projection_locked(
+        self,
+        library_id: str,
+        extracted: list[tuple[GraphSourceDocument, dict[str, object]]],
+        graph_library_id: str | None,
     ) -> None:
         library_root = self.root / library_id
         database = library_root / "graph.db"
@@ -147,16 +616,41 @@ class JiuwenMilvusGraphAdapter:
         try:
             store.rebuild()
             entities, relations, episodes = self._graph_objects(
-                library_id, extracted, Entity, Relation, Episode
+                graph_library_id or library_id, extracted, Entity, Relation, Episode
             )
-            asyncio.run(
-                self._write_projection(store, entities, relations, episodes)
-            )
+            self._write_projection_blocking(store, entities, relations, episodes)
         finally:
             store.close()
         temporary_marker = marker.with_suffix(".tmp")
         temporary_marker.write_text("ready\n", encoding="ascii")
         temporary_marker.replace(marker)
+
+    def _write_projection_blocking(
+        self,
+        store: Any,
+        entities: list[Any],
+        relations: list[Any],
+        episodes: list[Any],
+    ) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._write_projection(store, entities, relations, episodes))
+            return
+
+        errors: list[BaseException] = []
+
+        def write_projection() -> None:
+            try:
+                asyncio.run(self._write_projection(store, entities, relations, episodes))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=write_projection, name="graph-projection-write")
+        thread.start()
+        thread.join()
+        if errors:
+            raise errors[0]
 
     @classmethod
     def _graph_objects(
@@ -168,9 +662,7 @@ class JiuwenMilvusGraphAdapter:
         episode_type: Any,
     ) -> tuple[list[Any], list[Any], list[Any]]:
         mentions: dict[str, list[tuple[GraphSourceDocument, dict[str, str]]]] = {}
-        parsed: list[
-            tuple[GraphSourceDocument, list[dict[str, str]], list[dict[str, str]]]
-        ] = []
+        parsed: list[tuple[GraphSourceDocument, list[dict[str, str]], list[dict[str, str]]]] = []
         for document, payload in extracted:
             entities = cls._entities(payload)
             relations = cls._relations(payload)
@@ -283,6 +775,23 @@ class JiuwenMilvusGraphAdapter:
         max_hops: int,
         limit: int,
     ) -> list[GraphExpansion]:
+        if not self._operation_lock.acquire(blocking=False):
+            raise GraphAdapterBusyError("Milvus Lite graph projection is busy")
+        try:
+            with self._mutation_lock(library_id):
+                return self._expand_projection_locked(
+                    library_id, seed_documents, max_hops, limit
+                )
+        finally:
+            self._operation_lock.release()
+
+    def _expand_projection_locked(
+        self,
+        library_id: str,
+        seed_documents: set[str],
+        max_hops: int,
+        limit: int,
+    ) -> list[GraphExpansion]:
         library_root = self.root / library_id
         database = library_root / "graph.db"
         marker = library_root / self._PROJECTION_MARKER
@@ -295,9 +804,7 @@ class JiuwenMilvusGraphAdapter:
         store = self._open_projection(database)
         try:
             return asyncio.run(
-                self._query_projection(
-                    store, library_id, seed_documents, max_hops, limit
-                )
+                self._query_projection(store, library_id, seed_documents, max_hops, limit)
             )
         finally:
             store.close()
@@ -347,32 +854,54 @@ class JiuwenMilvusGraphAdapter:
                 extras = config.extras.copy()
                 self._config = config
                 self._embedder = None
+                self._local_uri = config.uri
                 self.alias = extras.setdefault("alias", f"pam-graph-{id(self)}")
-                self.client = MilvusClient(
-                    uri=config.uri,
-                    token=config.token,
-                    timeout=config.timeout,
-                    **extras,
+                self.client: Any = None
+                try:
+                    self.client = MilvusClient(
+                        uri=config.uri,
+                        token=config.token,
+                        timeout=config.timeout,
+                        **extras,
+                    )
+                    self.metric = (
+                        config.db_embed_config.distance_metric.replace("dot", "ip")
+                        .replace("euclidean", "l2")
+                        .upper()
+                    )
+                    self.full_text_search_params = MappingProxyType({"metric_type": "BM25"})
+                    self.dense_search_params = MappingProxyType({"metric_type": self.metric})
+                    self.field_def = {
+                        ENTITY_COLLECTION: [
+                            key for key in Entity.model_fields if not key.endswith("_bm25")
+                        ],
+                        RELATION_COLLECTION: [
+                            key for key in Relation.model_fields if not key.endswith("_bm25")
+                        ],
+                        EPISODE_COLLECTION: [
+                            key for key in Episode.model_fields if not key.endswith("_bm25")
+                        ],
+                    }
+                    self._build_lite_indices()
+                except BaseException:
+                    self._close_local_store()
+                    raise
+
+            def close(self) -> None:
+                self._close_local_store()
+
+            def _close_local_store(self) -> None:
+                client = self.client
+                self.client = None
+                if client is not None:
+                    with suppress(Exception):
+                        client.close()
+                from milvus_lite.server_manager import (  # type: ignore[import-untyped]
+                    server_manager_instance,
                 )
-                self.metric = (
-                    config.db_embed_config.distance_metric.replace("dot", "ip")
-                    .replace("euclidean", "l2")
-                    .upper()
-                )
-                self.full_text_search_params = MappingProxyType({"metric_type": "BM25"})
-                self.dense_search_params = MappingProxyType({"metric_type": self.metric})
-                self.field_def = {
-                    ENTITY_COLLECTION: [
-                        key for key in Entity.model_fields if not key.endswith("_bm25")
-                    ],
-                    RELATION_COLLECTION: [
-                        key for key in Relation.model_fields if not key.endswith("_bm25")
-                    ],
-                    EPISODE_COLLECTION: [
-                        key for key in Episode.model_fields if not key.endswith("_bm25")
-                    ],
-                }
-                self._build_lite_indices()
+
+                with suppress(Exception):
+                    server_manager_instance.release_server(self._local_uri)
 
             def _build_lite_indices(self) -> None:
                 from jiuwen_memory.foundation.store.graph.milvus import (
@@ -446,8 +975,7 @@ class JiuwenMilvusGraphAdapter:
         if not seed_entities:
             return []
         seed_query = " ".join(
-            str(entities[entity_id].get("name", ""))
-            for entity_id in sorted(seed_entities)
+            str(entities[entity_id].get("name", "")) for entity_id in sorted(seed_entities)
         )
         searched = await store.search(
             seed_query,
@@ -465,9 +993,7 @@ class JiuwenMilvusGraphAdapter:
             return []
         cls._require_complete_rows(ENTITY_COLLECTION, raw_candidates, entity_count)
         candidate_entities = {
-            str(row.get("uuid", ""))
-            for row in raw_candidates
-            if row.get("uuid") in entities
+            str(row.get("uuid", "")) for row in raw_candidates if row.get("uuid") in entities
         }
         if len(candidate_entities) != entity_count:
             raise GraphAdapterError("graph search returned an incomplete entity set")
@@ -552,9 +1078,7 @@ class JiuwenMilvusGraphAdapter:
         if count <= 0:
             raise GraphAdapterError("graph collection size is invalid")
         if count > cls._MILVUS_COMPLETE_READ_LIMIT:
-            raise GraphAdapterError(
-                f"graph collection exceeds complete read limit: {collection}"
-            )
+            raise GraphAdapterError(f"graph collection exceeds complete read limit: {collection}")
         return count
 
     @staticmethod
@@ -562,9 +1086,7 @@ class JiuwenMilvusGraphAdapter:
         collection: str, rows: list[dict[str, object]], expected: int
     ) -> None:
         if len(rows) != expected:
-            raise GraphAdapterError(
-                f"graph collection read was incomplete: {collection}"
-            )
+            raise GraphAdapterError(f"graph collection read was incomplete: {collection}")
 
     @staticmethod
     def _entity_sources(row: dict[str, object], library_id: str) -> list[dict[str, str]]:
@@ -582,8 +1104,7 @@ class JiuwenMilvusGraphAdapter:
             path = raw.get("path")
             source_version = raw.get("source_version")
             if not all(
-                isinstance(value, str) and value
-                for value in (document_id, path, source_version)
+                isinstance(value, str) and value for value in (document_id, path, source_version)
             ):
                 continue
             sources.append(

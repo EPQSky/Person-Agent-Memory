@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -117,6 +118,113 @@ def test_interrupted_turn_stays_durable_without_lifecycle_event(tmp_path: Path) 
             )
     finally:
         client.__exit__(None, None, None)
+
+
+def test_capture_completion_queues_successor_behind_incomplete_running_job(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        library_root = tmp_path / "libraries"
+        memory_root = library_root / "project-memory"
+        project = tmp_path / "project"
+        memory_root.mkdir(parents=True)
+        project.mkdir()
+        state = create_app(
+            Settings(state_dir=tmp_path / "state", library_roots=(library_root,))
+        ).state.platform_state
+        await state.start()
+        state.stop_worker.set()
+        assert state.worker_task is not None
+        await state.worker_task
+        assert state.capture_worker_task is not None
+        await state.capture_worker_task
+        try:
+            library_id = state.register_library(str(memory_root), "project").id
+            state.bind_project(str(project), library_id)
+            state.model_client.extract_candidate = lambda conversation: {"eligible": False}
+            state.ingest_capture_event(
+                **_event(project, "user", "Hold the first capture job.", "running-u")
+            )
+            state.connection_or_raise.execute(
+                "UPDATE background_jobs SET status = 'running' "
+                "WHERE kind = 'capture_consolidation'"
+            )
+            state.connection_or_raise.commit()
+
+            state.ingest_capture_event(
+                **_event(
+                    project,
+                    "assistant",
+                    "Complete the capture while its first job is running.",
+                    "running-a",
+                )
+            )
+            assert state.connection_or_raise.execute(
+                "SELECT status FROM background_jobs "
+                "WHERE kind = 'capture_consolidation' ORDER BY id"
+            ).fetchall() == [("running",), ("pending",)]
+
+            state.connection_or_raise.execute(
+                "UPDATE background_jobs SET status = 'done' WHERE status = 'running'"
+            )
+            state.connection_or_raise.commit()
+            await state._execute_pending_jobs()
+            assert state.connection_or_raise.execute(
+                "SELECT status FROM capture_rounds"
+            ).fetchone() == ("done",)
+        finally:
+            await state.close()
+
+    asyncio.run(scenario())
+
+
+def test_capture_worker_is_not_starved_by_long_rebuild_job(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        library_root = tmp_path / "libraries"
+        memory_root = library_root / "project-memory"
+        project = tmp_path / "project"
+        memory_root.mkdir(parents=True)
+        project.mkdir()
+        state = create_app(
+            Settings(state_dir=tmp_path / "state", library_roots=(library_root,))
+        ).state.platform_state
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_rebuild(library_id: str) -> None:
+            entered.set()
+            await release.wait()
+
+        state._rebuild_graph = slow_rebuild
+        state.model_client.extract_candidate = lambda conversation: {"eligible": False}
+        await state.start()
+        try:
+            library_id = state.register_library(str(memory_root), "project").id
+            state.bind_project(str(project), library_id)
+            state.enqueue_job("graph_rebuild", json.dumps({"library_id": library_id}))
+            await asyncio.wait_for(entered.wait(), timeout=1)
+
+            state.ingest_capture_event(
+                **_event(project, "user", "Capture despite rebuild.", "starvation-u")
+            )
+            state.ingest_capture_event(
+                **_event(project, "assistant", "The capture is complete.", "starvation-a")
+            )
+            deadline = asyncio.get_running_loop().time() + 1
+            while asyncio.get_running_loop().time() < deadline:
+                if state.connection_or_raise.execute(
+                    "SELECT status FROM capture_rounds"
+                ).fetchone() == ("done",):
+                    break
+                await asyncio.sleep(0.01)
+            assert state.connection_or_raise.execute(
+                "SELECT status FROM capture_rounds"
+            ).fetchone() == ("done",)
+        finally:
+            release.set()
+            await state.close()
+
+    asyncio.run(scenario())
 
 
 def test_transient_extraction_retries_after_restart_without_duplicate_candidate(

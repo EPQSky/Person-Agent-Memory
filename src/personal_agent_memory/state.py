@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ctypes
 import difflib
 import errno
@@ -14,9 +15,11 @@ import re
 import secrets
 import sqlite3
 import stat
+import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -24,6 +27,7 @@ from time import monotonic
 from typing import Literal, cast
 
 from personal_agent_memory.git_history import (
+    TOMBSTONE_DIRECTORY,
     GitHistoryError,
     GitInitialization,
     GitRepository,
@@ -31,8 +35,11 @@ from personal_agent_memory.git_history import (
 )
 from personal_agent_memory.graph_adapter import (
     GraphAdapter,
+    GraphAdapterBusyError,
     GraphAdapterError,
+    GraphPurge,
     GraphSourceDocument,
+    PreparedGraphRebuild,
 )
 from personal_agent_memory.markdown_index import (
     MarkdownDocument,
@@ -134,11 +141,62 @@ class BoundDocument:
     parent_identity: tuple[int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class BoundTombstoneMarker:
+    root_identity: tuple[int, int]
+    root_fd: int
+    directory_fd: int
+    directory_identity: tuple[int, int]
+    name: str
+    directory_created: bool
+
+
 @dataclass(slots=True)
 class DocumentReplacement:
     identity: tuple[int, int] | None = None
     renamed: bool = False
     expected_target_exchanged: bool = False
+
+
+@dataclass(slots=True)
+class _CombinedGraphPurge:
+    disposable: tuple[GraphPurge, ...]
+    rollback_critical: tuple[GraphPurge, ...]
+
+    def commit(self) -> None:
+        for purge in (*self.disposable, *self.rollback_critical):
+            purge.commit()
+
+    def rollback(self) -> None:
+        errors: list[str] = []
+        purges = (*reversed(self.rollback_critical), *reversed(self.disposable))
+        for purge in purges:
+            try:
+                purge.rollback()
+            except GraphAdapterError as error:
+                errors.append(str(error))
+        if errors:
+            raise GraphAdapterError("; ".join(errors))
+
+
+@dataclass(slots=True)
+class _IsolatedGraphRebuild:
+    adapter: GraphAdapter
+    library_id: str
+    staging_id: str
+    documents: tuple[GraphSourceDocument, ...]
+
+    def activate(self) -> GraphPurge:
+        staged = self.adapter.stage_purge(self.staging_id)
+        try:
+            replacement = self.adapter.stage_rebuild(self.library_id, self.documents)
+        except BaseException:
+            staged.rollback()
+            raise
+        return _CombinedGraphPurge((staged,), (replacement,))
+
+    def discard(self) -> None:
+        self.adapter.stage_purge(self.staging_id).commit()
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +218,43 @@ class CandidateResolutionSnapshot:
     candidate: tuple[object, ...]
     governance: tuple[object, ...]
     audit: tuple[tuple[object, ...], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ForgottenCandidateSnapshot:
+    candidates: tuple[tuple[object, ...], ...]
+    governance: tuple[tuple[object, ...], ...]
+    audit: tuple[tuple[object, ...], ...]
+    capture_rounds: tuple[tuple[str, str, str | None], ...]
+    capture_inbox: tuple[tuple[object, ...], ...]
+    plaintext_bodies: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ForgottenDocument:
+    path: str
+    source_version: str
+    content: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentDeletionImpact:
+    library_id: str
+    path: str
+    key_id: str
+    documents: tuple[ForgottenDocument, ...]
+    document_rows: tuple[tuple[object, ...], ...]
+    candidates: ForgottenCandidateSnapshot
+    chunks: tuple[tuple[object, ...], ...]
+    searches: tuple[tuple[object, ...], ...]
+    vectors: tuple[tuple[object, ...], ...]
+    versions: tuple[tuple[object, ...], ...]
+    graph_documents: tuple[tuple[object, ...], ...]
+    vector_indexes: tuple[tuple[object, ...], ...]
+    graph_indexes: tuple[tuple[object, ...], ...]
+    rebuild_jobs: tuple[tuple[object, ...], ...]
+
+    capture_round_details: tuple[tuple[object, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,10 +324,14 @@ class PlatformState:
         self.library_roots = library_roots
         self.connection: sqlite3.Connection | None = None
         self.worker_task: asyncio.Task[None] | None = None
+        self.capture_worker_task: asyncio.Task[None] | None = None
         self.stop_worker = asyncio.Event()
         self.startup_count = 0
         self.previous_shutdown_clean = True
         self.sensitive_dedupe_key = b""
+        self.tombstone_keys: dict[str, bytes] = {}
+        self.active_tombstone_key_id = ""
+        self._library_lock_state = threading.local()
         self.model_client = model_client or OpenAICompatibleClient(None, None)
         self.graph_adapter = graph_adapter
         self._last_reconciliation_check = 0.0
@@ -240,10 +339,12 @@ class PlatformState:
     async def start(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.sensitive_dedupe_key = self._load_or_create_sensitive_dedupe_key()
+        self.tombstone_keys, self.active_tombstone_key_id = self._load_tombstone_keys()
         connection = sqlite3.connect(self.database_path)
         self.connection = connection
         try:
             connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA secure_delete=ON")
             connection.execute("PRAGMA journal_mode=WAL")
             integrity = connection.execute("PRAGMA quick_check").fetchone()
             if integrity != ("ok",):
@@ -350,7 +451,7 @@ class PlatformState:
                 CREATE TABLE IF NOT EXISTS memory_operations (
                     operation_id TEXT PRIMARY KEY,
                     library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK(kind IN ('edit', 'restore')),
+                    kind TEXT NOT NULL CHECK(kind IN ('edit', 'restore', 'delete')),
                     document_path TEXT NOT NULL,
                     actor_type TEXT NOT NULL,
                     source TEXT NOT NULL,
@@ -440,6 +541,55 @@ class PlatformState:
                     candidate_id TEXT REFERENCES candidate_memories(id),
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(library_id, path, source_version)
+                );
+                CREATE TABLE IF NOT EXISTS memory_tombstones (
+                    id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL
+                        REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    match_fingerprint TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
+                    source_scope_json TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL,
+                    marker_path TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS active_memory_tombstone_path
+                    ON memory_tombstones(library_id, path);
+                CREATE TABLE IF NOT EXISTS graph_cleanup_intents (
+                    cleanup_id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    previous_head TEXT,
+                    document_paths_json TEXT,
+                    marker_path TEXT,
+                    marker_digest TEXT,
+                    document_modes_json TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_restore_intents (
+                    operation_id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    tombstone_id TEXT NOT NULL,
+                    source_commit TEXT NOT NULL,
+                    previous_head TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    marker_path TEXT NOT NULL,
+                    marker_digest TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    actor_type TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    root_device INTEGER NOT NULL,
+                    root_inode INTEGER NOT NULL,
+                    parent_device INTEGER NOT NULL,
+                    parent_inode INTEGER NOT NULL,
+                    marker_directory_device INTEGER NOT NULL,
+                    marker_directory_inode INTEGER NOT NULL,
+                    marker_device INTEGER NOT NULL,
+                    marker_inode INTEGER NOT NULL,
+                    document_device INTEGER,
+                    document_inode INTEGER,
+                    recovery_phase TEXT NOT NULL DEFAULT 'started',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS capture_inbox (
                     event_id TEXT PRIMARY KEY,
@@ -543,6 +693,64 @@ class PlatformState:
                     "ALTER TABLE out_of_band_changes "
                     "ADD COLUMN external_candidates_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            operation_sql = str(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'memory_operations'"
+                ).fetchone()[0]
+            )
+            if "'delete'" not in operation_sql:
+                connection.executescript(
+                    """
+                    ALTER TABLE memory_operations RENAME TO memory_operations_legacy;
+                    CREATE TABLE memory_operations (
+                        operation_id TEXT PRIMARY KEY,
+                        library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                        kind TEXT NOT NULL CHECK(kind IN ('edit', 'restore', 'delete')),
+                        document_path TEXT NOT NULL,
+                        actor_type TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        request_hash TEXT NOT NULL,
+                        commit_id TEXT NOT NULL,
+                        response_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO memory_operations SELECT * FROM memory_operations_legacy;
+                    DROP TABLE memory_operations_legacy;
+                    """
+                )
+            tombstone_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(memory_tombstones)")
+            }
+            if "match_fingerprint" not in tombstone_columns:
+                connection.execute(
+                    "ALTER TABLE memory_tombstones "
+                    "ADD COLUMN match_fingerprint TEXT NOT NULL DEFAULT ''"
+                )
+            cleanup_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(graph_cleanup_intents)")
+            }
+            for name in (
+                "previous_head",
+                "document_paths_json",
+                "marker_path",
+                "marker_digest",
+                "document_modes_json",
+            ):
+                if name not in cleanup_columns:
+                    connection.execute(
+                        f"ALTER TABLE graph_cleanup_intents ADD COLUMN {name} TEXT"
+                    )
+            restore_intent_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(memory_restore_intents)")
+            }
+            if "recovery_phase" not in restore_intent_columns:
+                connection.execute(
+                    "ALTER TABLE memory_restore_intents "
+                    "ADD COLUMN recovery_phase TEXT NOT NULL DEFAULT 'started'"
+                )
             job_columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(background_jobs)")
             }
@@ -569,12 +777,19 @@ class PlatformState:
             self._set_metadata("startup_count", str(self.startup_count))
             self._set_metadata("clean_shutdown", "false")
             connection.commit()
+            self._reconcile_graph_cleanup_intents()
+            self._reconcile_memory_restore_intents()
         except BaseException:
             connection.close()
             self.connection = None
             raise
         self.stop_worker.clear()
-        self.worker_task = asyncio.create_task(self._worker(), name="memory-background-worker")
+        self.worker_task = asyncio.create_task(
+            self._worker(capture_only=False), name="memory-background-worker"
+        )
+        self.capture_worker_task = asyncio.create_task(
+            self._worker(capture_only=True), name="memory-capture-worker"
+        )
 
     def _load_or_create_sensitive_dedupe_key(self) -> bytes:
         path = self.database_path.parent / "sensitive-dedupe-key"
@@ -598,20 +813,71 @@ class PlatformState:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
+    def _load_tombstone_keys(self) -> tuple[dict[str, bytes], str]:
+        path = self.database_path.parent / "tombstone-keys.json"
+        try:
+            payload = json.loads(path.read_text(encoding="ascii"))
+            active = str(payload["active"])
+            keys = {
+                str(key_id): base64.b64decode(str(value), validate=True)
+                for key_id, value in dict(payload["keys"]).items()
+            }
+            if active not in keys or any(len(key) != 32 for key in keys.values()):
+                raise ValueError
+            os.chmod(path, 0o600)
+            return keys, active
+        except FileNotFoundError:
+            key_id = uuid.uuid4().hex
+            keys = {key_id: secrets.token_bytes(32)}
+            self._write_tombstone_keys(path, keys, key_id)
+            return keys, key_id
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise sqlite3.DatabaseError("tombstone key ring is invalid") from error
+
+    @staticmethod
+    def _write_tombstone_keys(path: Path, keys: dict[str, bytes], active: str) -> None:
+        payload = {
+            "format": 1,
+            "active": active,
+            "keys": {key_id: base64.b64encode(key).decode("ascii") for key_id, key in keys.items()},
+        }
+        temporary = path.with_suffix(".tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+                json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def rotate_tombstone_key(self) -> str:
+        key_id = uuid.uuid4().hex
+        keys = {**self.tombstone_keys, key_id: secrets.token_bytes(32)}
+        self._write_tombstone_keys(self.database_path.parent / "tombstone-keys.json", keys, key_id)
+        self.tombstone_keys = keys
+        self.active_tombstone_key_id = key_id
+        return key_id
+
     async def close(self) -> None:
         if self.worker_task is not None:
             self.stop_worker.set()
             await self.worker_task
+        if self.capture_worker_task is not None:
+            await self.capture_worker_task
         if self.connection is not None:
             self._set_metadata("clean_shutdown", "true")
             self.connection.commit()
             self.connection.close()
             self.connection = None
 
-    async def _worker(self) -> None:
+    async def _worker(self, *, capture_only: bool) -> None:
         while not self.stop_worker.is_set():
-            await self._execute_pending_jobs()
-            if monotonic() - self._last_reconciliation_check >= 0.5:
+            await self._execute_pending_jobs(capture_only=capture_only)
+            if not capture_only and monotonic() - self._last_reconciliation_check >= 0.5:
                 self._last_reconciliation_check = monotonic()
                 for library in self.list_libraries():
                     if library.availability != "available":
@@ -841,6 +1107,22 @@ class PlatformState:
         return normalized
 
     def scan_library(
+        self,
+        library_id: str,
+        *,
+        participate_in_transaction: bool = False,
+        frozen_scan: MarkdownScan | None = None,
+    ) -> dict[str, int | str]:
+        if self.library(library_id) is None:
+            raise LibraryRegistrationError("memory library not found")
+        with self._library_lock(library_id):
+            return self._scan_library_locked(
+                library_id,
+                participate_in_transaction=participate_in_transaction,
+                frozen_scan=frozen_scan,
+            )
+
+    def _scan_library_locked(
         self,
         library_id: str,
         *,
@@ -1955,7 +2237,28 @@ class PlatformState:
         creator: str,
         idempotency_key: str,
     ) -> dict[str, object]:
+        with self._library_lock(library_id):
+            return self._create_candidate_locked(
+                library_id,
+                suggested_type,
+                body,
+                source_references,
+                creator,
+                idempotency_key,
+            )
+
+    def _create_candidate_locked(
+        self,
+        library_id: str,
+        suggested_type: str,
+        body: str,
+        source_references: tuple[str, ...],
+        creator: str,
+        idempotency_key: str,
+    ) -> dict[str, object]:
         self._require_available_library(library_id)
+        if self._matches_active_tombstone(library_id, body, reject_invalid_formal=True):
+            raise CandidateGovernanceError("candidate matches forgotten memory")
         persisted_input = "\n".join((body, *source_references, creator, idempotency_key))
         finding = inspect_sensitive_text(persisted_input)
         if finding is not None:
@@ -2125,6 +2428,33 @@ class PlatformState:
                 library_id,
                 content if inspect_sensitive_text(content) is not None else None,
             )
+        with self._library_lock(library_id):
+            return self._ingest_capture_event_locked(
+                event_id,
+                session_id,
+                turn_id,
+                event_kind,
+                content,
+                occurred_at,
+                project_id,
+                library_id,
+            )
+
+    def _ingest_capture_event_locked(
+        self,
+        event_id: str,
+        session_id: str,
+        turn_id: str,
+        event_kind: str,
+        content: str,
+        occurred_at: str,
+        project_id: str,
+        library_id: str,
+    ) -> dict[str, object]:
+        if self._matches_active_tombstone(
+            library_id, content, reject_invalid_formal=True
+        ):
+            raise CandidateGovernanceError("capture event matches forgotten memory")
         request_hash = hashlib.sha256(
             json.dumps(
                 {
@@ -2487,9 +2817,7 @@ class PlatformState:
                     ),
                 ).fetchone()
                 if version is not None:
-                    source_references = [
-                        f"markdown:{target['path']}@{target['source_version']}"
-                    ]
+                    source_references = [f"markdown:{target['path']}@{target['source_version']}"]
                     source_created_at = None
                     if version[4] is not None:
                         source = self.connection_or_raise.execute(
@@ -2498,9 +2826,7 @@ class PlatformState:
                             (str(version[4]),),
                         ).fetchone()
                         if source is not None:
-                            source_references = [
-                                str(item) for item in json.loads(str(source[0]))
-                            ]
+                            source_references = [str(item) for item in json.loads(str(source[0]))]
                             source_created_at = str(source[1])
                     target.update(
                         {
@@ -2557,6 +2883,13 @@ class PlatformState:
     def edit_candidate(
         self, candidate_id: str, body: str, operator: str, reason: str
     ) -> dict[str, object]:
+        library_id = self._candidate_library_id(candidate_id)
+        with self._library_lock(library_id):
+            return self._edit_candidate_locked(candidate_id, body, operator, reason)
+
+    def _edit_candidate_locked(
+        self, candidate_id: str, body: str, operator: str, reason: str
+    ) -> dict[str, object]:
         current = self.candidate(candidate_id)
         self._validate_governance_actor(operator, reason)
         if current["status"] != "pending":
@@ -2565,6 +2898,10 @@ class PlatformState:
             raise CandidateGovernanceError("candidate body must contain Markdown text")
         if inspect_sensitive_text("\n".join((body, operator, reason))) is not None:
             raise CandidateGovernanceError("candidate content requires sensitive review")
+        if self._matches_active_tombstone(
+            str(current["library_id"]), body, reject_invalid_formal=True
+        ):
+            raise CandidateGovernanceError("candidate matches forgotten memory")
         if body == current["body"]:
             return current
         try:
@@ -2607,10 +2944,37 @@ class PlatformState:
         publication_source: str = "candidate-approval",
         commit_message: str | None = None,
     ) -> dict[str, object]:
+        library_id = self._candidate_library_id(candidate_id)
+        with self._library_lock(library_id):
+            return self._approve_candidate_locked(
+                candidate_id,
+                operator,
+                reason,
+                operation_id,
+                publication_source=publication_source,
+                commit_message=commit_message,
+            )
+
+    def _approve_candidate_locked(
+        self,
+        candidate_id: str,
+        operator: str,
+        reason: str,
+        operation_id: str,
+        *,
+        publication_source: str = "candidate-approval",
+        commit_message: str | None = None,
+    ) -> dict[str, object]:
         self._validate_governance_actor(operator, reason)
         self._validate_operation_identifier(operation_id, "operation_id")
         self._ensure_decision_operation_available(candidate_id, operation_id)
         current = self.candidate(candidate_id)
+        if self._matches_active_tombstone(
+            str(current["library_id"]),
+            str(current["body"]),
+            reject_invalid_formal=True,
+        ):
+            raise CandidateGovernanceError("candidate matches forgotten memory")
         if (
             inspect_sensitive_text(
                 "\n".join((str(current["body"]), operator, reason, operation_id))
@@ -2808,6 +3172,31 @@ class PlatformState:
         effective_at: str | None = None,
         condition: str | None = None,
     ) -> dict[str, object]:
+        library_id = self._candidate_library_id(candidate_id)
+        with self._library_lock(library_id):
+            return self._resolve_candidate_locked(
+                candidate_id,
+                action,
+                operator,
+                reason,
+                operation_id,
+                merged_body=merged_body,
+                effective_at=effective_at,
+                condition=condition,
+            )
+
+    def _resolve_candidate_locked(
+        self,
+        candidate_id: str,
+        action: str,
+        operator: str,
+        reason: str,
+        operation_id: str,
+        *,
+        merged_body: str | None = None,
+        effective_at: str | None = None,
+        condition: str | None = None,
+    ) -> dict[str, object]:
         if action not in {"keep", "adopt", "merge", "scope"}:
             raise CandidateGovernanceError("invalid candidate resolution")
         self._validate_governance_actor(operator, reason)
@@ -2912,9 +3301,7 @@ class PlatformState:
             governance_metadata.append(
                 f"applicability_condition: {json.dumps(condition, ensure_ascii=False)}"
             )
-        content = content.replace(
-            "---\n", "---\n" + "\n".join(governance_metadata) + "\n", 1
-        )
+        content = content.replace("---\n", "---\n" + "\n".join(governance_metadata) + "\n", 1)
 
         def record_publication(response: dict[str, str]) -> None:
             self._record_candidate_resolution(
@@ -3200,9 +3587,7 @@ class PlatformState:
 
     def _candidate_conflicts_with_library(self, candidate: dict[str, object]) -> bool:
         return (
-            self._candidate_conflict_path(
-                str(candidate["library_id"]), str(candidate["body"])
-            )
+            self._candidate_conflict_path(str(candidate["library_id"]), str(candidate["body"]))
             is not None
         )
 
@@ -3530,6 +3915,17 @@ class PlatformState:
         reason: str,
         operation_id: str,
     ) -> dict[str, object]:
+        library_id = self._candidate_library_id(candidate_id)
+        with self._library_lock(library_id):
+            return self._reject_candidate_locked(candidate_id, operator, reason, operation_id)
+
+    def _reject_candidate_locked(
+        self,
+        candidate_id: str,
+        operator: str,
+        reason: str,
+        operation_id: str,
+    ) -> dict[str, object]:
         self._validate_governance_actor(operator, reason)
         self._validate_operation_identifier(operation_id, "operation_id")
         self._ensure_decision_operation_available(candidate_id, operation_id)
@@ -3769,6 +4165,756 @@ class PlatformState:
         )
         return {"library_id": library_id, "path": current["path"], "diff": diff}
 
+    def preview_document_deletion(
+        self, library_id: str, path: str, expected_source_version: str
+    ) -> dict[str, object]:
+        library = self._require_available_library(library_id)
+        with self._library_lock(library_id):
+            normalized, indexed_version = self._document_record(library_id, path)
+            if indexed_version != expected_source_version:
+                raise MemoryMutationError("document version conflict")
+            impact = self._document_deletion_impact(
+                library_id, normalized, self.active_tombstone_key_id
+            )
+            if Path(library.canonical_path) != Path(
+                self._require_available_library(library_id).canonical_path
+            ):
+                raise MemoryMutationError("memory library changed while preparing deletion")
+            return self._document_deletion_preview(impact)
+
+    def _document_deletion_preview(
+        self, impact: DocumentDeletionImpact
+    ) -> dict[str, object]:
+        current = next(document for document in impact.documents if document.path == impact.path)
+        governance_by_candidate = {
+            str(row[0]): row for row in impact.candidates.governance
+        }
+        audits_by_candidate: dict[str, list[dict[str, object]]] = {}
+        for row in impact.candidates.audit:
+            audits_by_candidate.setdefault(str(row[1]), []).append(
+                {
+                    "id": int(str(row[0])),
+                    "action": str(row[2]),
+                    "operator": str(row[3]),
+                    "reason": str(row[4]),
+                    "body": str(row[5]),
+                    "created_at": str(row[6]),
+                }
+            )
+        candidate_impacts: list[dict[str, object]] = []
+        references: set[str] = set()
+        for row in impact.candidates.candidates:
+            candidate_id = str(row[0])
+            source_references = [str(item) for item in json.loads(str(row[4]))]
+            references.update(source_references)
+            governance = governance_by_candidate.get(candidate_id)
+            candidate_impacts.append(
+                {
+                    "id": candidate_id,
+                    "suggested_type": str(row[2]),
+                    "body": str(row[3]),
+                    "source_references": source_references,
+                    "creator": str(row[5]),
+                    "status": str(row[8]),
+                    "published_path": None if row[12] is None else str(row[12]),
+                    "governance": None
+                    if governance is None
+                    else {
+                        "classification": str(governance[1]),
+                        "target_path": None
+                        if governance[2] is None
+                        else str(governance[2]),
+                        "similarity": float(str(governance[3])),
+                        "resolution": None
+                        if governance[4] is None
+                        else str(governance[4]),
+                        "effective_at": None
+                        if governance[5] is None
+                        else str(governance[5]),
+                        "condition": None
+                        if governance[6] is None
+                        else str(governance[6]),
+                    },
+                    "audit": audits_by_candidate.get(candidate_id, []),
+                }
+            )
+        candidate_by_capture = {
+            (session_id, turn_id): candidate_id
+            for session_id, turn_id, candidate_id in impact.candidates.capture_rounds
+        }
+        capture_impacts = [
+            {
+                "event_id": str(row[0]),
+                "session_id": str(row[2]),
+                "turn_id": str(row[5]),
+                "event_kind": str(row[6]),
+                "content": str(row[7]),
+                "occurred_at": str(row[8]),
+                "candidate_id": candidate_by_capture.get((str(row[2]), str(row[5]))),
+            }
+            for row in impact.candidates.capture_inbox
+        ]
+        return {
+            "library_id": impact.library_id,
+            "path": impact.path,
+            "source_version": current.source_version,
+            "content": current.content.decode("utf-8"),
+            "preview_token": self._document_deletion_preview_token(impact),
+            "authoritative_copies": [
+                {"path": document.path, "source_version": document.source_version}
+                for document in impact.documents
+            ],
+            "source_scope": {
+                "document_path": impact.path,
+                "references": sorted(set(references)),
+                "candidate_ids": [str(row[0]) for row in impact.candidates.candidates],
+                "capture_ranges": [
+                    {
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "candidate_id": candidate_id,
+                        "event_count": sum(
+                            str(row[2]) == session_id and str(row[5]) == turn_id
+                            for row in impact.candidates.capture_inbox
+                        ),
+                    }
+                    for session_id, turn_id, candidate_id in impact.candidates.capture_rounds
+                ],
+            },
+            "derived": {
+                "summary": False,
+                "full_text_chunks": len(impact.chunks),
+                "full_text_entries": len(impact.searches),
+                "embeddings": len(impact.vectors),
+                "graph_documents": len(impact.graph_documents),
+                "graph_relationships": "all relationships sourced by this document",
+                "candidate_records": len(impact.candidates.candidates),
+                "candidate_audit_records": len(impact.candidates.audit),
+                "capture_events": len(impact.candidates.capture_inbox),
+            },
+            "candidate_impacts": candidate_impacts,
+            "capture_impacts": capture_impacts,
+            "supersession_chain": [
+                {
+                    "path": str(row[0]),
+                    "version_id": str(row[1]),
+                    "source_version": str(row[2]),
+                    "content": str(row[3]),
+                    "state": str(row[4]),
+                    "supersedes_version_id": None if row[5] is None else str(row[5]),
+                    "effective_at": None if row[6] is None else str(row[6]),
+                    "condition": None if row[7] is None else str(row[7]),
+                }
+                for row in impact.versions
+            ],
+        }
+
+    def _document_deletion_impact(
+        self, library_id: str, path: str, key_id: str
+    ) -> DocumentDeletionImpact:
+        if key_id not in self.tombstone_keys:
+            raise MemoryMutationError("deletion preview is stale; request a new preview")
+        documents = self._forgotten_documents(library_id, path, key_id)
+        document_paths = tuple(document.path for document in documents)
+        placeholders = ",".join("?" for _ in document_paths)
+        path_parameters = (library_id, *document_paths)
+        connection = self.connection_or_raise
+        document_rows = tuple(
+            connection.execute(
+                f"SELECT id, library_id, path, source_version FROM memory_documents "
+                f"WHERE library_id = ? AND path IN ({placeholders}) ORDER BY id",  # noqa: S608
+                path_parameters,
+            )
+        )
+        chunks = tuple(
+            connection.execute(
+                f"SELECT id, document_id, library_id, path, kind, heading, start_line, "
+                f"end_line, content, source_version FROM memory_chunks "
+                f"WHERE library_id = ? AND path IN ({placeholders}) ORDER BY id",  # noqa: S608
+                path_parameters,
+            )
+        )
+        chunk_ids = tuple(str(row[0]) for row in chunks)
+        searches: tuple[tuple[object, ...], ...] = ()
+        if chunk_ids:
+            chunk_placeholders = ",".join("?" for _ in chunk_ids)
+            searches = tuple(
+                connection.execute(
+                    f"SELECT chunk_id, content, heading, path FROM memory_chunk_search "
+                    f"WHERE chunk_id IN ({chunk_placeholders}) ORDER BY chunk_id",  # noqa: S608
+                    chunk_ids,
+                )
+            )
+        vectors = tuple(
+            connection.execute(
+                f"SELECT chunk_id, library_id, source_version, model, vector_json, created_at "
+                f"FROM memory_chunk_vectors WHERE chunk_id IN "
+                f"({','.join('?' for _ in chunk_ids)}) ORDER BY chunk_id",  # noqa: S608
+                chunk_ids,
+            )
+        ) if chunk_ids else ()
+        versions = tuple(
+            connection.execute(
+                f"SELECT path, version_id, source_version, content, state, "
+                f"supersedes_version_id, effective_at, condition_text, commit_id, "
+                f"candidate_id, updated_at FROM memory_versions "
+                f"WHERE library_id = ? AND path IN ({placeholders}) ORDER BY path, version_id",  # noqa: S608
+                path_parameters,
+            )
+        )
+        graph_documents = tuple(
+            connection.execute(
+                f"SELECT library_id, document_id, path, source_version "
+                f"FROM memory_graph_documents WHERE library_id = ? "
+                f"AND path IN ({placeholders}) ORDER BY document_id",  # noqa: S608
+                path_parameters,
+            )
+        )
+        vector_indexes = tuple(
+            connection.execute(
+                "SELECT library_id, model, dimension, updated_at "
+                "FROM memory_vector_indexes WHERE library_id = ?",
+                (library_id,),
+            )
+        )
+        graph_indexes = tuple(
+            connection.execute(
+                "SELECT library_id, status, total_documents, projected_documents, "
+                "last_error, updated_at FROM memory_graph_indexes WHERE library_id = ?",
+                (library_id,),
+            )
+        )
+        rebuild_jobs = tuple(
+            connection.execute(
+                "SELECT id, kind, payload, status, attempts, available_at, created_at "
+                "FROM background_jobs WHERE kind IN ('vector_rebuild', 'graph_rebuild') "
+                "AND json_extract(payload, '$.library_id') = ? ORDER BY id",
+                (library_id,),
+            )
+        )
+        current = next(document for document in documents if document.path == path)
+        match_fingerprint = self._tombstone_match_fingerprint(
+            library_id,
+            self._deleted_document_match_content(
+                library_id, path, current.content.decode("utf-8")
+            ),
+            key_id,
+        )
+        candidates = self._snapshot_forgotten_candidates(
+            library_id, match_fingerprint, key_id
+        )
+        capture_round_details: tuple[tuple[object, ...], ...] = ()
+        if candidates.capture_rounds:
+            capture_keys = tuple((row[0], row[1]) for row in candidates.capture_rounds)
+            conditions = " OR ".join(
+                "(session_id = ? AND turn_id = ?)" for _ in capture_keys
+            )
+            capture_round_details = tuple(
+                connection.execute(
+                    "SELECT session_id, turn_id, library_id, status, candidate_id, "
+                    "last_error, updated_at FROM capture_rounds "
+                    f"WHERE library_id = ? AND ({conditions}) "  # noqa: S608
+                    "ORDER BY session_id, turn_id",
+                    (library_id, *(value for key in capture_keys for value in key)),
+                )
+            )
+        return DocumentDeletionImpact(
+            library_id,
+            path,
+            key_id,
+            documents,
+            document_rows,
+            candidates,
+            chunks,
+            searches,
+            vectors,
+            versions,
+            graph_documents,
+            vector_indexes,
+            graph_indexes,
+            rebuild_jobs,
+            capture_round_details,
+        )
+
+    def _document_deletion_preview_token(self, impact: DocumentDeletionImpact) -> str:
+        key = self.tombstone_keys.get(impact.key_id)
+        if key is None:
+            raise MemoryMutationError("deletion preview is stale; request a new preview")
+        material = {
+            "library_id": impact.library_id,
+            "path": impact.path,
+            "key_id": impact.key_id,
+            "documents": [
+                {
+                    "path": document.path,
+                    "source_version": document.source_version,
+                    "content_sha256": hashlib.sha256(document.content).hexdigest(),
+                }
+                for document in impact.documents
+            ],
+            "document_rows": impact.document_rows,
+            "candidates": impact.candidates.candidates,
+            "candidate_governance": impact.candidates.governance,
+            "candidate_audit": impact.candidates.audit,
+            "capture_rounds": impact.capture_round_details,
+            "capture_inbox": impact.candidates.capture_inbox,
+            "chunks": impact.chunks,
+            "searches": impact.searches,
+            "vectors": impact.vectors,
+            "versions": impact.versions,
+            "graph_documents": impact.graph_documents,
+            "vector_indexes": impact.vector_indexes,
+            "graph_indexes": impact.graph_indexes,
+            "rebuild_jobs": impact.rebuild_jobs,
+        }
+        payload = b"personal-agent-memory:delete-preview:v1\0" + json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hmac.new(key, payload, hashlib.sha256).hexdigest()
+        return f"pam-delete-preview-v1:{impact.key_id}:{digest}"
+
+    def _document_deletion_preview_key_id(self, preview_token: str) -> str:
+        parts = preview_token.split(":")
+        if (
+            len(parts) != 3
+            or parts[0] != "pam-delete-preview-v1"
+            or not parts[1]
+            or len(parts[2]) != 64
+            or any(character not in "0123456789abcdef" for character in parts[2])
+            or parts[1] not in self.tombstone_keys
+        ):
+            raise MemoryMutationError("deletion preview is stale; request a new preview")
+        return parts[1]
+
+    def delete_document(
+        self,
+        library_id: str,
+        path: str,
+        expected_source_version: str,
+        operation_id: str,
+        actor_type: str,
+        source: str,
+        preview_token: str,
+    ) -> dict[str, str]:
+        self._validate_memory_operation(operation_id, actor_type, source)
+        request_hash = self._memory_operation_hash(
+            library_id,
+            path,
+            expected_source_version,
+            actor_type,
+            source,
+            "delete",
+            preview_token,
+        )
+        existing = self._completed_memory_operation(operation_id, request_hash)
+        if existing is not None:
+            self._finish_completed_graph_cleanup(existing)
+            return existing
+        library = self._require_available_library(library_id)
+        with self._library_lock(library_id):
+            existing = self._completed_memory_operation(operation_id, request_hash)
+            if existing is not None:
+                self._finish_completed_graph_cleanup(existing)
+                return existing
+            normalized, indexed_version = self._document_record(library_id, path)
+            if indexed_version != expected_source_version:
+                raise MemoryMutationError("document version conflict")
+            root = Path(library.canonical_path)
+            preview_key_id = self._document_deletion_preview_key_id(preview_token)
+            impact = self._document_deletion_impact(library_id, normalized, preview_key_id)
+            expected_preview_token = self._document_deletion_preview_token(impact)
+            if not hmac.compare_digest(preview_token, expected_preview_token):
+                raise MemoryMutationError("deletion preview is stale; request a new preview")
+            impact = self._document_deletion_impact(library_id, normalized, preview_key_id)
+            expected_preview_token = self._document_deletion_preview_token(impact)
+            if not hmac.compare_digest(preview_token, expected_preview_token):
+                raise MemoryMutationError("deletion preview is stale; request a new preview")
+            tombstone_key_id = impact.key_id
+            documents = impact.documents
+            document_paths = tuple(document.path for document in documents)
+            content = next(
+                document.content for document in documents if document.path == normalized
+            )
+            repository = self._git_repository(library_id)
+            repository.ensure_index_clean()
+            previous_head = repository.head()
+            assert previous_head is not None
+            snapshot = self._snapshot_library_index(library_id)
+            graph_was_ready = bool(
+                snapshot.graph_indexes
+                and str(snapshot.graph_indexes[0][1]) == "ready"
+                and int(str(snapshot.graph_indexes[0][3])) > 0
+            )
+            tombstone_id = uuid.uuid4().hex
+            marker_path = f"{TOMBSTONE_DIRECTORY}/{tombstone_id}.json"
+            deleted_at = datetime.now(UTC).isoformat()
+            fingerprint = self._tombstone_fingerprint(
+                library_id, content.decode("utf-8"), tombstone_key_id
+            )
+            match_fingerprint = self._tombstone_match_fingerprint(
+                library_id,
+                self._deleted_document_match_content(
+                    library_id, normalized, content.decode("utf-8")
+                ),
+                tombstone_key_id,
+            )
+            candidate_snapshot = impact.candidates
+            source_scope = self._tombstone_source_scope(
+                library_id,
+                normalized,
+                document_paths,
+                candidate_snapshot,
+                tombstone_key_id,
+            )
+            marker = (
+                json.dumps(
+                    {
+                        "deleted_at": deleted_at,
+                        "fingerprint": fingerprint,
+                        "format": 1,
+                        "key_id": tombstone_key_id,
+                        "match_fingerprint": match_fingerprint,
+                        "source_scope": source_scope,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+            marker_name = f"{tombstone_id}.json"
+            commit: str | None = None
+            graph_purge: GraphPurge | None = None
+            cleanup_intent_started = False
+            with ExitStack() as bindings:
+                bound_documents = {
+                    document.path: bindings.enter_context(self._bind_document(root, document.path))
+                    for document in documents
+                }
+                marker_bound = bindings.enter_context(
+                    self._bind_tombstone_marker(root, marker_name)
+                )
+                if any(
+                    bound.root_identity != marker_bound.root_identity
+                    for bound in bound_documents.values()
+                ):
+                    raise MemoryMutationError("memory library changed while deleting")
+                bound_identities: dict[str, tuple[int, int]] = {}
+                document_modes: dict[str, int] = {}
+                for document in documents:
+                    bound = bound_documents[document.path]
+                    bound_content, identity, mode = self._read_bound_document_with_mode(bound)
+                    if bound_content != document.content:
+                        raise MemoryMutationError(
+                            "document changed outside the platform; rescan before deleting"
+                        )
+                    bound_identities[document.path] = identity
+                    document_modes[document.path] = mode
+                marker_identity: tuple[int, int] | None = None
+                deleted_paths: list[str] = []
+                database_committed = False
+                try:
+                    if self.graph_adapter is not None:
+                        self._begin_graph_cleanup_intent(
+                            library_id,
+                            tombstone_id,
+                            previous_head,
+                            document_paths,
+                            marker_path,
+                            marker,
+                            document_modes,
+                        )
+                        cleanup_intent_started = True
+                    descriptor = os.open(
+                        marker_bound.name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=marker_bound.directory_fd,
+                    )
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(marker)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                        metadata = os.fstat(stream.fileno())
+                        marker_identity = (metadata.st_dev, metadata.st_ino)
+                    os.fsync(marker_bound.directory_fd)
+                    os.fsync(marker_bound.root_fd)
+                    self._verify_bound_tombstone_marker(root, marker_bound, marker_identity)
+                    for document in documents:
+                        bound = bound_documents[document.path]
+                        self._verify_bound_document(
+                            root,
+                            document.path,
+                            bound,
+                            bound_identities[document.path],
+                        )
+                        os.unlink(bound.name, dir_fd=bound.parent_fd)
+                        deleted_paths.append(document.path)
+                        os.fsync(bound.parent_fd)
+                        self._verify_bound_parent(root, document.path, bound)
+                        self._verify_bound_tombstone_marker(root, marker_bound, marker_identity)
+                    commit = repository.commit(
+                        {
+                            **{document.path: None for document in documents},
+                            marker_path: marker,
+                        },
+                        "Forget memory document",
+                    )
+                    for document in documents:
+                        self._verify_bound_parent(
+                            root, document.path, bound_documents[document.path]
+                        )
+                    self._verify_bound_tombstone_marker(root, marker_bound, marker_identity)
+                    scan = scan_markdown_fd(
+                        marker_bound.root_fd,
+                        root,
+                        self.library_ignore_patterns(library_id),
+                        (self.database_path.parent,),
+                    )
+                    if not scan.complete:
+                        raise MemoryMutationError(
+                            f"Markdown scan incomplete: {'; '.join(scan.errors[:3])}"
+                        )
+                    self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                    self.scan_library(
+                        library_id,
+                        participate_in_transaction=True,
+                        frozen_scan=scan,
+                    )
+                    placeholders = ",".join("?" for _ in document_paths)
+                    path_parameters = (library_id, *document_paths)
+                    self.connection_or_raise.execute(
+                        f"DELETE FROM memory_graph_documents WHERE library_id = ? "
+                        f"AND path IN ({placeholders})",  # noqa: S608
+                        path_parameters,
+                    )
+                    self.connection_or_raise.execute(
+                        f"DELETE FROM memory_versions WHERE library_id = ? "
+                        f"AND path IN ({placeholders})",  # noqa: S608
+                        path_parameters,
+                    )
+                    if candidate_snapshot.capture_inbox:
+                        event_ids = tuple(str(row[0]) for row in candidate_snapshot.capture_inbox)
+                        event_placeholders = ",".join("?" for _ in event_ids)
+                        self.connection_or_raise.execute(
+                            f"DELETE FROM capture_inbox WHERE event_id IN ({event_placeholders})",  # noqa: S608
+                            event_ids,
+                        )
+                    forgotten_candidates = tuple(
+                        str(row[0]) for row in candidate_snapshot.candidates
+                    )
+                    if forgotten_candidates:
+                        candidate_placeholders = ",".join("?" for _ in forgotten_candidates)
+                        self.connection_or_raise.execute(
+                            f"UPDATE capture_rounds SET candidate_id = NULL "
+                            f"WHERE candidate_id IN ({candidate_placeholders})",  # noqa: S608
+                            forgotten_candidates,
+                        )
+                        self.connection_or_raise.execute(
+                            f"UPDATE memory_versions SET candidate_id = NULL "
+                            f"WHERE candidate_id IN ({candidate_placeholders})",  # noqa: S608
+                            forgotten_candidates,
+                        )
+                        self.connection_or_raise.execute(
+                            f"DELETE FROM candidate_memories "
+                            f"WHERE id IN ({candidate_placeholders})",  # noqa: S608
+                            forgotten_candidates,
+                        )
+                    if self.graph_adapter is not None:
+                        graph_count = self.connection_or_raise.execute(
+                            "SELECT COUNT(*) FROM memory_documents WHERE library_id = ?",
+                            (library_id,),
+                        ).fetchone()
+                        if graph_was_ready:
+                            graph_purge = self.graph_adapter.stage_rebuild(
+                                library_id,
+                                self._graph_source_documents(library_id),
+                                cleanup_id=tombstone_id,
+                            )
+                            self.connection_or_raise.execute(
+                                "DELETE FROM background_jobs WHERE kind = 'graph_rebuild' "
+                                "AND json_extract(payload, '$.library_id') = ?",
+                                (library_id,),
+                            )
+                            self.connection_or_raise.execute(
+                                "UPDATE memory_graph_indexes SET status = 'ready', "
+                                "total_documents = ?, projected_documents = ?, "
+                                "last_error = '', updated_at = CURRENT_TIMESTAMP "
+                                "WHERE library_id = ?",
+                                (int(graph_count[0]), int(graph_count[0]), library_id),
+                            )
+                        else:
+                            graph_purge = self.graph_adapter.stage_purge(
+                                library_id, cleanup_id=tombstone_id
+                            )
+                            self.connection_or_raise.execute(
+                                "DELETE FROM memory_graph_documents WHERE library_id = ?",
+                                (library_id,),
+                            )
+                            self.connection_or_raise.execute(
+                                "UPDATE memory_graph_indexes SET status = 'building', "
+                                "total_documents = ?, projected_documents = 0, "
+                                "last_error = '', updated_at = CURRENT_TIMESTAMP "
+                                "WHERE library_id = ?",
+                                (int(graph_count[0]), library_id),
+                            )
+                    response = {
+                        "library_id": library_id,
+                        "path": normalized,
+                        "tombstone_id": tombstone_id,
+                        "commit": commit,
+                        "operation_id": operation_id,
+                    }
+                    self.connection_or_raise.execute(
+                        """INSERT INTO memory_tombstones
+                           (id, library_id, path, fingerprint, match_fingerprint, key_id,
+                            source_scope_json, deleted_at, marker_path)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            tombstone_id,
+                            library_id,
+                            normalized,
+                            fingerprint,
+                            match_fingerprint,
+                            tombstone_key_id,
+                            json.dumps(source_scope, sort_keys=True),
+                            deleted_at,
+                            marker_path,
+                        ),
+                    )
+                    self._insert_memory_operation(
+                        operation_id,
+                        library_id,
+                        "delete",
+                        normalized,
+                        actor_type,
+                        source,
+                        request_hash,
+                        commit,
+                        response,
+                    )
+                    for document in documents:
+                        self._verify_bound_parent(
+                            root, document.path, bound_documents[document.path]
+                        )
+                    self._verify_bound_tombstone_marker(root, marker_bound, marker_identity)
+                    self.connection_or_raise.commit()
+                    database_committed = True
+                    for document in documents:
+                        self._verify_bound_parent(
+                            root, document.path, bound_documents[document.path]
+                        )
+                    self._verify_bound_tombstone_marker(root, marker_bound, marker_identity)
+                    self._checkpoint_forgotten_plaintext(
+                        tuple(document.content for document in documents)
+                        + candidate_snapshot.plaintext_bodies
+                    )
+                    if graph_purge is not None:
+                        graph_purge.commit()
+                    if cleanup_intent_started:
+                        self._complete_graph_cleanup_intent(tombstone_id)
+                    return response
+                except BaseException as error:
+                    self.connection_or_raise.rollback()
+                    compensation_errors: list[str] = []
+                    if commit is not None:
+                        try:
+                            repository.rollback_commit(commit, previous_head)
+                        except BaseException as compensation_error:
+                            compensation_errors.append(f"Git: {compensation_error}")
+                    try:
+                        self._remove_bound_tombstone_marker(marker_bound, marker_identity)
+                    except BaseException as compensation_error:
+                        compensation_errors.append(f"marker: {compensation_error}")
+                    for document in documents:
+                        if document.path not in deleted_paths:
+                            continue
+                        bound = bound_documents[document.path]
+                        try:
+                            descriptor = os.open(
+                                bound.name,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                document_modes[document.path],
+                                dir_fd=bound.parent_fd,
+                            )
+                            with os.fdopen(descriptor, "wb") as stream:
+                                stream.write(document.content)
+                                stream.flush()
+                                self._fchmod_verified(
+                                    stream.fileno(), document_modes[document.path]
+                                )
+                                os.fsync(stream.fileno())
+                            os.fsync(bound.parent_fd)
+                        except BaseException as compensation_error:
+                            compensation_errors.append(
+                                f"document {document.path}: {compensation_error}"
+                            )
+                    if commit is not None or database_committed:
+                        try:
+                            self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                            self.connection_or_raise.execute(
+                                "DELETE FROM memory_operations WHERE operation_id = ?",
+                                (operation_id,),
+                            )
+                            self.connection_or_raise.execute(
+                                "DELETE FROM memory_tombstones WHERE id = ?",
+                                (tombstone_id,),
+                            )
+                            self._restore_forgotten_candidates(candidate_snapshot)
+                            self._restore_library_index(library_id, snapshot)
+                            self._restore_forgotten_capture_rounds(candidate_snapshot)
+                            self.connection_or_raise.commit()
+                        except BaseException as compensation_error:
+                            self.connection_or_raise.rollback()
+                            compensation_errors.append(f"database: {compensation_error}")
+                    if graph_purge is not None:
+                        try:
+                            graph_purge.rollback()
+                        except BaseException as compensation_error:
+                            compensation_errors.append(f"graph: {compensation_error}")
+                    if cleanup_intent_started and not compensation_errors:
+                        try:
+                            self._complete_graph_cleanup_intent(tombstone_id)
+                        except BaseException as compensation_error:
+                            compensation_errors.append(
+                                f"graph cleanup intent: {compensation_error}"
+                            )
+                    if compensation_errors:
+                        raise MemoryMutationError(
+                            f"{error}; compensation failed: {'; '.join(compensation_errors)}"
+                        ) from error
+                    if isinstance(
+                        error,
+                        (GitHistoryError, GraphAdapterError, MemoryMutationError),
+                    ):
+                        raise MemoryMutationError(str(error)) from error
+                    if isinstance(error, OSError):
+                        raise MemoryMutationError(
+                            f"tombstone marker cannot be created safely: {error}"
+                        ) from error
+                    raise
+
+    def list_forgotten_memories(self, library_id: str) -> list[dict[str, object]]:
+        self._require_available_library(library_id)
+        return [
+            {
+                "id": str(row[0]),
+                "library_id": library_id,
+                "path": str(row[1]),
+                "source_scope": json.loads(str(row[2])),
+                "deleted_at": str(row[3]),
+            }
+            for row in self.connection_or_raise.execute(
+                """SELECT id, path, source_scope_json, deleted_at
+                   FROM memory_tombstones WHERE library_id = ?
+                   ORDER BY deleted_at DESC, id""",
+                (library_id,),
+            )
+        ]
+
     def edit_document(
         self,
         library_id: str,
@@ -3818,6 +4964,395 @@ class PlatformState:
             f"Restore memory document from {repository.resolve_commit(commit)[:12]}",
         )
 
+    def restore_forgotten_memory(
+        self,
+        library_id: str,
+        tombstone_id: str,
+        commit: str,
+        operation_id: str,
+        actor_type: str,
+        source: str,
+    ) -> dict[str, str]:
+        self._validate_memory_operation(operation_id, actor_type, source)
+        request_hash = self._memory_operation_hash(
+            library_id, tombstone_id, commit, actor_type, source, "restore-forgotten"
+        )
+        existing = self._completed_memory_operation(operation_id, request_hash)
+        if existing is not None:
+            return existing
+        row = self.connection_or_raise.execute(
+            """SELECT id, library_id, path, fingerprint, match_fingerprint, key_id,
+                      source_scope_json, deleted_at, marker_path
+               FROM memory_tombstones WHERE id = ? AND library_id = ?""",
+            (tombstone_id, library_id),
+        ).fetchone()
+        if row is None:
+            raise MemoryMutationError("forgotten memory not found")
+        tombstone_row = tuple(str(value) for value in row)
+        path = tombstone_row[2]
+        expected_fingerprint = tombstone_row[3]
+        key_id = tombstone_row[5]
+        marker_path = tombstone_row[8]
+        library = self._require_available_library(library_id)
+        repository = self._git_repository(library_id)
+        try:
+            resolved = repository.resolve_commit(commit)
+            content = repository.content_at(resolved, path)
+        except GitHistoryError as error:
+            raise MemoryMutationError(str(error)) from error
+        if not hmac.compare_digest(
+            expected_fingerprint, self._tombstone_fingerprint(library_id, content, key_id)
+        ):
+            raise MemoryMutationError("selected history does not match forgotten memory")
+        root = Path(library.canonical_path)
+        with self._library_lock(library_id):
+            existing = self._completed_memory_operation(operation_id, request_hash)
+            if existing is not None:
+                return existing
+            with (
+                self._bind_document(root, path) as target,
+                self._bind_document(root, marker_path) as marker_bound,
+            ):
+                return self._restore_forgotten_bound(
+                    library_id=library_id,
+                    tombstone_id=tombstone_id,
+                    path=path,
+                    marker_path=marker_path,
+                    content=content,
+                    resolved=resolved,
+                    operation_id=operation_id,
+                    actor_type=actor_type,
+                    source=source,
+                    request_hash=request_hash,
+                    root=root,
+                    repository=repository,
+                    target=target,
+                    marker_bound=marker_bound,
+                    tombstone_row=tombstone_row,
+                )
+
+    def _restore_forgotten_bound(
+        self,
+        *,
+        library_id: str,
+        tombstone_id: str,
+        path: str,
+        marker_path: str,
+        content: str,
+        resolved: str,
+        operation_id: str,
+        actor_type: str,
+        source: str,
+        request_hash: str,
+        root: Path,
+        repository: GitRepository,
+        target: BoundDocument,
+        marker_bound: BoundDocument,
+        tombstone_row: tuple[str, ...],
+    ) -> dict[str, str]:
+        self._verify_bound_parent(root, path, target)
+        try:
+            os.stat(target.name, dir_fd=target.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise MemoryMutationError("memory document already exists")
+        marker, marker_identity = self._read_bound_document(marker_bound)
+        self._verify_bound_document(root, marker_path, marker_bound, marker_identity)
+        trusted_scan = self._trusted_library_scan_for_creation(root, target, library_id, path)
+        previous_head = repository.head()
+        assert previous_head is not None
+        snapshot = self._snapshot_library_index(library_id)
+        commit_id: str | None = None
+        created_identity: tuple[int, int] | None = None
+        marker_removed = False
+        content_bytes = content.encode()
+        commit_message = f"Restore forgotten memory from {resolved[:12]}"
+        response: dict[str, str] | None = None
+        expected_index: LibraryIndexSnapshot | None = None
+        restore_intent_started = False
+        try:
+            self._begin_memory_restore_intent(
+                operation_id=operation_id,
+                library_id=library_id,
+                tombstone_id=tombstone_id,
+                source_commit=resolved,
+                previous_head=previous_head,
+                path=path,
+                marker_path=marker_path,
+                marker=marker,
+                marker_identity=marker_identity,
+                request_hash=request_hash,
+                actor_type=actor_type,
+                source=source,
+                target=target,
+                marker_bound=marker_bound,
+            )
+            restore_intent_started = True
+            descriptor = os.open(
+                target.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=target.parent_fd,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+                metadata = os.fstat(stream.fileno())
+                created_identity = (metadata.st_dev, metadata.st_ino)
+            os.fsync(target.parent_fd)
+            self._verify_bound_document(root, path, target, created_identity)
+            self._record_memory_restore_document_identity(operation_id, created_identity)
+            expected_scan = self._created_library_scan(
+                trusted_scan, path, content, created_identity
+            )
+            self._require_matching_scan(
+                self._scan_bound_library(root, target, library_id), expected_scan
+            )
+            self._verify_bound_document(root, marker_path, marker_bound, marker_identity)
+            os.unlink(marker_bound.name, dir_fd=marker_bound.parent_fd)
+            os.fsync(marker_bound.parent_fd)
+            marker_removed = True
+            commit_id = repository.commit(
+                {path: content_bytes, marker_path: None},
+                commit_message,
+            )
+            self.connection_or_raise.execute("BEGIN IMMEDIATE")
+            self.scan_library(
+                library_id, participate_in_transaction=True, frozen_scan=expected_scan
+            )
+            expected_index = self._snapshot_library_index(library_id)
+            response = {
+                "library_id": library_id,
+                "path": path,
+                "source_version": hashlib.sha256(content_bytes).hexdigest(),
+                "commit": commit_id,
+                "operation_id": operation_id,
+                "tombstone_id": tombstone_id,
+            }
+            self.connection_or_raise.execute(
+                "DELETE FROM memory_tombstones WHERE id = ?", (tombstone_id,)
+            )
+            self._insert_memory_operation(
+                operation_id,
+                library_id,
+                "restore",
+                path,
+                actor_type,
+                source,
+                request_hash,
+                commit_id,
+                response,
+            )
+            self.connection_or_raise.commit()
+            self._complete_memory_restore_intent(operation_id)
+            return response
+        except BaseException as error:
+            self.connection_or_raise.rollback()
+            if (
+                commit_id is not None
+                and response is not None
+                and created_identity is not None
+                and expected_index is not None
+                and self._persisted_forgotten_restore(
+                    library_id=library_id,
+                    tombstone_id=tombstone_id,
+                    path=path,
+                    marker_path=marker_path,
+                    content=content_bytes,
+                    operation_id=operation_id,
+                    request_hash=request_hash,
+                    commit=commit_id,
+                    response=response,
+                    repository=repository,
+                    root=root,
+                    target=target,
+                    marker_bound=marker_bound,
+                    created_identity=created_identity,
+                    previous_head=previous_head,
+                    expected_index=expected_index,
+                    commit_message=commit_message,
+                )
+            ):
+                if restore_intent_started:
+                    with suppress(BaseException):
+                        self._complete_memory_restore_intent(operation_id)
+                return response
+            rollback_commit_id = commit_id
+            if restore_intent_started:
+                current_head = repository.head()
+                if current_head is None:
+                    raise MemoryMutationError(
+                        "memory history disappeared during restore compensation"
+                    ) from error
+                if current_head != previous_head:
+                    try:
+                        repository.verify_commit_transition(
+                            current_head,
+                            previous_head,
+                            {path: content_bytes, marker_path: None},
+                            commit_message,
+                        )
+                    except GitHistoryError as verification_error:
+                        raise MemoryMutationError(str(verification_error)) from verification_error
+                    if commit_id is not None and current_head != commit_id:
+                        raise MemoryMutationError(
+                            "memory restore history changed before compensation"
+                        ) from error
+                    rollback_commit_id = current_head
+                elif commit_id is not None:
+                    raise MemoryMutationError(
+                        "memory restore history changed before compensation"
+                    ) from error
+                self._validate_interrupted_memory_restore_rollback(
+                    target,
+                    marker_bound,
+                    content_bytes,
+                    hashlib.sha256(marker).hexdigest(),
+                    marker_identity,
+                    created_identity,
+                )
+                self._begin_memory_restore_rollback(operation_id)
+            compensation_errors: list[str] = []
+            if rollback_commit_id is not None:
+                try:
+                    repository.rollback_commit(rollback_commit_id, previous_head)
+                except BaseException as compensation_error:
+                    raise MemoryMutationError(
+                        f"{error}; compensation failed: Git: {compensation_error}"
+                    ) from error
+            if created_identity is not None:
+                try:
+                    current, current_identity = self._read_bound_document(target)
+                    if current_identity != created_identity or current != content_bytes:
+                        raise MemoryMutationError("restored document changed before compensation")
+                    os.unlink(target.name, dir_fd=target.parent_fd)
+                    os.fsync(target.parent_fd)
+                except BaseException as compensation_error:
+                    compensation_errors.append(f"file: {compensation_error}")
+            if marker_removed:
+                try:
+                    descriptor = os.open(
+                        marker_bound.name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=marker_bound.parent_fd,
+                    )
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(marker)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                        restored_marker = os.fstat(stream.fileno())
+                    os.fsync(marker_bound.parent_fd)
+                    self._verify_bound_document(
+                        root,
+                        marker_path,
+                        marker_bound,
+                        (restored_marker.st_dev, restored_marker.st_ino),
+                    )
+                except BaseException as compensation_error:
+                    compensation_errors.append(f"marker: {compensation_error}")
+            if commit_id is not None:
+                try:
+                    self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                    self.connection_or_raise.execute(
+                        "DELETE FROM memory_operations WHERE operation_id = ?",
+                        (operation_id,),
+                    )
+                    self._restore_library_index(library_id, snapshot)
+                    self._restore_memory_tombstone(tombstone_row)
+                    self.connection_or_raise.commit()
+                except BaseException as compensation_error:
+                    self.connection_or_raise.rollback()
+                    compensation_errors.append(f"database: {compensation_error}")
+            if compensation_errors:
+                raise MemoryMutationError(
+                    f"{error}; compensation failed: {'; '.join(compensation_errors)}"
+                ) from error
+            if restore_intent_started:
+                self._complete_memory_restore_intent(operation_id)
+            if isinstance(error, (GitHistoryError, MemoryMutationError)):
+                raise MemoryMutationError(str(error)) from error
+            raise
+
+    def _persisted_forgotten_restore(
+        self,
+        *,
+        library_id: str,
+        tombstone_id: str,
+        path: str,
+        marker_path: str,
+        content: bytes,
+        operation_id: str,
+        request_hash: str,
+        commit: str,
+        response: dict[str, str],
+        repository: GitRepository,
+        root: Path,
+        target: BoundDocument,
+        marker_bound: BoundDocument,
+        created_identity: tuple[int, int],
+        previous_head: str,
+        expected_index: LibraryIndexSnapshot,
+        commit_message: str,
+    ) -> bool:
+        operation = self.connection_or_raise.execute(
+            """SELECT library_id, kind, document_path, request_hash, commit_id, response_json
+               FROM memory_operations WHERE operation_id = ?""",
+            (operation_id,),
+        ).fetchone()
+        if operation is None or tuple(str(value) for value in operation[:5]) != (
+            library_id,
+            "restore",
+            path,
+            request_hash,
+            commit,
+        ):
+            return False
+        try:
+            if json.loads(str(operation[5])) != response:
+                return False
+        except (TypeError, ValueError):
+            return False
+        if self.connection_or_raise.execute(
+            """SELECT 1 FROM memory_tombstones
+               WHERE id = ? OR (library_id = ? AND path = ?)""",
+            (tombstone_id, library_id, path),
+        ).fetchone() is not None:
+            return False
+        try:
+            marker_metadata = os.stat(
+                marker_bound.name,
+                dir_fd=marker_bound.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        else:
+            del marker_metadata
+            return False
+        try:
+            current, current_identity = self._read_bound_document(target)
+            self._verify_bound_document(root, path, target, created_identity)
+            self._verify_bound_parent(root, marker_path, marker_bound)
+            repository.verify_commit_transition(
+                commit,
+                previous_head,
+                {path: content, marker_path: None},
+                commit_message,
+            )
+            return (
+                current_identity == created_identity
+                and current == content
+                and self._snapshot_library_index(library_id) == expected_index
+                and self._read_optional_document_bytes(root, marker_path) is None
+            )
+        except (GitHistoryError, MemoryMutationError, OSError, UnicodeError):
+            return False
+
     def library_history(self, library_id: str, limit: int = 50) -> list[dict[str, str]]:
         self._require_available_library(library_id)
         try:
@@ -3854,15 +5389,1390 @@ class PlatformState:
     def history_diff(self, library_id: str, commit: str) -> dict[str, object]:
         self._require_available_library(library_id)
         try:
-            diff = self._git_repository(library_id).diff(commit)
+            repository = self._git_repository(library_id)
+            diff = repository.diff(commit)
+            changed_paths = repository.changed_paths(commit)
         except GitHistoryError as error:
             raise MemoryMutationError(str(error)) from error
+        forgotten_paths = {
+            str(row[0])
+            for row in self.connection_or_raise.execute(
+                "SELECT path FROM memory_tombstones WHERE library_id = ?",
+                (library_id,),
+            )
+        }
+        for (scope_json,) in self.connection_or_raise.execute(
+            "SELECT source_scope_json FROM memory_tombstones WHERE library_id = ?",
+            (library_id,),
+        ):
+            scope = json.loads(str(scope_json))
+            authoritative_paths = scope.get("authoritative_paths", [])
+            if isinstance(authoritative_paths, list):
+                forgotten_paths.update(
+                    str(item) for item in authoritative_paths if isinstance(item, str)
+                )
+        if changed_paths & forgotten_paths:
+            diff = "[redacted: this commit contains a currently forgotten memory]\n"
         return {
             "library_id": library_id,
             "commit": commit,
             "diff": diff,
             "lines": _diff_lines(diff),
         }
+
+    def _validate_memory_operation(self, operation_id: str, actor_type: str, source: str) -> None:
+        if not operation_id.strip() or len(operation_id) > 200:
+            raise MemoryMutationError("operation_id must be present and at most 200 characters")
+        if actor_type not in {"user", "platform"}:
+            raise MemoryMutationError("actor_type must be user or platform")
+        if not source.strip() or len(source) > 200:
+            raise MemoryMutationError("source must be present and at most 200 characters")
+
+    @staticmethod
+    def _memory_operation_hash(
+        library_id: str,
+        path: str,
+        version: str,
+        actor_type: str,
+        source: str,
+        kind: str,
+        preview_token: str | None = None,
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "library_id": library_id,
+                    "path": path,
+                    "version": version,
+                    "actor_type": actor_type,
+                    "source": source,
+                    "kind": kind,
+                    "preview_token": preview_token,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    def _completed_memory_operation(
+        self, operation_id: str, request_hash: str
+    ) -> dict[str, str] | None:
+        row = self.connection_or_raise.execute(
+            "SELECT response_json, request_hash FROM memory_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if str(row[1]) != request_hash:
+            raise MemoryMutationError("operation_id was already used for another mutation")
+        return {str(key): str(value) for key, value in json.loads(str(row[0])).items()}
+
+    def _begin_graph_cleanup_intent(
+        self,
+        library_id: str,
+        cleanup_id: str,
+        previous_head: str,
+        document_paths: tuple[str, ...],
+        marker_path: str,
+        marker: bytes,
+        document_modes: dict[str, int],
+    ) -> None:
+        self.connection_or_raise.execute(
+            """INSERT INTO graph_cleanup_intents
+               (cleanup_id, library_id, previous_head, document_paths_json,
+                marker_path, marker_digest, document_modes_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                cleanup_id,
+                library_id,
+                previous_head,
+                json.dumps(document_paths),
+                marker_path,
+                hashlib.sha256(marker).hexdigest(),
+                json.dumps(document_modes, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        self.connection_or_raise.commit()
+
+    def _complete_graph_cleanup_intent(self, cleanup_id: str) -> None:
+        self.connection_or_raise.execute(
+            "DELETE FROM graph_cleanup_intents WHERE cleanup_id = ?", (cleanup_id,)
+        )
+        self.connection_or_raise.commit()
+
+    def _begin_memory_restore_intent(
+        self,
+        *,
+        operation_id: str,
+        library_id: str,
+        tombstone_id: str,
+        source_commit: str,
+        previous_head: str,
+        path: str,
+        marker_path: str,
+        marker: bytes,
+        marker_identity: tuple[int, int],
+        request_hash: str,
+        actor_type: str,
+        source: str,
+        target: BoundDocument,
+        marker_bound: BoundDocument,
+    ) -> None:
+        self.connection_or_raise.execute(
+            """INSERT INTO memory_restore_intents
+               (operation_id, library_id, tombstone_id, source_commit, previous_head,
+                path, marker_path, marker_digest, request_hash, actor_type, source,
+                root_device, root_inode, parent_device, parent_inode,
+                marker_directory_device, marker_directory_inode, marker_device, marker_inode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                operation_id,
+                library_id,
+                tombstone_id,
+                source_commit,
+                previous_head,
+                path,
+                marker_path,
+                hashlib.sha256(marker).hexdigest(),
+                request_hash,
+                actor_type,
+                source,
+                *target.root_identity,
+                *target.parent_identity,
+                *marker_bound.parent_identity,
+                *marker_identity,
+            ),
+        )
+        self.connection_or_raise.commit()
+
+    def _record_memory_restore_document_identity(
+        self, operation_id: str, identity: tuple[int, int]
+    ) -> None:
+        cursor = self.connection_or_raise.execute(
+            """UPDATE memory_restore_intents SET document_device = ?, document_inode = ?
+               WHERE operation_id = ? AND document_device IS NULL AND document_inode IS NULL""",
+            (*identity, operation_id),
+        )
+        if cursor.rowcount != 1:
+            self.connection_or_raise.rollback()
+            raise MemoryMutationError("memory restore intent changed unexpectedly")
+        self.connection_or_raise.commit()
+
+    def _complete_memory_restore_intent(self, operation_id: str) -> None:
+        self.connection_or_raise.execute(
+            "DELETE FROM memory_restore_intents WHERE operation_id = ?", (operation_id,)
+        )
+        self.connection_or_raise.commit()
+
+    def _begin_memory_restore_rollback(self, operation_id: str) -> None:
+        cursor = self.connection_or_raise.execute(
+            """UPDATE memory_restore_intents SET recovery_phase = 'rollback'
+               WHERE operation_id = ? AND recovery_phase = 'started'""",
+            (operation_id,),
+        )
+        if cursor.rowcount != 1:
+            self.connection_or_raise.rollback()
+            raise MemoryMutationError("memory restore intent changed unexpectedly")
+        self.connection_or_raise.commit()
+
+    def _reconcile_memory_restore_intents(self) -> None:
+        rows = self.connection_or_raise.execute(
+            """SELECT operation_id, library_id, tombstone_id, source_commit,
+                      previous_head, path, marker_path, marker_digest, request_hash,
+                      actor_type, source, root_device, root_inode, parent_device,
+                      parent_inode, marker_directory_device, marker_directory_inode,
+                      marker_device, marker_inode, document_device, document_inode,
+                      recovery_phase
+               FROM memory_restore_intents ORDER BY created_at, operation_id"""
+        ).fetchall()
+        for row in rows:
+            operation_id = str(row[0])
+            library_id = str(row[1])
+            with self._library_lock(library_id):
+                self._reconcile_memory_restore_intent(row)
+                self._complete_memory_restore_intent(operation_id)
+
+    def _reconcile_memory_restore_intent(self, row: tuple[object, ...]) -> None:
+        (
+            operation_id_value,
+            library_id_value,
+            tombstone_id_value,
+            source_commit_value,
+            previous_head_value,
+            path_value,
+            marker_path_value,
+            marker_digest_value,
+            request_hash_value,
+            actor_type_value,
+            source_value,
+            root_device,
+            root_inode,
+            parent_device,
+            parent_inode,
+            marker_directory_device,
+            marker_directory_inode,
+            marker_device,
+            marker_inode,
+            document_device,
+            document_inode,
+            recovery_phase_value,
+        ) = row
+        values = (
+            operation_id_value,
+            library_id_value,
+            tombstone_id_value,
+            source_commit_value,
+            previous_head_value,
+            path_value,
+            marker_path_value,
+            marker_digest_value,
+            request_hash_value,
+            actor_type_value,
+            source_value,
+            recovery_phase_value,
+        )
+        if any(not isinstance(value, str) for value in values):
+            raise MemoryMutationError("memory restore intent is invalid")
+        operation_id, library_id, tombstone_id, source_commit, previous_head, path = cast(
+            tuple[str, str, str, str, str, str], values[:6]
+        )
+        marker_path, marker_digest, request_hash, actor_type, source, recovery_phase = cast(
+            tuple[str, str, str, str, str, str], values[6:]
+        )
+        identities = (
+            root_device,
+            root_inode,
+            parent_device,
+            parent_inode,
+            marker_directory_device,
+            marker_directory_inode,
+            marker_device,
+            marker_inode,
+        )
+        if (
+            not operation_id
+            or not library_id
+            or re.fullmatch(r"[0-9a-f]{32}", tombstone_id) is None
+            or re.fullmatch(r"[0-9a-f]{40,64}", source_commit) is None
+            or re.fullmatch(r"[0-9a-f]{40,64}", previous_head) is None
+            or not allowed_markdown_path(path)
+            or marker_path != f"{TOMBSTONE_DIRECTORY}/{tombstone_id}.json"
+            or re.fullmatch(r"[0-9a-f]{64}", marker_digest) is None
+            or re.fullmatch(r"[0-9a-f]{64}", request_hash) is None
+            or actor_type not in {"user", "platform"}
+            or not source
+            or recovery_phase not in {"started", "rollback"}
+            or any(not isinstance(value, int) or isinstance(value, bool) for value in identities)
+            or ((document_device is None) != (document_inode is None))
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in (document_device, document_inode)
+                if value is not None
+            )
+        ):
+            raise MemoryMutationError("memory restore intent is invalid")
+        library = self._require_available_library(library_id)
+        root = Path(library.canonical_path)
+        repository = self._git_repository(library_id)
+        content = repository.content_bytes_at(source_commit, path)
+        marker = repository.history_bytes_at(previous_head, marker_path)
+        if not hmac.compare_digest(hashlib.sha256(marker).hexdigest(), marker_digest):
+            raise MemoryMutationError("memory restore intent marker does not match history")
+        with (
+            self._bind_document(root, path) as target,
+            self._bind_document(root, marker_path) as marker_bound,
+        ):
+            if (
+                target.root_identity != (root_device, root_inode)
+                or target.parent_identity != (parent_device, parent_inode)
+                or marker_bound.root_identity != (root_device, root_inode)
+                or marker_bound.parent_identity
+                != (marker_directory_device, marker_directory_inode)
+            ):
+                raise MemoryMutationError("memory restore path changed during recovery")
+            expected_document_identity = (
+                None
+                if document_device is None
+                else (cast(int, document_device), cast(int, document_inode))
+            )
+            current_head = repository.head()
+            commit_message = f"Restore forgotten memory from {source_commit[:12]}"
+            operation = self.connection_or_raise.execute(
+                """SELECT library_id, kind, document_path, actor_type, source, request_hash,
+                          commit_id, response_json FROM memory_operations
+                   WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+            tombstone = self.connection_or_raise.execute(
+                """SELECT id, library_id, path, marker_path FROM memory_tombstones
+                   WHERE id = ?""",
+                (tombstone_id,),
+            ).fetchone()
+            if current_head == previous_head:
+                if operation is not None or tombstone != (
+                    tombstone_id,
+                    library_id,
+                    path,
+                    marker_path,
+                ):
+                    raise MemoryMutationError("memory restore database state is inconsistent")
+                self._verify_forgotten_restore_rollback_index(library_id, path)
+                if recovery_phase == "rollback" and self._forgotten_restore_rollback_is_complete(
+                    library_id,
+                    tombstone_id,
+                    target,
+                    marker_bound,
+                    marker_digest,
+                ):
+                    return
+                if recovery_phase == "started":
+                    self._validate_interrupted_memory_restore_rollback(
+                        target,
+                        marker_bound,
+                        content,
+                        marker_digest,
+                        (cast(int, marker_device), cast(int, marker_inode)),
+                        expected_document_identity,
+                    )
+                    self._begin_memory_restore_rollback(operation_id)
+                self._rollback_interrupted_memory_restore(
+                    root,
+                    path,
+                    marker_path,
+                    target,
+                    marker_bound,
+                    content,
+                    marker,
+                    marker_digest,
+                    (cast(int, marker_device), cast(int, marker_inode)),
+                    expected_document_identity,
+                )
+                return
+            if current_head is None:
+                raise MemoryMutationError("memory history disappeared during restore recovery")
+            repository.verify_commit_transition(
+                current_head,
+                previous_head,
+                {path: content, marker_path: None},
+                commit_message,
+            )
+            if operation is None:
+                if tombstone != (tombstone_id, library_id, path, marker_path):
+                    raise MemoryMutationError("memory restore database state is inconsistent")
+                self._validate_interrupted_memory_restore_rollback(
+                    target,
+                    marker_bound,
+                    content,
+                    marker_digest,
+                    (cast(int, marker_device), cast(int, marker_inode)),
+                    expected_document_identity,
+                )
+                self._verify_forgotten_restore_rollback_index(library_id, path)
+                if recovery_phase == "started":
+                    self._begin_memory_restore_rollback(operation_id)
+                repository.rollback_commit(current_head, previous_head)
+                self._rollback_interrupted_memory_restore(
+                    root,
+                    path,
+                    marker_path,
+                    target,
+                    marker_bound,
+                    content,
+                    marker,
+                    marker_digest,
+                    (cast(int, marker_device), cast(int, marker_inode)),
+                    expected_document_identity,
+                )
+                return
+            expected_response = {
+                "library_id": library_id,
+                "path": path,
+                "source_version": hashlib.sha256(content).hexdigest(),
+                "commit": current_head,
+                "operation_id": operation_id,
+                "tombstone_id": tombstone_id,
+            }
+            if (
+                tuple(str(value) for value in operation[:7])
+                != (
+                    library_id,
+                    "restore",
+                    path,
+                    actor_type,
+                    source,
+                    request_hash,
+                    current_head,
+                )
+                or json.loads(str(operation[7])) != expected_response
+                or tombstone is not None
+            ):
+                raise MemoryMutationError("memory restore operation is inconsistent")
+            document = self._read_bound_recovery_file(target)
+            if (
+                document is None
+                or document[0] != content
+                or document[2] != 0o600
+                or (
+                    expected_document_identity is not None
+                    and document[1] != expected_document_identity
+                )
+                or self._read_bound_recovery_file(marker_bound) is not None
+                or not self._forgotten_restore_projection_is_complete(
+                    library_id, path, content
+                )
+            ):
+                raise MemoryMutationError("completed memory restore is inconsistent")
+
+    def _forgotten_restore_rollback_is_complete(
+        self,
+        library_id: str,
+        tombstone_id: str,
+        target: BoundDocument,
+        marker_bound: BoundDocument,
+        marker_digest: str,
+    ) -> bool:
+        if self._read_bound_recovery_file(target) is not None:
+            return False
+        marker = self._read_bound_recovery_file(marker_bound)
+        if marker is None:
+            return False
+        if marker[2] != 0o600 or not hmac.compare_digest(
+            hashlib.sha256(marker[0]).hexdigest(), marker_digest
+        ):
+            raise MemoryMutationError("forgotten marker changed during restore recovery")
+        if self.connection_or_raise.execute(
+            "SELECT 1 FROM graph_cleanup_intents WHERE cleanup_id = ? AND library_id = ?",
+            (tombstone_id, library_id),
+        ).fetchone() is not None or self.connection_or_raise.execute(
+            """SELECT 1 FROM background_jobs
+               WHERE kind IN ('vector_rebuild', 'graph_rebuild')
+                 AND json_extract(payload, '$.library_id') = ? AND status = 'running'""",
+            (library_id,),
+        ).fetchone() is not None:
+            raise MemoryMutationError("forgotten restore rollback worker state is inconsistent")
+        return True
+
+    @staticmethod
+    def _read_bound_recovery_file(
+        bound: BoundDocument,
+    ) -> tuple[bytes, tuple[int, int], int] | None:
+        try:
+            path_descriptor = os.open(
+                bound.name,
+                os.O_PATH | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=bound.parent_fd,
+            )
+        except FileNotFoundError:
+            return None
+        readable: int | None = None
+        try:
+            metadata = os.fstat(path_descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise MemoryMutationError("memory restore recovery target is not a regular file")
+            identity = (metadata.st_dev, metadata.st_ino)
+            readable = os.open(
+                f"/proc/self/fd/{path_descriptor}",
+                os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC,
+            )
+            readable_metadata = os.fstat(readable)
+            if (
+                not stat.S_ISREG(readable_metadata.st_mode)
+                or (readable_metadata.st_dev, readable_metadata.st_ino) != identity
+            ):
+                raise MemoryMutationError("memory restore recovery target changed")
+            content = bytearray()
+            while block := os.read(readable, 1024 * 1024):
+                content.extend(block)
+            confirmed = os.stat(
+                bound.name, dir_fd=bound.parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(confirmed.st_mode)
+                or (confirmed.st_dev, confirmed.st_ino) != identity
+            ):
+                raise MemoryMutationError("memory restore recovery target changed")
+            return bytes(content), identity, stat.S_IMODE(metadata.st_mode)
+        finally:
+            if readable is not None:
+                os.close(readable)
+            os.close(path_descriptor)
+
+    def _rollback_interrupted_memory_restore(
+        self,
+        root: Path,
+        path: str,
+        marker_path: str,
+        target: BoundDocument,
+        marker_bound: BoundDocument,
+        content: bytes,
+        marker: bytes,
+        marker_digest: str,
+        marker_identity: tuple[int, int],
+        document_identity: tuple[int, int] | None,
+    ) -> None:
+        self._validate_interrupted_memory_restore_rollback(
+            target,
+            marker_bound,
+            content,
+            marker_digest,
+            marker_identity,
+            document_identity,
+        )
+        document = self._read_bound_recovery_file(target)
+        if document is not None:
+            os.unlink(target.name, dir_fd=target.parent_fd)
+            os.fsync(target.parent_fd)
+            self._verify_bound_parent(root, path, target)
+        current_marker = self._read_bound_recovery_file(marker_bound)
+        if current_marker is not None:
+            return
+        descriptor = os.open(
+            marker_bound.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=marker_bound.parent_fd,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(marker)
+            stream.flush()
+            os.fsync(stream.fileno())
+            restored = os.fstat(stream.fileno())
+        os.fsync(marker_bound.parent_fd)
+        self._verify_bound_document(
+            root,
+            marker_path,
+            marker_bound,
+            (restored.st_dev, restored.st_ino),
+        )
+
+    def _validate_interrupted_memory_restore_rollback(
+        self,
+        target: BoundDocument,
+        marker_bound: BoundDocument,
+        content: bytes,
+        marker_digest: str,
+        marker_identity: tuple[int, int],
+        document_identity: tuple[int, int] | None,
+    ) -> None:
+        document = self._read_bound_recovery_file(target)
+        if document is not None and (
+            document[0] != content
+            or document[2] != 0o600
+            or (document_identity is not None and document[1] != document_identity)
+        ):
+            raise MemoryMutationError("restored document changed during recovery")
+        current_marker = self._read_bound_recovery_file(marker_bound)
+        if current_marker is not None and (
+            current_marker[1] != marker_identity
+            or current_marker[2] != 0o600
+            or not hmac.compare_digest(
+                hashlib.sha256(current_marker[0]).hexdigest(), marker_digest
+            )
+        ):
+            raise MemoryMutationError("forgotten marker changed during restore recovery")
+
+    def _verify_forgotten_restore_rollback_index(self, library_id: str, path: str) -> None:
+        if self.connection_or_raise.execute(
+            "SELECT 1 FROM memory_documents WHERE library_id = ? AND path = ?",
+            (library_id, path),
+        ).fetchone() is not None or self.connection_or_raise.execute(
+            "SELECT 1 FROM memory_chunks WHERE library_id = ? AND path = ?",
+            (library_id, path),
+        ).fetchone() is not None or self.connection_or_raise.execute(
+            """SELECT 1 FROM memory_chunk_search AS search
+               JOIN memory_chunks AS chunk ON chunk.id = search.chunk_id
+               WHERE chunk.library_id = ? AND chunk.path = ?""",
+            (library_id, path),
+        ).fetchone() is not None or self.connection_or_raise.execute(
+            "SELECT 1 FROM memory_versions WHERE library_id = ? AND path = ?",
+            (library_id, path),
+        ).fetchone() is not None or self.connection_or_raise.execute(
+            "SELECT 1 FROM memory_graph_documents WHERE library_id = ? AND path = ?",
+            (library_id, path),
+        ).fetchone() is not None:
+            raise MemoryMutationError("forgotten restore rollback index is inconsistent")
+
+    def _forgotten_restore_projection_is_complete(
+        self, library_id: str, path: str, content: bytes
+    ) -> bool:
+        expected_version = hashlib.sha256(content).hexdigest()
+        document_id = stable_document_id(library_id, path)
+        if self.connection_or_raise.execute(
+            "SELECT id, library_id, path, source_version FROM memory_documents "
+            "WHERE library_id = ? AND path = ?",
+            (library_id, path),
+        ).fetchone() != (document_id, library_id, path, expected_version):
+            return False
+        rows = self.connection_or_raise.execute(
+            """SELECT chunk.id, chunk.document_id, chunk.library_id, chunk.path,
+                      chunk.kind, chunk.heading, chunk.start_line, chunk.end_line,
+                      chunk.content, chunk.source_version, search.chunk_id,
+                      search.content, search.heading, search.path
+               FROM memory_chunks AS chunk
+               LEFT JOIN memory_chunk_search AS search ON search.chunk_id = chunk.id
+               WHERE chunk.library_id = ? AND chunk.path = ?
+               ORDER BY chunk.start_line, chunk.id""",
+            (library_id, path),
+        ).fetchall()
+        expected_chunks = chunk_markdown(content.decode("utf-8"))
+        if len(rows) != len(expected_chunks):
+            return False
+        for row, expected in zip(rows, expected_chunks, strict=True):
+            if tuple(row[1:10]) != (
+                document_id,
+                library_id,
+                path,
+                expected.kind,
+                expected.heading,
+                expected.start_line,
+                expected.end_line,
+                expected.content,
+                expected_version,
+            ) or tuple(row[10:]) != (
+                str(row[0]),
+                expected.content,
+                expected.heading or "",
+                path,
+            ):
+                return False
+        chunk_ids = tuple(str(row[0]) for row in rows)
+        if chunk_ids:
+            placeholders = ",".join("?" for _ in chunk_ids)
+            if self.connection_or_raise.execute(
+                f"SELECT 1 FROM memory_chunk_vectors "
+                f"WHERE chunk_id IN ({placeholders}) LIMIT 1",  # noqa: S608
+                chunk_ids,
+            ).fetchone() is not None:
+                return False
+        if self.connection_or_raise.execute(
+            "SELECT 1 FROM memory_graph_documents WHERE library_id = ? AND path = ?",
+            (library_id, path),
+        ).fetchone() is not None:
+            return False
+        version_id = hashlib.sha256(
+            f"{library_id}\0{path}\0{expected_version}".encode()
+        ).hexdigest()
+        versions = self.connection_or_raise.execute(
+            """SELECT version_id, library_id, path, source_version, content, state,
+                      supersedes_version_id, commit_id, effective_at, condition_text,
+                      candidate_id FROM memory_versions WHERE library_id = ? AND path = ?""",
+            (library_id, path),
+        ).fetchall()
+        if versions != [
+            (
+                version_id,
+                library_id,
+                path,
+                expected_version,
+                content.decode("utf-8"),
+                "current",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        ] or self.connection_or_raise.execute(
+            "SELECT sync_status FROM memory_libraries WHERE id = ?", (library_id,)
+        ).fetchone() != ("ready",):
+            return False
+        jobs = self.connection_or_raise.execute(
+            """SELECT kind, payload, status FROM background_jobs
+               WHERE kind IN ('vector_rebuild', 'graph_rebuild')
+                 AND json_extract(payload, '$.library_id') = ? AND status = 'pending'""",
+            (library_id,),
+        ).fetchall()
+        expected_kinds = set()
+        if self.model_client.embedding is not None:
+            expected_kinds.add("vector_rebuild")
+        if self.graph_adapter is not None and self.model_client.graph is not None:
+            expected_kinds.add("graph_rebuild")
+        return (
+            {str(row[0]) for row in jobs} == expected_kinds
+            and len(jobs) == len(expected_kinds)
+            and all(
+                str(row[2]) == "pending"
+                and json.loads(str(row[1])) == {"library_id": library_id}
+                for row in jobs
+            )
+        )
+
+    def _finish_completed_graph_cleanup(self, response: dict[str, str]) -> None:
+        cleanup_id = response.get("tombstone_id", "")
+        library_id = response.get("library_id", "")
+        row = self.connection_or_raise.execute(
+            "SELECT 1 FROM graph_cleanup_intents WHERE cleanup_id = ? AND library_id = ?",
+            (cleanup_id, library_id),
+        ).fetchone()
+        if row is None:
+            return
+        if self.graph_adapter is None:
+            raise MemoryMutationError("graph cleanup is pending but graph adapter is unavailable")
+        self.graph_adapter.reconcile_staged_purge(library_id, cleanup_id, committed=True)
+        self._complete_graph_cleanup_intent(cleanup_id)
+
+    def _reconcile_graph_cleanup_intents(self) -> None:
+        rows = self.connection_or_raise.execute(
+            """SELECT cleanup_id, library_id, previous_head, document_paths_json,
+                      marker_path, marker_digest, document_modes_json
+               FROM graph_cleanup_intents """
+            "ORDER BY created_at, cleanup_id"
+        ).fetchall()
+        if not rows:
+            return
+        if self.graph_adapter is None:
+            raise MemoryMutationError("graph cleanup is pending but graph adapter is unavailable")
+        self._checkpoint_forgotten_plaintext(())
+        for row in rows:
+            cleanup_id_value, library_id_value = row[:2]
+            cleanup_id = str(cleanup_id_value)
+            library_id = str(library_id_value)
+            completed = self.connection_or_raise.execute(
+                "SELECT 1 FROM memory_tombstones WHERE id = ? AND library_id = ?",
+                (cleanup_id, library_id),
+            ).fetchone()
+            if completed is not None:
+                self.graph_adapter.reconcile_staged_purge(
+                    library_id, cleanup_id, committed=True
+                )
+            elif all(value is None for value in row[2:]):
+                self.graph_adapter.reconcile_staged_purge(
+                    library_id, cleanup_id, committed=False
+                )
+            else:
+                self._rollback_incomplete_forgetting(
+                    library_id,
+                    cleanup_id,
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4]),
+                    str(row[5]),
+                    None if row[6] is None else str(row[6]),
+                )
+            self.connection_or_raise.execute(
+                "DELETE FROM graph_cleanup_intents WHERE cleanup_id = ?", (cleanup_id,)
+            )
+            self.connection_or_raise.commit()
+
+    def _rollback_incomplete_forgetting(
+        self,
+        library_id: str,
+        cleanup_id: str,
+        previous_head: str,
+        document_paths_json: str,
+        marker_path: str,
+        marker_digest: str,
+        document_modes_json: str | None,
+    ) -> None:
+        try:
+            parsed_paths = json.loads(document_paths_json)
+            parsed_modes = (
+                None if document_modes_json is None else json.loads(document_modes_json)
+            )
+        except (TypeError, ValueError) as error:
+            raise MemoryMutationError("graph cleanup rollback journal is invalid") from error
+        if (
+            not isinstance(parsed_paths, list)
+            or not parsed_paths
+            or any(
+                not isinstance(path, str) or not allowed_markdown_path(path)
+                for path in parsed_paths
+            )
+            or len(set(parsed_paths)) != len(parsed_paths)
+            or marker_path != f"{TOMBSTONE_DIRECTORY}/{cleanup_id}.json"
+            or re.fullmatch(r"[0-9a-f]{64}", marker_digest) is None
+            or (
+                parsed_modes is not None
+                and (not isinstance(parsed_modes, dict) or set(parsed_modes) != set(parsed_paths))
+            )
+        ):
+            raise MemoryMutationError("graph cleanup rollback journal is invalid")
+        document_paths = tuple(cast(str, path) for path in parsed_paths)
+        document_modes = (
+            {path: 0o600 for path in document_paths}
+            if parsed_modes is None
+            else {
+                path: self._validated_document_mode(parsed_modes[path])
+                for path in document_paths
+            }
+        )
+        library = self._require_available_library(library_id)
+        root = Path(library.canonical_path)
+        repository = self._git_repository(library_id)
+        contents = {
+            path: repository.content_bytes_at(previous_head, path) for path in document_paths
+        }
+        repository.rollback_interrupted_commit(
+            previous_head, set(document_paths), marker_path, marker_digest
+        )
+        for path, content in contents.items():
+            self._restore_interrupted_document(root, path, content, document_modes[path])
+        self._remove_interrupted_marker(root, cleanup_id, marker_digest)
+        assert self.graph_adapter is not None
+        self.graph_adapter.reconcile_staged_purge(library_id, cleanup_id, committed=False)
+
+    @staticmethod
+    def _validated_document_mode(mode: object) -> int:
+        if not isinstance(mode, int) or isinstance(mode, bool) or not 0 <= mode <= 0o7777:
+            raise MemoryMutationError("graph cleanup rollback document mode is invalid")
+        return mode
+
+    @staticmethod
+    def _fchmod_verified(descriptor: int, mode: int) -> None:
+        os.fchmod(descriptor, mode)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+            raise MemoryMutationError("memory document mode could not be restored")
+
+    @staticmethod
+    def _chmod_path_descriptor_verified(descriptor: int, mode: int) -> None:
+        proc_path = f"/proc/self/fd/{descriptor}"
+        try:
+            os.chmod(proc_path, mode)
+        except OSError as error:
+            raise MemoryMutationError("memory document mode could not be restored") from error
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+            raise MemoryMutationError("memory document mode could not be restored")
+
+    @staticmethod
+    def _restore_interrupted_document(
+        root: Path, path: str, content: bytes, mode: int
+    ) -> None:
+        mode = PlatformState._validated_document_mode(mode)
+        parent, name = PlatformState._open_document_parent(root, path)
+        path_descriptor: int | None = None
+        try:
+            try:
+                path_descriptor = os.open(
+                    name,
+                    os.O_PATH | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=parent,
+                )
+            except FileNotFoundError:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NONBLOCK
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    mode,
+                    dir_fd=parent,
+                )
+                with os.fdopen(descriptor, "wb") as stream:
+                    metadata = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise MemoryMutationError(
+                            "interrupted forgetting target is not a regular file"
+                        ) from None
+                    stream.write(content)
+                    stream.flush()
+                    PlatformState._fchmod_verified(stream.fileno(), mode)
+                    os.fsync(stream.fileno())
+                    identity = (metadata.st_dev, metadata.st_ino)
+                os.fsync(parent)
+                PlatformState._verify_recovery_directory_entry(
+                    parent, name, identity, mode
+                )
+                return
+            metadata = os.fstat(path_descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise MemoryMutationError(
+                    "interrupted forgetting target is not a regular file"
+                )
+            identity = (metadata.st_dev, metadata.st_ino)
+            original_mode = stat.S_IMODE(metadata.st_mode)
+            if original_mode != mode:
+                raise MemoryMutationError(
+                    "memory document mode changed after interrupted forgetting"
+                )
+            temporary_mode_applied = False
+            mode_finalized = False
+            readable: int | None = None
+            proc_path = f"/proc/self/fd/{path_descriptor}"
+            try:
+                try:
+                    readable = os.open(proc_path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                except PermissionError:
+                    temporary_mode_applied = True
+                    PlatformState._chmod_path_descriptor_verified(
+                        path_descriptor, original_mode | stat.S_IRUSR
+                    )
+                    readable = os.open(proc_path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                readable_metadata = os.fstat(readable)
+                if (
+                    not stat.S_ISREG(readable_metadata.st_mode)
+                    or (readable_metadata.st_dev, readable_metadata.st_ino) != identity
+                ):
+                    raise MemoryMutationError(
+                        "interrupted forgetting target changed during recovery"
+                    )
+                with os.fdopen(readable, "rb") as stream:
+                    readable = None
+                    if (
+                        readable_metadata.st_size != len(content)
+                        or stream.read(len(content) + 1) != content
+                    ):
+                        raise MemoryMutationError(
+                            "memory document changed after interrupted forgetting"
+                        )
+                    PlatformState._fchmod_verified(stream.fileno(), mode)
+                    mode_finalized = True
+                PlatformState._verify_recovery_directory_entry(
+                    parent, name, identity, mode
+                )
+            finally:
+                if readable is not None:
+                    os.close(readable)
+                if temporary_mode_applied and not mode_finalized:
+                    PlatformState._chmod_path_descriptor_verified(
+                        path_descriptor, original_mode
+                    )
+        finally:
+            if path_descriptor is not None:
+                os.close(path_descriptor)
+            os.close(parent)
+
+    @staticmethod
+    def _verify_recovery_directory_entry(
+        parent: int,
+        name: str,
+        expected_identity: tuple[int, int],
+        expected_mode: int,
+    ) -> None:
+        try:
+            metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError as error:
+            raise MemoryMutationError(
+                "interrupted forgetting target changed during recovery"
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != expected_identity
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+        ):
+            raise MemoryMutationError(
+                "interrupted forgetting target changed during recovery"
+            )
+
+    @staticmethod
+    def _remove_interrupted_marker(root: Path, cleanup_id: str, marker_digest: str) -> None:
+        with PlatformState._bind_tombstone_marker(root, f"{cleanup_id}.json") as bound:
+            try:
+                descriptor = os.open(
+                    bound.name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=bound.directory_fd,
+                )
+            except FileNotFoundError:
+                PlatformState._remove_bound_tombstone_marker(bound, None)
+                return
+            with os.fdopen(descriptor, "rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise MemoryMutationError(
+                        "interrupted forgetting marker is not a regular file"
+                    )
+                if metadata.st_size > 64 * 1024:
+                    raise MemoryMutationError("interrupted forgetting marker is too large")
+                content = stream.read(metadata.st_size + 1)
+                identity = (metadata.st_dev, metadata.st_ino)
+            if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), marker_digest):
+                raise MemoryMutationError("interrupted forgetting marker changed externally")
+            PlatformState._remove_bound_tombstone_marker(bound, identity)
+
+    def _insert_memory_operation(
+        self,
+        operation_id: str,
+        library_id: str,
+        kind: str,
+        path: str,
+        actor_type: str,
+        source: str,
+        request_hash: str,
+        commit: str,
+        response: dict[str, str],
+    ) -> None:
+        self.connection_or_raise.execute(
+            """INSERT INTO memory_operations
+               (operation_id, library_id, kind, document_path, actor_type, source,
+                request_hash, commit_id, response_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                operation_id,
+                library_id,
+                kind,
+                path,
+                actor_type,
+                source,
+                request_hash,
+                commit,
+                json.dumps(response, sort_keys=True),
+            ),
+        )
+
+    def _restore_memory_tombstone(self, row: tuple[str, ...]) -> None:
+        self.connection_or_raise.execute(
+            """INSERT OR IGNORE INTO memory_tombstones
+               (id, library_id, path, fingerprint, match_fingerprint, key_id,
+                source_scope_json, deleted_at, marker_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            row,
+        )
+        restored = self.connection_or_raise.execute(
+            """SELECT id, library_id, path, fingerprint, match_fingerprint, key_id,
+                      source_scope_json, deleted_at, marker_path
+               FROM memory_tombstones WHERE id = ?""",
+            (row[0],),
+        ).fetchone()
+        if restored is None or tuple(str(value) for value in restored) != row:
+            raise MemoryMutationError("forgotten memory tombstone could not be restored")
+
+    def _tombstone_fingerprint(self, library_id: str, content: str, key_id: str) -> str:
+        key = self.tombstone_keys.get(key_id)
+        if key is None:
+            raise MemoryMutationError("tombstone key is unavailable")
+        material = b"personal-agent-memory:tombstone-content:v1\0" + json.dumps(
+            {"library_id": library_id, "content": content},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hmac.new(key, material, hashlib.sha256).hexdigest()
+        return f"hmac-sha256:{digest}"
+
+    def _tombstone_source_scope(
+        self,
+        library_id: str,
+        path: str,
+        authoritative_paths: tuple[str, ...],
+        candidate_snapshot: ForgottenCandidateSnapshot,
+        key_id: str,
+    ) -> dict[str, object]:
+        key = self.tombstone_keys.get(key_id)
+        if key is None:
+            raise MemoryMutationError("tombstone key is unavailable")
+        event_counts: dict[tuple[str, str], int] = {}
+        for row in candidate_snapshot.capture_inbox:
+            capture_key = (str(row[2]), str(row[5]))
+            event_counts[capture_key] = event_counts.get(capture_key, 0) + 1
+        ranges: list[dict[str, object]] = []
+        for (session_id, turn_id), event_count in sorted(event_counts.items()):
+            material = b"personal-agent-memory:tombstone-source:v1\0" + json.dumps(
+                {
+                    "library_id": library_id,
+                    "session_id": str(session_id),
+                    "turn_id": str(turn_id),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            ranges.append(
+                {
+                    "scope_id": "hmac-sha256:"
+                    + hmac.new(key, material, hashlib.sha256).hexdigest(),
+                    "event_count": int(event_count),
+                }
+            )
+        scope: dict[str, object] = {"document_path": path, "capture_ranges": ranges}
+        if len(authoritative_paths) > 1:
+            scope["authoritative_paths"] = list(authoritative_paths)
+        return scope
+
+    def _tombstone_match_fingerprint(
+        self,
+        library_id: str,
+        content: str,
+        key_id: str,
+        *,
+        reject_invalid_formal: bool = False,
+    ) -> str:
+        key = self.tombstone_keys.get(key_id)
+        if key is None:
+            raise MemoryMutationError("tombstone key is unavailable")
+        semantic = self._memory_semantic_body(content, reject_invalid_formal=reject_invalid_formal)
+        normalized = "\n".join(line.rstrip() for line in semantic.splitlines()).strip().casefold()
+        material = b"personal-agent-memory:tombstone-semantic-body:v2\0" + json.dumps(
+            {"library_id": library_id, "content": normalized},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "hmac-sha256:" + hmac.new(key, material, hashlib.sha256).hexdigest()
+
+    def _forgotten_documents(
+        self, library_id: str, path: str, key_id: str
+    ) -> tuple[ForgottenDocument, ...]:
+        root = Path(self._require_available_library(library_id).canonical_path)
+        target_content = self._read_document_bytes(root, path)
+        target_match = self._tombstone_match_fingerprint(
+            library_id,
+            self._deleted_document_match_content(library_id, path, target_content.decode("utf-8")),
+            key_id,
+        )
+        documents: list[ForgottenDocument] = []
+        for candidate_path, source_version in self.connection_or_raise.execute(
+            "SELECT path, source_version FROM memory_documents WHERE library_id = ? ORDER BY path",
+            (library_id,),
+        ):
+            candidate = self._read_document_bytes(root, str(candidate_path))
+            if hashlib.sha256(candidate).hexdigest() != str(source_version):
+                raise MemoryMutationError(
+                    "document changed outside the platform; rescan before deleting"
+                )
+            try:
+                candidate_text = candidate.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise MemoryMutationError("memory document is not valid UTF-8") from error
+            candidate_match = self._tombstone_match_fingerprint(
+                library_id,
+                self._deleted_document_match_content(
+                    library_id, str(candidate_path), candidate_text
+                ),
+                key_id,
+            )
+            if hmac.compare_digest(target_match, candidate_match):
+                documents.append(
+                    ForgottenDocument(str(candidate_path), str(source_version), candidate)
+                )
+        if not documents or all(document.path != path for document in documents):
+            raise MemoryMutationError("memory document changed while preparing deletion")
+        return tuple(documents)
+
+    def _memory_semantic_body(self, content: str, *, reject_invalid_formal: bool) -> str:
+        semantic = content
+        while True:
+            body = self._formal_memory_body(semantic, reject_invalid=reject_invalid_formal)
+            if body is None or body == semantic:
+                return semantic
+            semantic = body
+
+    def _deleted_document_match_content(self, library_id: str, path: str, content: str) -> str:
+        rows = self.connection_or_raise.execute(
+            "SELECT id FROM candidate_memories WHERE library_id = ? AND published_path = ?",
+            (library_id, path),
+        ).fetchall()
+        if len(rows) != 1:
+            return content
+        candidate = self.candidate(str(rows[0][0]))
+        operator = candidate.get("operator")
+        reason = candidate.get("reason")
+        if not isinstance(operator, str) or not isinstance(reason, str):
+            return content
+        if self._published_candidate_markdown(candidate, operator, reason) != content:
+            return content
+        return str(candidate["body"])
+
+    @staticmethod
+    def _formal_memory_body(content: str, *, reject_invalid: bool = False) -> str | None:
+        lines = content.splitlines(keepends=True)
+        if not lines or lines[0].strip() != "---":
+            return None
+        closing = next(
+            (offset for offset, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+            None,
+        )
+        header_lines = lines[1:closing] if closing is not None else lines[1:]
+        required_keys = {
+            "memory_id",
+            "memory_type",
+            "candidate_id",
+            "created_by",
+            "approved_by",
+            "approval_reason",
+            "source_references",
+        }
+        reserved_keys = required_keys
+        key_pattern = r'(?P<key>"(?:[^"\\]|\\.)*"|\'(?:[^\']|\'\')*\'|[A-Za-z_][A-Za-z0-9_-]*)'
+        mapping_pattern = re.compile(rf"^\s*{key_pattern}\s*:\s*(?P<value>.*)$")
+
+        def decode_key(token: str) -> str | None:
+            if token.startswith('"'):
+                try:
+                    decoded = json.loads(token)
+                except json.JSONDecodeError:
+                    return None
+                return decoded if isinstance(decoded, str) else None
+            if token.startswith("'"):
+                if not token.endswith("'"):
+                    return None
+                return token[1:-1].replace("''", "'")
+            return token
+
+        def invalid() -> None:
+            if reject_invalid:
+                raise CandidateGovernanceError("candidate has invalid formal memory metadata")
+
+        platform_hint = False
+        for line in header_lines:
+            match = mapping_pattern.fullmatch(line.rstrip("\r\n"))
+            if match is not None and decode_key(match.group("key")) in reserved_keys:
+                platform_hint = True
+                break
+        if not platform_hint:
+            if closing is None:
+                return None
+            body_lines = lines[closing + 1 :]
+            if body_lines and not body_lines[0].strip():
+                body_lines = body_lines[1:]
+            return "".join(body_lines).rstrip()
+        if closing is None:
+            invalid()
+            return None
+
+        def decode_value(encoded: str) -> object:
+            value = encoded.strip()
+            if value.startswith("'"):
+                if len(value) < 2 or not value.endswith("'"):
+                    raise ValueError
+                return value[1:-1].replace("''", "'")
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                if not value or any(character in value for character in "{}[]#&*!|>"):
+                    raise ValueError from None
+                return value
+
+        values: dict[str, object] = {}
+        offset = 0
+        while offset < len(header_lines):
+            raw_line = header_lines[offset].rstrip("\r\n")
+            if not raw_line.strip():
+                offset += 1
+                continue
+            match = mapping_pattern.fullmatch(raw_line)
+            if match is None:
+                invalid()
+                return None
+            key = decode_key(match.group("key"))
+            encoded = match.group("value")
+            if key is None:
+                invalid()
+                return None
+            if key in values:
+                invalid()
+                return None
+            if encoded:
+                try:
+                    value = decode_value(encoded)
+                except ValueError:
+                    invalid()
+                    return None
+                if isinstance(value, dict) or (
+                    isinstance(value, list) and key != "source_references"
+                ):
+                    invalid()
+                    return None
+                values[key] = value
+                offset += 1
+                continue
+            items: list[object] = []
+            if key != "source_references":
+                invalid()
+                return None
+            offset += 1
+            while offset < len(header_lines):
+                item_line = header_lines[offset].rstrip("\r\n")
+                item_match = re.fullmatch(r"\s{2,}-\s+(.+)", item_line)
+                if item_match is None:
+                    break
+                try:
+                    item = decode_value(item_match.group(1))
+                except ValueError:
+                    invalid()
+                    return None
+                if isinstance(item, (dict, list)):
+                    invalid()
+                    return None
+                items.append(item)
+                offset += 1
+            if not items:
+                invalid()
+                return None
+            values[key] = items
+        if not required_keys.issubset(values):
+            invalid()
+            return None
+        scalar_keys = required_keys - {"source_references"}
+        references = values["source_references"]
+        if (
+            values["memory_id"] != values["candidate_id"]
+            or not all(isinstance(values[key], str) and values[key] for key in scalar_keys)
+            or not isinstance(references, list)
+            or not all(isinstance(reference, str) and reference for reference in references)
+        ):
+            invalid()
+            return None
+        try:
+            if str(uuid.UUID(cast(str, values["memory_id"]))) != values["memory_id"]:
+                invalid()
+                return None
+        except ValueError:
+            invalid()
+            return None
+        if values["memory_type"] not in {
+            "preference",
+            "decision",
+            "constraint",
+            "domain_fact",
+            "reusable_experience",
+            "external_reference",
+        }:
+            invalid()
+            return None
+        body_lines = lines[closing + 1 :]
+        if body_lines and not body_lines[0].strip():
+            body_lines = body_lines[1:]
+        body = "".join(body_lines)
+        if not body.strip():
+            invalid()
+            return None
+        return body.rstrip()
+
+    def _graph_source_documents(
+        self, library_id: str, *, connection: sqlite3.Connection | None = None
+    ) -> tuple[GraphSourceDocument, ...]:
+        database = connection or self.connection_or_raise
+        rows = database.execute(
+            "SELECT document.id, document.path, document.source_version, "
+            "group_concat(chunk.content, char(10) || char(10)) "
+            "FROM memory_documents AS document "
+            "LEFT JOIN memory_chunks AS chunk ON chunk.document_id = document.id "
+            "WHERE document.library_id = ? GROUP BY document.id ORDER BY document.path",
+            (library_id,),
+        ).fetchall()
+        return tuple(
+            GraphSourceDocument(str(row[0]), str(row[1]), str(row[2]), str(row[3] or ""))
+            for row in rows
+        )
+
+    def _matches_active_tombstone(
+        self,
+        library_id: str,
+        content: str,
+        *,
+        reject_invalid_formal: bool = False,
+    ) -> bool:
+        if reject_invalid_formal:
+            self._memory_semantic_body(content, reject_invalid_formal=True)
+        rows = self.connection_or_raise.execute(
+            """SELECT match_fingerprint, key_id FROM memory_tombstones
+               WHERE library_id = ?""",
+            (library_id,),
+        ).fetchall()
+        return any(
+            hmac.compare_digest(
+                str(row[0]),
+                self._tombstone_match_fingerprint(
+                    library_id,
+                    content,
+                    str(row[1]),
+                    reject_invalid_formal=reject_invalid_formal,
+                ),
+            )
+            for row in rows
+            if str(row[0])
+        )
 
     def _mutate_document(
         self,
@@ -3921,6 +6831,14 @@ class PlatformState:
                 if str(existing[1]) != request_hash:
                     raise MemoryMutationError("operation_id was already used for another mutation")
                 return {str(key): str(value) for key, value in json.loads(str(existing[0])).items()}
+            try:
+                matches_tombstone = self._matches_active_tombstone(
+                    library_id, content, reject_invalid_formal=True
+                )
+            except CandidateGovernanceError as error:
+                raise MemoryMutationError("content has invalid formal memory metadata") from error
+            if matches_tombstone:
+                raise MemoryMutationError("content matches forgotten memory")
             normalized, indexed_version = self._document_record(library_id, path)
             if indexed_version != expected_source_version:
                 raise MemoryMutationError("document version conflict")
@@ -4157,6 +7075,14 @@ class PlatformState:
         if "\x00" in content:
             raise MemoryMutationError("Markdown content cannot contain NUL bytes")
         self._ensure_markdown_has_no_sensitive_content(content)
+        try:
+            matches_tombstone = self._matches_active_tombstone(
+                library_id, content, reject_invalid_formal=True
+            )
+        except CandidateGovernanceError as error:
+            raise MemoryMutationError("content has invalid formal memory metadata") from error
+        if matches_tombstone:
+            raise MemoryMutationError("content matches forgotten memory")
         request_hash = self._publication_request_hash(library_id, normalized, content, source)
         existing = self.connection_or_raise.execute(
             "SELECT response_json, request_hash FROM memory_operations WHERE operation_id = ?",
@@ -4595,15 +7521,20 @@ class PlatformState:
         root_metadata = os.fstat(root_fd)
         parent_fd = root_fd
         try:
-            for part in PurePosixPath(path).parts[:-1]:
-                child = os.open(
-                    part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=parent_fd,
-                )
-                if parent_fd != root_fd:
-                    os.close(parent_fd)
-                parent_fd = child
+            try:
+                for part in PurePosixPath(path).parts[:-1]:
+                    child = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=parent_fd,
+                    )
+                    if parent_fd != root_fd:
+                        os.close(parent_fd)
+                    parent_fd = child
+            except OSError as error:
+                raise MemoryMutationError(
+                    f"document parent cannot be opened safely: {error}"
+                ) from error
             parent_metadata = os.fstat(parent_fd)
             yield BoundDocument(
                 root_identity=(root_metadata.st_dev, root_metadata.st_ino),
@@ -4616,6 +7547,231 @@ class PlatformState:
             if parent_fd != root_fd:
                 os.close(parent_fd)
             os.close(root_fd)
+
+    @staticmethod
+    @contextmanager
+    def _bind_tombstone_marker(root: Path, name: str) -> Iterator[BoundTombstoneMarker]:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory_fd = -1
+        directory_created = False
+        completed = False
+        directory_identity: tuple[int, int] | None = None
+        try:
+            root_metadata = os.fstat(root_fd)
+            root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+            try:
+                os.mkdir(TOMBSTONE_DIRECTORY, 0o700, dir_fd=root_fd)
+                directory_created = True
+            except FileExistsError:
+                pass
+            try:
+                directory_fd = os.open(
+                    TOMBSTONE_DIRECTORY,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+            except OSError as error:
+                raise MemoryMutationError(
+                    f"tombstone directory cannot be opened safely: {error}"
+                ) from error
+            directory_metadata = os.fstat(directory_fd)
+            directory_identity = (directory_metadata.st_dev, directory_metadata.st_ino)
+            entry_metadata = os.stat(TOMBSTONE_DIRECTORY, dir_fd=root_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(entry_metadata.st_mode)
+                or (entry_metadata.st_dev, entry_metadata.st_ino) != directory_identity
+            ):
+                raise MemoryMutationError("tombstone directory changed while binding")
+            yield BoundTombstoneMarker(
+                root_identity=root_identity,
+                root_fd=root_fd,
+                directory_fd=directory_fd,
+                directory_identity=directory_identity,
+                name=name,
+                directory_created=directory_created,
+            )
+            completed = True
+        except OSError as error:
+            raise MemoryMutationError(
+                f"tombstone directory cannot be bound safely: {error}"
+            ) from error
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+            if not completed and directory_created and directory_identity is not None:
+                try:
+                    directory = os.stat(
+                        TOMBSTONE_DIRECTORY,
+                        dir_fd=root_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        stat.S_ISDIR(directory.st_mode)
+                        and (directory.st_dev, directory.st_ino) == directory_identity
+                    ):
+                        os.rmdir(TOMBSTONE_DIRECTORY, dir_fd=root_fd)
+                        os.fsync(root_fd)
+                except OSError:
+                    pass
+            os.close(root_fd)
+
+    @staticmethod
+    def _verify_bound_tombstone_marker(
+        root: Path,
+        bound: BoundTombstoneMarker,
+        marker_identity: tuple[int, int],
+    ) -> None:
+        current_root_fd = -1
+        current_directory_fd = -1
+        try:
+            held_root = os.fstat(bound.root_fd)
+            held_directory = os.fstat(bound.directory_fd)
+            if (held_root.st_dev, held_root.st_ino) != bound.root_identity or (
+                held_directory.st_dev,
+                held_directory.st_ino,
+            ) != bound.directory_identity:
+                raise MemoryMutationError("tombstone binding changed while deleting")
+            current_root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            current_root = os.fstat(current_root_fd)
+            if (current_root.st_dev, current_root.st_ino) != bound.root_identity:
+                raise MemoryMutationError("memory library changed while deleting")
+            directory_entry = os.stat(
+                TOMBSTONE_DIRECTORY,
+                dir_fd=bound.root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(directory_entry.st_mode)
+                or (directory_entry.st_dev, directory_entry.st_ino) != bound.directory_identity
+            ):
+                raise MemoryMutationError("tombstone directory changed while deleting")
+            current_directory_fd = os.open(
+                TOMBSTONE_DIRECTORY,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=bound.root_fd,
+            )
+            current_directory = os.fstat(current_directory_fd)
+            if (current_directory.st_dev, current_directory.st_ino) != (bound.directory_identity):
+                raise MemoryMutationError("tombstone directory changed while deleting")
+            marker = os.stat(bound.name, dir_fd=bound.directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(marker.st_mode)
+                or (marker.st_dev, marker.st_ino) != marker_identity
+            ):
+                raise MemoryMutationError("tombstone marker changed while deleting")
+        except OSError as error:
+            raise MemoryMutationError(
+                f"tombstone path changed while the platform was deleting: {error}"
+            ) from error
+        finally:
+            if current_directory_fd >= 0:
+                os.close(current_directory_fd)
+            if current_root_fd >= 0:
+                os.close(current_root_fd)
+
+    @staticmethod
+    def _remove_bound_tombstone_marker(
+        bound: BoundTombstoneMarker,
+        marker_identity: tuple[int, int] | None,
+    ) -> None:
+        if marker_identity is not None:
+            try:
+                marker = os.stat(bound.name, dir_fd=bound.directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                marker = None
+            if marker is not None:
+                if (
+                    not stat.S_ISREG(marker.st_mode)
+                    or (marker.st_dev, marker.st_ino) != marker_identity
+                ):
+                    raise MemoryMutationError(
+                        "compensation conflict: tombstone marker changed externally"
+                    )
+                os.unlink(bound.name, dir_fd=bound.directory_fd)
+                os.fsync(bound.directory_fd)
+        if not bound.directory_created:
+            return
+        try:
+            directory = os.stat(
+                TOMBSTONE_DIRECTORY,
+                dir_fd=bound.root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISDIR(directory.st_mode)
+            and (directory.st_dev, directory.st_ino) == bound.directory_identity
+        ):
+            with suppress(OSError):
+                os.rmdir(TOMBSTONE_DIRECTORY, dir_fd=bound.root_fd)
+                os.fsync(bound.root_fd)
+
+    @staticmethod
+    def _verify_bound_parent(root: Path, path: str, bound: BoundDocument) -> None:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent_fd = root_fd
+        try:
+            root_metadata = os.fstat(root_fd)
+            if (root_metadata.st_dev, root_metadata.st_ino) != bound.root_identity:
+                raise MemoryMutationError("memory library changed while saving")
+            for part in PurePosixPath(path).parts[:-1]:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                if parent_fd != root_fd:
+                    os.close(parent_fd)
+                parent_fd = child
+            metadata = os.fstat(parent_fd)
+            if (metadata.st_dev, metadata.st_ino) != bound.parent_identity:
+                raise MemoryMutationError("document parent changed while saving")
+        except OSError as error:
+            raise MemoryMutationError(
+                f"document parent changed while the platform was saving it: {error}"
+            ) from error
+        finally:
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            os.close(root_fd)
+
+    def _trusted_library_scan_for_creation(
+        self, root: Path, bound: BoundDocument, library_id: str, path: str
+    ) -> MarkdownScan:
+        scan = self._scan_bound_library(root, bound, library_id)
+        self._verify_bound_library_scan(root, bound, library_id, scan)
+        self._verify_bound_parent(root, path, bound)
+        indexed = tuple(
+            (str(row[0]), str(row[1]))
+            for row in self.connection_or_raise.execute(
+                "SELECT path, source_version FROM memory_documents "
+                "WHERE library_id = ? ORDER BY path",
+                (library_id,),
+            )
+        )
+        observed = tuple((document.path, document.version) for document in scan.documents)
+        if observed != indexed:
+            raise MemoryMutationError(
+                "memory library changed outside the platform; rescan before restoring"
+            )
+        return scan
+
+    @staticmethod
+    def _created_library_scan(
+        trusted: MarkdownScan, path: str, content: str, identity: tuple[int, int]
+    ) -> MarkdownScan:
+        version = hashlib.sha256(content.encode()).hexdigest()
+        documents = tuple(
+            sorted(
+                (*trusted.documents, MarkdownDocument(path, content, version)),
+                key=lambda item: item.path,
+            )
+        )
+        identities = tuple(
+            sorted((*trusted.identities, (path, "file", identity[0], identity[1], version)))
+        )
+        return MarkdownScan(documents, (), identities)
 
     def _scan_bound_library(
         self,
@@ -4801,7 +7957,9 @@ class PlatformState:
             raise MemoryMutationError("memory library changed while the platform was saving it")
 
     @staticmethod
-    def _read_bound_name(bound: BoundDocument, name: str) -> tuple[bytes, tuple[int, int]]:
+    def _read_bound_name_with_mode(
+        bound: BoundDocument, name: str
+    ) -> tuple[bytes, tuple[int, int], int]:
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=bound.parent_fd)
         try:
             metadata = os.fstat(descriptor)
@@ -4810,13 +7968,26 @@ class PlatformState:
             content = b""
             while chunk := os.read(descriptor, 1024 * 1024):
                 content += chunk
-            return content, (metadata.st_dev, metadata.st_ino)
+            mode = stat.S_IMODE(metadata.st_mode)
+            return content, (metadata.st_dev, metadata.st_ino), mode
         finally:
             os.close(descriptor)
 
     @staticmethod
+    def _read_bound_name(bound: BoundDocument, name: str) -> tuple[bytes, tuple[int, int]]:
+        content, identity, _mode = PlatformState._read_bound_name_with_mode(bound, name)
+        return content, identity
+
+    @staticmethod
     def _read_bound_document(bound: BoundDocument) -> tuple[bytes, tuple[int, int]]:
         return PlatformState._read_bound_name(bound, bound.name)
+
+    @staticmethod
+    def _read_bound_document_with_mode(
+        bound: BoundDocument,
+    ) -> tuple[bytes, tuple[int, int], int]:
+        content, identity, mode = PlatformState._read_bound_name_with_mode(bound, bound.name)
+        return content, identity, PlatformState._validated_document_mode(mode)
 
     @staticmethod
     def _replace_bound_document(
@@ -5124,6 +8295,205 @@ class PlatformState:
         )
         return CandidateResolutionSnapshot(tuple(candidate), tuple(governance), audit)
 
+    def _snapshot_forgotten_candidates(
+        self, library_id: str, match_fingerprint: str, key_id: str
+    ) -> ForgottenCandidateSnapshot:
+        connection = self.connection_or_raise
+        candidate_rows = tuple(
+            connection.execute(
+                "SELECT * FROM candidate_memories WHERE library_id = ? ORDER BY id",
+                (library_id,),
+            )
+        )
+        matching_ids: set[str] = set()
+        plaintext_bodies: set[bytes] = set()
+        for row in candidate_rows:
+            candidate_id = str(row[0])
+            bodies = [str(row[3])]
+            bodies.extend(
+                str(audit_row[0])
+                for audit_row in connection.execute(
+                    "SELECT body FROM candidate_audit WHERE candidate_id = ? ORDER BY id",
+                    (candidate_id,),
+                )
+            )
+            if any(
+                hmac.compare_digest(
+                    match_fingerprint,
+                    self._tombstone_match_fingerprint(library_id, body, key_id),
+                )
+                for body in bodies
+            ):
+                matching_ids.add(candidate_id)
+                plaintext_bodies.update(body.encode("utf-8") for body in bodies if body)
+        candidates = tuple(row for row in candidate_rows if str(row[0]) in matching_ids)
+        governance: tuple[tuple[object, ...], ...] = ()
+        audit: tuple[tuple[object, ...], ...] = ()
+        capture_keys: set[tuple[str, str]] = set()
+        if matching_ids:
+            placeholders = ",".join("?" for _ in matching_ids)
+            parameters = tuple(sorted(matching_ids))
+            governance = tuple(
+                connection.execute(
+                    f"SELECT * FROM candidate_governance "
+                    f"WHERE candidate_id IN ({placeholders}) ORDER BY candidate_id",  # noqa: S608
+                    parameters,
+                )
+            )
+            audit = tuple(
+                connection.execute(
+                    f"SELECT * FROM candidate_audit "
+                    f"WHERE candidate_id IN ({placeholders}) ORDER BY id",  # noqa: S608
+                    parameters,
+                )
+            )
+            capture_keys.update(
+                (str(row[0]), str(row[1]))
+                for row in connection.execute(
+                    f"SELECT session_id, turn_id FROM capture_rounds "
+                    f"WHERE candidate_id IN ({placeholders})",  # noqa: S608
+                    parameters,
+                )
+            )
+        library_capture_rows = tuple(
+            connection.execute(
+                "SELECT event_id, request_hash, session_id, project_id, library_id, "
+                "turn_id, event_kind, content, occurred_at, received_at, consolidated_at "
+                "FROM capture_inbox WHERE library_id = ? ORDER BY event_id",
+                (library_id,),
+            )
+        )
+        capture_keys.update(
+            (str(row[2]), str(row[5]))
+            for row in library_capture_rows
+            if hmac.compare_digest(
+                match_fingerprint,
+                self._tombstone_match_fingerprint(library_id, str(row[7]), key_id),
+            )
+        )
+        ordered_capture_keys = tuple(sorted(capture_keys))
+        capture_rounds: tuple[tuple[str, str, str | None], ...] = ()
+        capture_inbox: tuple[tuple[object, ...], ...] = ()
+        if ordered_capture_keys:
+            conditions = " OR ".join(
+                "(session_id = ? AND turn_id = ?)" for _ in ordered_capture_keys
+            )
+            capture_rounds = tuple(
+                (
+                    str(row[0]),
+                    str(row[1]),
+                    None if row[2] is None else str(row[2]),
+                )
+                for row in connection.execute(
+                    "SELECT session_id, turn_id, candidate_id FROM capture_rounds "
+                    f"WHERE library_id = ? AND ({conditions}) "  # noqa: S608
+                    "ORDER BY session_id, turn_id",
+                    (
+                        library_id,
+                        *(value for key in ordered_capture_keys for value in key),
+                    ),
+                )
+            )
+            capture_inbox = tuple(
+                row
+                for row in library_capture_rows
+                if (str(row[2]), str(row[5])) in capture_keys
+            )
+            plaintext_bodies.update(str(row[7]).encode("utf-8") for row in capture_inbox if row[7])
+        return ForgottenCandidateSnapshot(
+            candidates,
+            governance,
+            audit,
+            capture_rounds,
+            capture_inbox,
+            tuple(sorted(plaintext_bodies)),
+        )
+
+    def _restore_forgotten_candidates(self, snapshot: ForgottenCandidateSnapshot) -> None:
+        if not snapshot.candidates:
+            return
+        connection = self.connection_or_raise
+        candidate_ids = tuple(str(row[0]) for row in snapshot.candidates)
+        placeholders = ",".join("?" for _ in candidate_ids)
+        connection.execute(
+            f"UPDATE capture_rounds SET candidate_id = NULL WHERE candidate_id IN ({placeholders})",  # noqa: S608
+            candidate_ids,
+        )
+        connection.execute(
+            f"UPDATE memory_versions SET candidate_id = NULL "
+            f"WHERE candidate_id IN ({placeholders})",  # noqa: S608
+            candidate_ids,
+        )
+        connection.execute(
+            f"DELETE FROM candidate_memories WHERE id IN ({placeholders})",  # noqa: S608
+            candidate_ids,
+        )
+        for table, rows in (
+            ("candidate_memories", snapshot.candidates),
+            ("candidate_governance", snapshot.governance),
+            ("candidate_audit", snapshot.audit),
+        ):
+            if not rows:
+                continue
+            columns = tuple(
+                str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+            )
+            connection.executemany(
+                f"INSERT INTO {table} ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",  # noqa: S608
+                rows,
+            )
+
+    def _restore_forgotten_capture_rounds(self, snapshot: ForgottenCandidateSnapshot) -> None:
+        for row in snapshot.capture_inbox:
+            existing = self.connection_or_raise.execute(
+                """SELECT event_id, request_hash, session_id, project_id, library_id,
+                          turn_id, event_kind, content, occurred_at, received_at,
+                          consolidated_at
+                   FROM capture_inbox WHERE event_id = ?""",
+                (row[0],),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != row:
+                    raise MemoryMutationError(
+                        "compensation conflict: capture event changed externally"
+                    )
+                continue
+            self.connection_or_raise.execute(
+                """INSERT INTO capture_inbox
+                   (event_id, request_hash, session_id, project_id, library_id, turn_id,
+                    event_kind, content, occurred_at, received_at, consolidated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                row,
+            )
+        self.connection_or_raise.executemany(
+            "UPDATE capture_rounds SET candidate_id = ? WHERE session_id = ? AND turn_id = ?",
+            (
+                (candidate_id, session_id, turn_id)
+                for session_id, turn_id, candidate_id in snapshot.capture_rounds
+            ),
+        )
+
+    def _checkpoint_forgotten_plaintext(self, plaintext_bodies: tuple[bytes, ...]) -> None:
+        result: tuple[object, ...] | None = None
+        for attempt in range(3):
+            row = self.connection_or_raise.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            result = None if row is None else tuple(row)
+            if result == (0, 0, 0):
+                break
+            if attempt < 2:
+                time.sleep(0.01)
+        if result != (0, 0, 0):
+            raise MemoryMutationError("SQLite WAL checkpoint is busy")
+        for suffix in ("-wal", "-shm"):
+            path = Path(f"{self.database_path}{suffix}")
+            try:
+                persisted = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            if any(body and body in persisted for body in plaintext_bodies):
+                raise MemoryMutationError("SQLite WAL checkpoint retained forgotten plaintext")
+
     def _restore_candidate_resolution(self, snapshot: CandidateResolutionSnapshot) -> None:
         connection = self.connection_or_raise
         candidate_columns = tuple(
@@ -5370,14 +8740,61 @@ class PlatformState:
 
     @contextmanager
     def _library_lock(self, library_id: str) -> Iterator[None]:
-        lock_directory = self.database_path.parent / "locks"
-        lock_directory.mkdir(mode=0o700, exist_ok=True)
-        with (lock_directory / f"{library_id}.lock").open("a+b") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        if not isinstance(library_id, str) or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", library_id
+        ) is None:
+            raise MemoryMutationError("invalid memory library identifier")
+        try:
+            normalized_library_id = str(uuid.UUID(library_id))
+        except ValueError:
+            normalized_library_id = library_id
+        depths = getattr(self._library_lock_state, "depths", None)
+        if depths is None:
+            depths = {}
+            self._library_lock_state.depths = depths
+        depth = int(depths.get(normalized_library_id, 0))
+        if depth:
+            depths[normalized_library_id] = depth + 1
             try:
                 yield
             finally:
+                if depths[normalized_library_id] == 1:
+                    del depths[normalized_library_id]
+                else:
+                    depths[normalized_library_id] -= 1
+            return
+        lock_directory = self.database_path.parent / "locks"
+        lock_directory.mkdir(mode=0o700, exist_ok=True)
+        directory_fd = os.open(
+            lock_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        try:
+            lock_fd = os.open(
+                f"{normalized_library_id}.lock",
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        finally:
+            os.close(directory_fd)
+        with os.fdopen(lock_fd, "a+b") as lock:
+            if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+                raise MemoryMutationError("memory library lock is not a regular file")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            depths[normalized_library_id] = 1
+            try:
+                yield
+            finally:
+                del depths[normalized_library_id]
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _candidate_library_id(self, candidate_id: str) -> str:
+        row = self.connection_or_raise.execute(
+            "SELECT library_id FROM candidate_memories WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        if row is None:
+            raise CandidateGovernanceError("candidate memory not found")
+        return str(row[0])
 
     async def search_project(
         self,
@@ -5698,6 +9115,8 @@ class PlatformState:
                             "retrieval_sources": ["graph"],
                         }
                     )
+            except GraphAdapterBusyError:
+                degradation.append("graph_unavailable")
             except GraphAdapterError as error:
                 degradation.append("graph_unavailable")
                 self.connection_or_raise.execute(
@@ -5731,6 +9150,11 @@ class PlatformState:
                    FROM memory_versions WHERE library_id = ?""",
                 (library_id,),
             ).fetchall()
+            history_rows = [
+                row
+                for row in history_rows
+                if not self._matches_active_tombstone(library_id, str(row[3]))
+            ]
             by_version = {str(row[0]): row for row in history_rows}
             with sqlite3.connect(":memory:") as history_search:
                 history_search.execute(
@@ -6241,14 +9665,23 @@ class PlatformState:
             return "unavailable"
         return "available"
 
-    async def _execute_pending_jobs(self) -> None:
+    async def _execute_pending_jobs(self, *, capture_only: bool | None = None) -> None:
         assert self.connection is not None
-        job = self.connection.execute(
-            "SELECT id, kind, payload, attempts FROM background_jobs "
-            "WHERE status = 'pending' "
-            "AND available_at <= (julianday('now') - 2440587.5) * 86400.0 "
-            "ORDER BY available_at, id LIMIT 1"
-        ).fetchone()
+        kind_filter = ""
+        if capture_only is True:
+            kind_filter = "AND kind = 'capture_consolidation' "
+        elif capture_only is False:
+            kind_filter = "AND kind != 'capture_consolidation' "
+        query = "".join(
+            (
+                "SELECT id, kind, payload, attempts FROM background_jobs ",
+                "WHERE status = 'pending' ",
+                kind_filter,
+                "AND available_at <= (julianday('now') - 2440587.5) * 86400.0 ",
+                "ORDER BY available_at, id LIMIT 1",
+            )
+        )
+        job = self.connection.execute(query).fetchone()
         if job is None:
             return
         job_id, kind, payload, attempts = job
@@ -6286,21 +9719,50 @@ class PlatformState:
             json.JSONDecodeError,
         ) as error:
             self.connection.rollback()
+            retry_capture_job = str(kind) == "capture_consolidation" and int(attempts) < 5
             if str(kind) == "capture_consolidation":
                 with suppress(KeyError, TypeError, ValueError, json.JSONDecodeError):
                     parsed_capture = json.loads(str(payload))
-                    retry = int(attempts) < 5
-                    self.connection.execute(
-                        """UPDATE capture_rounds SET status = ?, last_error = ?,
-                           updated_at = CURRENT_TIMESTAMP
-                           WHERE session_id = ? AND turn_id = ?""",
-                        (
-                            "pending" if retry else "error",
-                            str(error)[:1000],
-                            str(parsed_capture["session_id"]),
-                            str(parsed_capture["turn_id"]),
-                        ),
-                    )
+                    capture_session_id = str(parsed_capture["session_id"])
+                    capture_turn_id = str(parsed_capture["turn_id"])
+                    round_row = self.connection.execute(
+                        "SELECT library_id FROM capture_rounds "
+                        "WHERE session_id = ? AND turn_id = ?",
+                        (capture_session_id, capture_turn_id),
+                    ).fetchone()
+                    if round_row is not None:
+                        capture_library_id = str(round_row[0])
+                        with self._library_lock(capture_library_id):
+                            rows = self._capture_round_rows(
+                                capture_session_id,
+                                capture_turn_id,
+                                capture_library_id,
+                            )
+                            complete = {str(row[2]) for row in rows} == {
+                                "user",
+                                "assistant",
+                            }
+                            retry_capture_job = retry_capture_job and complete
+                            if complete:
+                                self.connection.execute(
+                                    """UPDATE capture_rounds SET status = ?, last_error = ?,
+                                       updated_at = CURRENT_TIMESTAMP
+                                       WHERE session_id = ? AND turn_id = ?""",
+                                    (
+                                        "pending" if retry_capture_job else "error",
+                                        str(error)[:1000],
+                                        capture_session_id,
+                                        capture_turn_id,
+                                    ),
+                                )
+                            else:
+                                self.connection.execute(
+                                    """UPDATE capture_rounds SET status = 'done',
+                                       candidate_id = NULL, last_error = '',
+                                       updated_at = CURRENT_TIMESTAMP
+                                       WHERE session_id = ? AND turn_id = ?""",
+                                    (capture_session_id, capture_turn_id),
+                                )
             if str(kind) == "graph_rebuild":
                 with suppress(KeyError, TypeError, ValueError, json.JSONDecodeError):
                     library_id = str(json.loads(str(payload))["library_id"])
@@ -6311,7 +9773,7 @@ class PlatformState:
                         "last_error = excluded.last_error, updated_at = CURRENT_TIMESTAMP",
                         (library_id, str(error)[:1000]),
                     )
-            if str(kind) == "capture_consolidation" and int(attempts) < 5:
+            if retry_capture_job:
                 retry_delay = min(0.5 * (2 ** int(attempts)), 8.0)
                 self.connection.execute(
                     """UPDATE background_jobs
@@ -6331,7 +9793,7 @@ class PlatformState:
     ) -> int:
         pending = self.connection_or_raise.execute(
             """SELECT id FROM background_jobs WHERE kind = 'capture_consolidation'
-               AND status IN ('pending', 'running')
+               AND status = 'pending'
                AND json_extract(payload, '$.session_id') = ?
                AND json_extract(payload, '$.turn_id') = ? LIMIT 1""",
             (session_id, turn_id),
@@ -6348,25 +9810,24 @@ class PlatformState:
         return int(cursor.lastrowid)
 
     async def _consolidate_capture_round(self, session_id: str, turn_id: str) -> None:
-        rows = self.connection_or_raise.execute(
-            """SELECT event_id, library_id, event_kind, content, occurred_at
-               FROM capture_inbox WHERE session_id = ? AND turn_id = ?
-               ORDER BY CASE event_kind WHEN 'user' THEN 0 ELSE 1 END""",
+        round_row = self.connection_or_raise.execute(
+            "SELECT library_id FROM capture_rounds WHERE session_id = ? AND turn_id = ?",
             (session_id, turn_id),
-        ).fetchall()
-        by_kind = {str(row[2]): row for row in rows}
-        if set(by_kind) != {"user", "assistant"}:
+        ).fetchone()
+        if round_row is None:
             return
-        library_ids = {str(row[1]) for row in rows}
-        if len(library_ids) != 1:
-            raise CandidateGovernanceError("capture round crosses memory libraries")
-        library_id = library_ids.pop()
-        self.connection_or_raise.execute(
-            """UPDATE capture_rounds SET status = 'processing', last_error = '',
-               updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND turn_id = ?""",
-            (session_id, turn_id),
-        )
-        self.connection_or_raise.commit()
+        library_id = str(round_row[0])
+        with self._library_lock(library_id):
+            rows = self._capture_round_rows(session_id, turn_id, library_id)
+            by_kind = {str(row[2]): row for row in rows}
+            if set(by_kind) != {"user", "assistant"}:
+                return
+            self.connection_or_raise.execute(
+                """UPDATE capture_rounds SET status = 'processing', last_error = '',
+                   updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND turn_id = ?""",
+                (session_id, turn_id),
+            )
+            self.connection_or_raise.commit()
         conversation = (
             f"User:\n{by_kind['user'][3]}\n\nAssistant final reply:\n{by_kind['assistant'][3]}"
         )
@@ -6379,58 +9840,88 @@ class PlatformState:
             "reusable_experience",
             "external_reference",
         }
-        candidate_id: str | None = None
-        if extracted.get("eligible") is True:
-            suggested_type = extracted.get("suggested_type")
-            body = extracted.get("body")
-            if suggested_type not in allowed_types or not isinstance(body, str):
-                raise ModelServiceError("candidate extraction returned malformed data")
-            source_references = tuple(
-                f"capture:{session_id}:{turn_id}:{str(row[0])}:{str(row[4])}" for row in rows
-            )
-            candidate = self.create_candidate(
-                library_id,
-                str(suggested_type),
-                body,
-                source_references,
-                "session-capture",
-                "capture-round:" + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest(),
-            )
-            candidate_id = str(candidate["id"])
-            blockers = self._auto_promotion_blockers(
-                candidate,
-                extracted,
-                str(by_kind["user"][3]),
-                session_id,
-                turn_id,
-            )
-            if not blockers:
-                operation_id = (
-                    "auto-promotion:"
-                    + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest()
+        with self._library_lock(library_id):
+            rows = self._capture_round_rows(session_id, turn_id, library_id)
+            by_kind = {str(row[2]): row for row in rows}
+            if set(by_kind) != {"user", "assistant"}:
+                self.connection_or_raise.execute(
+                    """UPDATE capture_rounds SET status = 'done', candidate_id = NULL,
+                       last_error = '', updated_at = CURRENT_TIMESTAMP
+                       WHERE session_id = ? AND turn_id = ? AND library_id = ?""",
+                    (session_id, turn_id, library_id),
                 )
-                promoted = self.approve_candidate(
-                    candidate_id,
-                    "platform:auto-promotion",
-                    f"Background auto-promotion from source session {session_id}, turn {turn_id}",
-                    operation_id,
-                    publication_source=f"background-auto-promotion:{session_id}:{turn_id}",
-                    commit_message=(
-                        f"Auto-promote candidate {candidate_id} from session {session_id}"
-                    ),
+                self.connection_or_raise.commit()
+                return
+            candidate_id: str | None = None
+            if extracted.get("eligible") is True:
+                suggested_type = extracted.get("suggested_type")
+                body = extracted.get("body")
+                if suggested_type not in allowed_types or not isinstance(body, str):
+                    raise ModelServiceError("candidate extraction returned malformed data")
+                source_references = tuple(
+                    f"capture:{session_id}:{turn_id}:{str(row[0])}:{str(row[4])}"
+                    for row in rows
                 )
-                candidate_id = str(promoted["id"])
-        self.connection_or_raise.execute(
-            """UPDATE capture_rounds SET status = 'done', candidate_id = ?, last_error = '',
-               updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND turn_id = ?""",
-            (candidate_id, session_id, turn_id),
-        )
-        self.connection_or_raise.execute(
-            """UPDATE capture_inbox SET consolidated_at = CURRENT_TIMESTAMP
-               WHERE session_id = ? AND turn_id = ?""",
-            (session_id, turn_id),
-        )
-        self.connection_or_raise.commit()
+                if not self._matches_active_tombstone(
+                    library_id, body, reject_invalid_formal=True
+                ):
+                    candidate = self.create_candidate(
+                        library_id,
+                        str(suggested_type),
+                        body,
+                        source_references,
+                        "session-capture",
+                        "capture-round:"
+                        + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest(),
+                    )
+                    candidate_id = str(candidate["id"])
+                    blockers = self._auto_promotion_blockers(
+                        candidate,
+                        extracted,
+                        str(by_kind["user"][3]),
+                        session_id,
+                        turn_id,
+                    )
+                    if not blockers:
+                        operation_id = (
+                            "auto-promotion:"
+                            + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest()
+                        )
+                        promoted = self.approve_candidate(
+                            candidate_id,
+                            "platform:auto-promotion",
+                            "Background auto-promotion from source session "
+                            f"{session_id}, turn {turn_id}",
+                            operation_id,
+                            publication_source=(
+                                f"background-auto-promotion:{session_id}:{turn_id}"
+                            ),
+                            commit_message=(
+                                f"Auto-promote candidate {candidate_id} from session {session_id}"
+                            ),
+                        )
+                        candidate_id = str(promoted["id"])
+            self.connection_or_raise.execute(
+                """UPDATE capture_rounds SET status = 'done', candidate_id = ?, last_error = '',
+                   updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND turn_id = ?""",
+                (candidate_id, session_id, turn_id),
+            )
+            self.connection_or_raise.execute(
+                """UPDATE capture_inbox SET consolidated_at = CURRENT_TIMESTAMP
+                   WHERE session_id = ? AND turn_id = ?""",
+                (session_id, turn_id),
+            )
+            self.connection_or_raise.commit()
+
+    def _capture_round_rows(
+        self, session_id: str, turn_id: str, library_id: str
+    ) -> list[tuple[object, ...]]:
+        return self.connection_or_raise.execute(
+            """SELECT event_id, library_id, event_kind, content, occurred_at
+               FROM capture_inbox WHERE session_id = ? AND turn_id = ? AND library_id = ?
+               ORDER BY CASE event_kind WHEN 'user' THEN 0 ELSE 1 END""",
+            (session_id, turn_id, library_id),
+        ).fetchall()
 
     def _queue_vector_rebuild(self, library_id: str, participate_in_transaction: bool) -> int:
         if self.model_client.embedding is None:
@@ -6489,63 +9980,124 @@ class PlatformState:
         adapter = self.graph_adapter
         if adapter is None:
             raise GraphAdapterError("graph projection is not configured")
-        rows = self.connection_or_raise.execute(
-            "SELECT document.id, document.path, document.source_version, "
-            "group_concat(chunk.content, char(10) || char(10)) "
-            "FROM memory_documents AS document "
-            "LEFT JOIN memory_chunks AS chunk ON chunk.document_id = document.id "
-            "WHERE document.library_id = ? GROUP BY document.id "
-            "ORDER BY document.path",
-            (library_id,),
-        ).fetchall()
-        documents = tuple(
-            GraphSourceDocument(str(row[0]), str(row[1]), str(row[2]), str(row[3] or ""))
-            for row in rows
+        with self._library_lock(library_id):
+            documents = self._graph_source_documents(library_id)
+            self.connection_or_raise.execute(
+                "UPDATE memory_graph_indexes SET total_documents = ?, "
+                "projected_documents = 0, updated_at = CURRENT_TIMESTAMP WHERE library_id = ?",
+                (len(documents), library_id),
+            )
+            self.connection_or_raise.commit()
+        expected = {(document.document_id, document.source_version) for document in documents}
+
+        prepare = getattr(adapter, "prepare_rebuild", None)
+        prepared: PreparedGraphRebuild | _IsolatedGraphRebuild | None = None
+        if callable(prepare):
+            prepared = await prepare(library_id, documents)
+        elif callable(getattr(adapter, "stage_purge", None)) and callable(
+            getattr(adapter, "stage_rebuild", None)
+        ):
+            staging_id = f"{library_id}.staging-{uuid.uuid4().hex}"
+            try:
+                await adapter.rebuild(staging_id, documents)
+            except BaseException:
+                adapter.stage_purge(staging_id).commit()
+                raise
+            prepared = _IsolatedGraphRebuild(adapter, library_id, staging_id, documents)
+        else:
+            await adapter.rebuild(library_id, documents)
+
+        activated = await asyncio.to_thread(
+            self._finalize_graph_rebuild,
+            library_id,
+            documents,
+            expected,
+            prepared,
         )
-        self.connection_or_raise.execute(
-            "UPDATE memory_graph_indexes SET total_documents = ?, "
-            "projected_documents = 0, updated_at = CURRENT_TIMESTAMP WHERE library_id = ?",
-            (len(documents), library_id),
-        )
-        self.connection_or_raise.commit()
-        await adapter.rebuild(library_id, documents)
-        current = {
+        if not activated:
+            self._queue_graph_rebuild(library_id, False)
+
+    def _finalize_graph_rebuild(
+        self,
+        library_id: str,
+        documents: tuple[GraphSourceDocument, ...],
+        expected: set[tuple[str, str]],
+        prepared: PreparedGraphRebuild | _IsolatedGraphRebuild | None,
+    ) -> bool:
+        adapter = self.graph_adapter
+        if adapter is None:
+            raise GraphAdapterError("graph projection is not configured")
+        with self._library_lock(library_id), sqlite3.connect(self.database_path) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            current = self._graph_document_versions(library_id, connection=connection)
+            if current != expected:
+                if prepared is not None:
+                    prepared.discard()
+                elif callable(getattr(adapter, "stage_rebuild", None)):
+                    correction = adapter.stage_rebuild(
+                        library_id,
+                        self._graph_source_documents(library_id, connection=connection),
+                    )
+                    correction.commit()
+                return False
+            replacement = prepared.activate() if prepared is not None else None
+            try:
+                self._record_graph_projection(library_id, documents, connection=connection)
+            except BaseException:
+                if replacement is not None:
+                    replacement.rollback()
+                raise
+            if replacement is not None:
+                replacement.commit()
+            return True
+
+    def _graph_document_versions(
+        self, library_id: str, *, connection: sqlite3.Connection | None = None
+    ) -> set[tuple[str, str]]:
+        database = connection or self.connection_or_raise
+        return {
             (str(row[0]), str(row[1]))
-            for row in self.connection_or_raise.execute(
+            for row in database.execute(
                 "SELECT id, source_version FROM memory_documents WHERE library_id = ?",
                 (library_id,),
             )
         }
-        expected = {(document.document_id, document.source_version) for document in documents}
-        if current != expected:
-            self._queue_graph_rebuild(library_id, False)
-            return
-        self.connection_or_raise.execute("BEGIN IMMEDIATE")
-        self.connection_or_raise.execute(
+
+    def _record_graph_projection(
+        self,
+        library_id: str,
+        documents: tuple[GraphSourceDocument, ...],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        database = connection or self.connection_or_raise
+        database.execute("BEGIN IMMEDIATE")
+        database.execute(
             "DELETE FROM memory_graph_documents WHERE library_id = ?", (library_id,)
         )
-        self.connection_or_raise.executemany(
+        database.executemany(
             "INSERT INTO memory_graph_documents "
             "(library_id, document_id, path, source_version) VALUES (?, ?, ?, ?)",
             [(library_id, item.document_id, item.path, item.source_version) for item in documents],
         )
-        self.connection_or_raise.execute(
+        database.execute(
             "UPDATE memory_graph_indexes SET status = 'ready', total_documents = ?, "
             "projected_documents = ?, last_error = '', updated_at = CURRENT_TIMESTAMP "
             "WHERE library_id = ?",
             (len(documents), len(documents), library_id),
         )
-        self.connection_or_raise.commit()
+        database.commit()
 
     async def _rebuild_vectors(self, library_id: str) -> None:
         endpoint = self.model_client.embedding
         if endpoint is None:
             raise ModelServiceError("embedding is not configured")
-        rows = self.connection_or_raise.execute(
-            "SELECT id, content, source_version FROM memory_chunks "
-            "WHERE library_id = ? ORDER BY id",
-            (library_id,),
-        ).fetchall()
+        with self._library_lock(library_id):
+            rows = self.connection_or_raise.execute(
+                "SELECT id, content, source_version FROM memory_chunks "
+                "WHERE library_id = ? ORDER BY id",
+                (library_id,),
+            ).fetchall()
         rebuilt: list[tuple[str, str, str, str, str]] = []
         dimension: int | None = None
         for offset in range(0, len(rows), 32):
@@ -6568,34 +10120,37 @@ class PlatformState:
                 )
                 for row, vector in zip(batch, vectors, strict=True)
             )
-        self.connection_or_raise.execute("BEGIN IMMEDIATE")
-        current = {
-            (str(row[0]), str(row[1]))
-            for row in self.connection_or_raise.execute(
-                "SELECT id, source_version FROM memory_chunks WHERE library_id = ?",
-                (library_id,),
+        with self._library_lock(library_id):
+            self.connection_or_raise.execute("BEGIN IMMEDIATE")
+            current = {
+                (str(row[0]), str(row[1]))
+                for row in self.connection_or_raise.execute(
+                    "SELECT id, source_version FROM memory_chunks WHERE library_id = ?",
+                    (library_id,),
+                )
+            }
+            expected = {(row[0], row[2]) for row in rebuilt}
+            if current != expected:
+                self.connection_or_raise.rollback()
+                self._queue_vector_rebuild(library_id, False)
+                return
+            self.connection_or_raise.execute(
+                "DELETE FROM memory_chunk_vectors WHERE library_id = ?", (library_id,)
             )
-        }
-        expected = {(row[0], row[2]) for row in rebuilt}
-        if current != expected:
-            self.connection_or_raise.rollback()
-            self._queue_vector_rebuild(library_id, False)
-            return
-        self.connection_or_raise.execute(
-            "DELETE FROM memory_chunk_vectors WHERE library_id = ?", (library_id,)
-        )
-        self.connection_or_raise.executemany(
-            "INSERT INTO memory_chunk_vectors "
-            "(chunk_id, library_id, source_version, model, vector_json) VALUES (?, ?, ?, ?, ?)",
-            rebuilt,
-        )
-        self.connection_or_raise.execute(
-            "INSERT INTO memory_vector_indexes (library_id, model, dimension) VALUES (?, ?, ?) "
-            "ON CONFLICT(library_id) DO UPDATE SET model = excluded.model, "
-            "dimension = excluded.dimension, updated_at = CURRENT_TIMESTAMP",
-            (library_id, endpoint.model, 0 if dimension is None else dimension),
-        )
-        self.connection_or_raise.commit()
+            self.connection_or_raise.executemany(
+                "INSERT INTO memory_chunk_vectors "
+                "(chunk_id, library_id, source_version, model, vector_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rebuilt,
+            )
+            self.connection_or_raise.execute(
+                "INSERT INTO memory_vector_indexes (library_id, model, dimension) "
+                "VALUES (?, ?, ?) ON CONFLICT(library_id) DO UPDATE SET "
+                "model = excluded.model, dimension = excluded.dimension, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (library_id, endpoint.model, 0 if dimension is None else dimension),
+            )
+            self.connection_or_raise.commit()
 
     def _metadata(self, key: str) -> str | None:
         assert self.connection is not None

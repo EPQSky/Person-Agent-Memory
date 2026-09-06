@@ -120,7 +120,7 @@
         const documentTree = document.createElement('nav');
         documentTree.className = 'document-tree';
         const editor = document.createElement('div');
-        editor.innerHTML = '<strong id="document-path">Select a document</strong><div class="editor-tabs"><button type="button" id="source-tab">Source</button><button type="button" id="preview-tab">Preview</button><button type="button" id="diff-tab">Diff</button></div><textarea id="document-source" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Rendered Markdown preview"></iframe><pre id="document-diff" class="diff" hidden></pre><button type="button" id="preview-change" disabled>Preview changes</button><button type="button" id="save-change" disabled>Save</button><p id="editor-message"></p>';
+        editor.innerHTML = '<strong id="document-path">Select a document</strong><div class="editor-tabs"><button type="button" id="source-tab">Source</button><button type="button" id="preview-tab">Preview</button><button type="button" id="diff-tab">Diff</button></div><textarea id="document-source" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Rendered Markdown preview"></iframe><pre id="document-diff" class="diff" hidden></pre><button type="button" id="preview-change" disabled>Preview changes</button><button type="button" id="save-change" disabled>Save</button><button type="button" id="preview-delete" class="danger" disabled>Preview forgetting</button><button type="button" id="confirm-delete" class="danger" disabled>Forget</button><p id="editor-message"></p>';
         editorLayout.append(documentTree, editor);
         const reconciliationHeading = document.createElement('h2');
         reconciliationHeading.textContent = 'Out-of-band changes';
@@ -137,13 +137,19 @@
         history.className = 'history';
         const restoreAction = document.createElement('div');
         const historyDiff = document.createElement('pre');
+        const forgottenHeading = document.createElement('h2');
+        forgottenHeading.textContent = 'Forgotten memories';
+        const forgottenForm = document.createElement('form');
+        forgottenForm.innerHTML = '<div class="field"><label for="forgotten-memory">Forgotten memory</label><select id="forgotten-memory" required></select></div><div class="field"><label for="forgotten-commit">Allowed history revision</label><select id="forgotten-commit" required></select></div><button type="submit">Restore as new transaction</button><p id="forgotten-message"></p>';
         historyDiff.className = 'diff';
-        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, candidateHeading, candidateStatus, candidateLayout, sensitiveHeading, sensitiveLayout, editorHeading, editorLibrary, editorLayout, reconciliationHeading, reconciliationLayout, historyHeading, history, restoreAction, historyDiff);
+        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, candidateHeading, candidateStatus, candidateLayout, sensitiveHeading, sensitiveLayout, editorHeading, editorLibrary, editorLayout, reconciliationHeading, reconciliationLayout, historyHeading, history, restoreAction, historyDiff, forgottenHeading, forgottenForm);
 
         let projectLibraries = [];
         let projectBindings = [];
         let allLibraries = [];
         let activeDocument = null;
+        let deletionPreviewVersion = null;
+        let deletionPreviewToken = null;
         let activeCandidate = null;
         let activeSensitiveRecord = null;
         let activeReconciliation = null;
@@ -423,11 +429,15 @@
           historySelection.clear();
           historyDiff.textContent = '';
           activeDocument = null;
+          deletionPreviewVersion = null;
+          deletionPreviewToken = null;
           editor.querySelector('#document-path').textContent = 'Select a document';
           editor.querySelector('#document-source').value = '';
           editor.querySelector('#document-source').disabled = true;
           editor.querySelector('#preview-change').disabled = true;
           editor.querySelector('#save-change').disabled = true;
+          editor.querySelector('#preview-delete').disabled = true;
+          editor.querySelector('#confirm-delete').disabled = true;
           if (!selectedLibrary) return;
           const response = await fetch(`/api/v1/libraries/${selectedLibrary}/documents`, {headers: {Authorization: `Bearer ${key}`}});
           if (!response.ok) return;
@@ -440,6 +450,7 @@
             button.addEventListener('click', () => loadDocument(item.path));
           }
           await refreshHistory();
+          await refreshForgotten();
         }
 
         async function loadDocument(path) {
@@ -458,6 +469,10 @@
           editor.querySelector('#document-source').disabled = false;
           editor.querySelector('#preview-change').disabled = false;
           editor.querySelector('#save-change').disabled = false;
+          editor.querySelector('#preview-delete').disabled = false;
+          editor.querySelector('#confirm-delete').disabled = true;
+          deletionPreviewVersion = null;
+          deletionPreviewToken = null;
           showEditorPanel('source');
           await refreshHistory();
         }
@@ -532,6 +547,60 @@
           restoreAction.replaceChildren();
           historySelection.clear();
           if (editorContext.isCurrent(context)) await loadDocument(selection.path);
+        }
+
+        async function previewForgetting() {
+          const context = editorContext.snapshot();
+          if (!context || !context.path || !context.sourceVersion) return;
+          const response = await fetch(`/api/v1/libraries/${context.libraryId}/document/delete-preview`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, operation_id: crypto.randomUUID()})});
+          if (!editorContext.isCurrent(context)) return;
+          const message = editor.querySelector('#editor-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          const preview = await response.json();
+          editor.querySelector('#document-diff').textContent = JSON.stringify(preview, null, 2);
+          showEditorPanel('diff');
+          deletionPreviewVersion = context.sourceVersion;
+          deletionPreviewToken = preview.preview_token;
+          editor.querySelector('#confirm-delete').disabled = false;
+          message.className = '';
+          message.textContent = 'Review every affected source and derived store before forgetting.';
+        }
+
+        async function forgetDocument() {
+          const context = editorContext.snapshot();
+          if (!context || deletionPreviewVersion !== context.sourceVersion || !deletionPreviewToken) return;
+          const response = await fetch(`/api/v1/libraries/${context.libraryId}/document`, {method: 'DELETE', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, preview_token: deletionPreviewToken, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-delete'})});
+          const message = editor.querySelector('#editor-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          message.className = '';
+          message.textContent = 'Memory forgotten.';
+          await refreshDocuments();
+        }
+
+        async function refreshForgotten() {
+          const libraryId = editorLibrary.value;
+          const memorySelect = forgottenForm.querySelector('#forgotten-memory');
+          const commitSelect = forgottenForm.querySelector('#forgotten-commit');
+          memorySelect.replaceChildren();
+          commitSelect.replaceChildren();
+          if (!libraryId) return;
+          const [forgottenResponse, historyResponse] = await Promise.all([
+            fetch(`/api/v1/libraries/${libraryId}/forgotten`, {headers: {Authorization: `Bearer ${key}`}}),
+            fetch(`/api/v1/libraries/${libraryId}/history`, {headers: {Authorization: `Bearer ${key}`}}),
+          ]);
+          if (!forgottenResponse.ok || !historyResponse.ok) return;
+          for (const item of await forgottenResponse.json()) {
+            const option = document.createElement('option');
+            option.value = item.id;
+            option.textContent = `${item.path} · deleted ${item.deleted_at}`;
+            memorySelect.append(option);
+          }
+          for (const entry of await historyResponse.json()) {
+            const option = document.createElement('option');
+            option.value = entry.commit;
+            option.textContent = `${entry.commit.slice(0, 12)} · ${entry.subject}`;
+            commitSelect.append(option);
+          }
         }
 
         async function refreshBindings() {
@@ -666,10 +735,25 @@
         editor.querySelector('#preview-tab').addEventListener('click', async () => { if (await previewChange()) showEditorPanel('preview'); });
         editor.querySelector('#diff-tab').addEventListener('click', previewChange);
         editor.querySelector('#preview-change').addEventListener('click', previewChange);
+        editor.querySelector('#preview-delete').addEventListener('click', previewForgetting);
+        editor.querySelector('#confirm-delete').addEventListener('click', forgetDocument);
         editor.querySelector('#document-source').addEventListener('input', () => {
           editorContext.edit(editor.querySelector('#document-source').value);
           restoreAction.replaceChildren();
           historySelection.clear();
+          deletionPreviewVersion = null;
+          deletionPreviewToken = null;
+          editor.querySelector('#confirm-delete').disabled = true;
+        });
+        forgottenForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const libraryId = editorLibrary.value;
+          const response = await fetch(`/api/v1/libraries/${libraryId}/forgotten/restore`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({tombstone_id: forgottenForm.querySelector('#forgotten-memory').value, commit: forgottenForm.querySelector('#forgotten-commit').value, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-forgotten-history'})});
+          const message = forgottenForm.querySelector('#forgotten-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          message.className = '';
+          message.textContent = 'Forgotten memory restored in a new commit.';
+          await refreshDocuments();
         });
         editor.querySelector('#save-change').addEventListener('click', async () => {
           const context = editorContext.snapshot();

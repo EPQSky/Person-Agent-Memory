@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import threading
@@ -43,7 +44,11 @@ def request(
             body = response.read()
             return response.status, {} if not body else json.loads(body)
     except urllib.error.HTTPError as error:
-        return error.code, json.load(error)
+        body = error.read()
+        try:
+            return error.code, {} if not body else json.loads(body)
+        except json.JSONDecodeError:
+            return error.code, {"detail": body.decode("utf-8", errors="replace")}
 
 
 def import_external_changes(
@@ -149,6 +154,7 @@ def run_capture_hook(
     url: str = "http://127.0.0.1:7331",
     session_id: str = "docker-ticket12",
     turn_id: str | None = None,
+    plugin_data: str = "/tmp/personal-agent-memory-plugin-data-ticket12",
 ) -> subprocess.CompletedProcess[str]:
     event: dict[str, object] = {
         "session_id": session_id,
@@ -176,7 +182,7 @@ def run_capture_hook(
         env={
             **os.environ,
             "PERSONAL_AGENT_MEMORY_API_KEY": api_key,
-            "PLUGIN_DATA": "/tmp/personal-agent-memory-plugin-data-ticket12",
+            "PLUGIN_DATA": plugin_data,
             "PERSONAL_AGENT_MEMORY_URL": url,
             "PERSONAL_AGENT_MEMORY_TIMEOUT_MS": "300",
         },
@@ -970,7 +976,7 @@ retry_command = [
 
 def start_retry_daemon() -> subprocess.Popen[bytes]:
     process = subprocess.Popen(retry_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError("retry daemon exited during startup")
@@ -2483,9 +2489,9 @@ def start_supersession_restart_daemon() -> subprocess.Popen[bytes]:
         if process.poll() is not None:
             raise RuntimeError("Ticket 14 restart daemon exited during startup")
         if (supersession_restart_state / "api-key").exists():
-            restart_key = (supersession_restart_state / "api-key").read_text(
-                encoding="utf-8"
-            ).strip()
+            restart_key = (
+                (supersession_restart_state / "api-key").read_text(encoding="utf-8").strip()
+            )
             try:
                 if request("http://127.0.0.1:27331/health/live", restart_key)[0] == 200:
                     return process
@@ -2499,9 +2505,9 @@ def start_supersession_restart_daemon() -> subprocess.Popen[bytes]:
 
 supersession_restart_process = start_supersession_restart_daemon()
 first_supersession_process = supersession_restart_process
-supersession_restart_key = (supersession_restart_state / "api-key").read_text(
-    encoding="utf-8"
-).strip()
+supersession_restart_key = (
+    (supersession_restart_state / "api-key").read_text(encoding="utf-8").strip()
+)
 try:
     restart_library_code, restart_library = request(
         "http://127.0.0.1:27331/api/v1/libraries",
@@ -2531,33 +2537,39 @@ try:
         "ticket14-restart-oracle",
         "# Database\n\nThe application database is Oracle Database.\n",
     )
-    assert request(
-        f"http://127.0.0.1:27331/api/v1/candidates/{restart_oracle['id']}/resolve",
-        supersession_restart_key,
-        {
-            "action": "adopt",
-            "operator": "docker-user",
-            "reason": "First persisted migration",
-            "operation_id": "ticket14-restart-adopt-oracle",
-            "effective_at": "2020-01-01T00:00:00Z",
-        },
-    )[0] == 200
+    assert (
+        request(
+            f"http://127.0.0.1:27331/api/v1/candidates/{restart_oracle['id']}/resolve",
+            supersession_restart_key,
+            {
+                "action": "adopt",
+                "operator": "docker-user",
+                "reason": "First persisted migration",
+                "operation_id": "ticket14-restart-adopt-oracle",
+                "effective_at": "2020-01-01T00:00:00Z",
+            },
+        )[0]
+        == 200
+    )
     restart_maria = restart_governance_candidate(
         "ticket14-restart-maria",
         "# Database\n\nThe application database is MySQL.\n",
     )
-    assert request(
-        f"http://127.0.0.1:27331/api/v1/candidates/{restart_maria['id']}/resolve",
-        supersession_restart_key,
-        {
-            "action": "merge",
-            "operator": "docker-user",
-            "reason": "Second persisted migration",
-            "operation_id": "ticket14-restart-merge-maria",
-            "merged_body": "# Database\n\nThe application database is MariaDB.\n",
-            "effective_at": "2020-02-01T00:00:00Z",
-        },
-    )[0] == 200
+    assert (
+        request(
+            f"http://127.0.0.1:27331/api/v1/candidates/{restart_maria['id']}/resolve",
+            supersession_restart_key,
+            {
+                "action": "merge",
+                "operator": "docker-user",
+                "reason": "Second persisted migration",
+                "operation_id": "ticket14-restart-merge-maria",
+                "merged_body": "# Database\n\nThe application database is MariaDB.\n",
+                "effective_at": "2020-02-01T00:00:00Z",
+            },
+        )[0]
+        == 200
+    )
 finally:
     supersession_restart_process.send_signal(signal.SIGINT)
     assert supersession_restart_process.wait(timeout=20) == 0
@@ -2602,13 +2614,9 @@ try:
         )
         for item in restored_chain
     ] == ["Microsoft SQL Server", "Oracle Database", "MariaDB"]
-    assert restored_chain[0]["superseded_by_version_ids"] == [
-        restored_chain[1]["version_id"]
-    ]
+    assert restored_chain[0]["superseded_by_version_ids"] == [restored_chain[1]["version_id"]]
     assert restored_chain[1]["supersedes_version_id"] == restored_chain[0]["version_id"]
-    assert restored_chain[1]["superseded_by_version_ids"] == [
-        restored_chain[2]["version_id"]
-    ]
+    assert restored_chain[1]["superseded_by_version_ids"] == [restored_chain[2]["version_id"]]
     assert restored_chain[2]["supersedes_version_id"] == restored_chain[1]["version_id"]
     assert restored_chain[2]["classification"] == "history_current"
     current_after_restart = request(
@@ -2620,6 +2628,555 @@ try:
 finally:
     supersession_restart_process.send_signal(signal.SIGINT)
     assert supersession_restart_process.wait(timeout=20) == 0
+
+# Ticket 15 runs true forgetting against real Git, SQLite, vector/graph workers,
+# capture replay, and a daemon restart before an explicit restoration transaction.
+forget_state = Path("/tmp/pam-ticket15-restart-state")
+forget_root = Path("/project-roots/ticket15-memory")
+forget_other_root = Path("/project-roots/ticket15-other-memory")
+forget_project = Path("/project-roots/ticket15-project")
+for item in (forget_state, forget_root, forget_other_root, forget_project):
+    shutil.rmtree(item, ignore_errors=True)
+forget_root.mkdir()
+forget_other_root.mkdir()
+forget_project.mkdir()
+forget_user = "Remember GraphReplayNeedle.\nGraph: Alpha -> ForgottenNode: old edge."
+forget_assistant = "GraphReplayNeedle is confirmed.\nEntity: ForgottenNode: forgotten source."
+forget_content = (
+    "# Captured decision\n\nUser:\n"
+    + forget_user
+    + "\n\nAssistant final reply:\n"
+    + forget_assistant
+)
+forgotten_capture_content = "DockerForgottenCaptureNeedle"
+(forget_root / "forgotten.md").write_text(forget_content, encoding="utf-8")
+(forget_root / "ordinary-copy.md").write_text(
+    "---\ntitle: Docker equivalent copy\npriority: 4\n---\n\n" + forget_content,
+    encoding="utf-8",
+)
+(forget_root / "platform-copy.md").write_text(
+    "\n".join(
+        (
+            "---",
+            'memory_id: "11111111-2222-4333-8444-555555555555"',
+            'memory_type: "decision"',
+            'candidate_id: "11111111-2222-4333-8444-555555555555"',
+            'created_by: "docker-ticket15"',
+            'approved_by: "epq"',
+            'approval_reason: "confirmed"',
+            "source_references:",
+            '  - "docker-ticket15:authoritative-copy"',
+            "---",
+            "",
+            forget_content,
+        )
+    ),
+    encoding="utf-8",
+)
+(forget_other_root / "same.md").write_text(forget_content, encoding="utf-8")
+forget_command = [
+    "personal-agent-memory",
+    "serve",
+    "--state-dir",
+    str(forget_state),
+    "--library-root",
+    "/project-roots",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "37331",
+    "--embedding-url",
+    "http://127.0.0.1:18080",
+    "--embedding-model",
+    "deterministic-test-model",
+    "--graph-url",
+    "http://127.0.0.1:18080",
+    "--graph-model",
+    "deterministic-graph",
+]
+
+
+def start_forget_daemon() -> subprocess.Popen[bytes]:
+    process = subprocess.Popen(forget_command)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Ticket 15 restart daemon exited during startup")
+        if (forget_state / "api-key").exists():
+            current_key = (forget_state / "api-key").read_text(encoding="utf-8").strip()
+            try:
+                if request("http://127.0.0.1:37331/health/live", current_key)[0] == 200:
+                    return process
+            except OSError:
+                pass
+        time.sleep(0.1)
+    process.terminate()
+    process.wait(timeout=10)
+    raise RuntimeError("Ticket 15 restart daemon did not become ready")
+
+
+forget_process = start_forget_daemon()
+forget_key = (forget_state / "api-key").read_text(encoding="utf-8").strip()
+try:
+    forget_library_code, forget_library = request(
+        "http://127.0.0.1:37331/api/v1/libraries",
+        forget_key,
+        {"path": str(forget_root), "kind": "project"},
+    )
+    other_forget_code, other_forget_library = request(
+        "http://127.0.0.1:37331/api/v1/libraries",
+        forget_key,
+        {"path": str(forget_other_root), "kind": "user"},
+    )
+    assert forget_library_code == other_forget_code == 201
+    forget_library_id = str(forget_library["id"])
+    assert (
+        request(
+            "http://127.0.0.1:37331/api/v1/project-bindings",
+            forget_key,
+            {"project_root": str(forget_project), "library_id": forget_library_id},
+        )[0]
+        == 201
+    )
+    pending_replay_code, pending_replay = request(
+        "http://127.0.0.1:37331/mcp/candidates",
+        forget_key,
+        {
+            "library_id": forget_library_id,
+            "suggested_type": "decision",
+            "body": forget_content,
+            "source_references": ["docker-ticket15:pending-before-delete"],
+            "creator": "docker-ticket15",
+            "idempotency_key": "docker-ticket15-pending-before-delete",
+        },
+    )
+    assert pending_replay_code == 201
+    with sqlite3.connect(forget_state / "platform.sqlite3") as setup:
+        setup.execute(
+            """INSERT INTO capture_rounds
+               (session_id, turn_id, library_id, status, candidate_id)
+               VALUES ('docker-ticket15-capture', 'turn-1', ?, 'done', ?)""",
+            (forget_library_id, pending_replay["id"]),
+        )
+        setup.execute(
+            """INSERT INTO capture_inbox
+               (event_id, request_hash, session_id, project_id, library_id, turn_id,
+                event_kind, content, occurred_at)
+               VALUES ('docker-ticket15-forgotten-event', 'forgotten-request',
+                       'docker-ticket15-capture', 'docker-ticket15-project', ?, 'turn-1',
+                       'assistant', ?, '2026-09-06T00:00:00Z')""",
+            (forget_library_id, forgotten_capture_content),
+        )
+        setup.execute(
+            """INSERT INTO capture_inbox
+               (event_id, request_hash, session_id, project_id, library_id, turn_id,
+                event_kind, content, occurred_at)
+               VALUES ('docker-ticket15-retained-event', 'retained-request',
+                       'docker-ticket15-retained', 'docker-ticket15-project', ?, 'turn-2',
+                       'assistant', 'DockerRetainedCaptureNeedle',
+                       '2026-09-06T00:00:00Z')""",
+            (forget_library_id,),
+        )
+        setup.execute(
+            """INSERT INTO capture_rounds
+               (session_id, turn_id, library_id, status)
+               VALUES ('docker-ticket15-retained', 'turn-2', ?, 'done')""",
+            (forget_library_id,),
+        )
+        setup.commit()
+    history_before_forget = cast(
+        list[dict[str, object]],
+        request(
+            f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/history",
+            forget_key,
+        )[1],
+    )
+    restore_source_commit = str(history_before_forget[0]["commit"])
+    current_forget_document = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/document?path=forgotten.md",
+        forget_key,
+    )[1]
+    for endpoint in ("vector-index/rebuild", "graph-index/rebuild"):
+        code, job = request(
+            f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/{endpoint}",
+            forget_key,
+            {},
+        )
+        assert code == 202
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            _, job_status = request(
+                f"http://127.0.0.1:37331/api/v1/jobs/{job['job_id']}", forget_key
+            )
+            if job_status["status"] in {"done", "error"}:
+                break
+            time.sleep(0.05)
+        assert job_status["status"] == "done"
+
+    (forget_root / "unrelated.md").write_text(
+        "# Retained\n\nKeep DockerRetainedNeedle available.\n", encoding="utf-8"
+    )
+    scan_code, scan_result = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/scan",
+        forget_key,
+        {},
+    )
+    assert scan_code == 200, scan_result
+
+    preview_code, forget_preview = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/document/delete-preview",
+        forget_key,
+        {
+            "path": "forgotten.md",
+            "expected_source_version": current_forget_document["source_version"],
+            "operation_id": "docker-ticket15-preview",
+        },
+    )
+    assert preview_code == 200
+    assert forget_preview["content"] == forget_content
+    assert forget_preview["derived"]["full_text_chunks"] > 0
+    assert forget_preview["derived"]["embeddings"] > 0
+    assert forget_preview["derived"]["graph_documents"] == 3
+    assert forget_preview["derived"]["candidate_records"] == 1
+    assert forget_preview["derived"]["capture_events"] == 1
+    assert forget_preview["candidate_impacts"][0]["body"] == forget_content
+    assert forget_preview["capture_impacts"][0]["event_id"] == (
+        "docker-ticket15-forgotten-event"
+    )
+    assert [item["path"] for item in forget_preview["authoritative_copies"]] == [
+        "forgotten.md",
+        "ordinary-copy.md",
+        "platform-copy.md",
+    ], forget_preview["authoritative_copies"]
+    delete_code, forgotten = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/document",
+        forget_key,
+        {
+            "path": "forgotten.md",
+            "expected_source_version": current_forget_document["source_version"],
+            "preview_token": forget_preview["preview_token"],
+            "operation_id": "docker-ticket15-delete",
+            "actor_type": "user",
+            "source": "docker-ticket15",
+        },
+        method="DELETE",
+    )
+    assert delete_code == 200, forgotten
+    assert not (forget_root / "forgotten.md").exists()
+    assert not (forget_root / "ordinary-copy.md").exists()
+    assert not (forget_root / "platform-copy.md").exists()
+    assert (forget_root / "unrelated.md").exists()
+    assert (forget_other_root / "same.md").exists()
+    marker = next((forget_root / ".personal-agent-memory-tombstones").glob("*.json"))
+    marker_text = marker.read_text(encoding="utf-8")
+    marker_payload = json.loads(marker_text)
+    assert forget_content not in marker_text
+    assert marker_payload["fingerprint"].startswith("hmac-sha256:")
+    assert set(marker_payload) == {
+        "deleted_at",
+        "fingerprint",
+        "format",
+        "key_id",
+        "match_fingerprint",
+        "source_scope",
+    }
+    with sqlite3.connect(f"file:{forget_state / 'platform.sqlite3'}?mode=ro", uri=True) as db:
+        for table in (
+            "memory_documents",
+            "memory_chunks",
+            "memory_graph_documents",
+            "memory_versions",
+        ):
+            assert db.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE library_id = ? "  # noqa: S608
+                "AND path IN ('forgotten.md', 'ordinary-copy.md', 'platform-copy.md')",
+                (forget_library_id,),
+            ).fetchone() == (0,)
+        assert db.execute(
+            """SELECT COUNT(*) FROM memory_chunk_vectors AS vector
+               JOIN memory_chunks AS chunk ON chunk.id = vector.chunk_id
+               WHERE vector.library_id = ? AND chunk.path IN
+                 ('forgotten.md', 'ordinary-copy.md', 'platform-copy.md')""",
+            (forget_library_id,),
+        ).fetchone() == (0,)
+        tombstone_row = db.execute(
+            """SELECT fingerprint, key_id, source_scope_json, deleted_at
+               FROM memory_tombstones WHERE id = ?""",
+            (forgotten["tombstone_id"],),
+        ).fetchone()
+        assert db.execute(
+            "SELECT COUNT(*) FROM candidate_memories WHERE id = ?",
+            (pending_replay["id"],),
+        ).fetchone() == (0,)
+        assert db.execute(
+            "SELECT COUNT(*) FROM candidate_governance WHERE candidate_id = ?",
+            (pending_replay["id"],),
+        ).fetchone() == (0,)
+        assert db.execute(
+            "SELECT COUNT(*) FROM candidate_audit WHERE candidate_id = ?",
+            (pending_replay["id"],),
+        ).fetchone() == (0,)
+        assert db.execute(
+            "SELECT COUNT(*) FROM capture_inbox WHERE event_id = 'docker-ticket15-forgotten-event'"
+        ).fetchone() == (0,)
+        assert db.execute(
+            "SELECT content FROM capture_inbox WHERE event_id = 'docker-ticket15-retained-event'"
+        ).fetchone() == ("DockerRetainedCaptureNeedle",)
+    capture_events = cast(
+        list[dict[str, object]],
+        request("http://127.0.0.1:37331/api/v1/capture/events", forget_key)[1],
+    )
+    assert all(item["event_id"] != "docker-ticket15-forgotten-event" for item in capture_events)
+    assert any(item["event_id"] == "docker-ticket15-retained-event" for item in capture_events)
+    assert forget_content not in json.dumps(tombstone_row)
+    for suffix in ("", "-wal", "-shm"):
+        persisted_path = Path(f"{forget_state / 'platform.sqlite3'}{suffix}")
+        if persisted_path.exists():
+            assert forgotten_capture_content.encode() not in persisted_path.read_bytes()
+finally:
+    forget_process.send_signal(signal.SIGINT)
+    assert forget_process.wait(timeout=20) == 0
+
+crash_cleanup_id = str(forgotten["tombstone_id"])
+crash_quarantine = (
+    forget_state
+    / "graphs"
+    / f".{forget_library_id}.purge-{crash_cleanup_id}-docker-crash"
+)
+crash_quarantine.mkdir()
+(crash_quarantine / "graph.db").write_text(forget_content, encoding="utf-8")
+unrelated_cleanup = (
+    forget_state
+    / "graphs"
+    / f".{forget_library_id}.purge-{'f' * 32}-unrelated"
+)
+unrelated_cleanup.mkdir()
+(unrelated_cleanup / "graph.db").write_text("unrelated cleanup", encoding="utf-8")
+official_projection = forget_state / "graphs" / forget_library_id
+official_projection.mkdir(exist_ok=True)
+(official_projection / "retained-live-projection").write_text(
+    "DockerRetainedNeedle", encoding="utf-8"
+)
+official_projection_before_restart = {
+    path.relative_to(official_projection).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in official_projection.rglob("*")
+    if path.is_file()
+}
+with sqlite3.connect(forget_state / "platform.sqlite3") as setup:
+    setup.execute(
+        "INSERT INTO graph_cleanup_intents (cleanup_id, library_id) VALUES (?, ?)",
+        (crash_cleanup_id, forget_library_id),
+    )
+    setup.commit()
+
+forget_spool_data = "/tmp/personal-agent-memory-plugin-data-ticket15"
+shutil.rmtree(forget_spool_data, ignore_errors=True)
+spooled_replay_user = run_capture_hook(
+    forget_project,
+    "UserPromptSubmit",
+    forget_user,
+    api_key=forget_key,
+    url="http://127.0.0.1:37331",
+    session_id="docker-ticket15-spool-replay",
+    turn_id="forgotten-spooled-turn",
+    plugin_data=forget_spool_data,
+)
+spooled_replay_assistant = run_capture_hook(
+    forget_project,
+    "Stop",
+    forget_assistant,
+    api_key=forget_key,
+    url="http://127.0.0.1:37331",
+    session_id="docker-ticket15-spool-replay",
+    turn_id="forgotten-spooled-turn",
+    plugin_data=forget_spool_data,
+)
+assert spooled_replay_user.returncode == spooled_replay_assistant.returncode == 0
+forget_capture_spool = Path(forget_spool_data) / "capture" / "spool"
+assert len(list(forget_capture_spool.glob("event-*.json"))) == 2
+
+forget_process = start_forget_daemon()
+try:
+    assert not crash_quarantine.exists()
+    assert unrelated_cleanup.exists()
+    assert {
+        path.relative_to(official_projection).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in official_projection.rglob("*")
+        if path.is_file()
+    } == official_projection_before_restart
+    with sqlite3.connect(forget_state / "platform.sqlite3") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM graph_cleanup_intents WHERE cleanup_id = ?",
+            (crash_cleanup_id,),
+        ).fetchone() == (0,)
+    assert (
+        request(
+            "http://127.0.0.1:37331/api/v1/search",
+            forget_key,
+            {"library_id": forget_library_id, "query": "GraphReplayNeedle"},
+        )[1]["results"]
+        == []
+    )
+    restart_capture_events = cast(
+        list[dict[str, object]],
+        request("http://127.0.0.1:37331/api/v1/capture/events", forget_key)[1],
+    )
+    assert all(
+        item["event_id"] != "docker-ticket15-forgotten-event" for item in restart_capture_events
+    )
+    assert any(
+        item["event_id"] == "docker-ticket15-retained-event" for item in restart_capture_events
+    )
+    assert (
+        request(
+            "http://127.0.0.1:37331/api/v1/search",
+            forget_key,
+            {
+                "library_id": forget_library_id,
+                "query": "GraphReplayNeedle",
+                "include_history": True,
+            },
+        )[1]["results"]
+        == []
+    )
+    replay_deadline = time.monotonic() + 20
+    while time.monotonic() < replay_deadline:
+        replay_spool = run_capture_hook(
+            forget_project,
+            "PreCompact",
+            "Replay the pending capture spool.",
+            api_key=forget_key,
+            url="http://127.0.0.1:37331",
+            session_id="docker-ticket15-spool-replay",
+            plugin_data=forget_spool_data,
+        )
+        assert replay_spool.returncode == 0
+        if not list(forget_capture_spool.glob("event-*.json")):
+            break
+        time.sleep(0.5)
+    assert not list(forget_capture_spool.glob("event-*.json"))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        _, replay_rounds = request(
+            "http://127.0.0.1:37331/api/v1/capture/rounds?session_id=docker-ticket15-spool-replay",
+            forget_key,
+        )
+        if replay_rounds and replay_rounds[0]["status"] == "done":
+            break
+        time.sleep(0.05)
+    assert replay_rounds[0]["status"] == "done", replay_rounds
+    assert replay_rounds[0]["candidate_id"] is None
+    formal_replay_id = "11111111-2222-4333-8444-555555555555"
+    reordered_formal_replay = "\r\n".join(
+        (
+            "---",
+            '"approved_by" : "different-operator"',
+            f"'candidate_id': '{formal_replay_id}'",
+            "format_version: 2",
+            '"approval_reason": "different reason"',
+            "'memory_type': 'decision'",
+            '"source_references":',
+            '    - "docker-ticket15:formal-replay"',
+            f'"memory_id": "{formal_replay_id}"',
+            "'created_by': 'different-creator'",
+            "---",
+            "",
+            forget_content,
+            "",
+        )
+    )
+    formal_replay_code, formal_replay_response = request(
+        "http://127.0.0.1:37331/mcp/candidates",
+        forget_key,
+        {
+            "library_id": forget_library_id,
+            "suggested_type": "decision",
+            "body": reordered_formal_replay,
+            "source_references": ["docker-ticket15:reordered-formal-envelope"],
+            "creator": "docker-ticket15",
+            "idempotency_key": "docker-ticket15-reordered-formal-envelope",
+        },
+    )
+    assert formal_replay_code == 422
+    assert formal_replay_response["detail"] == "candidate matches forgotten memory"
+    ordinary_frontmatter_replay = (
+        "---\ntitle: Rewrapped forgotten decision\npriority: 9\n---\n\n" + forget_content
+    )
+    ordinary_replay_code, ordinary_replay_response = request(
+        "http://127.0.0.1:37331/mcp/candidates",
+        forget_key,
+        {
+            "library_id": forget_library_id,
+            "suggested_type": "decision",
+            "body": ordinary_frontmatter_replay,
+            "source_references": ["docker-ticket15:ordinary-frontmatter-replay"],
+            "creator": "docker-ticket15",
+            "idempotency_key": "docker-ticket15-ordinary-frontmatter-replay",
+        },
+    )
+    assert ordinary_replay_code == 422
+    assert ordinary_replay_response["detail"] == "candidate matches forgotten memory"
+    pending_approval_code, pending_approval_response = request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{pending_replay['id']}/approve",
+        forget_key,
+        {
+            "operator": "docker-ticket15",
+            "reason": "Must remain forgotten",
+            "operation_id": "docker-ticket15-approve-pending-replay",
+        },
+    )
+    assert pending_approval_code == 404
+    assert pending_approval_response["detail"] == "candidate memory not found"
+    cross_library_code, _ = request(
+        "http://127.0.0.1:37331/mcp/candidates",
+        forget_key,
+        {
+            "library_id": other_forget_library["id"],
+            "suggested_type": "decision",
+            "body": forget_content,
+            "source_references": ["docker-ticket15:other-library"],
+            "creator": "docker-ticket15",
+            "idempotency_key": "docker-ticket15-cross-library",
+        },
+    )
+    assert cross_library_code == 201
+    restore_code, restored_forget = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/forgotten/restore",
+        forget_key,
+        {
+            "tombstone_id": forgotten["tombstone_id"],
+            "commit": restore_source_commit,
+            "operation_id": "docker-ticket15-restore",
+            "actor_type": "user",
+            "source": "docker-ticket15-history",
+        },
+    )
+    assert restore_code == 200
+    assert restored_forget["commit"] not in {
+        restore_source_commit,
+        forgotten["commit"],
+    }
+    assert (forget_root / "forgotten.md").read_text(encoding="utf-8") == forget_content
+    assert (
+        request(
+            f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/forgotten",
+            forget_key,
+        )[1]
+        == []
+    )
+    restored_history = cast(
+        list[dict[str, object]],
+        request(
+            f"http://127.0.0.1:37331/api/v1/libraries/{forget_library_id}/history",
+            forget_key,
+        )[1],
+    )
+    assert [item["kind"] for item in restored_history[:2]] == ["restore", "delete"]
+finally:
+    forget_process.send_signal(signal.SIGINT)
+    assert forget_process.wait(timeout=20) == 0
 
 browser_approve_code, browser_approve_candidate = request(
     "http://127.0.0.1:7331/mcp/candidates",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +10,7 @@ import pytest
 from pytest import MonkeyPatch
 
 from personal_agent_memory.graph_adapter import (
+    GraphAdapterBusyError,
     GraphAdapterError,
     GraphExpansion,
     GraphSourceDocument,
@@ -23,6 +26,7 @@ class RecordingGraphAdapter:
         self.expansions: list[GraphExpansion] = []
         self.expand_calls: list[tuple[str, tuple[str, ...], int, int]] = []
         self.fail_search = False
+        self.busy_search = False
 
     async def rebuild(
         self, library_id: str, documents: tuple[GraphSourceDocument, ...]
@@ -38,6 +42,8 @@ class RecordingGraphAdapter:
         limit: int,
     ) -> list[GraphExpansion]:
         self.expand_calls.append((library_id, seed_document_ids, max_hops, limit))
+        if self.busy_search:
+            raise GraphAdapterBusyError("deterministic graph mutation")
         if self.fail_search:
             raise GraphAdapterError("deterministic graph outage")
         return [item for item in self.expansions if item.hop <= max_hops][:limit]
@@ -178,6 +184,14 @@ def test_graph_expansion_is_direct_seeded_source_bounded_and_degrades(tmp_path: 
             assert two_hop["results"][2]["graph_hop"] == 2
             assert max(call[2] for call in adapter.expand_calls) == 2
 
+            adapter.busy_search = True
+            busy = await state.search_project(str(project_root), "DirectNeedle", 10, 2)
+            assert [item["path"] for item in busy["results"]] == ["seed.md"]
+            assert busy["degradation"] == ["graph_unavailable"]
+            assert busy["graph_index_status"] == "ready"
+            assert state.graph_status(library.id)["status"] == "ready"
+
+            adapter.busy_search = False
             adapter.fail_search = True
             degraded = await state.search_project(str(project_root), "DirectNeedle", 10, 2)
             assert [item["path"] for item in degraded["results"]] == ["seed.md"]
@@ -196,6 +210,207 @@ def test_graph_expansion_is_direct_seeded_source_bounded_and_degrades(tmp_path: 
             await state.close()
 
     asyncio.run(scenario())
+
+
+def test_real_adapter_graph_query_fails_fast_while_projection_is_mutating(
+    tmp_path: Path,
+) -> None:
+    adapter = JiuwenMilvusGraphAdapter(
+        tmp_path / "graphs", OpenAICompatibleClient(None, None, None)
+    )
+
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_operation_lock() -> None:
+        with adapter._operation_lock:
+            acquired.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_operation_lock)
+    holder.start()
+    assert acquired.wait(timeout=5)
+    try:
+        with pytest.raises(GraphAdapterBusyError):
+            asyncio.run(adapter.expand("library-one", ("seed",), max_hops=1, limit=5))
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    assert not holder.is_alive()
+
+
+def test_real_adapter_releases_milvus_server_after_partial_store_initialization(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    model = OpenAICompatibleClient(
+        None,
+        None,
+        ModelEndpoint("http://127.0.0.1:9", "deterministic-graph", retries=0),
+    )
+    monkeypatch.setattr(
+        model,
+        "extract_graph",
+        lambda content: {
+            "entities": [{"name": "Alpha", "content": content}],
+            "relations": [],
+        },
+    )
+    adapter = JiuwenMilvusGraphAdapter(tmp_path / "graphs", model)
+    document = GraphSourceDocument("one", "one.md", "v1", "Alpha source")
+
+    from jiuwen_memory.foundation.store.graph.milvus import MilvusGraphStore
+    from milvus_lite.server_manager import server_manager_instance
+
+    attempts = 0
+
+    def fail_index_build(store: object) -> None:
+        nonlocal attempts
+        del store
+        attempts += 1
+        raise RuntimeError("injected index build failure")
+
+    monkeypatch.setattr(MilvusGraphStore, "_build_indices", fail_index_build)
+    for _ in range(2):
+        prepared = asyncio.run(adapter.prepare_rebuild("library-one", (document,)))
+        with pytest.raises(RuntimeError, match="injected index build failure"):
+            prepared.activate()
+        assert server_manager_instance._servers == {}
+        assert not list((tmp_path / "graphs").glob(".library-one.replacement-*"))
+
+    assert attempts == 2
+
+
+def test_projection_write_can_run_from_an_active_event_loop(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    adapter = JiuwenMilvusGraphAdapter(tmp_path / "graphs", object())  # type: ignore[arg-type]
+    caller_thread = threading.get_ident()
+    write_threads: list[int] = []
+
+    async def record_write(
+        store: object,
+        entities: list[object],
+        relations: list[object],
+        episodes: list[object],
+    ) -> None:
+        del store, entities, relations, episodes
+        await asyncio.sleep(0)
+        write_threads.append(threading.get_ident())
+
+    monkeypatch.setattr(adapter, "_write_projection", record_write)
+
+    async def scenario() -> None:
+        adapter._write_projection_blocking(object(), [], [], [])
+
+    asyncio.run(scenario())
+
+    assert len(write_threads) == 1
+    assert write_threads[0] != caller_thread
+
+
+def test_prepared_rebuild_preserves_official_projection_until_stale_cleanup_succeeds(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    graph_root = tmp_path / "graphs"
+    library_id = "library-one"
+    projection = graph_root / library_id
+    projection.mkdir(parents=True)
+    (projection / "graph.db").write_text("old official projection", encoding="utf-8")
+    (projection / "projection.ready").write_text("ready\n", encoding="ascii")
+    stale_a = graph_root / f".{library_id}.replacement-a"
+    stale_b = graph_root / f".{library_id}.replacement-b"
+    stale_a.mkdir()
+    stale_b.mkdir()
+    (stale_a / "stale-a").write_text("disposable", encoding="ascii")
+    (stale_b / "stale-b").write_text("retryable", encoding="ascii")
+    adapter = JiuwenMilvusGraphAdapter(graph_root, object())  # type: ignore[arg-type]
+
+    def build_replacement(
+        temporary_id: str,
+        extracted: list[tuple[GraphSourceDocument, dict[str, object]]],
+        expected_library_id: str,
+    ) -> None:
+        del extracted
+        assert expected_library_id == library_id
+        temporary = graph_root / temporary_id
+        temporary.mkdir()
+        (temporary / "graph.db").write_text("new official projection", encoding="utf-8")
+        (temporary / "projection.ready").write_text("ready\n", encoding="ascii")
+
+    monkeypatch.setattr(adapter, "_replace_projection", build_replacement)
+    prepared = asyncio.run(adapter.prepare_rebuild(library_id, ()))
+    activated = prepared.activate()
+    real_rmtree = shutil.rmtree
+
+    def fail_second_stale(directory: Path, *args: object, **kwargs: object) -> None:
+        directory = Path(directory)
+        marker = directory / "stale-b"
+        if marker.exists():
+            marker.unlink()
+            raise OSError("injected later stale cleanup failure")
+        real_rmtree(directory, *args, **kwargs)
+
+    monkeypatch.setattr("personal_agent_memory.graph_adapter.shutil.rmtree", fail_second_stale)
+    with pytest.raises(GraphAdapterError, match="graph projection cleanup failed"):
+        activated.commit()
+    activated.rollback()
+
+    assert (projection / "graph.db").read_text(encoding="utf-8") == "old official projection"
+    assert not stale_a.exists()
+    assert (stale_b / "stale-b").read_text(encoding="ascii") == "retryable"
+    assert not list(graph_root.glob(f".{library_id}.purge-*"))
+    assert not list(graph_root.glob(f".{library_id}.rollback-*"))
+
+    monkeypatch.setattr("personal_agent_memory.graph_adapter.shutil.rmtree", real_rmtree)
+    retry = asyncio.run(adapter.prepare_rebuild(library_id, ())).activate()
+    retry.commit()
+    assert (projection / "graph.db").read_text(encoding="utf-8") == "new official projection"
+    assert not list(graph_root.glob(f".{library_id}.replacement-*"))
+    assert not list(graph_root.glob(f".{library_id}.purge-*"))
+
+
+def test_restart_reconciliation_rolls_back_incomplete_staged_rebuild(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    graph_root = tmp_path / "graphs"
+    library_id = "library-one"
+    cleanup_id = "a" * 32
+    projection = graph_root / library_id
+    projection.mkdir(parents=True)
+    (projection / "graph.db").write_text("old official projection", encoding="utf-8")
+    stale = graph_root / f".{library_id}.replacement-stale"
+    stale.mkdir()
+    (stale / "graph.db").write_text("stale but recoverable", encoding="utf-8")
+    adapter = JiuwenMilvusGraphAdapter(graph_root, object())  # type: ignore[arg-type]
+
+    def build_replacement(
+        temporary_id: str,
+        extracted: list[tuple[GraphSourceDocument, dict[str, object]]],
+        expected_library_id: str,
+    ) -> None:
+        del extracted
+        assert expected_library_id == library_id
+        temporary = graph_root / temporary_id
+        temporary.mkdir()
+        (temporary / "graph.db").write_text("uncommitted replacement", encoding="utf-8")
+
+    monkeypatch.setattr(adapter, "_replace_projection", build_replacement)
+    staged = adapter.stage_rebuild(library_id, (), cleanup_id=cleanup_id)
+    del staged
+    assert (projection / "graph.db").read_text(encoding="utf-8") == "uncommitted replacement"
+
+    restarted = JiuwenMilvusGraphAdapter(graph_root, object())  # type: ignore[arg-type]
+    restarted.reconcile_staged_purge(library_id, cleanup_id, committed=False)
+
+    assert (projection / "graph.db").read_text(encoding="utf-8") == "old official projection"
+    recovered = list(graph_root.glob(f".{library_id}.replacement-recovered-*"))
+    assert len(recovered) == 1
+    assert (recovered[0] / "graph.db").read_text(encoding="utf-8") == "stale but recoverable"
+    assert not list(graph_root.glob(f".{library_id}.purge-{cleanup_id}-*"))
 
 
 def test_empty_library_projection_is_cleared_by_background_rebuild(tmp_path: Path) -> None:
@@ -459,6 +674,9 @@ def test_real_jiuwen_milvus_adapter_projects_and_reads_source_metadata(
     ]
     assert capped == two_hops
     assert (tmp_path / "graphs" / "library-one" / "graph.db").is_file()
+    from milvus_lite.server_manager import server_manager_instance
+
+    assert server_manager_instance._servers == {}
 
     isolated = GraphSourceDocument(
         "isolated", "isolated.md", "isolated-v1", "Other library document"

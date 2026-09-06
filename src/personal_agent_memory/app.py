@@ -111,6 +111,26 @@ class OutOfBandResolution(BaseModel):
     external_path: str | None = Field(default=None, min_length=1, max_length=2_000)
 
 
+class DocumentDeletePreview(BaseModel):
+    path: str
+    expected_source_version: str
+    operation_id: str
+
+
+class DocumentDelete(DocumentDeletePreview):
+    preview_token: str
+    actor_type: Literal["user", "platform"] = "user"
+    source: str = "web-delete"
+
+
+class ForgottenMemoryRestore(BaseModel):
+    tombstone_id: str
+    commit: str
+    operation_id: str
+    actor_type: Literal["user", "platform"] = "user"
+    source: str = "web-forgotten-history"
+
+
 CandidateType = Literal[
     "preference",
     "decision",
@@ -753,7 +773,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     def mutation_error(error: MemoryMutationError) -> HTTPException:
         detail = str(error)
-        if detail in {"memory library not found", "memory document not found"}:
+        if detail in {
+            "memory library not found",
+            "memory document not found",
+            "forgotten memory not found",
+        }:
             code = status.HTTP_404_NOT_FOUND
         elif (
             "version conflict" in detail
@@ -761,6 +785,7 @@ def create_app(settings: Settings) -> FastAPI:
             or "out-of-band conflict" in detail
             or "version changed again" in detail
             or "withheld sensitive external content" in detail
+            or "deletion preview" in detail
         ):
             code = status.HTTP_409_CONFLICT
         else:
@@ -806,6 +831,67 @@ def create_app(settings: Settings) -> FastAPI:
                 edit.operation_id,
                 edit.actor_type,
                 edit.source,
+            )
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/document/delete-preview",
+        dependencies=[Depends(authenticate)],
+    )
+    async def preview_document_deletion(
+        library_id: str, deletion: DocumentDeletePreview
+    ) -> dict[str, object]:
+        try:
+            return platform_state.preview_document_deletion(
+                library_id, deletion.path, deletion.expected_source_version
+            )
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.delete(
+        "/api/v1/libraries/{library_id}/document",
+        dependencies=[Depends(authenticate)],
+    )
+    async def delete_document(library_id: str, deletion: DocumentDelete) -> dict[str, str]:
+        try:
+            return platform_state.delete_document(
+                library_id,
+                deletion.path,
+                deletion.expected_source_version,
+                deletion.operation_id,
+                deletion.actor_type,
+                deletion.source,
+                deletion.preview_token,
+            )
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/forgotten",
+        dependencies=[Depends(authenticate)],
+    )
+    async def list_forgotten_memories(library_id: str) -> list[dict[str, object]]:
+        try:
+            return platform_state.list_forgotten_memories(library_id)
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/forgotten/restore",
+        dependencies=[Depends(authenticate)],
+    )
+    async def restore_forgotten_memory(
+        library_id: str, restore: ForgottenMemoryRestore
+    ) -> dict[str, str]:
+        try:
+            return platform_state.restore_forgotten_memory(
+                library_id,
+                restore.tombstone_id,
+                restore.commit,
+                restore.operation_id,
+                restore.actor_type,
+                restore.source,
             )
         except MemoryMutationError as error:
             raise mutation_error(error) from error

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import shutil
 import subprocess
@@ -319,6 +321,23 @@ class GitRepository:
             "show", "--format=", "--no-ext-diff", "--unified=3", resolved,
         ).stdout
 
+    def changed_paths(self, commit: str) -> set[str]:
+        resolved = self.resolve_commit(commit)
+        output = self._run_bytes(
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-z",
+            "-r",
+            resolved,
+        ).stdout
+        return {
+            path.decode("utf-8", errors="surrogateescape")
+            for path in output.split(b"\0")
+            if path
+        }
+
     def content_at(self, commit: str, path: str) -> str:
         if not allowed_markdown_path(path):
             raise GitHistoryError("only authoritative Markdown can be restored")
@@ -327,6 +346,102 @@ class GitRepository:
         if result.returncode != 0:
             raise GitHistoryError("document does not exist in the selected commit")
         return result.stdout
+
+    def content_bytes_at(self, commit: str, path: str) -> bytes:
+        if not allowed_markdown_path(path):
+            raise GitHistoryError("only authoritative Markdown can be restored")
+        resolved = self.resolve_commit(commit)
+        result = self._run_bytes("show", f"{resolved}:{path}", check=False)
+        if result.returncode != 0:
+            raise GitHistoryError("document does not exist in the selected commit")
+        return result.stdout
+
+    def history_bytes_at(self, commit: str, path: str) -> bytes:
+        if not allowed_history_path(path):
+            raise GitHistoryError("history path is not authoritative")
+        resolved = self.resolve_commit(commit)
+        result = self._run_bytes("show", f"{resolved}:{path}", check=False)
+        if result.returncode != 0:
+            raise GitHistoryError("history path does not exist in the selected commit")
+        return result.stdout
+
+    def verify_commit_transition(
+        self,
+        commit: str,
+        previous_head: str,
+        contents: dict[str, bytes | None],
+        message: str,
+    ) -> None:
+        resolved = self.resolve_commit(commit)
+        resolved_previous = self.resolve_commit(previous_head)
+        if self.head() != resolved:
+            raise GitHistoryError("memory history advanced after the expected commit")
+        parent = self._run("rev-parse", f"{resolved}^", check=False)
+        if parent.returncode != 0 or parent.stdout.strip() != resolved_previous:
+            raise GitHistoryError("memory history commit has an unexpected parent")
+        stored_message = self._run("show", "-s", "--format=%B", resolved).stdout.rstrip("\n")
+        if stored_message != message:
+            raise GitHistoryError("memory history commit has an unexpected message")
+        if self.changed_paths(resolved) != set(contents):
+            raise GitHistoryError("memory history commit changed unexpected paths")
+        for path, expected in contents.items():
+            entry = self._run_bytes("ls-tree", "-z", resolved, "--", path).stdout
+            if expected is None:
+                if entry:
+                    raise GitHistoryError("memory history commit retained a deleted path")
+                continue
+            prefix = b"100644 blob "
+            if not entry.startswith(prefix) or not entry.endswith(
+                b"\t" + path.encode("utf-8", errors="surrogateescape") + b"\0"
+            ):
+                raise GitHistoryError("memory history commit has an invalid file entry")
+            blob = self._run_bytes("show", f"{resolved}:{path}", check=False)
+            if blob.returncode != 0 or not hmac.compare_digest(blob.stdout, expected):
+                raise GitHistoryError("memory history commit content does not match")
+
+    def rollback_interrupted_commit(
+        self,
+        previous_head: str,
+        document_paths: set[str],
+        marker_path: str,
+        marker_digest: str,
+    ) -> None:
+        resolved_previous = self.resolve_commit(previous_head)
+        current = self.head()
+        if current == resolved_previous:
+            return
+        if current is None:
+            raise GitHistoryError("memory history disappeared during recovery")
+        parent = self._run("rev-parse", f"{current}^", check=False)
+        if parent.returncode != 0 or parent.stdout.strip() != resolved_previous:
+            raise GitHistoryError("memory history advanced after interrupted forgetting")
+        if self.changed_paths(current) != {*document_paths, marker_path}:
+            raise GitHistoryError("interrupted forgetting commit changed unexpected paths")
+        for path in document_paths:
+            if self._run_bytes("ls-tree", "-z", current, "--", path).stdout:
+                raise GitHistoryError(
+                    "interrupted forgetting commit retained a deleted document"
+                )
+        marker_type = self._run(
+            "cat-file", "-t", f"{current}:{marker_path}", check=False
+        )
+        if marker_type.returncode != 0 or marker_type.stdout.strip() != "blob":
+            raise GitHistoryError("interrupted forgetting commit has no marker blob")
+        marker_size = self._run(
+            "cat-file", "-s", f"{current}:{marker_path}", check=False
+        )
+        if (
+            marker_size.returncode != 0
+            or not marker_size.stdout.strip().isdigit()
+            or int(marker_size.stdout.strip()) > 64 * 1024
+        ):
+            raise GitHistoryError("interrupted forgetting commit marker is invalid")
+        marker = self._run_bytes("show", f"{current}:{marker_path}", check=False)
+        if marker.returncode != 0 or not hmac.compare_digest(
+            hashlib.sha256(marker.stdout).hexdigest(), marker_digest
+        ):
+            raise GitHistoryError("interrupted forgetting commit marker does not match journal")
+        self.rollback_commit(current, resolved_previous)
 
     def resolve_commit(self, commit: str) -> str:
         if not commit or any(character not in "0123456789abcdefABCDEF" for character in commit):
@@ -380,6 +495,47 @@ class GitRepository:
         )
         if extra_env:
             environment.update(extra_env)
+        result = self._run_bytes(
+            *arguments,
+            bare=bare,
+            check=False,
+            extra_env=extra_env,
+            input_bytes=input_bytes,
+        )
+        stdout = result.stdout.decode(errors="replace")
+        stderr = result.stderr.decode(errors="replace")
+        if check and result.returncode != 0:
+            detail = stderr.strip() or stdout.strip() or "Git command failed"
+            raise GitHistoryError(detail)
+        return subprocess.CompletedProcess(result.args, result.returncode, stdout, stderr)
+
+    def _run_bytes(
+        self,
+        *arguments: str,
+        bare: bool = True,
+        check: bool = True,
+        extra_env: dict[str, str] | None = None,
+        input_bytes: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        command = ["git"]
+        if bare:
+            command.extend((f"--git-dir={self.git_dir}", f"--work-tree={self.work_tree}"))
+        command.extend(arguments)
+        environment = {
+            key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+        }
+        environment.update(
+            {
+                "GIT_AUTHOR_NAME": PLATFORM_GIT_NAME,
+                "GIT_AUTHOR_EMAIL": PLATFORM_GIT_EMAIL,
+                "GIT_COMMITTER_NAME": PLATFORM_GIT_NAME,
+                "GIT_COMMITTER_EMAIL": PLATFORM_GIT_EMAIL,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+        if extra_env:
+            environment.update(extra_env)
         result = subprocess.run(
             command,
             cwd=self.work_tree,
@@ -389,12 +545,14 @@ class GitRepository:
             input=input_bytes,
             timeout=30,
         )
-        stdout = result.stdout.decode(errors="replace")
-        stderr = result.stderr.decode(errors="replace")
         if check and result.returncode != 0:
-            detail = stderr.strip() or stdout.strip() or "Git command failed"
+            detail = (
+                result.stderr.decode(errors="replace").strip()
+                or result.stdout.decode(errors="replace").strip()
+                or "Git command failed"
+            )
             raise GitHistoryError(detail)
-        return subprocess.CompletedProcess(command, result.returncode, stdout, stderr)
+        return result
 
 
 def allowed_markdown_path(path: str) -> bool:
