@@ -122,6 +122,15 @@
         const editor = document.createElement('div');
         editor.innerHTML = '<strong id="document-path">Select a document</strong><div class="editor-tabs"><button type="button" id="source-tab">Source</button><button type="button" id="preview-tab">Preview</button><button type="button" id="diff-tab">Diff</button></div><textarea id="document-source" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Rendered Markdown preview"></iframe><pre id="document-diff" class="diff" hidden></pre><button type="button" id="preview-change" disabled>Preview changes</button><button type="button" id="save-change" disabled>Save</button><p id="editor-message"></p>';
         editorLayout.append(documentTree, editor);
+        const reconciliationHeading = document.createElement('h2');
+        reconciliationHeading.textContent = 'Out-of-band changes';
+        const reconciliationLayout = document.createElement('div');
+        reconciliationLayout.className = 'candidate-layout';
+        const reconciliationList = document.createElement('nav');
+        reconciliationList.className = 'candidate-list';
+        const reconciliationDetail = document.createElement('div');
+        reconciliationDetail.innerHTML = '<strong id="reconciliation-title">Select a change</strong><p id="reconciliation-status" class="source"></p><h3>Base</h3><pre id="reconciliation-base" class="diff"></pre><h3>Platform</h3><pre id="reconciliation-platform" class="diff"></pre><h3>External</h3><pre id="reconciliation-external" class="diff"></pre><div class="field" id="reconciliation-path-field" hidden><label for="reconciliation-path">External path</label><select id="reconciliation-path"></select></div><div class="field"><label for="reconciliation-final">Final content for conflicts</label><textarea id="reconciliation-final" spellcheck="false" disabled></textarea></div><div class="candidate-actions"><button type="button" id="reconciliation-import" disabled>Import external</button><button type="button" id="reconciliation-restore" disabled>Restore platform</button></div><p id="reconciliation-message"></p>';
+        reconciliationLayout.append(reconciliationList, reconciliationDetail);
         const historyHeading = document.createElement('h2');
         historyHeading.textContent = 'Local history';
         const history = document.createElement('div');
@@ -129,7 +138,7 @@
         const restoreAction = document.createElement('div');
         const historyDiff = document.createElement('pre');
         historyDiff.className = 'diff';
-        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, candidateHeading, candidateStatus, candidateLayout, sensitiveHeading, sensitiveLayout, editorHeading, editorLibrary, editorLayout, historyHeading, history, restoreAction, historyDiff);
+        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, candidateHeading, candidateStatus, candidateLayout, sensitiveHeading, sensitiveLayout, editorHeading, editorLibrary, editorLayout, reconciliationHeading, reconciliationLayout, historyHeading, history, restoreAction, historyDiff);
 
         let projectLibraries = [];
         let projectBindings = [];
@@ -137,6 +146,7 @@
         let activeDocument = null;
         let activeCandidate = null;
         let activeSensitiveRecord = null;
+        let activeReconciliation = null;
         let sensitiveOffset = 0;
         const sensitivePageSize = 50;
         const historySelection = PamHistory.selectionStore();
@@ -178,6 +188,87 @@
           await refreshCandidates();
           await refreshSensitiveQuarantine();
           await refreshDocuments();
+          await refreshReconciliation();
+        }
+
+        async function refreshReconciliation(selectedId = activeReconciliation?.id) {
+          const libraryId = editorLibrary.value;
+          reconciliationList.replaceChildren();
+          activeReconciliation = null;
+          if (!libraryId) return;
+          const response = await fetch(`/api/v1/libraries/${libraryId}/out-of-band-changes`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) return;
+          const changes = await response.json();
+          for (const change of changes) {
+            const button = reconciliationList.appendChild(document.createElement('button'));
+            button.type = 'button';
+            button.textContent = `${change.status} · ${change.kind} · ${change.base_path}`;
+            button.addEventListener('click', () => showReconciliation(change));
+          }
+          const selected = changes.find((change) => change.id === selectedId);
+          if (selected) showReconciliation(selected);
+        }
+
+        function showReconciliation(change) {
+          activeReconciliation = change;
+          reconciliationDetail.querySelector('#reconciliation-title').textContent = change.base_path;
+          const candidatePaths = change.external_candidates || [];
+          reconciliationDetail.querySelector('#reconciliation-status').textContent = `${change.status} · ${change.kind}${change.external_path ? ` · ${change.external_path}` : ''}${candidatePaths.length > 1 ? ` · candidates: ${candidatePaths.join(', ')}` : ''}`;
+          reconciliationDetail.querySelector('#reconciliation-base').textContent = change.base;
+          reconciliationDetail.querySelector('#reconciliation-platform').textContent = change.platform;
+          reconciliationDetail.querySelector('#reconciliation-external').textContent = change.external_withheld
+            ? '(withheld: sensitive content is not stored or displayed)'
+            : candidatePaths.length > 1
+              ? `(ambiguous move: ${candidatePaths.join(', ')})`
+              : change.external || '(deleted)';
+          const finalContent = reconciliationDetail.querySelector('#reconciliation-final');
+          const externalPath = reconciliationDetail.querySelector('#reconciliation-path');
+          const pathField = reconciliationDetail.querySelector('#reconciliation-path-field');
+          externalPath.replaceChildren();
+          if (candidatePaths.length > 1) {
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.textContent = 'Select a candidate';
+            externalPath.append(placeholder);
+            for (const path of candidatePaths) {
+              const option = document.createElement('option');
+              option.value = path;
+              option.textContent = path;
+              externalPath.append(option);
+            }
+          }
+          pathField.hidden = candidatePaths.length <= 1;
+          const requiresFinal = change.status === 'conflict' || change.external_withheld;
+          finalContent.disabled = !requiresFinal;
+          finalContent.value = change.external_withheld
+            ? ''
+            : requiresFinal
+              ? change.external || change.platform
+              : '';
+          const candidateMissing = candidatePaths.length > 1 && !externalPath.value;
+          reconciliationDetail.querySelector('#reconciliation-import').disabled =
+            (change.external_withheld && !finalContent.value.trim()) || candidateMissing;
+          reconciliationDetail.querySelector('#reconciliation-restore').disabled = candidateMissing;
+        }
+
+        async function resolveReconciliation(action) {
+          if (!activeReconciliation) return;
+          const resolution = PamHistory.reconciliationRequest(
+            editorLibrary.value,
+            activeReconciliation,
+            action,
+            crypto.randomUUID(),
+            reconciliationDetail.querySelector('#reconciliation-final').value,
+            reconciliationDetail.querySelector('#reconciliation-path').value,
+          );
+          const response = await fetch(resolution.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(resolution.body)});
+          const message = reconciliationDetail.querySelector('#reconciliation-message');
+          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          message.className = '';
+          message.textContent = action === 'import' ? 'External version imported.' : 'Platform version restored.';
+          activeReconciliation = null;
+          await refreshDocuments();
+          await refreshReconciliation();
         }
 
         async function refreshCandidates(selectedId = activeCandidate?.id) {
@@ -556,7 +647,21 @@
         sensitivePagination.querySelector('#sensitive-previous').addEventListener('click', () => { sensitiveOffset = Math.max(0, sensitiveOffset - sensitivePageSize); refreshSensitiveQuarantine(); });
         sensitivePagination.querySelector('#sensitive-next').addEventListener('click', () => { sensitiveOffset += sensitivePageSize; refreshSensitiveQuarantine(); });
         sensitivePagination.querySelector('#sensitive-refresh').addEventListener('click', () => refreshSensitiveQuarantine());
-        editorLibrary.addEventListener('change', refreshDocuments);
+        editorLibrary.addEventListener('change', async () => { await refreshDocuments(); await refreshReconciliation(); });
+        reconciliationDetail.querySelector('#reconciliation-import').addEventListener('click', () => resolveReconciliation('import'));
+        reconciliationDetail.querySelector('#reconciliation-restore').addEventListener('click', () => resolveReconciliation('restore'));
+        reconciliationDetail.querySelector('#reconciliation-final').addEventListener('input', (event) => {
+          const candidatePaths = activeReconciliation?.external_candidates || [];
+          reconciliationDetail.querySelector('#reconciliation-import').disabled =
+            (activeReconciliation?.external_withheld && !event.target.value.trim())
+            || (candidatePaths.length > 1 && !reconciliationDetail.querySelector('#reconciliation-path').value);
+        });
+        reconciliationDetail.querySelector('#reconciliation-path').addEventListener('change', (event) => {
+          reconciliationDetail.querySelector('#reconciliation-import').disabled =
+            !event.target.value
+            || (activeReconciliation?.external_withheld && !reconciliationDetail.querySelector('#reconciliation-final').value.trim());
+          reconciliationDetail.querySelector('#reconciliation-restore').disabled = !event.target.value;
+        });
         editor.querySelector('#source-tab').addEventListener('click', () => showEditorPanel('source'));
         editor.querySelector('#preview-tab').addEventListener('click', async () => { if (await previewChange()) showEditorPanel('preview'); });
         editor.querySelector('#diff-tab').addEventListener('click', previewChange);

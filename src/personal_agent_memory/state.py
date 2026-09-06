@@ -20,6 +20,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from time import monotonic
 from typing import Literal, cast
 
 from personal_agent_memory.git_history import (
@@ -234,6 +235,7 @@ class PlatformState:
         self.sensitive_dedupe_key = b""
         self.model_client = model_client or OpenAICompatibleClient(None, None)
         self.graph_adapter = graph_adapter
+        self._last_reconciliation_check = 0.0
 
     async def start(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -356,6 +358,25 @@ class PlatformState:
                     commit_id TEXT NOT NULL,
                     response_json TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS out_of_band_changes (
+                    id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('edit', 'move', 'delete')),
+                    base_path TEXT NOT NULL,
+                    external_path TEXT,
+                    base_version TEXT NOT NULL,
+                    base_content TEXT NOT NULL,
+                    platform_version TEXT NOT NULL,
+                    platform_content TEXT NOT NULL,
+                    external_version TEXT,
+                    external_content TEXT,
+                    external_candidates_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'conflict')),
+                    detected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(library_id, base_path)
                 );
                 CREATE TABLE IF NOT EXISTS candidate_memories (
                     id TEXT PRIMARY KEY,
@@ -513,6 +534,15 @@ class PlatformState:
                 connection.execute(
                     "ALTER TABLE memory_operations ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''"
                 )
+            reconciliation_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(out_of_band_changes)")
+            }
+            if "external_candidates_json" not in reconciliation_columns:
+                connection.execute(
+                    "ALTER TABLE out_of_band_changes "
+                    "ADD COLUMN external_candidates_json TEXT NOT NULL DEFAULT '[]'"
+                )
             job_columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(background_jobs)")
             }
@@ -581,6 +611,13 @@ class PlatformState:
     async def _worker(self) -> None:
         while not self.stop_worker.is_set():
             await self._execute_pending_jobs()
+            if monotonic() - self._last_reconciliation_check >= 0.5:
+                self._last_reconciliation_check = monotonic()
+                for library in self.list_libraries():
+                    if library.availability != "available":
+                        continue
+                    with suppress(LibraryRegistrationError, MemoryMutationError, OSError):
+                        self.reconcile_library(library.id)
             try:
                 await asyncio.wait_for(self.stop_worker.wait(), timeout=0.1)
             except TimeoutError:
@@ -976,10 +1013,938 @@ class PlatformState:
                WHERE library_id = ? ORDER BY path""",
             (library.id,),
         ).fetchall()
-        return [
-            {"library_id": library.id, "path": str(row[0]), "source_version": str(row[1])}
-            for row in rows
-        ]
+        result: list[dict[str, object]] = []
+        for row in rows:
+            payload: dict[str, object] = {
+                "library_id": library.id,
+                "path": str(row[0]),
+                "source_version": str(row[1]),
+            }
+            change_id = self._pending_change_for_path(library.id, str(row[0]))
+            if change_id is not None:
+                payload["out_of_band"] = True
+                payload["out_of_band_change_id"] = change_id
+            result.append(payload)
+        return result
+
+    def reconcile_library(self, library_id: str) -> dict[str, int | str]:
+        library = self._require_available_library(library_id)
+        root = Path(library.canonical_path)
+        detected = 0
+        cleared = 0
+        with self._library_lock(library_id):
+            scan = scan_markdown(
+                root,
+                self.library_ignore_patterns(library_id),
+                (self.database_path.parent,),
+            )
+            if not scan.complete:
+                self.connection_or_raise.execute(
+                    "UPDATE memory_libraries SET sync_status = 'error' WHERE id = ?",
+                    (library_id,),
+                )
+                self.connection_or_raise.commit()
+                raise LibraryRegistrationError(
+                    f"Markdown scan incomplete: {'; '.join(scan.errors[:3])}"
+                )
+            observed = {document.path: document for document in scan.documents}
+            indexed_rows = self.connection_or_raise.execute(
+                "SELECT path, source_version FROM memory_documents "
+                "WHERE library_id = ? ORDER BY path",
+                (library_id,),
+            ).fetchall()
+            indexed = {str(row[0]): str(row[1]) for row in indexed_rows}
+            unmatched = {
+                path: document for path, document in observed.items() if path not in indexed
+            }
+            try:
+                self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                for path, version in indexed.items():
+                    current = observed.get(path)
+                    if current is not None and current.version == version:
+                        cleared += self.connection_or_raise.execute(
+                            "DELETE FROM out_of_band_changes "
+                            "WHERE library_id = ? AND base_path = ?",
+                            (library_id, path),
+                        ).rowcount
+                        continue
+                    base_content = self._indexed_document_content(library_id, path, version)
+                    moved = [
+                        document
+                        for document in unmatched.values()
+                        if document.version == version
+                    ]
+                    external_candidates: tuple[str, ...]
+                    if current is None and len(moved) == 1:
+                        kind = "move"
+                        external_path = moved[0].path
+                        external_content = moved[0].content
+                        external_version = moved[0].version
+                        external_candidates = (moved[0].path,)
+                        unmatched.pop(external_path, None)
+                    elif current is None and moved:
+                        kind = "move"
+                        external_path = None
+                        external_content = None
+                        external_version = version
+                        external_candidates = tuple(
+                            sorted(document.path for document in moved)
+                        )
+                    elif current is None:
+                        kind = "delete"
+                        external_path = None
+                        external_content = None
+                        external_version = None
+                        external_candidates = ()
+                    else:
+                        kind = "edit"
+                        external_path = path
+                        external_content = current.content
+                        external_version = current.version
+                        external_candidates = (path,)
+                    if external_content is not None and inspect_sensitive_text(
+                        external_content
+                    ) is not None:
+                        external_content = None
+                    repository = self._git_repository(library_id)
+                    try:
+                        platform_content = repository.content_at(repository.head() or "", path)
+                    except GitHistoryError:
+                        platform_content = base_content
+                    platform_version = hashlib.sha256(platform_content.encode()).hexdigest()
+                    status_value = (
+                        "conflict"
+                        if platform_version != version or len(external_candidates) > 1
+                        else "pending"
+                    )
+                    change_id = hashlib.sha256(f"{library_id}\0{path}".encode()).hexdigest()
+                    self.connection_or_raise.execute(
+                        """INSERT INTO out_of_band_changes
+                           (id, library_id, kind, base_path, external_path, base_version,
+                            base_content, platform_version, platform_content, external_version,
+                            external_content, external_candidates_json, status)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(library_id, base_path) DO UPDATE SET
+                             kind = excluded.kind,
+                             external_path = excluded.external_path,
+                             platform_version = excluded.platform_version,
+                             platform_content = excluded.platform_content,
+                             external_version = excluded.external_version,
+                             external_content = excluded.external_content,
+                             external_candidates_json = excluded.external_candidates_json,
+                             status = CASE
+                               WHEN out_of_band_changes.external_version
+                                      IS NOT excluded.external_version
+                                 OR out_of_band_changes.external_path IS NOT excluded.external_path
+                               THEN 'conflict'
+                               ELSE excluded.status
+                             END,
+                             updated_at = CURRENT_TIMESTAMP""",
+                        (
+                            change_id,
+                            library_id,
+                            kind,
+                            path,
+                            external_path,
+                            version,
+                            base_content,
+                            platform_version,
+                            platform_content,
+                            external_version,
+                            external_content,
+                            json.dumps(external_candidates),
+                            status_value,
+                        ),
+                    )
+                    detected += 1
+                pending_count = int(
+                    self.connection_or_raise.execute(
+                        "SELECT COUNT(*) FROM out_of_band_changes WHERE library_id = ?",
+                        (library_id,),
+                    ).fetchone()[0]
+                )
+                self.connection_or_raise.execute(
+                    "UPDATE memory_libraries SET sync_status = ? WHERE id = ?",
+                    ("out_of_band" if pending_count else "ready", library_id),
+                )
+                self.connection_or_raise.commit()
+            except BaseException:
+                self.connection_or_raise.rollback()
+                raise
+        return {
+            "library_id": library_id,
+            "detected": detected,
+            "pending": pending_count,
+            "cleared": cleared,
+        }
+
+    def import_external_scan(self, library_id: str) -> dict[str, int | str]:
+        library = self._require_available_library(library_id)
+        root = Path(library.canonical_path)
+        scan = scan_markdown(
+            root,
+            self.library_ignore_patterns(library_id),
+            (self.database_path.parent,),
+        )
+        if not scan.complete:
+            self.connection_or_raise.execute(
+                "UPDATE memory_libraries SET sync_status = 'error' WHERE id = ?",
+                (library_id,),
+            )
+            self.connection_or_raise.commit()
+            raise LibraryRegistrationError(
+                f"Markdown scan incomplete: {'; '.join(scan.errors[:3])}"
+            )
+        self._ensure_scan_has_no_sensitive_content(scan, LibraryRegistrationError)
+        current = {
+            str(row[0]): str(row[1])
+            for row in self.connection_or_raise.execute(
+                "SELECT path, source_version FROM memory_documents WHERE library_id = ?",
+                (library_id,),
+            )
+        }
+        observed = {document.path: document for document in scan.documents}
+        changed_paths = {
+            path for path, document in observed.items() if current.get(path) != document.version
+        }
+        removed_paths = set(current) - set(observed)
+        if not changed_paths and not removed_paths:
+            result = self.scan_library(library_id, frozen_scan=scan)
+            result["commit"] = ""
+            return result
+        if self.connection_or_raise.execute(
+            "SELECT 1 FROM library_git_repositories WHERE library_id = ?", (library_id,)
+        ).fetchone() is None:
+            return self.scan_library(library_id, frozen_scan=scan)
+        repository = self._git_repository(library_id)
+        contents: dict[str, bytes | None] = {
+            path: observed[path].content.encode() for path in changed_paths
+        }
+        contents.update({path: None for path in removed_paths})
+        with self._library_lock(library_id):
+            repository.ensure_index_clean()
+            previous_head = repository.head()
+            assert previous_head is not None
+            snapshot = self._snapshot_library_index(library_id)
+            commit: str | None = None
+            try:
+                commit = repository.commit(contents, "Import reviewed external Markdown changes")
+                self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                result = self.scan_library(
+                    library_id, participate_in_transaction=True, frozen_scan=scan
+                )
+                self.connection_or_raise.execute(
+                    "DELETE FROM out_of_band_changes WHERE library_id = ?", (library_id,)
+                )
+                self.connection_or_raise.commit()
+                result["commit"] = commit
+                return result
+            except BaseException as error:
+                self.connection_or_raise.rollback()
+                errors: list[str] = []
+                if commit is not None:
+                    try:
+                        repository.rollback_commit(commit, previous_head)
+                    except BaseException as caught:
+                        errors.append(f"Git: {caught}")
+                try:
+                    self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                    self._restore_library_index(library_id, snapshot)
+                    self.connection_or_raise.commit()
+                except BaseException as caught:
+                    self.connection_or_raise.rollback()
+                    errors.append(f"database: {caught}")
+                if errors:
+                    raise MemoryMutationError(
+                        f"{error}; compensation failed: {'; '.join(errors)}"
+                    ) from error
+                if isinstance(error, (GitHistoryError, LibraryRegistrationError)):
+                    raise MemoryMutationError(str(error)) from error
+                raise
+
+    def list_out_of_band_changes(self, library_id: str) -> list[dict[str, object]]:
+        self._require_available_library(library_id)
+        rows = self.connection_or_raise.execute(
+            """SELECT id, kind, base_path, external_path, base_version, base_content,
+                      platform_version, platform_content, external_version, external_content,
+                      external_candidates_json, status, detected_at, updated_at
+               FROM out_of_band_changes WHERE library_id = ? ORDER BY base_path""",
+            (library_id,),
+        ).fetchall()
+        return [self._out_of_band_payload(library_id, row) for row in rows]
+
+    def out_of_band_change(self, library_id: str, change_id: str) -> dict[str, object]:
+        row = self.connection_or_raise.execute(
+            """SELECT id, kind, base_path, external_path, base_version, base_content,
+                      platform_version, platform_content, external_version, external_content,
+                      external_candidates_json, status, detected_at, updated_at
+               FROM out_of_band_changes WHERE library_id = ? AND id = ?""",
+            (library_id, change_id),
+        ).fetchone()
+        if row is None:
+            raise MemoryMutationError("out-of-band change not found")
+        return self._out_of_band_payload(library_id, row)
+
+    def resolve_out_of_band_change(
+        self,
+        library_id: str,
+        change_id: str,
+        action: str,
+        operation_id: str,
+        actor_type: str,
+        source: str,
+        final_content: str | None = None,
+        requested_external_path: str | None = None,
+    ) -> dict[str, str]:
+        if action not in {"import", "restore"}:
+            raise MemoryMutationError("resolution action must be import or restore")
+        if action == "restore":
+            final_content = None
+        if not operation_id.strip() or len(operation_id) > 200:
+            raise MemoryMutationError("operation_id must be present and at most 200 characters")
+        if actor_type not in {"user", "platform"}:
+            raise MemoryMutationError("actor_type must be user or platform")
+        if not source.strip() or len(source) > 200:
+            raise MemoryMutationError("source must be present and at most 200 characters")
+        if final_content is not None:
+            if "\x00" in final_content:
+                raise MemoryMutationError("Markdown content cannot contain NUL bytes")
+            self._ensure_markdown_has_no_sensitive_content(final_content)
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "library_id": library_id,
+                    "change_id": change_id,
+                    "action": action,
+                    "actor_type": actor_type,
+                    "source": source,
+                    "final_content": final_content,
+                    "external_path": requested_external_path,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        existing = self._stored_operation(operation_id, request_hash)
+        if existing is not None:
+            return existing
+        library = self._require_available_library(library_id)
+        root = Path(library.canonical_path)
+        with self._library_lock(library_id):
+            existing = self._stored_operation(operation_id, request_hash)
+            if existing is not None:
+                return existing
+            change = self.out_of_band_change(library_id, change_id)
+            status_value = str(change["status"])
+            if status_value == "conflict" and action == "import" and final_content is None:
+                raise MemoryMutationError(
+                    "out-of-band conflict requires explicit final_content"
+                )
+            if (
+                bool(change["external_withheld"])
+                and action == "import"
+                and (final_content is None or not final_content.strip())
+            ):
+                raise MemoryMutationError(
+                    "withheld sensitive external content requires non-blank safe final_content"
+                )
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                current_scan = scan_markdown_fd(
+                    root_fd,
+                    root,
+                    self.library_ignore_patterns(library_id),
+                    (self.database_path.parent,),
+                )
+            finally:
+                os.close(root_fd)
+            if not current_scan.complete:
+                raise MemoryMutationError(
+                    f"Markdown scan incomplete: {'; '.join(current_scan.errors[:3])}"
+                )
+            current_documents = {document.path: document for document in current_scan.documents}
+            base_path = str(change["base_path"])
+            external_path_value = change["external_path"]
+            external_path = (
+                None if external_path_value is None else str(external_path_value)
+            )
+            external_candidates = cast(tuple[str, ...], change["external_candidates"])
+            if requested_external_path is not None and (
+                requested_external_path not in external_candidates
+            ):
+                raise MemoryMutationError(
+                    "selected external_path is not a candidate for this change"
+                )
+            if (
+                len(external_candidates) > 1
+                and requested_external_path is None
+            ):
+                raise MemoryMutationError(
+                    "ambiguous move resolution requires an explicit external_path candidate"
+                )
+            selected_external_path = requested_external_path or external_path
+            if len(external_candidates) > 1:
+                assert selected_external_path is not None
+                occupied = self.connection_or_raise.execute(
+                    "SELECT 1 FROM memory_documents WHERE library_id = ? AND path = ?",
+                    (library_id, selected_external_path),
+                ).fetchone()
+                if occupied is not None:
+                    raise MemoryMutationError(
+                        "selected external_path was already assigned by another resolution"
+                    )
+            self._verify_external_change(
+                library_id,
+                change,
+                current_documents,
+                selected_external_path,
+            )
+            platform_content = str(change["platform"])
+            external_content_value = change["external"]
+            external_content = (
+                None if external_content_value is None else str(external_content_value)
+            )
+            if action == "restore":
+                target_path = base_path
+                target_content = platform_content
+            elif str(change["kind"]) == "delete":
+                target_path = base_path
+                target_content = None
+            else:
+                target_path = selected_external_path or base_path
+                observed = current_documents.get(target_path)
+                target_content = (
+                    final_content
+                    if final_content is not None
+                    else external_content
+                    if external_content is not None
+                    else observed.content
+                    if observed is not None
+                    else None
+                )
+            if target_content is not None:
+                self._ensure_markdown_has_no_sensitive_content(target_content)
+            candidate_external_path = selected_external_path or external_path
+            affected_paths = tuple(
+                dict.fromkeys(
+                    path
+                    for path in (base_path, candidate_external_path, target_path)
+                    if path is not None
+                )
+            )
+            file_snapshot = {
+                path: self._read_optional_document_snapshot(root, path) for path in affected_paths
+            }
+            identities = {
+                item[0]: (item[2], item[3])
+                for item in current_scan.identities
+                if item[1] == "file"
+            }
+            expected_snapshot = {
+                path: (
+                    None,
+                    None,
+                )
+                if path not in current_documents
+                else (
+                    current_documents[path].content.encode(),
+                    identities.get(path),
+                )
+                for path in affected_paths
+            }
+            if file_snapshot != expected_snapshot:
+                raise MemoryMutationError(
+                    "out-of-band version changed again; refresh reconciliation before resolving"
+                )
+            repository = self._git_repository(library_id)
+            try:
+                repository.ensure_index_clean()
+            except GitHistoryError as error:
+                raise MemoryMutationError(str(error)) from error
+            previous_head = repository.head()
+            assert previous_head is not None
+            index_snapshot = self._snapshot_library_index(library_id)
+            out_of_band_snapshot = self.list_out_of_band_changes(library_id)
+            git_contents: dict[str, bytes | None] = {}
+            for path in affected_paths:
+                git_contents[path] = None
+            if target_content is not None:
+                git_contents[target_path] = target_content.encode()
+            commit: str | None = None
+            response: dict[str, str] | None = None
+            applied_snapshot = dict(file_snapshot)
+            try:
+                for path in affected_paths:
+                    desired = (
+                        target_content.encode()
+                        if path == target_path and target_content is not None
+                        else None
+                    )
+                    original_content, original_identity = file_snapshot[path]
+                    self._replace_optional_document_cas(
+                        root,
+                        path,
+                        original_content,
+                        original_identity,
+                        desired,
+                    )
+                    applied_snapshot[path] = self._read_optional_document_snapshot(root, path)
+                physical_scan = scan_markdown(
+                    root,
+                    self.library_ignore_patterns(library_id),
+                    (self.database_path.parent,),
+                )
+                if not physical_scan.complete:
+                    raise MemoryMutationError(
+                        f"Markdown scan incomplete: {'; '.join(physical_scan.errors[:3])}"
+                    )
+                expected_physical = dict(current_documents)
+                for path in affected_paths:
+                    expected_physical.pop(path, None)
+                if target_content is not None:
+                    expected_physical[target_path] = MarkdownDocument(
+                        target_path,
+                        target_content,
+                        hashlib.sha256(target_content.encode()).hexdigest(),
+                    )
+                if physical_scan.documents != tuple(
+                    sorted(expected_physical.values(), key=lambda item: item.path)
+                ):
+                    raise MemoryMutationError(
+                        "memory library changed while resolving the out-of-band version"
+                    )
+                resolved_scan = self._resolved_reconciliation_scan(
+                    library_id,
+                    affected_paths,
+                    target_path,
+                    target_content,
+                )
+                message = (
+                    "Import out-of-band Markdown change"
+                    if action == "import"
+                    else "Restore platform Markdown after out-of-band change"
+                )
+                commit = repository.commit(git_contents, message)
+                self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                self.scan_library(
+                    library_id,
+                    participate_in_transaction=True,
+                    frozen_scan=resolved_scan,
+                )
+                source_version = (
+                    ""
+                    if target_content is None
+                    else hashlib.sha256(target_content.encode()).hexdigest()
+                )
+                response = {
+                    "library_id": library_id,
+                    "change_id": change_id,
+                    "path": target_path,
+                    "source_version": source_version,
+                    "commit": commit,
+                    "operation_id": operation_id,
+                    "resolution": action,
+                }
+                self.connection_or_raise.execute(
+                    """INSERT INTO memory_operations
+                       (operation_id, library_id, kind, document_path, actor_type, source,
+                        request_hash, commit_id, response_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        operation_id,
+                        library_id,
+                        "edit" if action == "import" else "restore",
+                        target_path,
+                        actor_type,
+                        f"out-of-band:{source}",
+                        request_hash,
+                        commit,
+                        json.dumps(response, sort_keys=True),
+                    ),
+                )
+                self.connection_or_raise.execute(
+                    "DELETE FROM out_of_band_changes WHERE id = ? AND library_id = ?",
+                    (change_id, library_id),
+                )
+                if len(external_candidates) > 1:
+                    assert selected_external_path is not None
+                    self._consume_ambiguous_external_candidate(
+                        library_id,
+                        change_id,
+                        selected_external_path,
+                        current_documents,
+                    )
+                pending_count = int(
+                    self.connection_or_raise.execute(
+                        "SELECT COUNT(*) FROM out_of_band_changes WHERE library_id = ?",
+                        (library_id,),
+                    ).fetchone()[0]
+                )
+                self.connection_or_raise.execute(
+                    "UPDATE memory_libraries SET sync_status = ? WHERE id = ?",
+                    ("out_of_band" if pending_count else "ready", library_id),
+                )
+                self.connection_or_raise.commit()
+                if self._persisted_reconciliation(
+                    response,
+                    request_hash,
+                    target_content,
+                    tuple(
+                        path
+                        for path in affected_paths
+                        if path != target_path or target_content is None
+                    ),
+                    repository,
+                ):
+                    return response
+                raise MemoryMutationError("out-of-band resolution did not persist consistently")
+            except BaseException as error:
+                self.connection_or_raise.rollback()
+                if commit is not None and response is not None and self._persisted_reconciliation(
+                    response,
+                    request_hash,
+                    target_content,
+                    tuple(
+                        path
+                        for path in affected_paths
+                        if path != target_path or target_content is None
+                    ),
+                    repository,
+                ):
+                    return response
+                compensation_errors: list[str] = []
+                if commit is not None:
+                    try:
+                        repository.rollback_commit(commit, previous_head)
+                    except BaseException as caught:
+                        compensation_errors.append(f"Git: {caught}")
+                try:
+                    self.connection_or_raise.execute("BEGIN IMMEDIATE")
+                    self.connection_or_raise.execute(
+                        "DELETE FROM memory_operations WHERE operation_id = ?", (operation_id,)
+                    )
+                    self._restore_library_index(library_id, index_snapshot)
+                    self.connection_or_raise.execute(
+                        "DELETE FROM out_of_band_changes WHERE library_id = ?",
+                        (library_id,),
+                    )
+                    for pending_change in out_of_band_snapshot:
+                        self._restore_out_of_band_change(pending_change)
+                    self.connection_or_raise.commit()
+                except BaseException as caught:
+                    self.connection_or_raise.rollback()
+                    compensation_errors.append(f"database: {caught}")
+                for path, original_snapshot in file_snapshot.items():
+                    try:
+                        if (
+                            self._read_optional_document_snapshot(root, path)
+                            != applied_snapshot.get(path)
+                        ):
+                            compensation_errors.append(
+                                f"file {path}: concurrent external version preserved"
+                            )
+                            continue
+                        current_content, current_identity = applied_snapshot[path]
+                        self._replace_optional_document_cas(
+                            root,
+                            path,
+                            current_content,
+                            current_identity,
+                            original_snapshot[0],
+                        )
+                    except BaseException as caught:
+                        compensation_errors.append(f"file {path}: {caught}")
+                if compensation_errors:
+                    raise MemoryMutationError(
+                        f"{error}; compensation failed: {'; '.join(compensation_errors)}"
+                    ) from error
+                if isinstance(
+                    error,
+                    (GitHistoryError, LibraryRegistrationError, MemoryMutationError),
+                ):
+                    raise MemoryMutationError(str(error)) from error
+                raise
+
+    def _stored_operation(self, operation_id: str, request_hash: str) -> dict[str, str] | None:
+        row = self.connection_or_raise.execute(
+            "SELECT response_json, request_hash FROM memory_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if str(row[1]) != request_hash:
+            raise MemoryMutationError("operation_id was already used for another mutation")
+        return {str(key): str(value) for key, value in json.loads(str(row[0])).items()}
+
+    def _persisted_reconciliation(
+        self,
+        response: dict[str, str],
+        request_hash: str,
+        content: str | None,
+        removed_paths: tuple[str, ...],
+        repository: GitRepository,
+    ) -> bool:
+        row = self.connection_or_raise.execute(
+            """SELECT request_hash, commit_id, response_json FROM memory_operations
+               WHERE operation_id = ?""",
+            (response["operation_id"],),
+        ).fetchone()
+        if row is None or str(row[0]) != request_hash or str(row[1]) != response["commit"]:
+            return False
+        if json.loads(str(row[2])) != response:
+            return False
+        if self.connection_or_raise.execute(
+            "SELECT 1 FROM out_of_band_changes WHERE id = ?", (response["change_id"],)
+        ).fetchone() is not None:
+            return False
+        try:
+            if repository.resolve_commit(response["commit"]) != response["commit"]:
+                return False
+            for removed_path in removed_paths:
+                if self.connection_or_raise.execute(
+                    "SELECT 1 FROM memory_documents WHERE library_id = ? AND path = ?",
+                    (response["library_id"], removed_path),
+                ).fetchone() is not None:
+                    return False
+                if (
+                    self._read_optional_document_bytes(repository.work_tree, removed_path)
+                    is not None
+                ):
+                    return False
+                try:
+                    repository.content_at(response["commit"], removed_path)
+                except GitHistoryError:
+                    pass
+                else:
+                    return False
+            if content is None:
+                return True
+            content_bytes = content.encode()
+            stored = self._document_record(response["library_id"], response["path"])
+            return (
+                stored[1] == response["source_version"]
+                and self._read_document_bytes(repository.work_tree, response["path"])
+                == content_bytes
+                and repository.content_at(response["commit"], response["path"]).encode()
+                == content_bytes
+            )
+        except (GitHistoryError, MemoryMutationError, OSError):
+            return False
+
+    def _restore_out_of_band_change(self, change: dict[str, object]) -> None:
+        self.connection_or_raise.execute(
+            """INSERT OR REPLACE INTO out_of_band_changes
+               (id, library_id, kind, base_path, external_path, base_version,
+                base_content, platform_version, platform_content, external_version,
+                external_content, external_candidates_json, status, detected_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                change["id"],
+                change["library_id"],
+                change["kind"],
+                change["base_path"],
+                change["external_path"],
+                change["base_version"],
+                change["base"],
+                change["platform_version"],
+                change["platform"],
+                change["external_version"],
+                change["external"],
+                json.dumps(change["external_candidates"]),
+                change["status"],
+                change["detected_at"],
+                change["updated_at"],
+            ),
+        )
+
+    def _consume_ambiguous_external_candidate(
+        self,
+        library_id: str,
+        resolved_change_id: str,
+        selected_external_path: str,
+        documents: dict[str, MarkdownDocument],
+    ) -> None:
+        rows = self.connection_or_raise.execute(
+            """SELECT id, base_version, platform_version, external_candidates_json
+               FROM out_of_band_changes WHERE library_id = ? AND id != ?""",
+            (library_id, resolved_change_id),
+        ).fetchall()
+        for change_id, base_version, platform_version, candidates_json in rows:
+            candidates = tuple(str(item) for item in json.loads(str(candidates_json)))
+            if selected_external_path not in candidates:
+                continue
+            remaining = tuple(path for path in candidates if path != selected_external_path)
+            external_path = remaining[0] if len(remaining) == 1 else None
+            external_content = None
+            if external_path is not None:
+                observed = documents.get(external_path)
+                if observed is not None and inspect_sensitive_text(observed.content) is None:
+                    external_content = observed.content
+            status_value = (
+                "pending"
+                if len(remaining) == 1 and str(platform_version) == str(base_version)
+                else "conflict"
+            )
+            self.connection_or_raise.execute(
+                """UPDATE out_of_band_changes
+                   SET external_path = ?, external_content = ?,
+                       external_candidates_json = ?, status = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND library_id = ?""",
+                (
+                    external_path,
+                    external_content,
+                    json.dumps(remaining),
+                    status_value,
+                    str(change_id),
+                    library_id,
+                ),
+            )
+
+    def _verify_external_change(
+        self,
+        library_id: str,
+        change: dict[str, object],
+        documents: dict[str, MarkdownDocument],
+        selected_external_path: str | None = None,
+    ) -> None:
+        base_path = str(change["base_path"])
+        external_path_value = change["external_path"]
+        external_path = None if external_path_value is None else str(external_path_value)
+        expected_version_value = change["external_version"]
+        expected_version = None if expected_version_value is None else str(expected_version_value)
+        candidates = cast(tuple[str, ...], change["external_candidates"])
+        kind = str(change["kind"])
+        if kind == "delete":
+            matches = base_path not in documents
+        elif len(candidates) > 1:
+            indexed_paths = {
+                str(row[0])
+                for row in self.connection_or_raise.execute(
+                    "SELECT path FROM memory_documents WHERE library_id = ?",
+                    (library_id,),
+                )
+            }
+            unresolved_candidates = tuple(
+                path for path in candidates if path not in indexed_paths
+            )
+            matches = (
+                base_path not in documents
+                and selected_external_path in unresolved_candidates
+                and all(
+                (observed := documents.get(path)) is not None
+                and observed.version == expected_version
+                    for path in unresolved_candidates
+                )
+            )
+        elif kind == "move":
+            move_path = selected_external_path or external_path
+            observed = None if move_path is None else documents.get(move_path)
+            matches = (
+                base_path not in documents
+                and observed is not None
+                and observed.version == expected_version
+            )
+        else:
+            observed = documents.get(external_path or base_path)
+            matches = observed is not None and observed.version == expected_version
+        if not matches:
+            raise MemoryMutationError(
+                "out-of-band version changed again; refresh reconciliation before resolving"
+            )
+
+    @staticmethod
+    def _out_of_band_payload(library_id: str, row: tuple[object, ...]) -> dict[str, object]:
+        base_path = str(row[2])
+        external_path = None if row[3] is None else str(row[3])
+        base_content = str(row[5])
+        platform_content = str(row[7])
+        external_content = None if row[9] is None else str(row[9])
+        external_candidates = tuple(str(item) for item in json.loads(str(row[10])))
+        external_withheld = external_content is None and row[8] is not None and bool(
+            external_path
+        )
+        return {
+            "id": str(row[0]),
+            "library_id": library_id,
+            "kind": str(row[1]),
+            "base_path": base_path,
+            "external_path": external_path,
+            "base_version": str(row[4]),
+            "platform_version": str(row[6]),
+            "external_version": None if row[8] is None else str(row[8]),
+            "external_candidates": external_candidates,
+            "status": str(row[11]),
+            "detected_at": str(row[12]),
+            "updated_at": str(row[13]),
+            "base": base_content,
+            "platform": platform_content,
+            "external": external_content,
+            "external_withheld": external_withheld,
+            "base_to_platform_diff": _three_way_diff(
+                base_path, base_content, platform_content, "platform"
+            ),
+            "base_to_external_diff": None
+            if external_withheld or len(external_candidates) > 1
+            else _three_way_diff(
+                base_path,
+                base_content,
+                external_content or "",
+                "external" if external_path is None else external_path,
+            ),
+        }
+
+    def _pending_change_for_path(self, library_id: str, path: str) -> str | None:
+        row = self.connection_or_raise.execute(
+            "SELECT id FROM out_of_band_changes WHERE library_id = ? AND base_path = ?",
+            (library_id, path),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def _indexed_document_content(self, library_id: str, path: str, version: str) -> str:
+        row = self.connection_or_raise.execute(
+            """SELECT content FROM memory_versions
+               WHERE library_id = ? AND path = ? AND source_version = ?""",
+            (library_id, path, version),
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
+        document_id = stable_document_id(library_id, path)
+        chunks = self.connection_or_raise.execute(
+            "SELECT content FROM memory_chunks WHERE document_id = ? ORDER BY start_line, id",
+            (document_id,),
+        ).fetchall()
+        if not chunks:
+            raise MemoryMutationError("indexed memory document content is unavailable")
+        return "\n\n".join(str(row[0]) for row in chunks)
+
+    def _resolved_reconciliation_scan(
+        self,
+        library_id: str,
+        affected_paths: tuple[str, ...],
+        target_path: str,
+        target_content: str | None,
+    ) -> MarkdownScan:
+        documents: dict[str, MarkdownDocument] = {}
+        rows = self.connection_or_raise.execute(
+            "SELECT path, source_version FROM memory_documents WHERE library_id = ?",
+            (library_id,),
+        ).fetchall()
+        for path_value, version_value in rows:
+            path = str(path_value)
+            version = str(version_value)
+            content = self._indexed_document_content(library_id, path, version)
+            documents[path] = MarkdownDocument(path, content, version)
+        for path in affected_paths:
+            documents.pop(path, None)
+        if target_content is not None:
+            documents[target_path] = MarkdownDocument(
+                target_path,
+                target_content,
+                hashlib.sha256(target_content.encode()).hexdigest(),
+            )
+        scan = MarkdownScan(tuple(sorted(documents.values(), key=lambda item: item.path)), ())
+        self._ensure_scan_has_no_sensitive_content(scan, MemoryMutationError)
+        return scan
 
     def create_candidate(
         self,
@@ -2973,7 +3938,7 @@ class PlatformState:
                     )
                 if content == original:
                     raise MemoryMutationError("document content is unchanged")
-                trusted_scan = self._trusted_library_scan(
+                physical_scan, trusted_scan = self._trusted_library_scan(
                     root,
                     bound,
                     library_id,
@@ -3004,7 +3969,13 @@ class PlatformState:
                     replacement_identity = replacement.identity
                     if replacement_identity is None:
                         raise MemoryMutationError("document replacement identity is unavailable")
-                    expected_scan = self._updated_library_scan(
+                    expected_physical_scan = self._updated_library_scan(
+                        physical_scan,
+                        normalized,
+                        content,
+                        replacement_identity,
+                    )
+                    expected_index_scan = self._updated_library_scan(
                         trusted_scan,
                         normalized,
                         content,
@@ -3022,7 +3993,7 @@ class PlatformState:
                     commit = repository.commit({normalized: platform_content}, message)
                     self._verify_bound_document(root, normalized, bound, replacement_identity)
                     scan = self._scan_bound_library(root, bound, library_id)
-                    self._require_matching_scan(scan, expected_scan)
+                    self._require_matching_scan(scan, expected_physical_scan)
                     self._verify_bound_library_scan(root, bound, library_id, scan)
                     self.connection_or_raise.execute("BEGIN IMMEDIATE")
                     original_version_id = hashlib.sha256(
@@ -3037,7 +4008,7 @@ class PlatformState:
                     self.scan_library(
                         library_id,
                         participate_in_transaction=True,
-                        frozen_scan=scan,
+                        frozen_scan=expected_index_scan,
                     )
                     self._verify_bound_library_scan(root, bound, library_id, scan)
                     self._verify_bound_document(root, normalized, bound, replacement_identity)
@@ -3647,7 +4618,10 @@ class PlatformState:
             os.close(root_fd)
 
     def _scan_bound_library(
-        self, root: Path, bound: BoundDocument, library_id: str
+        self,
+        root: Path,
+        bound: BoundDocument,
+        library_id: str,
     ) -> MarkdownScan:
         scan = scan_markdown_fd(
             bound.root_fd,
@@ -3658,7 +4632,6 @@ class PlatformState:
         if not scan.complete:
             details = "; ".join(scan.errors[:3])
             raise MemoryMutationError(f"Markdown scan incomplete: {details}")
-        self._ensure_scan_has_no_sensitive_content(scan, MemoryMutationError)
         return scan
 
     @staticmethod
@@ -3685,22 +4658,68 @@ class PlatformState:
         path: str,
         document_identity: tuple[int, int],
         source_version: str,
-    ) -> MarkdownScan:
+    ) -> tuple[MarkdownScan, MarkdownScan]:
         scan = self._scan_bound_library(root, bound, library_id)
         self._verify_bound_library_scan(root, bound, library_id, scan)
         self._verify_bound_document(root, path, bound, document_identity)
-        indexed = tuple(
-            (str(row[0]), str(row[1]))
+        indexed = {
+            str(row[0]): str(row[1])
             for row in self.connection_or_raise.execute(
                 "SELECT path, source_version FROM memory_documents "
                 "WHERE library_id = ? ORDER BY path",
                 (library_id,),
             )
+        }
+        observed = {document.path: document for document in scan.documents}
+        pending_rows = self.connection_or_raise.execute(
+            """SELECT kind, base_path, external_path, base_version, base_content,
+                      external_version, external_candidates_json
+               FROM out_of_band_changes WHERE library_id = ?""",
+            (library_id,),
+        ).fetchall()
+        pending = {str(row[1]): row for row in pending_rows}
+        logical_documents = dict(observed)
+        for base_path, row in pending.items():
+            kind = str(row[0])
+            external_path = None if row[2] is None else str(row[2])
+            base_version = str(row[3])
+            base_content = str(row[4])
+            external_version = None if row[5] is None else str(row[5])
+            external_candidates = tuple(str(item) for item in json.loads(str(row[6])))
+            if indexed.get(base_path) != base_version:
+                continue
+            if kind == "delete":
+                matches = base_path not in observed
+            elif len(external_candidates) > 1:
+                matches = all(
+                    (external_document := observed.get(candidate)) is not None
+                    and external_document.version == external_version
+                    for candidate in external_candidates
+                )
+            else:
+                external_document = observed.get(external_path or base_path)
+                matches = (
+                    external_document is not None
+                    and external_document.version == external_version
+                )
+            if not matches:
+                continue
+            if len(external_candidates) > 1:
+                for candidate in external_candidates:
+                    if candidate not in indexed:
+                        logical_documents.pop(candidate, None)
+            else:
+                logical_documents.pop(external_path or base_path, None)
+            logical_documents[base_path] = MarkdownDocument(
+                base_path, base_content, base_version
+            )
+        logical = tuple(
+            (document.path, document.version)
+            for document in sorted(logical_documents.values(), key=lambda item: item.path)
         )
-        observed = tuple((document.path, document.version) for document in scan.documents)
-        if observed != indexed:
+        if logical != tuple(sorted(indexed.items())):
             raise MemoryMutationError(
-                "memory library changed outside the platform; rescan before editing"
+                "memory library has an unreviewed external change; refresh reconciliation"
             )
         expected_identity = (
             path,
@@ -3711,7 +4730,11 @@ class PlatformState:
         )
         if expected_identity not in scan.identities:
             raise MemoryMutationError("document path changed while the platform was saving it")
-        return scan
+        return scan, MarkdownScan(
+            tuple(sorted(logical_documents.values(), key=lambda item: item.path)),
+            (),
+            scan.identities,
+        )
 
     @staticmethod
     def _updated_library_scan(
@@ -4154,6 +5177,174 @@ class PlatformState:
                 os.fsync(stream.fileno())
             os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
             os.fsync(parent)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=parent)
+            os.close(parent)
+
+    @staticmethod
+    def _read_optional_document_bytes(root: Path, path: str) -> bytes | None:
+        try:
+            return PlatformState._read_document_bytes(root, path)
+        except MemoryMutationError as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                return None
+            raise
+
+    @staticmethod
+    def _read_optional_document_snapshot(
+        root: Path, path: str
+    ) -> tuple[bytes | None, tuple[int, int] | None]:
+        parent, name = PlatformState._open_document_parent(root, path)
+        try:
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            except FileNotFoundError:
+                return None, None
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise MemoryMutationError("memory document is not a regular file")
+                content = b""
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    content += chunk
+                confirmed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                identity = (metadata.st_dev, metadata.st_ino)
+                if (confirmed.st_dev, confirmed.st_ino) != identity:
+                    raise MemoryMutationError(
+                        "out-of-band version changed again; refresh reconciliation before resolving"
+                    )
+                return content, identity
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise MemoryMutationError(f"memory document cannot be read: {error}") from error
+        finally:
+            os.close(parent)
+
+    @staticmethod
+    def _replace_optional_document_cas(
+        root: Path,
+        path: str,
+        expected_content: bytes | None,
+        expected_identity: tuple[int, int] | None,
+        content: bytes | None,
+    ) -> None:
+        observed_content, observed_identity = PlatformState._read_optional_document_snapshot(
+            root, path
+        )
+        if (observed_content, observed_identity) != (expected_content, expected_identity):
+            raise MemoryMutationError(
+                "out-of-band version changed again; refresh reconciliation before resolving"
+            )
+        if expected_content is None:
+            if content is None:
+                return
+            parent, name = PlatformState._open_document_parent(root, path)
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=parent,
+                )
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = -1
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.fsync(parent)
+                return
+            except OSError as error:
+                raise MemoryMutationError(
+                    "out-of-band version changed again; refresh reconciliation before resolving"
+                ) from error
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                os.close(parent)
+        assert expected_identity is not None
+        if content is not None:
+            with PlatformState._bind_document(root, path) as bound:
+                replacement = DocumentReplacement()
+                PlatformState._replace_bound_document(
+                    bound,
+                    content,
+                    expected_identity,
+                    expected_content,
+                    replacement,
+                )
+            return
+        parent, name = PlatformState._open_document_parent(root, path)
+        held = f".{name}.{uuid.uuid4().hex}.reconcile"
+        try:
+            os.rename(name, held, src_dir_fd=parent, dst_dir_fd=parent)
+            held_bound = BoundDocument((0, 0), parent, parent, held, (0, 0))
+            moved_content, moved_identity = PlatformState._read_bound_name(held_bound, held)
+            if (moved_content, moved_identity) != (expected_content, expected_identity):
+                try:
+                    os.stat(name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.rename(held, name, src_dir_fd=parent, dst_dir_fd=parent)
+                raise MemoryMutationError(
+                    "out-of-band version changed again; refresh reconciliation before resolving"
+                )
+            os.unlink(held, dir_fd=parent)
+            os.fsync(parent)
+        except OSError as error:
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                with suppress(FileNotFoundError):
+                    os.rename(held, name, src_dir_fd=parent, dst_dir_fd=parent)
+            raise MemoryMutationError(
+                "out-of-band version changed again; refresh reconciliation before resolving"
+            ) from error
+        finally:
+            os.close(parent)
+
+    @staticmethod
+    def _replace_optional_document(root: Path, path: str, content: bytes | None) -> None:
+        normalized = PurePosixPath(path).as_posix()
+        if not allowed_markdown_path(normalized) or normalized != path.replace("\\", "/"):
+            raise MemoryMutationError("invalid Markdown document path")
+        parent, name = PlatformState._open_document_parent(root, normalized)
+        temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            if content is None:
+                try:
+                    metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise MemoryMutationError("memory document is not a regular file")
+                os.unlink(name, dir_fd=parent)
+                os.fsync(parent)
+                return
+            mode = 0o600
+            try:
+                metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise MemoryMutationError("memory document is not a regular file")
+                mode = stat.S_IMODE(metadata.st_mode)
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                mode,
+                dir_fd=parent,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+        except OSError as error:
+            raise MemoryMutationError(f"memory document cannot be reconciled: {error}") from error
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary, dir_fd=parent)
@@ -5438,3 +6629,14 @@ def _diff_lines(diff: str) -> list[dict[str, str]]:
             kind = "deletion"
         result.append({"kind": kind, "text": line})
     return result
+
+
+def _three_way_diff(path: str, base: str, value: str, label: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            base.splitlines(keepends=True),
+            value.splitlines(keepends=True),
+            fromfile=f"base/{path}",
+            tofile=f"{label}/{path}",
+        )
+    )

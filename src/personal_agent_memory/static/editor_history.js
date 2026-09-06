@@ -127,6 +127,20 @@
     });
   }
 
+  function reconciliationRequest(
+    libraryId, change, action, operationId, finalContent, externalPath
+  ) {
+    const body = {action, operation_id: operationId};
+    if (action === 'import' && (change.status === 'conflict' || change.external_withheld)) {
+      body.final_content = finalContent;
+    }
+    if (externalPath) body.external_path = externalPath;
+    return Object.freeze({
+      url: `/api/v1/libraries/${libraryId}/out-of-band-changes/${change.id}/resolve`,
+      body: Object.freeze(body),
+    });
+  }
+
   const api = Object.freeze({
     capture,
     request,
@@ -134,6 +148,7 @@
     contextStore,
     previewRequest,
     saveRequest,
+    reconciliationRequest,
   });
   scope.PamHistory = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

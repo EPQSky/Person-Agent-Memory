@@ -393,8 +393,14 @@ def test_web_edit_and_markdown_import_reject_confirmed_secrets(tmp_path: Path) -
         rescan = client.post(
             f"/api/v1/libraries/{library['id']}/scan", headers=headers
         )
-        assert rescan.status_code == 422
+        assert rescan.status_code == 200
         assert secret not in rescan.text
+        changes = client.get(
+            f"/api/v1/libraries/{library['id']}/out-of-band-changes", headers=headers
+        ).json()
+        assert len(changes) == 1
+        assert changes[0]["external"] is None
+        assert changes[0]["external_withheld"] is True
         assert client.get(
             f"/api/v1/libraries/{library['id']}/documents", headers=headers
         ).json()[0]["source_version"] == hashlib.sha256(original.encode()).hexdigest()

@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,34 @@ from personal_agent_memory.state import MemoryMutationError, PlatformState
 def auth_headers(state_dir: Path) -> dict[str, str]:
     key = (state_dir / "api-key").read_text(encoding="utf-8").strip()
     return {"Authorization": f"Bearer {key}"}
+
+
+def import_external_changes(
+    client: TestClient,
+    headers: dict[str, str],
+    library_id: str,
+    root: Path,
+) -> dict[str, int | str]:
+    scanned = client.post(f"/api/v1/libraries/{library_id}/scan", headers=headers)
+    assert scanned.status_code == 200, scanned.text
+    changes = client.get(
+        f"/api/v1/libraries/{library_id}/out-of-band-changes", headers=headers
+    ).json()
+    for change in changes:
+        payload: dict[str, str] = {
+            "action": "import",
+            "operation_id": f"test-import-{uuid.uuid4()}",
+        }
+        if change["status"] == "conflict" or change["external_withheld"]:
+            path = change["external_path"] or change["base_path"]
+            payload["final_content"] = (root / path).read_text(encoding="utf-8")
+        resolved = client.post(
+            f"/api/v1/libraries/{library_id}/out-of-band-changes/{change['id']}/resolve",
+            headers=headers,
+            json=payload,
+        )
+        assert resolved.status_code == 200, resolved.text
+    return scanned.json()
 
 
 def require_relative_worktrees(repository: Path) -> None:
@@ -1479,6 +1508,18 @@ def test_legacy_chunk_kind_migration_preserves_code_id_after_heading_change(
             path TEXT NOT NULL, heading TEXT, start_line INTEGER NOT NULL,
             end_line INTEGER NOT NULL, content TEXT NOT NULL, source_version TEXT NOT NULL
         );
+        CREATE TABLE memory_versions (
+            version_id TEXT PRIMARY KEY, library_id TEXT NOT NULL, path TEXT NOT NULL,
+            source_version TEXT NOT NULL, content TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'current', supersedes_version_id TEXT,
+            commit_id TEXT, effective_at TEXT, condition_text TEXT, candidate_id TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(library_id, path, source_version)
+        );
+        CREATE TABLE library_git_repositories (
+            library_id TEXT PRIMARY KEY, git_dir TEXT NOT NULL UNIQUE,
+            mode TEXT NOT NULL, created_at TEXT
+        );
         """
     )
     version = hashlib.sha256(original.encode()).hexdigest()
@@ -1501,17 +1542,28 @@ def test_legacy_chunk_kind_migration_preserves_code_id_after_heading_change(
             version,
         ),
     )
+    connection.execute(
+        """INSERT INTO memory_versions
+           (version_id, library_id, path, source_version, content)
+           VALUES ('legacy-version', 'legacy-library', 'code.md', ?, ?)""",
+        (version, original),
+    )
+    repository = GitRepository(state_dir / "git" / "legacy-library.git", library_path)
+    repository.initialize("legacy-library", {"code.md": original.encode()})
+    connection.execute(
+        """INSERT INTO library_git_repositories (library_id, git_dir, mode)
+           VALUES ('legacy-library', ?, 'sidecar')""",
+        (str(repository.git_dir),),
+    )
     connection.commit()
     connection.close()
 
     with TestClient(
         create_app(Settings(state_dir=state_dir, library_roots=(library_root,)))
     ) as client:
+        headers = auth_headers(state_dir)
         source.write_text(original.replace("Old heading", "New heading"), encoding="utf-8")
-        response = client.post(
-            "/api/v1/libraries/legacy-library/scan", headers=auth_headers(state_dir)
-        )
-        assert response.status_code == 200
+        import_external_changes(client, headers, "legacy-library", library_path)
         migrated = sqlite3.connect(database_path).execute(
             "SELECT id, kind, heading FROM memory_chunks"
         ).fetchone()
@@ -1564,8 +1616,8 @@ def test_markdown_import_ignore_rules_symlink_safety_and_stable_sidecar_ids(
         unchanged = client.post(
             f"/api/v1/libraries/{library['id']}/scan", headers=headers
         ).json()
-        assert unchanged["changed"] == 0
-        assert unchanged["unchanged"] == 2
+        assert unchanged["detected"] == 0
+        assert unchanged["pending"] == 0
         assert connection.execute(
             "SELECT id FROM memory_chunks WHERE library_id = ? ORDER BY start_line",
             (library["id"],),
@@ -1626,7 +1678,10 @@ def test_incomplete_markdown_scan_preserves_old_index_and_reports_error(
             return real_scandir(path)
 
         monkeypatch.setattr(markdown_index.os, "scandir", failing_scandir)
-        failed = client.post(f"/api/v1/libraries/{library['id']}/scan", headers=headers)
+        failed = client.post(
+            f"/api/v1/libraries/{library['id']}/scan",
+            headers=headers,
+        )
         assert failed.status_code == 422
         assert "scan incomplete" in failed.json()["detail"]
         assert database.execute(
@@ -1647,7 +1702,7 @@ def test_incomplete_markdown_scan_preserves_old_index_and_reports_error(
             f"/api/v1/libraries/{library['id']}/scan", headers=headers
         )
         assert recovered.status_code == 200
-        assert recovered.json()["unchanged"] == 1
+        assert recovered.json()["detected"] == 0
         database.close()
 
 
@@ -1822,8 +1877,7 @@ def test_sqlite_rescan_keeps_only_exact_heading_duplicate_id(tmp_path: Path) -> 
         )
 
         source.write_text("# X\n\nSame.\n\n# A\n\nSame.\n", encoding="utf-8")
-        response = client.post(f"/api/v1/libraries/{library['id']}/scan", headers=headers)
-        assert response.status_code == 200
+        import_external_changes(client, headers, library["id"], library_path)
         new_ids = dict(
             connection.execute(
                 "SELECT heading, id FROM memory_chunks WHERE library_id = ?",
@@ -1923,10 +1977,7 @@ def test_direct_search_is_project_scoped_source_attributed_and_incremental(
 
         original_chunk_id = hit["chunk_id"]
         source.write_text("# 新决策\n\nProject alpha uses ExactNeedle42.\n", encoding="utf-8")
-        heading_rescan = client.post(
-            f"/api/v1/libraries/{first['id']}/scan", headers=headers
-        )
-        assert heading_rescan.status_code == 200
+        import_external_changes(client, headers, first["id"], first_library)
         renamed = client.post(
             "/api/v1/search",
             headers=headers,
@@ -1936,10 +1987,7 @@ def test_direct_search_is_project_scoped_source_attributed_and_incremental(
         assert renamed["heading"] == "新决策"
 
         source.write_text("# 决策\n\nProject alpha uses UpdatedNeedle77.\n", encoding="utf-8")
-        rescanned = client.post(
-            f"/api/v1/libraries/{first['id']}/scan", headers=headers
-        ).json()
-        assert rescanned["changed"] == 1
+        import_external_changes(client, headers, first["id"], first_library)
         updated = client.post(
             "/api/v1/search",
             headers=headers,
@@ -1954,10 +2002,7 @@ def test_direct_search_is_project_scoped_source_attributed_and_incremental(
         ).json()["results"] == []
 
         source.unlink()
-        removed = client.post(
-            f"/api/v1/libraries/{first['id']}/scan", headers=headers
-        ).json()
-        assert removed["removed"] == 1
+        import_external_changes(client, headers, first["id"], first_library)
         assert client.post(
             "/api/v1/search",
             headers=headers,
@@ -3854,10 +3899,7 @@ def test_early_replacement_failures_compensate_without_overwriting_external_stat
         if failure_mode.startswith("recovery-replace-"):
             assert "compensation conflict" in failed.json()["detail"]
             assert ".fact.md." in failed.json()["detail"]
-            rescanned = client.post(
-                f"/api/v1/libraries/{library_id}/scan", headers=headers
-            )
-            assert rescanned.status_code == 200
+            import_external_changes(client, headers, library_id, library)
             assert [
                 item["path"]
                 for item in client.get(

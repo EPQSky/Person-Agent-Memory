@@ -102,6 +102,15 @@ class DocumentRestore(BaseModel):
     source: str = "web"
 
 
+class OutOfBandResolution(BaseModel):
+    action: Literal["import", "restore"]
+    operation_id: str = Field(min_length=1, max_length=200)
+    actor_type: Literal["user", "platform"] = "user"
+    source: str = Field(default="web-reconciliation", min_length=1, max_length=200)
+    final_content: str | None = Field(default=None, max_length=2_000_000)
+    external_path: str | None = Field(default=None, min_length=1, max_length=2_000)
+
+
 CandidateType = Literal[
     "preference",
     "decision",
@@ -251,16 +260,64 @@ def create_app(settings: Settings) -> FastAPI:
             ) from error
 
     @app.post("/api/v1/libraries/{library_id}/scan", dependencies=[Depends(authenticate)])
-    async def scan_library(library_id: str) -> dict[str, int | str]:
+    async def scan_library(
+        library_id: str, accept_external: bool = False
+    ) -> dict[str, int | str]:
         try:
-            return platform_state.scan_library(library_id)
-        except LibraryRegistrationError as error:
+            if accept_external:
+                raise MemoryMutationError(
+                    "bulk external acceptance is disabled; resolve each out-of-band "
+                    "change explicitly"
+                )
+            return platform_state.reconcile_library(library_id)
+        except (LibraryRegistrationError, MemoryMutationError) as error:
             status_code = (
                 status.HTTP_404_NOT_FOUND
                 if str(error) == "memory library not found"
                 else status.HTTP_422_UNPROCESSABLE_CONTENT
             )
             raise HTTPException(status_code=status_code, detail=str(error)) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/out-of-band-changes",
+        dependencies=[Depends(authenticate)],
+    )
+    async def out_of_band_changes(library_id: str) -> list[dict[str, object]]:
+        try:
+            return platform_state.list_out_of_band_changes(library_id)
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/out-of-band-changes/{change_id}",
+        dependencies=[Depends(authenticate)],
+    )
+    async def out_of_band_change(library_id: str, change_id: str) -> dict[str, object]:
+        try:
+            return platform_state.out_of_band_change(library_id, change_id)
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/out-of-band-changes/{change_id}/resolve",
+        dependencies=[Depends(authenticate)],
+    )
+    async def resolve_out_of_band_change(
+        library_id: str, change_id: str, resolution: OutOfBandResolution
+    ) -> dict[str, str]:
+        try:
+            return platform_state.resolve_out_of_band_change(
+                library_id,
+                change_id,
+                resolution.action,
+                resolution.operation_id,
+                resolution.actor_type,
+                resolution.source,
+                resolution.final_content,
+                resolution.external_path,
+            )
+        except MemoryMutationError as error:
+            raise mutation_error(error) from error
 
     @app.post(
         "/api/v1/libraries/{library_id}/vector-index/rebuild",
@@ -698,7 +755,13 @@ def create_app(settings: Settings) -> FastAPI:
         detail = str(error)
         if detail in {"memory library not found", "memory document not found"}:
             code = status.HTTP_404_NOT_FOUND
-        elif "version conflict" in detail or "changed outside" in detail:
+        elif (
+            "version conflict" in detail
+            or "changed outside" in detail
+            or "out-of-band conflict" in detail
+            or "version changed again" in detail
+            or "withheld sensitive external content" in detail
+        ):
             code = status.HTTP_409_CONFLICT
         else:
             code = status.HTTP_422_UNPROCESSABLE_CONTENT

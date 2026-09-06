@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
@@ -43,6 +44,39 @@ def request(
             return response.status, {} if not body else json.loads(body)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
+
+
+def import_external_changes(
+    library_id: str, root: Path, key: str
+) -> list[dict[str, object]]:
+    scan_code, _ = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{library_id}/scan",
+        key,
+        method="POST",
+    )
+    assert scan_code == 200
+    pending_code, changes = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{library_id}/out-of-band-changes",
+        key,
+    )
+    assert pending_code == 200
+    assert isinstance(changes, list)
+    for item in changes:
+        change = cast(dict[str, object], item)
+        payload: dict[str, object] = {
+            "action": "import",
+            "operation_id": f"docker-import-{uuid.uuid4()}",
+        }
+        if change["status"] == "conflict" or change["external_withheld"]:
+            path = str(change["external_path"] or change["base_path"])
+            payload["final_content"] = (root / path).read_text(encoding="utf-8")
+        resolve_code, _ = request(
+            f"http://127.0.0.1:7331/api/v1/libraries/{library_id}/out-of-band-changes/{change['id']}/resolve",
+            key,
+            payload,
+        )
+        assert resolve_code == 200
+    return [cast(dict[str, object], item) for item in changes]
 
 
 def wait_for(url: str) -> None:
@@ -354,6 +388,9 @@ def docker_fixture() -> str:
     "# Graph two\n\nEntity: Gamma: Two-hop authoritative source.\n",
     encoding="utf-8",
 )
+(retrieval_library_path / "budget.md").write_text(
+    "# Budget\n\nAccepted baseline.\n", encoding="utf-8"
+)
 (retrieval_library_path / "ignored.md").write_text("IgnoredNeedle", encoding="utf-8")
 (retrieval_library_path / "node_modules").mkdir()
 (retrieval_library_path / "node_modules" / "hidden.md").write_text(
@@ -361,6 +398,12 @@ def docker_fixture() -> str:
 )
 (Path("/tmp") / "outside-retrieval.md").write_text("OutsideNeedle", encoding="utf-8")
 (retrieval_library_path / "escape.md").symlink_to(Path("/tmp") / "outside-retrieval.md")
+replacement_path = memory_root / "binding-replacement"
+replacement_path.mkdir(parents=True, exist_ok=True)
+(replacement_path / "same-name.md").write_text(
+    "# Other service\n\nSameNameSecondNeedle belongs only to the second service.\n",
+    encoding="utf-8",
+)
 project_library_code, project_library = request(
     "http://127.0.0.1:7331/api/v1/libraries",
     key,
@@ -369,7 +412,7 @@ project_library_code, project_library = request(
 replacement_library_code, replacement_library = request(
     "http://127.0.0.1:7331/api/v1/libraries",
     key,
-    {"path": str(memory_root / "binding-replacement"), "kind": "project"},
+    {"path": str(replacement_path), "kind": "project"},
 )
 assert project_library_code == replacement_library_code == 201
 docker_projects = Path("/project-roots")
@@ -541,21 +584,6 @@ assert graph_status["status"] == "ready"
 assert graph_status["projected_documents"] == graph_status["total_documents"]
 
 # The globally installable Codex plugin executes the real Node Hook over stdin/stdout.
-replacement_path = Path(str(replacement_library["canonical_path"]))
-(replacement_path / "same-name.md").write_text(
-    "# Other service\n\nSameNameSecondNeedle belongs only to the second service.\n",
-    encoding="utf-8",
-)
-assert (
-    request(
-        f"http://127.0.0.1:7331/api/v1/libraries/{replacement_library['id']}/scan",
-        key,
-        {},
-    )[0]
-    == 200
-)
-
-
 def hook_context(result: subprocess.CompletedProcess[str], event_name: str) -> str:
     assert result.returncode == 0
     assert result.stderr == ""
@@ -584,6 +612,13 @@ assert first_payload["budget"]["effective_tokens"] == 10_000
 assert first_payload["budget"]["used_tokens"] <= 10_000
 assert len(first_hook.stdout.encode()) <= 96 * 1024 + 1
 
+second_warm_code, second_warm_search = request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"cwd": str(same_name_two / "src"), "query": "SameNameSecondNeedle"},
+)
+assert second_warm_code == 200
+assert second_warm_search["results"]
 second_hook = run_recall_hook(same_name_two / "src", "SameNameSecondNeedle", api_key=key)
 second_context = hook_context(second_hook, "UserPromptSubmit")
 assert "SameNameSecondNeedle" in second_context
@@ -1223,13 +1258,13 @@ assert restored_graph["results"][1]["content"] == ("Entity: Beta: One-hop author
 # Removing a real source file and scanning it out immediately prevents the old
 # graph projection from returning it, then clears it from the durable projection.
 (retrieval_library_path / "graph-one.md").unlink()
-graph_delete_scan_code, graph_delete_scan = request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/scan",
-    key,
-    method="POST",
+graph_delete_changes = import_external_changes(
+    str(project_library["id"]), retrieval_library_path, key
 )
-assert graph_delete_scan_code == 200
-assert graph_delete_scan["removed"] == 1
+graph_delete_change = next(
+    item for item in graph_delete_changes if item["base_path"] == "graph-one.md"
+)
+assert graph_delete_change["kind"] == "delete"
 missing_source_code, missing_source = request(
     "http://127.0.0.1:7331/api/v1/search",
     key,
@@ -1333,13 +1368,11 @@ budget_note.write_text(
     "# Budget\n\nBudgetNeedle " + ("多字节 memory content. " * 4_000) + "\n",
     encoding="utf-8",
 )
-budget_scan_code, budget_scan = request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/scan",
-    key,
-    method="POST",
+budget_changes = import_external_changes(
+    str(project_library["id"]), retrieval_library_path, key
 )
-assert budget_scan_code == 200
-assert budget_scan["changed"] == 1
+budget_change = next(item for item in budget_changes if item["base_path"] == "budget.md")
+assert budget_change["kind"] == "edit"
 
 low_code, low_budget = request(
     "http://127.0.0.1:7331/mcp/search",
@@ -1488,13 +1521,13 @@ for excluded_query in ("IgnoredNeedle", "DependencyNeedle", "OutsideNeedle"):
     assert excluded["results"] == []
 
 retrieval_note.write_text("# Updated\n\nIncrementalNeedle99\n", encoding="utf-8")
-rescan_code, rescan = request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/scan",
-    key,
-    method="POST",
+rescan_changes = import_external_changes(
+    str(project_library["id"]), retrieval_library_path, key
 )
-assert rescan_code == 200
-assert rescan["changed"] == 1
+rescan_change = next(
+    item for item in rescan_changes if item["base_path"] == "真实语料.md"
+)
+assert rescan_change["kind"] == "edit"
 updated_code, updated_search = request(
     "http://127.0.0.1:7331/mcp/search",
     key,
@@ -1503,13 +1536,13 @@ updated_code, updated_search = request(
 assert updated_code == 200
 assert len(updated_search["results"]) == 1
 retrieval_note.unlink()
-delete_rescan_code, delete_rescan = request(
-    f"http://127.0.0.1:7331/api/v1/libraries/{project_library['id']}/scan",
-    key,
-    method="POST",
+delete_changes = import_external_changes(
+    str(project_library["id"]), retrieval_library_path, key
 )
-assert delete_rescan_code == 200
-assert delete_rescan["removed"] == 1
+delete_change = next(
+    item for item in delete_changes if item["base_path"] == "真实语料.md"
+)
+assert delete_change["kind"] == "delete"
 deleted_code, deleted_search = request(
     "http://127.0.0.1:7331/mcp/search",
     key,
@@ -1618,6 +1651,9 @@ def start_restart_daemon() -> subprocess.Popen[bytes]:
 restart_process = start_restart_daemon()
 restart_key = (restart_state / "api-key").read_text(encoding="utf-8").strip()
 try:
+    restart_path.mkdir(parents=True, exist_ok=True)
+    restart_note = restart_path / "pending.md"
+    restart_note.write_text("# Restart\n\nAccepted baseline.\n", encoding="utf-8")
     restart_code, restart_library = request(
         "http://127.0.0.1:17331/api/v1/libraries",
         restart_key,
@@ -1637,6 +1673,14 @@ try:
         },
     )
     assert restart_candidate_code == 201
+    restart_note.write_text("# Restart\n\nPending external version.\n", encoding="utf-8")
+    pending_scan_code, pending_scan = request(
+        f"http://127.0.0.1:17331/api/v1/libraries/{restart_library['id']}/scan",
+        restart_key,
+        method="POST",
+    )
+    assert pending_scan_code == 200
+    assert pending_scan["pending"] == 1
 finally:
     restart_process.send_signal(signal.SIGINT)
     assert restart_process.wait(timeout=10) == 0
@@ -1652,6 +1696,20 @@ try:
     )
     assert restored_candidate_code == 200
     assert restored_candidate == restart_candidate
+    restored_changes_code, restored_changes = request(
+        f"http://127.0.0.1:17331/api/v1/libraries/{restart_library['id']}/"
+        "out-of-band-changes",
+        restart_key,
+    )
+    assert restored_changes_code == 200
+    assert restored_changes[0]["external"].endswith("Pending external version.\n")
+    restart_import_code, _ = request(
+        f"http://127.0.0.1:17331/api/v1/libraries/{restart_library['id']}/"
+        f"out-of-band-changes/{restored_changes[0]['id']}/resolve",
+        restart_key,
+        {"action": "import", "operation_id": "docker-restart-oob-import"},
+    )
+    assert restart_import_code == 200
 finally:
     restart_process.send_signal(signal.SIGINT)
     assert restart_process.wait(timeout=10) == 0
@@ -1866,6 +1924,240 @@ assert restored["commit"] != edited["commit"]
 assert history_document.read_text(encoding="utf-8") == history_original
 assert request(f"http://127.0.0.1:7331/mcp/libraries/{history_id}/document", key)[0] == 404
 assert project_git_fingerprint() == project_before
+
+# Out-of-band edits, moves and deletions remain suspended until an explicit
+# reconciliation decision creates its own audit commit.
+history_before_external = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)[1]
+external_edit = "# Docker decision\n\nDockerExternalImport.\n"
+history_document.write_text(external_edit, encoding="utf-8")
+external_scan_code, external_scan = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/scan", key, method="POST"
+)
+assert external_scan_code == 200
+assert external_scan["detected"] == 1
+changes_code, changes = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes", key
+)
+assert changes_code == 200
+edit_change = changes[0]
+assert edit_change["kind"] == "edit"
+assert edit_change["base"] == history_original
+assert edit_change["platform"] == history_original
+assert edit_change["external"] == external_edit
+assert request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+)[1] == history_before_external
+assert request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"library_id": history_id, "query": "DockerExternalImport"},
+)[1]["results"] == []
+import_code, imported_external = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes/"
+    f"{edit_change['id']}/resolve",
+    key,
+    {"action": "import", "operation_id": "docker-oob-import"},
+)
+assert import_code == 200
+assert imported_external["commit"] != history_before_external[0]["commit"]
+assert request(
+    "http://127.0.0.1:7331/api/v1/search",
+    key,
+    {"library_id": history_id, "query": "DockerExternalImport"},
+)[1]["results"]
+
+moved_document = history_library / "moved-decisions.md"
+history_document.rename(moved_document)
+request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/scan", key, method="POST"
+)
+move_change = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes", key
+)[1][0]
+assert move_change["kind"] == "move"
+move_restore_code, _ = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes/"
+    f"{move_change['id']}/resolve",
+    key,
+    {"action": "restore", "operation_id": "docker-oob-move-restore"},
+)
+assert move_restore_code == 200
+assert history_document.read_text(encoding="utf-8") == external_edit
+assert not moved_document.exists()
+
+history_document.unlink()
+request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/scan", key, method="POST"
+)
+delete_change = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes", key
+)[1][0]
+assert delete_change["kind"] == "delete"
+delete_restore_code, _ = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes/"
+    f"{delete_change['id']}/resolve",
+    key,
+    {"action": "restore", "operation_id": "docker-oob-delete-restore"},
+)
+assert delete_restore_code == 200
+assert history_document.read_text(encoding="utf-8") == external_edit
+
+history_document.write_text("# Docker decision\n\nExternal first.\n", encoding="utf-8")
+request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/scan", key, method="POST"
+)
+history_document.write_text("# Docker decision\n\nExternal second.\n", encoding="utf-8")
+request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/scan", key, method="POST"
+)
+conflict_change = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes", key
+)[1][0]
+assert conflict_change["status"] == "conflict"
+missing_final_code, _ = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes/"
+    f"{conflict_change['id']}/resolve",
+    key,
+    {"action": "import", "operation_id": "docker-oob-conflict-no-final"},
+)
+assert missing_final_code == 409
+conflict_code, _ = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes/"
+    f"{conflict_change['id']}/resolve",
+    key,
+    {
+        "action": "import",
+        "operation_id": "docker-oob-conflict-final",
+        "final_content": "# Docker decision\n\nDockerChosenFinal.\n",
+    },
+)
+assert conflict_code == 200
+assert history_document.read_text(encoding="utf-8").endswith("DockerChosenFinal.\n")
+
+ambiguous_library = Path("/memory-libraries/ambiguous-moves")
+ambiguous_library.mkdir()
+ambiguous_content = "# Shared\n\nDockerAmbiguousMove.\n"
+(ambiguous_library / "one.md").write_text(ambiguous_content, encoding="utf-8")
+(ambiguous_library / "two.md").write_text(ambiguous_content, encoding="utf-8")
+ambiguous_register_code, ambiguous_registered = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(ambiguous_library), "kind": "project"},
+)
+assert ambiguous_register_code == 201
+ambiguous_id = str(ambiguous_registered["id"])
+(ambiguous_library / "one.md").rename(ambiguous_library / "moved-a.md")
+(ambiguous_library / "two.md").rename(ambiguous_library / "moved-b.md")
+assert request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_id}/scan",
+    key,
+    method="POST",
+)[0] == 200
+ambiguous_changes = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_id}/out-of-band-changes",
+    key,
+)[1]
+assert len(ambiguous_changes) == 2
+ambiguous_by_base = {str(item["base_path"]): item for item in ambiguous_changes}
+assert all(
+    set(cast(list[str], item["external_candidates"])) == {"moved-a.md", "moved-b.md"}
+    for item in ambiguous_changes
+)
+assert request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_id}/out-of-band-changes/"
+    f"{ambiguous_by_base['one.md']['id']}/resolve",
+    key,
+    {
+        "action": "import",
+        "operation_id": "docker-ambiguous-missing-path",
+        "final_content": "# One\n\nDocker chosen one.\n",
+    },
+)[0] == 422
+for base_path, external_path, chosen in (
+    ("one.md", "moved-a.md", "# One\n\nDocker chosen one.\n"),
+    ("two.md", "moved-b.md", "# Two\n\nDocker chosen two.\n"),
+):
+    resolve_code, resolved_move = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_id}/out-of-band-changes/"
+        f"{ambiguous_by_base[base_path]['id']}/resolve",
+        key,
+        {
+            "action": "import",
+            "operation_id": f"docker-ambiguous-{external_path}",
+            "external_path": external_path,
+            "final_content": chosen,
+        },
+    )
+    assert resolve_code == 200
+    assert resolved_move["path"] == external_path
+    assert (ambiguous_library / external_path).read_text(encoding="utf-8") == chosen
+assert not (ambiguous_library / "one.md").exists()
+assert not (ambiguous_library / "two.md").exists()
+
+ambiguous_restore_library = Path("/memory-libraries/ambiguous-restore")
+ambiguous_restore_library.mkdir()
+(ambiguous_restore_library / "one.md").write_text(
+    ambiguous_content, encoding="utf-8"
+)
+(ambiguous_restore_library / "two.md").write_text(
+    ambiguous_content, encoding="utf-8"
+)
+ambiguous_restore_code, ambiguous_restore_registered = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(ambiguous_restore_library), "kind": "project"},
+)
+assert ambiguous_restore_code == 201
+ambiguous_restore_id = str(ambiguous_restore_registered["id"])
+(ambiguous_restore_library / "one.md").rename(
+    ambiguous_restore_library / "moved-a.md"
+)
+(ambiguous_restore_library / "two.md").rename(
+    ambiguous_restore_library / "moved-b.md"
+)
+assert request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_restore_id}/scan",
+    key,
+    method="POST",
+)[0] == 200
+restore_changes = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_restore_id}/out-of-band-changes",
+    key,
+)[1]
+restore_by_base = {str(item["base_path"]): item for item in restore_changes}
+assert request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_restore_id}/out-of-band-changes/"
+    f"{restore_by_base['one.md']['id']}/resolve",
+    key,
+    {"action": "restore", "operation_id": "docker-ambiguous-restore-missing"},
+)[0] == 422
+for base_path, external_path in (
+    ("one.md", "moved-a.md"),
+    ("two.md", "moved-b.md"),
+):
+    current_changes = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_restore_id}/out-of-band-changes",
+        key,
+    )[1]
+    current_change = next(item for item in current_changes if item["base_path"] == base_path)
+    restore_code, restored_move = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{ambiguous_restore_id}/out-of-band-changes/"
+        f"{current_change['id']}/resolve",
+        key,
+        {
+            "action": "restore",
+            "operation_id": f"docker-ambiguous-restore-{external_path}",
+            "external_path": external_path,
+        },
+    )
+    assert restore_code == 200
+    assert restored_move["path"] == base_path
+    assert (ambiguous_restore_library / base_path).read_text(
+        encoding="utf-8"
+    ) == ambiguous_content
+    assert not (ambiguous_restore_library / external_path).exists()
 
 # MCP can submit and inspect candidates, while only Web REST governance can
 # edit, approve, reject, and create authoritative Markdown.
@@ -2355,6 +2647,54 @@ assert browser_approve_code == browser_reject_code == 201
 browser_history_before = request(
     f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
 )[1]
+browser_platform_before = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/document?"
+    + urllib.parse.urlencode({"path": "decisions.md"}),
+    key,
+)[1]["content"]
+history_document.write_text(
+    "# Docker decision\n\nBrowserOutOfBandPending.\n", encoding="utf-8"
+)
+browser_oob_scan_code, browser_oob_scan = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/scan", key, method="POST"
+)
+assert browser_oob_scan_code == 200
+assert browser_oob_scan["pending"] == 1
+history_document.write_text(
+    "# Docker decision\n\nBrowserOutOfBandConflict.\n", encoding="utf-8"
+)
+browser_conflict_scan_code, browser_conflict_scan = request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/scan", key, method="POST"
+)
+assert browser_conflict_scan_code == 200
+assert browser_conflict_scan["pending"] == 1
+
+browser_ambiguous_library = Path("/memory-libraries/browser-ambiguous-restore")
+browser_ambiguous_library.mkdir()
+(browser_ambiguous_library / "one.md").write_text(
+    ambiguous_content, encoding="utf-8"
+)
+(browser_ambiguous_library / "two.md").write_text(
+    ambiguous_content, encoding="utf-8"
+)
+browser_ambiguous_code, browser_ambiguous_registered = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(browser_ambiguous_library), "kind": "project"},
+)
+assert browser_ambiguous_code == 201
+browser_ambiguous_id = str(browser_ambiguous_registered["id"])
+(browser_ambiguous_library / "one.md").rename(
+    browser_ambiguous_library / "moved-a.md"
+)
+(browser_ambiguous_library / "two.md").rename(
+    browser_ambiguous_library / "moved-b.md"
+)
+assert request(
+    f"http://127.0.0.1:7331/api/v1/libraries/{browser_ambiguous_id}/scan",
+    key,
+    method="POST",
+)[0] == 200
 
 options = Options()
 options.binary_location = "/usr/bin/chromium"
@@ -2373,6 +2713,136 @@ try:
     browser.find_element(By.ID, "key").send_keys(key)
     browser.find_element(By.ID, "connect").click()
     wait.until(lambda driver: driver.find_elements(By.ID, "candidate-title"))
+    browser.execute_script(
+        "const select = document.querySelector('[aria-label=\"Memory library to edit\"]'); "
+        "select.value = arguments[0]; select.dispatchEvent(new Event('change'));",
+        browser_ambiguous_id,
+    )
+    wait.until(
+        lambda driver: driver.execute_script(
+            "return [...document.querySelectorAll('.candidate-list button')]"
+            ".some(item => item.textContent.includes('one.md') && "
+            "item.textContent.includes('move'));"
+        )
+    )
+    browser.execute_script(
+        "const item = [...document.querySelectorAll('.candidate-list button')]"
+        ".find(item => item.textContent.includes('one.md') && "
+        "item.textContent.includes('move')); item.click();"
+    )
+    browser_import_button = browser.find_element(By.ID, "reconciliation-import")
+    browser_restore_button = browser.find_element(By.ID, "reconciliation-restore")
+    assert not browser_import_button.is_enabled()
+    assert not browser_restore_button.is_enabled()
+    browser.execute_script(
+        "const select = document.querySelector('#reconciliation-path'); "
+        "select.value = 'moved-a.md'; select.dispatchEvent(new Event('change'));"
+    )
+    wait.until(lambda _driver: browser_import_button.is_enabled())
+    wait.until(lambda _driver: browser_restore_button.is_enabled())
+    browser_restore_button.click()
+    wait.until(
+        lambda driver: "Platform version restored"
+        in driver.find_element(By.ID, "reconciliation-message").text
+    )
+    assert (browser_ambiguous_library / "one.md").read_text(
+        encoding="utf-8"
+    ) == ambiguous_content
+    assert not (browser_ambiguous_library / "moved-a.md").exists()
+    browser.execute_script(
+        "const select = document.querySelector('[aria-label=\"Memory library to edit\"]'); "
+        "select.value = arguments[0]; select.dispatchEvent(new Event('change'));",
+        history_id,
+    )
+    wait.until(
+        lambda driver: driver.execute_script(
+            "return [...document.querySelectorAll('.candidate-list button')]"
+            ".some(item => item.textContent.includes('decisions.md'));"
+        )
+    )
+    browser.execute_script(
+        "const item = [...document.querySelectorAll('.candidate-list button')]"
+        ".find(item => item.textContent.includes('decisions.md') && "
+        "item.textContent.includes('edit')); item.click();"
+    )
+    assert "BrowserOutOfBandConflict" in browser.find_element(
+        By.ID, "reconciliation-external"
+    ).text
+    browser.find_element(By.ID, "reconciliation-restore").click()
+    wait.until(
+        lambda driver: "Platform version restored"
+        in driver.find_element(By.ID, "reconciliation-message").text
+    )
+    browser_restore_commit = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+    )[1][0]["commit"]
+    assert history_document.read_text(encoding="utf-8") == browser_platform_before
+
+    history_document.write_text(
+        "# Secret\n\nAKIAIOSFODNN7EXAMPLE\n", encoding="utf-8"
+    )
+    withheld_scan_code, withheld_scan = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/scan",
+        key,
+        method="POST",
+    )
+    assert withheld_scan_code == 200
+    assert withheld_scan["pending"] == 1
+    withheld_change = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes",
+        key,
+    )[1][0]
+    for operation_id, final_content in (
+        ("docker-withheld-empty", ""),
+        ("docker-withheld-whitespace", " \n\t "),
+    ):
+        blank_code, _ = request(
+            f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/out-of-band-changes/"
+            f"{withheld_change['id']}/resolve",
+            key,
+            {
+                "action": "import",
+                "operation_id": operation_id,
+                "final_content": final_content,
+            },
+        )
+        assert blank_code == 409
+        assert history_document.read_text(encoding="utf-8").endswith(
+            "AKIAIOSFODNN7EXAMPLE\n"
+        )
+    browser.execute_script(
+        "const select = document.querySelector('[aria-label=\"Memory library to edit\"]'); "
+        "select.dispatchEvent(new Event('change'));"
+    )
+    wait.until(
+        lambda driver: driver.execute_script(
+            "return [...document.querySelectorAll('.candidate-list button')]"
+            ".some(item => item.textContent.includes('decisions.md') && "
+            "item.textContent.includes('edit'));"
+        )
+    )
+    browser.execute_script(
+        "const item = [...document.querySelectorAll('.candidate-list button')]"
+        ".find(item => item.textContent.includes('decisions.md') && "
+        "item.textContent.includes('edit')); item.click();"
+    )
+    final_input = browser.find_element(By.ID, "reconciliation-final")
+    import_button = browser.find_element(By.ID, "reconciliation-import")
+    assert final_input.get_attribute("value") == ""
+    assert import_button.get_attribute("disabled") is not None
+    final_input.send_keys("# Docker decision\n\nBrowserSafeReplacement.\n")
+    wait.until(lambda _driver: import_button.is_enabled())
+    import_button.click()
+    wait.until(
+        lambda driver: "External version imported"
+        in driver.find_element(By.ID, "reconciliation-message").text
+    )
+    assert history_document.read_text(encoding="utf-8").endswith(
+        "BrowserSafeReplacement.\n"
+    )
+    browser_import_commit = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
+    )[1][0]["commit"]
 
     unresolved_sensitive = [
         record for record in quarantine_records if record["resolved_at"] is None
@@ -2569,8 +3039,10 @@ assert "The Web approval fixture uses Cobalt Canary." in browser_published.read_
     encoding="utf-8"
 )
 browser_history = request(f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key)[1]
-assert len(browser_history) == len(browser_history_before) + 1
+assert len(browser_history) == len(browser_history_before) + 3
 assert browser_history[0]["commit"] == browser_approved["commit"]
+assert browser_history[1]["commit"] == browser_import_commit
+assert browser_history[2]["commit"] == browser_restore_commit
 assert (
     request(
         "http://127.0.0.1:7331/mcp/search",

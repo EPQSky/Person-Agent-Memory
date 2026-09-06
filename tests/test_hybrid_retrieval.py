@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -18,6 +19,33 @@ from personal_agent_memory.app import create_app
 from personal_agent_memory.config import ConfigurationError, Settings
 from personal_agent_memory.model_client import ModelEndpoint, OpenAICompatibleClient
 from personal_agent_memory.state import PlatformState
+
+
+def import_external_changes(
+    client: TestClient,
+    headers: dict[str, str],
+    library_id: str,
+    root: Path,
+) -> None:
+    scanned = client.post(f"/api/v1/libraries/{library_id}/scan", headers=headers)
+    assert scanned.status_code == 200, scanned.text
+    changes = client.get(
+        f"/api/v1/libraries/{library_id}/out-of-band-changes", headers=headers
+    ).json()
+    for change in changes:
+        payload: dict[str, str] = {
+            "action": "import",
+            "operation_id": f"test-import-{uuid.uuid4()}",
+        }
+        if change["status"] == "conflict" or change["external_withheld"]:
+            path = change["external_path"] or change["base_path"]
+            payload["final_content"] = (root / path).read_text(encoding="utf-8")
+        resolved = client.post(
+            f"/api/v1/libraries/{library_id}/out-of-band-changes/{change['id']}/resolve",
+            headers=headers,
+            json=payload,
+        )
+        assert resolved.status_code == 200, resolved.text
 
 
 class DeterministicModelHandler(BaseHTTPRequestHandler):
@@ -262,7 +290,9 @@ SQLite keeps local durable state.
                 )
             }
             source.write_text("# Current\n\nUse FreshExact99 for storage.\n", encoding="utf-8")
-            client.post(f"/api/v1/libraries/{registered['id']}/scan", headers=headers)
+            import_external_changes(
+                client, headers, registered["id"], library_path
+            )
             current = client.post(
                 "/api/v1/search",
                 headers=headers,
@@ -569,9 +599,7 @@ def test_vector_rebuild_requests_and_scans_coalesce_per_library(tmp_path: Path) 
                 source.write_text(
                     f"# Current\n\nQueueNeedle {version}.\n", encoding="utf-8"
                 )
-                assert client.post(
-                    f"/api/v1/libraries/{library['id']}/scan", headers=headers
-                ).status_code == 200
+                import_external_changes(client, headers, library["id"], library_path)
 
             database = sqlite3.connect(state_dir / "platform.sqlite3")
             active = database.execute(
