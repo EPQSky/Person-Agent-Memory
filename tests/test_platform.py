@@ -208,6 +208,77 @@ def test_capture_consolidation_is_fail_fast_when_sqlite_writer_is_busy(
             ).fetchone() == (0,)
 
 
+def test_capture_consolidation_does_not_report_timeout_during_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    library_root = tmp_path / "libraries"
+    library_path = library_root / "project-memory"
+    library_path.mkdir(parents=True)
+    app = create_app(Settings(state_dir=state_dir, library_roots=(library_root,)))
+    with TestClient(app) as client:
+        headers = auth_headers(state_dir)
+        library = client.post(
+            "/api/v1/libraries",
+            headers=headers,
+            json={"path": str(library_path), "kind": "project"},
+        ).json()
+        database = state_dir / "platform.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "INSERT INTO capture_rounds (session_id, turn_id, library_id) VALUES (?, ?, ?)",
+                ("commit-boundary-session", "commit-boundary-turn", library["id"]),
+            )
+
+        actual_connect = state_module.sqlite3.connect
+        commit_started = threading.Event()
+
+        class SlowCommitConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self._connection = connection
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._connection, name)
+
+            def commit(self) -> None:
+                commit_started.set()
+                time.sleep(0.2)
+                self._connection.commit()
+
+        def slow_connect(*args: object, **kwargs: object) -> SlowCommitConnection:
+            return SlowCommitConnection(actual_connect(*args, **kwargs))
+
+        monkeypatch.setattr(state_module.sqlite3, "connect", slow_connect)
+        deadline = int(time.time() * 1000) + 100
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            started = time.monotonic()
+            request = executor.submit(
+                client.post,
+                "/api/v1/capture/consolidate",
+                headers={
+                    **headers,
+                    "X-Personal-Agent-Memory-Persistence-Deadline-Ms": str(deadline),
+                },
+                json={"session_id": "commit-boundary-session"},
+            )
+            assert commit_started.wait(timeout=1)
+            health_started = time.monotonic()
+            health = client.get("/health/live", headers=headers)
+            health_elapsed = time.monotonic() - health_started
+            response = request.result(timeout=1)
+            elapsed = time.monotonic() - started
+
+        assert response.status_code == 202, response.text
+        assert response.json() == {"queued": 1}
+        assert elapsed >= 0.2
+        assert health.status_code == 200
+        assert health_elapsed < 0.1
+        with actual_connect(database) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM background_jobs WHERE kind = 'capture_consolidation'"
+            ).fetchone() == (1,)
+
+
 def import_external_changes(
     client: TestClient,
     headers: dict[str, str],

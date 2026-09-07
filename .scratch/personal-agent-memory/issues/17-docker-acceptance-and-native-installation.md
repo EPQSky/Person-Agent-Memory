@@ -6,6 +6,10 @@
 
 **Status:** done
 
+**Corrective verification:** SQLite consolidation deadlines are enforced before the irreversible
+commit boundary; once commit starts, the API waits for its definitive result instead of returning
+`503` before a late durable queue write. Independent corrective Review 1 passed.
+
 - [x] Docker 验收从隔离空状态启动真实守护进程、SQLite、sidecar Git、JiuwenMemory/Milvus Lite、真实插件脚本和确定性假模型服务。
 - [x] 完整场景注册已有 Markdown 目录、绑定项目、完成直接与 Graph 索引，并从新 Codex 会话检索低于 10K tokens 且带来源的项目记忆。
 - [x] 完整场景采集一轮用户消息与助手最终回复，生成候选，在 Web 中批准，并验证正式 Markdown、索引和单一 Git 提交。

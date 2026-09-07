@@ -2738,7 +2738,6 @@ class PlatformState:
                 self._require_capture_deadline(deadline)
             self._require_capture_deadline(deadline)
             connection.commit()
-            self._require_capture_deadline(deadline)
             return queued
         except sqlite3.OperationalError as error:
             if connection.in_transaction:

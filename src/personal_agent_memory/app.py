@@ -828,14 +828,15 @@ def create_app(settings: Settings) -> FastAPI:
             request_deadline - CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS
         )
         try:
-            async with asyncio.timeout_at(request_deadline):
-                queued = await asyncio.to_thread(
-                    platform_state.trigger_capture_consolidation,
-                    request.session_id,
-                    persistence_deadline,
-                )
+            # The deadline is a pre-commit admission boundary. Once SQLite commit starts,
+            # await its definitive result rather than returning 503 while it can still land.
+            queued = await asyncio.to_thread(
+                platform_state.trigger_capture_consolidation,
+                request.session_id,
+                persistence_deadline,
+            )
             return {"queued": queued}
-        except (TimeoutError, CapturePersistenceBusyError) as error:
+        except CapturePersistenceBusyError as error:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="capture consolidation is temporarily unavailable",
