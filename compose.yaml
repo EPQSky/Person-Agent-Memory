@@ -8,6 +8,8 @@ services:
       - platform-state:/state
       - memory-libraries:/memory-libraries
       - project-roots:/project-roots
+    environment:
+      PERSONAL_AGENT_MEMORY_RETENTION_NOW: ${PERSONAL_AGENT_MEMORY_RETENTION_NOW:-2026-09-07T00:00:00Z}
     healthcheck:
       test:
         - CMD

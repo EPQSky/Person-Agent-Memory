@@ -72,6 +72,10 @@ SENSITIVE_QUARANTINE_TTL_DAYS = 30
 SENSITIVE_QUARANTINE_MAX_RECORDS = 512
 SENSITIVE_QUARANTINE_MAX_BYTES = 64 * 1024
 SENSITIVE_QUARANTINE_PAGE_LIMIT = 100
+DEFAULT_INBOX_RETENTION_DAYS = 30
+DEFAULT_CANDIDATE_RETENTION_DAYS = 90
+DEFAULT_RECYCLE_RETENTION_DAYS = 30
+DEFAULT_DIAGNOSTIC_RETENTION_DAYS = 7
 
 
 def _rename_exchange(
@@ -306,6 +310,23 @@ class CandidateMemory:
 
 
 @dataclass(frozen=True, slots=True)
+class RetentionCleanupPlan:
+    inbox_event_ids: tuple[str, ...]
+    candidate_ids_to_recycle: tuple[str, ...]
+    candidate_ids_to_delete: tuple[str, ...]
+    protected_candidates: int
+    plaintext_bodies: tuple[bytes, ...]
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "capture_inbox": len(self.inbox_event_ids),
+            "candidates_to_recycle": len(self.candidate_ids_to_recycle),
+            "candidates_to_delete": len(self.candidate_ids_to_delete),
+            "protected_candidates": self.protected_candidates,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class GovernanceFact:
     relation: str
     value: str
@@ -319,6 +340,7 @@ class PlatformState:
         library_roots: tuple[Path, ...] = (),
         model_client: OpenAICompatibleClient | None = None,
         graph_adapter: GraphAdapter | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self.database_path = database_path
         self.library_roots = library_roots
@@ -335,6 +357,9 @@ class PlatformState:
         self.model_client = model_client or OpenAICompatibleClient(None, None)
         self.graph_adapter = graph_adapter
         self._last_reconciliation_check = 0.0
+        self._last_retention_check = 0.0
+        self._retention_generation = 0
+        self._now = now or (lambda: datetime.now(UTC))
 
     async def start(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -632,6 +657,52 @@ class PlatformState:
                     resolution TEXT,
                     UNIQUE(source_kind, source_id)
                 );
+                CREATE TABLE IF NOT EXISTS library_retention_policies (
+                    library_id TEXT PRIMARY KEY REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    inbox_days INTEGER NOT NULL DEFAULT 30 CHECK(inbox_days >= 0),
+                    candidate_days INTEGER NOT NULL DEFAULT 90 CHECK(candidate_days >= 0),
+                    recycle_days INTEGER NOT NULL DEFAULT 30 CHECK(recycle_days >= 0),
+                    early_inbox_cleanup INTEGER NOT NULL DEFAULT 1
+                        CHECK(early_inbox_cleanup IN (0, 1)),
+                    diagnostics_enabled INTEGER NOT NULL DEFAULT 1
+                        CHECK(diagnostics_enabled IN (0, 1)),
+                    diagnostic_days INTEGER NOT NULL DEFAULT 7 CHECK(diagnostic_days >= 0),
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS candidate_retention (
+                    candidate_id TEXT PRIMARY KEY
+                        REFERENCES candidate_memories(id) ON DELETE CASCADE,
+                    pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0, 1)),
+                    recycled_at TEXT,
+                    active_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS retention_cleanup_runs (
+                    id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL CHECK(status IN ('done', 'error')),
+                    counts_json TEXT NOT NULL DEFAULT '{}',
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS retention_erasure_jobs (
+                    run_id TEXT PRIMARY KEY,
+                    library_id TEXT NOT NULL REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    fingerprints_json TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS diagnostic_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    library_id TEXT REFERENCES memory_libraries(id) ON DELETE CASCADE,
+                    category TEXT NOT NULL,
+                    occurrence_count INTEGER NOT NULL DEFAULT 1,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             quarantine_columns = {
@@ -742,6 +813,11 @@ class PlatformState:
                     connection.execute(
                         f"ALTER TABLE graph_cleanup_intents ADD COLUMN {name} TEXT"
                     )
+            retention_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(candidate_retention)")
+            }
+            if "active_at" not in retention_columns:
+                connection.execute("ALTER TABLE candidate_retention ADD COLUMN active_at TEXT")
             restore_intent_columns = {
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(memory_restore_intents)")
@@ -777,6 +853,8 @@ class PlatformState:
             self._set_metadata("startup_count", str(self.startup_count))
             self._set_metadata("clean_shutdown", "false")
             connection.commit()
+            with suppress(MemoryMutationError, sqlite3.DatabaseError):
+                self._retry_pending_retention_erasures()
             self._reconcile_graph_cleanup_intents()
             self._reconcile_memory_restore_intents()
         except BaseException:
@@ -784,6 +862,7 @@ class PlatformState:
             self.connection = None
             raise
         self.stop_worker.clear()
+        self._last_retention_check = monotonic()
         self.worker_task = asyncio.create_task(
             self._worker(capture_only=False), name="memory-background-worker"
         )
@@ -884,6 +963,19 @@ class PlatformState:
                         continue
                     with suppress(LibraryRegistrationError, MemoryMutationError, OSError):
                         self.reconcile_library(library.id)
+                if monotonic() - self._last_retention_check >= 60.0:
+                    self._last_retention_check = monotonic()
+                    retention_generation = self._retention_generation
+                    for library in self.list_libraries():
+                        if library.availability == "available":
+                            with suppress(
+                                LibraryRegistrationError,
+                                MemoryMutationError,
+                                sqlite3.DatabaseError,
+                            ):
+                                self._run_scheduled_retention_cleanup(
+                                    library.id, retention_generation
+                                )
             try:
                 await asyncio.wait_for(self.stop_worker.wait(), timeout=0.1)
             except TimeoutError:
@@ -2297,13 +2389,14 @@ class PlatformState:
                 )
             return self.candidate(str(existing[0]))
         candidate_id = str(uuid.uuid4())
+        created_at = self._now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             self.connection_or_raise.execute("BEGIN IMMEDIATE")
             self.connection_or_raise.execute(
                 """INSERT INTO candidate_memories
                    (id, library_id, suggested_type, body, source_references_json,
-                    creator, idempotency_key, request_hash)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    creator, idempotency_key, request_hash, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     candidate_id,
                     library_id,
@@ -2313,13 +2406,21 @@ class PlatformState:
                     creator,
                     idempotency_key,
                     request_hash,
+                    created_at,
+                    created_at,
                 ),
             )
             self.connection_or_raise.execute(
                 """INSERT INTO candidate_audit
-                   (candidate_id, action, operator, reason, body)
-                   VALUES (?, 'created', ?, ?, ?)""",
-                (candidate_id, creator, "candidate submitted", body),
+                   (candidate_id, action, operator, reason, body, created_at)
+                   VALUES (?, 'created', ?, ?, ?, ?)""",
+                (
+                    candidate_id,
+                    creator,
+                    "candidate submitted",
+                    body,
+                    created_at,
+                ),
             )
             classification, target_path, similarity = self._classify_candidate(library_id, body)
             self.connection_or_raise.execute(
@@ -2480,8 +2581,8 @@ class PlatformState:
             self.connection_or_raise.execute(
                 """INSERT INTO capture_inbox
                    (event_id, request_hash, session_id, project_id, library_id, turn_id,
-                    event_kind, content, occurred_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    event_kind, content, occurred_at, received_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     event_id,
                     request_hash,
@@ -2492,6 +2593,7 @@ class PlatformState:
                     event_kind,
                     content,
                     occurred_at,
+                    self._now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
             self.connection_or_raise.execute(
@@ -2753,12 +2855,396 @@ class PlatformState:
                 raise CandidateGovernanceError("invalid candidate status")
             predicates.append("status = ?")
             parameters.append(candidate_status)
-        where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+        predicates.append(
+            "NOT EXISTS (SELECT 1 FROM candidate_retention AS retention "
+            "WHERE retention.candidate_id = candidate_memories.id "
+            "AND retention.recycled_at IS NOT NULL)"
+        )
+        where = f" WHERE {' AND '.join(predicates)}"
         rows = self.connection_or_raise.execute(
             "SELECT id FROM candidate_memories" + where + " ORDER BY created_at DESC, id DESC",
             parameters,
         ).fetchall()
         return [self.candidate(str(row[0])) for row in rows]
+
+    def retention_policy(self, library_id: str) -> dict[str, object]:
+        self._require_available_library(library_id)
+        row = self.connection_or_raise.execute(
+            """SELECT inbox_days, candidate_days, recycle_days, early_inbox_cleanup,
+                      diagnostics_enabled, diagnostic_days
+               FROM library_retention_policies WHERE library_id = ?""",
+            (library_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "library_id": library_id,
+                "inbox_days": DEFAULT_INBOX_RETENTION_DAYS,
+                "candidate_days": DEFAULT_CANDIDATE_RETENTION_DAYS,
+                "recycle_days": DEFAULT_RECYCLE_RETENTION_DAYS,
+                "early_inbox_cleanup": True,
+                "diagnostics_enabled": True,
+                "diagnostic_days": DEFAULT_DIAGNOSTIC_RETENTION_DAYS,
+            }
+        return {
+            "library_id": library_id,
+            "inbox_days": int(row[0]),
+            "candidate_days": int(row[1]),
+            "recycle_days": int(row[2]),
+            "early_inbox_cleanup": bool(row[3]),
+            "diagnostics_enabled": bool(row[4]),
+            "diagnostic_days": int(row[5]),
+        }
+
+    def update_retention_policy(
+        self,
+        library_id: str,
+        *,
+        inbox_days: int,
+        candidate_days: int,
+        recycle_days: int,
+        early_inbox_cleanup: bool,
+        diagnostics_enabled: bool,
+        diagnostic_days: int,
+    ) -> dict[str, object]:
+        self._require_available_library(library_id)
+        values = (inbox_days, candidate_days, recycle_days, diagnostic_days)
+        if any(value < 0 for value in values):
+            raise LibraryRegistrationError("retention periods cannot be negative")
+        self.connection_or_raise.execute(
+            """INSERT INTO library_retention_policies
+               (library_id, inbox_days, candidate_days, recycle_days,
+                early_inbox_cleanup, diagnostics_enabled, diagnostic_days)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(library_id) DO UPDATE SET
+                 inbox_days = excluded.inbox_days,
+                 candidate_days = excluded.candidate_days,
+                 recycle_days = excluded.recycle_days,
+                 early_inbox_cleanup = excluded.early_inbox_cleanup,
+                 diagnostics_enabled = excluded.diagnostics_enabled,
+                 diagnostic_days = excluded.diagnostic_days,
+                 updated_at = CURRENT_TIMESTAMP""",
+            (
+                library_id,
+                inbox_days,
+                candidate_days,
+                recycle_days,
+                int(early_inbox_cleanup),
+                int(diagnostics_enabled),
+                diagnostic_days,
+            ),
+        )
+        if not diagnostics_enabled:
+            self.connection_or_raise.execute(
+                "DELETE FROM diagnostic_records WHERE library_id = ?", (library_id,)
+            )
+            self.connection_or_raise.execute(
+                """DELETE FROM retention_cleanup_runs WHERE library_id = ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM retention_erasure_jobs AS erasure
+                     WHERE erasure.run_id = retention_cleanup_runs.id
+                   )""",
+                (library_id,),
+            )
+        self.connection_or_raise.commit()
+        return self.retention_policy(library_id)
+
+    def set_candidate_pinned(self, candidate_id: str, pinned: bool) -> dict[str, object]:
+        candidate = self.candidate(candidate_id)
+        if candidate["status"] != "pending":
+            raise CandidateGovernanceError("only pending candidates can be pinned")
+        with self._library_lock(str(candidate["library_id"])):
+            self._require_candidate_not_recycled(candidate_id)
+            self.connection_or_raise.execute(
+                """INSERT INTO candidate_retention (candidate_id, pinned)
+                   VALUES (?, ?)
+                   ON CONFLICT(candidate_id) DO UPDATE SET pinned = excluded.pinned""",
+                (candidate_id, int(pinned)),
+            )
+            self.connection_or_raise.commit()
+        return {"candidate_id": candidate_id, "pinned": pinned}
+
+    def list_recycled_candidates(self, library_id: str) -> list[dict[str, object]]:
+        self._require_available_library(library_id)
+        rows = self.connection_or_raise.execute(
+            """SELECT candidate.id, retention.recycled_at
+               FROM candidate_memories AS candidate
+               JOIN candidate_retention AS retention ON retention.candidate_id = candidate.id
+               WHERE candidate.library_id = ? AND retention.recycled_at IS NOT NULL
+               ORDER BY retention.recycled_at DESC, candidate.id""",
+            (library_id,),
+        ).fetchall()
+        return [
+            {"candidate": self.candidate(str(row[0])), "recycled_at": str(row[1])} for row in rows
+        ]
+
+    def restore_recycled_candidate(self, candidate_id: str) -> dict[str, object]:
+        library_id = self._candidate_library_id(candidate_id)
+        with self._library_lock(library_id):
+            updated = self.connection_or_raise.execute(
+                "UPDATE candidate_retention SET recycled_at = NULL, active_at = ? "
+                "WHERE candidate_id = ? AND recycled_at IS NOT NULL",
+                (self._now().strftime("%Y-%m-%d %H:%M:%S"), candidate_id),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGovernanceError("candidate is not in the recycle bin")
+            self.connection_or_raise.commit()
+            return self.candidate(candidate_id)
+
+    def _retention_cutoff(self, days: int) -> str:
+        return datetime.fromtimestamp(self._now().timestamp() - days * 86400, tz=UTC).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    def _retention_plan(self, library_id: str) -> RetentionCleanupPlan:
+        policy = self.retention_policy(library_id)
+        inbox_cutoff = self._retention_cutoff(cast(int, policy["inbox_days"]))
+        candidate_cutoff = self._retention_cutoff(cast(int, policy["candidate_days"]))
+        recycle_cutoff = self._retention_cutoff(cast(int, policy["recycle_days"]))
+        early = bool(policy["early_inbox_cleanup"])
+        inbox_predicate = "datetime(inbox.received_at) <= datetime(?)"
+        inbox_parameters: list[object] = [library_id, inbox_cutoff]
+        if early:
+            inbox_predicate += (
+                " OR (inbox.consolidated_at IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM capture_rounds AS round "
+                "JOIN candidate_memories AS candidate ON candidate.id = round.candidate_id "
+                "LEFT JOIN candidate_retention AS retention "
+                "ON retention.candidate_id = candidate.id "
+                "LEFT JOIN candidate_governance AS governance "
+                "ON governance.candidate_id = candidate.id "
+                "WHERE round.session_id = inbox.session_id AND round.turn_id = inbox.turn_id "
+                "AND candidate.status = 'pending'))"
+            )
+        inbox_rows = self.connection_or_raise.execute(
+            "SELECT inbox.event_id, inbox.content FROM capture_inbox AS inbox "
+            "WHERE inbox.library_id = ? AND (" + inbox_predicate + ") "
+            "ORDER BY inbox.event_id",
+            inbox_parameters,
+        ).fetchall()
+        recycle_rows = self.connection_or_raise.execute(
+                """SELECT candidate.id FROM candidate_memories AS candidate
+                   LEFT JOIN candidate_retention AS retention
+                     ON retention.candidate_id = candidate.id
+                   LEFT JOIN candidate_governance AS governance
+                     ON governance.candidate_id = candidate.id
+                   WHERE candidate.library_id = ? AND candidate.status = 'pending'
+                     AND retention.recycled_at IS NULL
+                     AND coalesce(retention.pinned, 0) = 0
+                     AND coalesce(governance.classification, '') != 'conflict'
+                     AND datetime(coalesce(retention.active_at, candidate.created_at))
+                         <= datetime(?)
+                   ORDER BY candidate.id""",
+                (library_id, candidate_cutoff),
+            ).fetchall()
+        delete_rows = self.connection_or_raise.execute(
+                """SELECT candidate.id, candidate.body FROM candidate_memories AS candidate
+                   JOIN candidate_retention AS retention ON retention.candidate_id = candidate.id
+                   WHERE candidate.library_id = ? AND retention.recycled_at IS NOT NULL
+                     AND retention.pinned = 0
+                     AND datetime(retention.recycled_at) <= datetime(?)
+                   ORDER BY candidate.id""",
+                (library_id, recycle_cutoff),
+            ).fetchall()
+        protected = int(
+            self.connection_or_raise.execute(
+                """SELECT COUNT(*) FROM candidate_memories AS candidate
+                   LEFT JOIN candidate_retention AS retention
+                     ON retention.candidate_id = candidate.id
+                   LEFT JOIN candidate_governance AS governance
+                     ON governance.candidate_id = candidate.id
+                   WHERE candidate.library_id = ? AND candidate.status = 'pending'
+                     AND retention.recycled_at IS NULL
+                     AND datetime(coalesce(retention.active_at, candidate.created_at))
+                         <= datetime(?)
+                     AND (coalesce(retention.pinned, 0) = 1
+                          OR governance.classification = 'conflict')""",
+                (library_id, candidate_cutoff),
+            ).fetchone()[0]
+        )
+        doomed_ids = tuple(str(row[0]) for row in delete_rows)
+        audit_bodies: tuple[bytes, ...] = ()
+        if doomed_ids:
+            placeholders = ",".join("?" for _ in doomed_ids)
+            audit_bodies = tuple(
+                str(row[0]).encode()
+                for row in self.connection_or_raise.execute(
+                    f"SELECT body FROM candidate_audit WHERE candidate_id IN ({placeholders})",
+                    doomed_ids,
+                )
+                if row[0] is not None and str(row[0])
+            )
+        plaintext_bodies = tuple(
+            str(row[1]).encode() for row in inbox_rows if row[1] is not None and str(row[1])
+        ) + tuple(str(row[1]).encode() for row in delete_rows if str(row[1])) + audit_bodies
+        return RetentionCleanupPlan(
+            inbox_event_ids=tuple(str(row[0]) for row in inbox_rows),
+            candidate_ids_to_recycle=tuple(str(row[0]) for row in recycle_rows),
+            candidate_ids_to_delete=doomed_ids,
+            protected_candidates=protected,
+            plaintext_bodies=plaintext_bodies,
+        )
+
+    def preview_retention_cleanup(self, library_id: str) -> dict[str, object]:
+        self._require_available_library(library_id)
+        with self._library_lock(library_id):
+            plan = self._retention_plan(library_id)
+            return {
+                "library_id": library_id,
+                "as_of": self._now().isoformat().replace("+00:00", "Z"),
+                "policy": self.retention_policy(library_id),
+                "counts": plan.counts(),
+            }
+
+    def run_retention_cleanup(self, library_id: str) -> dict[str, object]:
+        self._require_available_library(library_id)
+        with self._library_lock(library_id):
+            result = self._run_retention_cleanup_locked(library_id)
+            self._last_retention_check = monotonic()
+            self._retention_generation += 1
+        return result
+
+    def _run_scheduled_retention_cleanup(
+        self, library_id: str, retention_generation: int
+    ) -> dict[str, object] | None:
+        with self._library_lock(library_id):
+            if retention_generation != self._retention_generation:
+                return None
+            return self._run_retention_cleanup_locked(library_id)
+
+    def _run_retention_cleanup_locked(self, library_id: str) -> dict[str, object]:
+        self._retry_pending_retention_erasures(library_id)
+        policy = self.retention_policy(library_id)
+        now = self._now().strftime("%Y-%m-%d %H:%M:%S")
+        run_id = uuid.uuid4().hex
+        plan: RetentionCleanupPlan | None = None
+        database_committed = False
+        try:
+            self.connection_or_raise.execute("BEGIN IMMEDIATE")
+            plan = self._retention_plan(library_id)
+            counts = plan.counts()
+            if plan.inbox_event_ids:
+                placeholders = ",".join("?" for _ in plan.inbox_event_ids)
+                self.connection_or_raise.execute(
+                    f"DELETE FROM capture_inbox WHERE event_id IN ({placeholders})",
+                    plan.inbox_event_ids,
+                )
+            if plan.candidate_ids_to_recycle:
+                self.connection_or_raise.executemany(
+                    """INSERT INTO candidate_retention
+                       (candidate_id, pinned, recycled_at, active_at)
+                       VALUES (?, 0, ?, NULL)
+                       ON CONFLICT(candidate_id) DO UPDATE SET
+                         recycled_at = excluded.recycled_at,
+                         active_at = NULL""",
+                    ((candidate_id, now) for candidate_id in plan.candidate_ids_to_recycle),
+                )
+            if plan.candidate_ids_to_delete:
+                placeholders = ",".join("?" for _ in plan.candidate_ids_to_delete)
+                clear_rounds = (
+                    "UPDATE capture_rounds SET candidate_id = NULL "
+                    f"WHERE candidate_id IN ({placeholders})"
+                )
+                self.connection_or_raise.execute(clear_rounds, plan.candidate_ids_to_delete)
+                self.connection_or_raise.execute(
+                    f"DELETE FROM candidate_memories WHERE id IN ({placeholders})",
+                    plan.candidate_ids_to_delete,
+                )
+            diagnostic_cutoff = self._retention_cutoff(cast(int, policy["diagnostic_days"]))
+            if bool(policy["diagnostics_enabled"]):
+                self.connection_or_raise.execute(
+                    "DELETE FROM diagnostic_records WHERE library_id = ? "
+                    "AND datetime(created_at) <= datetime(?)",
+                    (library_id, diagnostic_cutoff),
+                )
+                self.connection_or_raise.execute(
+                    "DELETE FROM retention_cleanup_runs WHERE library_id = ? "
+                    "AND datetime(completed_at) <= datetime(?) "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM retention_erasure_jobs AS erasure "
+                    "WHERE erasure.run_id = retention_cleanup_runs.id)",
+                    (library_id, diagnostic_cutoff),
+                )
+                cleanup_status = "error" if plan.plaintext_bodies else "done"
+                cleanup_error = "PhysicalErasePending" if plan.plaintext_bodies else ""
+                self.connection_or_raise.execute(
+                    """INSERT INTO retention_cleanup_runs
+                       (id, library_id, status, counts_json, last_error,
+                        started_at, completed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        library_id,
+                        cleanup_status,
+                        json.dumps(counts, sort_keys=True),
+                        cleanup_error,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                self.connection_or_raise.execute(
+                    "DELETE FROM diagnostic_records WHERE library_id = ?", (library_id,)
+                )
+                self.connection_or_raise.execute(
+                    """DELETE FROM retention_cleanup_runs WHERE library_id = ?
+                       AND NOT EXISTS (
+                         SELECT 1 FROM retention_erasure_jobs AS erasure
+                         WHERE erasure.run_id = retention_cleanup_runs.id
+                       )""",
+                    (library_id,),
+                )
+            if plan.plaintext_bodies:
+                fingerprints = self._retention_plaintext_fingerprints(plan.plaintext_bodies)
+                self.connection_or_raise.execute(
+                    """INSERT INTO retention_erasure_jobs
+                       (run_id, library_id, fingerprints_json, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (run_id, library_id, json.dumps(fingerprints), now, now),
+                )
+            self.connection_or_raise.commit()
+            database_committed = True
+            if plan.plaintext_bodies:
+                self._complete_retention_erasure(run_id, plan.plaintext_bodies)
+        except BaseException as error:
+            self.connection_or_raise.rollback()
+            with suppress(sqlite3.DatabaseError):
+                if not database_committed and bool(policy["diagnostics_enabled"]):
+                    self.connection_or_raise.execute(
+                        """INSERT INTO retention_cleanup_runs
+                           (id, library_id, status, counts_json, error_count, last_error,
+                            started_at, completed_at) VALUES (?, ?, 'error', '{}', 1, ?, ?, ?)""",
+                        (run_id, library_id, type(error).__name__, now, now),
+                    )
+                    self.connection_or_raise.commit()
+            raise
+        assert plan is not None
+        return {"run_id": run_id, "library_id": library_id, "counts": plan.counts()}
+
+    def clear_diagnostics(self) -> int:
+        count = int(
+            self.connection_or_raise.execute("SELECT COUNT(*) FROM diagnostic_records").fetchone()[
+                0
+            ]
+        )
+        count += int(
+            self.connection_or_raise.execute(
+                """SELECT COUNT(*) FROM retention_cleanup_runs
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM retention_erasure_jobs AS erasure
+                     WHERE erasure.run_id = retention_cleanup_runs.id
+                   )"""
+            ).fetchone()[0]
+        )
+        self.connection_or_raise.execute("DELETE FROM diagnostic_records")
+        self.connection_or_raise.execute(
+            """DELETE FROM retention_cleanup_runs
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM retention_erasure_jobs AS erasure
+                 WHERE erasure.run_id = retention_cleanup_runs.id
+               )"""
+        )
+        self.connection_or_raise.commit()
+        return count
 
     def candidate(self, candidate_id: str) -> dict[str, object]:
         row = self.connection_or_raise.execute(
@@ -2785,6 +3271,17 @@ class PlatformState:
             published_path=None if row[11] is None else str(row[11]),
             commit=None if row[12] is None else str(row[12]),
         ).payload()
+
+    def _require_candidate_not_recycled(self, candidate_id: str) -> None:
+        recycled = self.connection_or_raise.execute(
+            "SELECT 1 FROM candidate_retention WHERE candidate_id = ? "
+            "AND recycled_at IS NOT NULL",
+            (candidate_id,),
+        ).fetchone()
+        if recycled is not None:
+            raise CandidateGovernanceError(
+                "candidate is in the recycle bin; restore it before governance actions"
+            )
 
     def candidate_governance(self, candidate_id: str) -> dict[str, object]:
         candidate = self.candidate(candidate_id)
@@ -2869,7 +3366,11 @@ class PlatformState:
             raise CandidateGovernanceError("invalid governance classification")
         sql = """SELECT governance.candidate_id FROM candidate_governance AS governance
                  JOIN candidate_memories AS candidate ON candidate.id = governance.candidate_id
-                 WHERE candidate.status = 'pending'"""
+                 WHERE candidate.status = 'pending'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM candidate_retention AS retention
+                     WHERE retention.candidate_id = candidate.id
+                       AND retention.recycled_at IS NOT NULL)"""
         parameters: tuple[str, ...] = ()
         if classification is not None:
             sql += " AND governance.classification = ?"
@@ -2891,6 +3392,7 @@ class PlatformState:
         self, candidate_id: str, body: str, operator: str, reason: str
     ) -> dict[str, object]:
         current = self.candidate(candidate_id)
+        self._require_candidate_not_recycled(candidate_id)
         self._validate_governance_actor(operator, reason)
         if current["status"] != "pending":
             raise CandidateGovernanceError("only pending candidates can be edited")
@@ -2965,6 +3467,7 @@ class PlatformState:
         publication_source: str = "candidate-approval",
         commit_message: str | None = None,
     ) -> dict[str, object]:
+        self._require_candidate_not_recycled(candidate_id)
         self._validate_governance_actor(operator, reason)
         self._validate_operation_identifier(operation_id, "operation_id")
         self._ensure_decision_operation_available(candidate_id, operation_id)
@@ -3199,6 +3702,7 @@ class PlatformState:
     ) -> dict[str, object]:
         if action not in {"keep", "adopt", "merge", "scope"}:
             raise CandidateGovernanceError("invalid candidate resolution")
+        self._require_candidate_not_recycled(candidate_id)
         self._validate_governance_actor(operator, reason)
         self._validate_operation_identifier(operation_id, "operation_id")
         candidate = self.candidate(candidate_id)
@@ -3926,6 +4430,7 @@ class PlatformState:
         reason: str,
         operation_id: str,
     ) -> dict[str, object]:
+        self._require_candidate_not_recycled(candidate_id)
         self._validate_governance_actor(operator, reason)
         self._validate_operation_identifier(operation_id, "operation_id")
         self._ensure_decision_operation_available(candidate_id, operation_id)
@@ -8474,6 +8979,114 @@ class PlatformState:
             ),
         )
 
+    def _checkpoint_deleted_plaintext(self, plaintext_bodies: tuple[bytes, ...]) -> None:
+        result: tuple[object, ...] | None = None
+        for attempt in range(3):
+            row = self.connection_or_raise.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            result = None if row is None else tuple(row)
+            if result == (0, 0, 0):
+                break
+            if attempt < 2:
+                time.sleep(0.01)
+        if result != (0, 0, 0):
+            raise MemoryMutationError("SQLite WAL checkpoint is busy")
+        unreferenced_bodies = tuple(
+            body for body in plaintext_bodies if not self._plaintext_body_is_referenced(body)
+        )
+        for path in (
+            self.database_path,
+            Path(f"{self.database_path}-wal"),
+            Path(f"{self.database_path}-shm"),
+        ):
+            try:
+                persisted = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            if any(body and body in persisted for body in unreferenced_bodies):
+                raise MemoryMutationError("SQLite cleanup retained deleted plaintext")
+
+    def _retention_plaintext_fingerprints(
+        self, plaintext_bodies: tuple[bytes, ...]
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    "hmac-sha256:"
+                    + hmac.new(self.sensitive_dedupe_key, body, hashlib.sha256).hexdigest()
+                    for body in plaintext_bodies
+                    if body
+                }
+            )
+        )
+
+    def _complete_retention_erasure(
+        self, run_id: str, plaintext_bodies: tuple[bytes, ...] = ()
+    ) -> None:
+        try:
+            self._checkpoint_deleted_plaintext(plaintext_bodies)
+        except BaseException as error:
+            now = self._now().strftime("%Y-%m-%d %H:%M:%S")
+            with suppress(sqlite3.DatabaseError):
+                self.connection_or_raise.execute(
+                    """UPDATE retention_erasure_jobs
+                       SET attempts = attempts + 1, last_error = ?, updated_at = ?
+                       WHERE run_id = ?""",
+                    (type(error).__name__, now, run_id),
+                )
+                self.connection_or_raise.execute(
+                    """UPDATE retention_cleanup_runs
+                       SET status = 'error', error_count = error_count + 1,
+                           last_error = ?, completed_at = ?
+                       WHERE id = ?""",
+                    (type(error).__name__, now, run_id),
+                )
+                self.connection_or_raise.commit()
+            raise
+        now = self._now().strftime("%Y-%m-%d %H:%M:%S")
+        self.connection_or_raise.execute(
+            """UPDATE retention_cleanup_runs
+               SET status = 'done', last_error = '', completed_at = ? WHERE id = ?""",
+            (now, run_id),
+        )
+        self.connection_or_raise.execute(
+            "DELETE FROM retention_erasure_jobs WHERE run_id = ?", (run_id,)
+        )
+        self.connection_or_raise.commit()
+
+    def _retry_pending_retention_erasures(self, library_id: str | None = None) -> None:
+        rows = self.connection_or_raise.execute(
+            """SELECT run_id FROM retention_erasure_jobs
+               WHERE (? IS NULL OR library_id = ?) ORDER BY created_at, run_id""",
+            (library_id, library_id),
+        ).fetchall()
+        for row in rows:
+            self._complete_retention_erasure(str(row[0]))
+
+    def _plaintext_body_is_referenced(self, body: bytes) -> bool:
+        try:
+            text = body.decode()
+        except UnicodeDecodeError:
+            return False
+        queries = (
+            "SELECT 1 FROM capture_inbox WHERE instr(content, ?) > 0 LIMIT 1",
+            "SELECT 1 FROM candidate_memories WHERE instr(body, ?) > 0 LIMIT 1",
+            "SELECT 1 FROM candidate_audit WHERE instr(body, ?) > 0 LIMIT 1",
+            "SELECT 1 FROM memory_versions WHERE instr(content, ?) > 0 LIMIT 1",
+            "SELECT 1 FROM memory_chunks WHERE instr(content, ?) > 0 LIMIT 1",
+            """SELECT 1 FROM out_of_band_changes
+               WHERE instr(base_content, ?) > 0
+                  OR instr(platform_content, ?) > 0
+                  OR instr(coalesce(external_content, ''), ?) > 0
+               LIMIT 1""",
+        )
+        for query in queries:
+            parameter_count = query.count("?")
+            if self.connection_or_raise.execute(
+                query, (text,) * parameter_count
+            ).fetchone() is not None:
+                return True
+        return False
+
     def _checkpoint_forgotten_plaintext(self, plaintext_bodies: tuple[bytes, ...]) -> None:
         result: tuple[object, ...] | None = None
         for attempt in range(3):
@@ -9907,9 +10520,13 @@ class PlatformState:
                 (candidate_id, session_id, turn_id),
             )
             self.connection_or_raise.execute(
-                """UPDATE capture_inbox SET consolidated_at = CURRENT_TIMESTAMP
+                """UPDATE capture_inbox SET consolidated_at = ?
                    WHERE session_id = ? AND turn_id = ?""",
-                (session_id, turn_id),
+                (
+                    self._now().strftime("%Y-%m-%d %H:%M:%S"),
+                    session_id,
+                    turn_id,
+                ),
             )
             self.connection_or_raise.commit()
 

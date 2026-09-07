@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from personal_agent_memory.model_client import ModelEndpoint
@@ -29,6 +30,7 @@ class Settings:
     embedding: ModelEndpoint | None = None
     reranker: ModelEndpoint | None = None
     graph: ModelEndpoint | None = None
+    retention_now: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_dir", self.state_dir.expanduser().resolve())
@@ -52,3 +54,10 @@ class Settings:
             raise ConfigurationError("host must be an explicit loopback address")
         if not 1 <= self.port <= 65535:
             raise ConfigurationError("port must be between 1 and 65535")
+        if self.retention_now is not None:
+            try:
+                parsed = datetime.fromisoformat(self.retention_now.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ConfigurationError("retention clock must be an ISO-8601 timestamp") from error
+            if parsed.tzinfo is None:
+                raise ConfigurationError("retention clock must include a UTC offset")

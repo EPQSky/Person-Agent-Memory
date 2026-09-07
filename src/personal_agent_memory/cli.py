@@ -56,6 +56,11 @@ def serve(
     model_timeout: float = typer.Option(2.0, min=0.05, max=30.0),
     model_concurrency: int = typer.Option(2, min=1, max=32),
     model_retries: int = typer.Option(1, min=0, max=3),
+    retention_now: str | None = typer.Option(
+        None,
+        envvar="PERSONAL_AGENT_MEMORY_RETENTION_NOW",
+        help="Fixed UTC clock for retention acceptance tests.",
+    ),
 ) -> None:
     """Run the single local memory daemon."""
     try:
@@ -100,6 +105,7 @@ def serve(
                 if graph_url is not None
                 else None
             ),
+            retention_now=retention_now,
         )
         ensure_port_available(settings.host, settings.port)
     except (ConfigurationError, ValueError) as error:

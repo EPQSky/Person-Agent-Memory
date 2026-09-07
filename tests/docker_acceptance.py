@@ -2694,10 +2694,18 @@ forget_command = [
     "--graph-model",
     "deterministic-graph",
 ]
+forget_daemon_log = forget_state / "daemon.log"
 
 
 def start_forget_daemon() -> subprocess.Popen[bytes]:
-    process = subprocess.Popen(forget_command)
+    forget_state.mkdir(parents=True, exist_ok=True)
+    log_stream = forget_daemon_log.open("ab")
+    process = subprocess.Popen(
+        forget_command,
+        stdout=log_stream,
+        stderr=subprocess.STDOUT,
+    )
+    log_stream.close()
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -2934,8 +2942,12 @@ try:
         if persisted_path.exists():
             assert forgotten_capture_content.encode() not in persisted_path.read_bytes()
 finally:
-    forget_process.send_signal(signal.SIGINT)
-    assert forget_process.wait(timeout=20) == 0
+    if forget_process.poll() is None:
+        forget_process.send_signal(signal.SIGINT)
+        assert forget_process.wait(timeout=20) == 0
+    else:
+        print(forget_daemon_log.read_text(encoding="utf-8", errors="replace"))
+        assert forget_process.returncode == 0
 
 crash_cleanup_id = str(forgotten["tombstone_id"])
 crash_quarantine = (
@@ -3006,7 +3018,9 @@ try:
         for path in official_projection.rglob("*")
         if path.is_file()
     } == official_projection_before_restart
-    with sqlite3.connect(forget_state / "platform.sqlite3") as db:
+    with sqlite3.connect(
+        f"file:{forget_state / 'platform.sqlite3'}?mode=ro", uri=True
+    ) as db:
         assert db.execute(
             "SELECT COUNT(*) FROM graph_cleanup_intents WHERE cleanup_id = ?",
             (crash_cleanup_id,),
@@ -3617,6 +3631,379 @@ assert (
     == []
 )
 assert project_git_fingerprint() == project_before
+
+# Ticket 16 uses a fixed retention clock to exercise inclusive boundaries,
+# protected candidates, privacy cleanup, idempotency, and process restart.
+retention_state = Path("/tmp/pam-ticket16-retention-state")
+shutil.rmtree(retention_state, ignore_errors=True)
+retention_root = Path("/project-roots/ticket16-retention-memory")
+retention_root.mkdir()
+retention_document = retention_root / "formal.md"
+retention_formal = "# Database\n\nThe application database is PostgreSQL.\n"
+retention_document.write_text(retention_formal, encoding="utf-8")
+retention_command = [
+    "personal-agent-memory",
+    "serve",
+    "--state-dir",
+    str(retention_state),
+    "--library-root",
+    "/project-roots",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "37331",
+    "--retention-now",
+    "2026-09-07T00:00:00Z",
+]
+
+
+def start_retention_daemon() -> subprocess.Popen[bytes]:
+    process = subprocess.Popen(
+        retention_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Ticket 16 retention daemon exited during startup")
+        if (retention_state / "api-key").exists():
+            current_key = (retention_state / "api-key").read_text(encoding="utf-8").strip()
+            try:
+                if request("http://127.0.0.1:37331/health/live", current_key)[0] == 200:
+                    return process
+            except OSError:
+                pass
+        time.sleep(0.1)
+    process.terminate()
+    process.wait(timeout=10)
+    raise RuntimeError("Ticket 16 retention daemon did not become ready")
+
+
+retention_process = start_retention_daemon()
+retention_key = (retention_state / "api-key").read_text(encoding="utf-8").strip()
+try:
+    retention_library_code, retention_library = request(
+        "http://127.0.0.1:37331/api/v1/libraries",
+        retention_key,
+        {"path": str(retention_root), "kind": "project"},
+    )
+    assert retention_library_code == 201
+    retention_id = str(retention_library["id"])
+    default_policy_code, default_policy = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-policy",
+        retention_key,
+    )
+    assert default_policy_code == 200
+    assert default_policy == {
+        "library_id": retention_id,
+        "inbox_days": 30,
+        "candidate_days": 90,
+        "recycle_days": 30,
+        "early_inbox_cleanup": True,
+        "diagnostics_enabled": True,
+        "diagnostic_days": 7,
+    }
+    policy_code, policy = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-policy",
+        retention_key,
+        {
+            "inbox_days": 30,
+            "candidate_days": 0,
+            "recycle_days": 30,
+            "early_inbox_cleanup": True,
+            "diagnostics_enabled": True,
+            "diagnostic_days": 7,
+        },
+        method="PUT",
+    )
+    assert policy_code == 200
+    assert policy["candidate_days"] == 0
+
+    def retention_candidate(identifier: str, body: str) -> dict[str, object]:
+        code, value = request(
+            "http://127.0.0.1:37331/mcp/candidates",
+            retention_key,
+            {
+                "library_id": retention_id,
+                "suggested_type": "decision",
+                "body": body,
+                "source_references": [f"docker-session:ticket16:{identifier}"],
+                "creator": "docker-ticket16",
+                "idempotency_key": f"docker-ticket16-{identifier}",
+            },
+        )
+        assert code == 201
+        return cast(dict[str, object], value)
+
+    recoverable_candidate = retention_candidate(
+        "recoverable", "# Retention\n\nTicket16RecoverableBody.\n"
+    )
+    delete_candidate = retention_candidate(
+        "delete-boundary", "# Retention\n\nTicket16DeleteBoundaryBody.\n"
+    )
+    pinned_candidate = retention_candidate(
+        "pinned", "# Retention\n\nTicket16PinnedBody.\n"
+    )
+    conflict_candidate = retention_candidate(
+        "conflict", "# Database\n\nThe application database is MySQL.\n"
+    )
+    conflict_governance = request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{conflict_candidate['id']}/governance",
+        retention_key,
+    )[1]
+    assert conflict_governance["classification"] == "conflict"
+    pin_code, _ = request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{pinned_candidate['id']}/pin",
+        retention_key,
+        {"pinned": True},
+        method="PUT",
+    )
+    assert pin_code == 200
+
+    retention_database = retention_state / "platform.sqlite3"
+    with sqlite3.connect(retention_database) as database:
+        database.execute(
+            "UPDATE candidate_memories SET created_at = '2026-09-07 00:00:00' "
+            "WHERE library_id = ?",
+            (retention_id,),
+        )
+        database.execute(
+            "UPDATE candidate_memories SET created_at = '2026-01-01 00:00:00' "
+            "WHERE id = ?",
+            (recoverable_candidate["id"],),
+        )
+        database.execute(
+            """INSERT INTO capture_inbox
+               (event_id, request_hash, session_id, project_id, library_id, turn_id,
+                event_kind, content, occurred_at, received_at, consolidated_at)
+               VALUES ('ticket16-boundary', 'ticket16-boundary-hash', 'ticket16-old',
+                       'ticket16-project', ?, 'old-turn', 'user',
+                       'Ticket16InboxBoundaryBody', '2026-08-08T00:00:00Z',
+                       '2026-08-08 00:00:00', NULL),
+                      ('ticket16-early', 'ticket16-early-hash', 'ticket16-early',
+                       'ticket16-project', ?, 'early-turn', 'assistant',
+                       'Ticket16InboxEarlyBody', '2026-09-06T00:00:00Z',
+                       '2026-09-06 00:00:00', '2026-09-06 00:01:00')""",
+            (retention_id, retention_id),
+        )
+
+    retention_history_before = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/history", retention_key
+    )[1]
+    preview_code, retention_preview = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup/preview",
+        retention_key,
+    )
+    assert preview_code == 200
+    assert retention_preview["as_of"] == "2026-09-07T00:00:00Z"
+    assert retention_preview["counts"] == {
+        "capture_inbox": 2,
+        "candidates_to_recycle": 2,
+        "candidates_to_delete": 0,
+        "protected_candidates": 2,
+    }
+    cleanup_code, first_cleanup = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup",
+        retention_key,
+        method="POST",
+    )
+    assert cleanup_code == 200
+    assert first_cleanup["counts"] == retention_preview["counts"]
+    recycled = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/candidate-recycle-bin",
+        retention_key,
+    )[1]
+    assert {item["candidate"]["id"] for item in recycled} == {
+        recoverable_candidate["id"],
+        delete_candidate["id"],
+    }
+    active_candidates = request(
+        f"http://127.0.0.1:37331/api/v1/candidates?library_id={retention_id}", retention_key
+    )[1]
+    assert {item["id"] for item in active_candidates} == {
+        pinned_candidate["id"],
+        conflict_candidate["id"],
+    }
+    governance_queue = request(
+        "http://127.0.0.1:37331/api/v1/candidate-governance", retention_key
+    )[1]
+    assert recoverable_candidate["id"] not in {
+        item["candidate"]["id"] for item in governance_queue
+    }
+    recycled_edit_code, recycled_edit = request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{recoverable_candidate['id']}",
+        retention_key,
+        {
+            "body": "# Retention\n\nTicket16RecycledEditMustFail.\n",
+            "operator": "docker-ticket16",
+            "reason": "Recycle bin is restore-only",
+        },
+        method="PUT",
+    )
+    assert recycled_edit_code == 409
+    assert "restore it" in str(recycled_edit["detail"])
+
+    with sqlite3.connect(retention_database) as database:
+        assert database.execute(
+            "SELECT COUNT(*) FROM capture_inbox WHERE library_id = ?", (retention_id,)
+        ).fetchone() == (0,)
+        database.execute(
+            "UPDATE candidate_retention SET recycled_at = '2026-08-08 00:00:00' "
+            "WHERE candidate_id = ?",
+            (delete_candidate["id"],),
+        )
+        cleanup_records = database.execute(
+            "SELECT counts_json, last_error FROM retention_cleanup_runs WHERE library_id = ?",
+            (retention_id,),
+        ).fetchall()
+        assert cleanup_records
+        serialized_records = json.dumps(cleanup_records)
+        assert "Ticket16Inbox" not in serialized_records
+        assert "Ticket16RecoverableBody" not in serialized_records
+
+    delete_preview = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup/preview",
+        retention_key,
+    )[1]
+    assert delete_preview["counts"]["candidates_to_recycle"] == 0
+    assert delete_preview["counts"]["candidates_to_delete"] == 1
+    delete_cleanup_code, delete_cleanup = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup",
+        retention_key,
+        method="POST",
+    )
+    assert delete_cleanup_code == 200
+    assert delete_cleanup["counts"] == delete_preview["counts"]
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{delete_candidate['id']}", retention_key
+    )[0] == 404
+    restore_code, restored_candidate = request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{recoverable_candidate['id']}/restore",
+        retention_key,
+        method="POST",
+    )
+    assert restore_code == 200
+    assert restored_candidate["id"] == recoverable_candidate["id"]
+    policy["candidate_days"] = 90
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-policy",
+        retention_key,
+        policy,
+        method="PUT",
+    )[0] == 200
+    repeated_code, repeated_cleanup = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup",
+        retention_key,
+        method="POST",
+    )
+    assert repeated_code == 200
+    assert repeated_cleanup["counts"] == {
+        "capture_inbox": 0,
+        "candidates_to_recycle": 0,
+        "candidates_to_delete": 0,
+        "protected_candidates": 0,
+    }
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{recoverable_candidate['id']}/pin",
+        retention_key,
+        {"pinned": True},
+        method="PUT",
+    )[0] == 200
+    zero_day_candidate = retention_candidate(
+        "zero-day", "# Retention\n\nTicket16ZeroDayPhysicalPlaintext.\n"
+    )
+    zero_day_policy = dict(policy)
+    zero_day_policy["candidate_days"] = 0
+    zero_day_policy["recycle_days"] = 0
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-policy",
+        retention_key,
+        zero_day_policy,
+        method="PUT",
+    )[0] == 200
+    zero_first_preview = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup/preview",
+        retention_key,
+    )[1]
+    assert zero_first_preview["counts"]["candidates_to_recycle"] == 1
+    assert zero_first_preview["counts"]["candidates_to_delete"] == 0
+    zero_first_run = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup",
+        retention_key,
+        method="POST",
+    )[1]
+    assert zero_first_run["counts"] == zero_first_preview["counts"]
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{zero_day_candidate['id']}",
+        retention_key,
+    )[0] == 200
+    zero_second_preview = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup/preview",
+        retention_key,
+    )[1]
+    assert zero_second_preview["counts"]["candidates_to_recycle"] == 0
+    assert zero_second_preview["counts"]["candidates_to_delete"] == 1
+    zero_second_run = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup",
+        retention_key,
+        method="POST",
+    )[1]
+    assert zero_second_run["counts"] == zero_second_preview["counts"]
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/candidates/{zero_day_candidate['id']}",
+        retention_key,
+    )[0] == 404
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-policy",
+        retention_key,
+        policy,
+        method="PUT",
+    )[0] == 200
+    for suffix in ("", "-wal", "-shm"):
+        sqlite_path = Path(f"{retention_database}{suffix}")
+        if not sqlite_path.exists():
+            continue
+        persisted = sqlite_path.read_bytes()
+        assert b"Ticket16DeleteBoundaryBody" not in persisted
+        assert b"Ticket16InboxBoundaryBody" not in persisted
+        assert b"Ticket16InboxEarlyBody" not in persisted
+        assert b"Ticket16ZeroDayPhysicalPlaintext" not in persisted
+    assert retention_document.read_text(encoding="utf-8") == retention_formal
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/history", retention_key
+    )[1] == retention_history_before
+finally:
+    retention_process.send_signal(signal.SIGINT)
+    assert retention_process.wait(timeout=10) == 0
+
+retention_restart_process = start_retention_daemon()
+try:
+    restarted_policy = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-policy",
+        retention_key,
+    )[1]
+    assert restarted_policy["candidate_days"] == 90
+    restarted_candidates = request(
+        f"http://127.0.0.1:37331/api/v1/candidates?library_id={retention_id}", retention_key
+    )[1]
+    assert {item["id"] for item in restarted_candidates} == {
+        recoverable_candidate["id"],
+        pinned_candidate["id"],
+        conflict_candidate["id"],
+    }
+    restarted_cleanup = request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/retention-cleanup",
+        retention_key,
+        method="POST",
+    )[1]
+    assert restarted_cleanup["counts"]["candidates_to_recycle"] == 0
+    assert restarted_cleanup["counts"]["candidates_to_delete"] == 0
+    assert retention_document.read_text(encoding="utf-8") == retention_formal
+    assert request(
+        f"http://127.0.0.1:37331/api/v1/libraries/{retention_id}/history", retention_key
+    )[1] == retention_history_before
+finally:
+    retention_restart_process.send_signal(signal.SIGINT)
+    assert retention_restart_process.wait(timeout=10) == 0
 
 assert request("http://127.0.0.1:18080/v1/models")[1]["data"]
 assert request(

@@ -4,6 +4,7 @@ import hmac
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -187,14 +188,34 @@ class SensitiveResolution(BaseModel):
     resolution: Literal["discard", "acknowledge"]
 
 
+class RetentionPolicyUpdate(BaseModel):
+    inbox_days: int = Field(default=30, ge=0, le=3650)
+    candidate_days: int = Field(default=90, ge=0, le=3650)
+    recycle_days: int = Field(default=30, ge=0, le=3650)
+    early_inbox_cleanup: bool = True
+    diagnostics_enabled: bool = True
+    diagnostic_days: int = Field(default=7, ge=0, le=365)
+
+
+class CandidatePinUpdate(BaseModel):
+    pinned: bool
+
+
 def create_app(settings: Settings) -> FastAPI:
     key_store = ApiKeyStore(settings.state_dir / "api-key")
     model_client = OpenAICompatibleClient(settings.embedding, settings.reranker, settings.graph)
+    fixed_now: datetime | None = None
+    if settings.retention_now is not None:
+        fixed_now = datetime.fromisoformat(settings.retention_now.replace("Z", "+00:00"))
+        if fixed_now.tzinfo is None:
+            fixed_now = fixed_now.replace(tzinfo=UTC)
+        fixed_now = fixed_now.astimezone(UTC)
     platform_state = PlatformState(
         settings.state_dir / "platform.sqlite3",
         library_roots=settings.library_roots,
         model_client=model_client,
         graph_adapter=JiuwenMilvusGraphAdapter(settings.state_dir / "graphs", model_client),
+        now=(lambda: fixed_now) if fixed_now is not None else None,
     )
     markdown = MarkdownIt("commonmark", {"html": False})
 
@@ -280,9 +301,7 @@ def create_app(settings: Settings) -> FastAPI:
             ) from error
 
     @app.post("/api/v1/libraries/{library_id}/scan", dependencies=[Depends(authenticate)])
-    async def scan_library(
-        library_id: str, accept_external: bool = False
-    ) -> dict[str, int | str]:
+    async def scan_library(library_id: str, accept_external: bool = False) -> dict[str, int | str]:
         try:
             if accept_external:
                 raise MemoryMutationError(
@@ -573,7 +592,11 @@ def create_app(settings: Settings) -> FastAPI:
         detail = str(error)
         if detail in {"candidate memory not found", "memory library not found"}:
             code = status.HTTP_404_NOT_FOUND
-        elif "already" in detail or "no longer pending" in detail:
+        elif (
+            "already" in detail
+            or "no longer pending" in detail
+            or "in the recycle bin" in detail
+        ):
             code = status.HTTP_409_CONFLICT
         else:
             code = status.HTTP_422_UNPROCESSABLE_CONTENT
@@ -689,6 +712,82 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def consolidate_capture(request: CaptureConsolidation) -> dict[str, int]:
         return {"queued": platform_state.trigger_capture_consolidation(request.session_id)}
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/retention-policy",
+        dependencies=[Depends(authenticate)],
+    )
+    async def retention_policy(library_id: str) -> dict[str, object]:
+        try:
+            return platform_state.retention_policy(library_id)
+        except LibraryRegistrationError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+    @app.put(
+        "/api/v1/libraries/{library_id}/retention-policy",
+        dependencies=[Depends(authenticate)],
+    )
+    async def update_retention_policy(
+        library_id: str, policy: RetentionPolicyUpdate
+    ) -> dict[str, object]:
+        try:
+            return platform_state.update_retention_policy(library_id, **policy.model_dump())
+        except LibraryRegistrationError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/retention-cleanup/preview",
+        dependencies=[Depends(authenticate)],
+    )
+    async def preview_retention_cleanup(library_id: str) -> dict[str, object]:
+        try:
+            return platform_state.preview_retention_cleanup(library_id)
+        except LibraryRegistrationError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/retention-cleanup",
+        dependencies=[Depends(authenticate)],
+    )
+    async def run_retention_cleanup(library_id: str) -> dict[str, object]:
+        try:
+            return platform_state.run_retention_cleanup(library_id)
+        except LibraryRegistrationError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+    @app.put(
+        "/api/v1/candidates/{candidate_id}/pin",
+        dependencies=[Depends(authenticate)],
+    )
+    async def pin_candidate(candidate_id: str, update: CandidatePinUpdate) -> dict[str, object]:
+        try:
+            return platform_state.set_candidate_pinned(candidate_id, update.pinned)
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/candidate-recycle-bin",
+        dependencies=[Depends(authenticate)],
+    )
+    async def candidate_recycle_bin(library_id: str) -> list[dict[str, object]]:
+        try:
+            return platform_state.list_recycled_candidates(library_id)
+        except LibraryRegistrationError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+
+    @app.post(
+        "/api/v1/candidates/{candidate_id}/restore",
+        dependencies=[Depends(authenticate)],
+    )
+    async def restore_recycled_candidate(candidate_id: str) -> dict[str, object]:
+        try:
+            return platform_state.restore_recycled_candidate(candidate_id)
+        except CandidateGovernanceError as error:
+            raise candidate_error(error) from error
+
+    @app.delete("/api/v1/diagnostics", dependencies=[Depends(authenticate)])
+    async def clear_diagnostics() -> dict[str, int]:
+        return {"deleted": platform_state.clear_diagnostics()}
 
     @app.post(
         "/mcp/candidates",

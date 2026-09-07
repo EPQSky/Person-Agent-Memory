@@ -84,6 +84,10 @@
         searchHeading.textContent = 'Search project memory';
         const searchForm = document.createElement('form');
         searchForm.innerHTML = '<div class="field"><label for="search-cwd">Project working directory</label><input id="search-cwd" required></div><div class="field"><label for="search-query">Keywords</label><input id="search-query" required></div><button type="submit">Search</button><p id="search-message"></p><div id="search-results"></div>';
+        const retentionHeading = document.createElement('h2');
+        retentionHeading.textContent = 'Retention and privacy';
+        const retentionForm = document.createElement('form');
+        retentionForm.innerHTML = '<div class="field"><label for="retention-library">Memory library</label><select id="retention-library"></select></div><div class="field"><label for="inbox-days">Capture Inbox days</label><input id="inbox-days" type="number" min="0" max="3650"></div><div class="field"><label for="candidate-days">Candidate days</label><input id="candidate-days" type="number" min="0" max="3650"></div><div class="field"><label for="recycle-days">Recycle bin days</label><input id="recycle-days" type="number" min="0" max="3650"></div><div class="field"><label><input id="early-inbox-cleanup" type="checkbox"> Clean consolidated Inbox data early</label></div><div class="field"><label><input id="diagnostics-enabled" type="checkbox"> Retain bounded diagnostics</label></div><div class="field"><label for="diagnostic-days">Diagnostic days</label><input id="diagnostic-days" type="number" min="0" max="365"></div><div class="candidate-actions"><button type="submit">Save policy</button><button type="button" id="retention-preview">Preview cleanup</button><button type="button" id="retention-run" class="danger">Clean now</button><button type="button" id="diagnostics-clear" class="danger">Clear diagnostics</button></div><pre id="retention-impact" class="diff"></pre><div id="candidate-recycle-bin"></div><p id="retention-message"></p>';
         const candidateHeading = document.createElement('h2');
         candidateHeading.textContent = 'Candidate memories';
         const candidateStatus = document.createElement('select');
@@ -94,7 +98,7 @@
         const candidateList = document.createElement('nav');
         candidateList.className = 'candidate-list';
         const candidateDetail = document.createElement('div');
-        candidateDetail.innerHTML = '<strong id="candidate-title">Select a candidate</strong><p id="candidate-sources" class="source"></p><p id="candidate-governance" class="source"></p><pre id="candidate-current" class="diff" hidden></pre><pre id="candidate-conflict-diff" class="diff" hidden></pre><textarea id="candidate-body" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">Operator</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">Reason</label><input id="candidate-reason" disabled></div><div class="field"><label for="candidate-resolution">Resolution</label><select id="candidate-resolution" disabled><option value="keep">Keep current</option><option value="adopt">Adopt candidate</option><option value="merge">Merge as new version</option><option value="scope">Different conditions</option></select></div><div class="field"><label for="candidate-effective">Effective at</label><input id="candidate-effective" type="datetime-local" disabled></div><div class="field"><label for="candidate-condition">Condition</label><input id="candidate-condition" disabled></div><div class="candidate-actions"><button type="button" id="candidate-save" disabled>Save</button><button type="button" id="candidate-approve" disabled>Approve</button><button type="button" id="candidate-resolve" disabled>Resolve</button><button type="button" id="candidate-reject" class="danger" disabled>Reject</button></div><p id="candidate-message"></p>';
+        candidateDetail.innerHTML = '<strong id="candidate-title">Select a candidate</strong><p id="candidate-sources" class="source"></p><p id="candidate-governance" class="source"></p><pre id="candidate-current" class="diff" hidden></pre><pre id="candidate-conflict-diff" class="diff" hidden></pre><textarea id="candidate-body" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">Operator</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">Reason</label><input id="candidate-reason" disabled></div><div class="field"><label for="candidate-resolution">Resolution</label><select id="candidate-resolution" disabled><option value="keep">Keep current</option><option value="adopt">Adopt candidate</option><option value="merge">Merge as new version</option><option value="scope">Different conditions</option></select></div><div class="field"><label for="candidate-effective">Effective at</label><input id="candidate-effective" type="datetime-local" disabled></div><div class="field"><label for="candidate-condition">Condition</label><input id="candidate-condition" disabled></div><div class="candidate-actions"><button type="button" id="candidate-pin" disabled>Pin</button><button type="button" id="candidate-save" disabled>Save</button><button type="button" id="candidate-approve" disabled>Approve</button><button type="button" id="candidate-resolve" disabled>Resolve</button><button type="button" id="candidate-reject" class="danger" disabled>Reject</button></div><p id="candidate-message"></p>';
         candidateLayout.append(candidateList, candidateDetail);
         const sensitiveHeading = document.createElement('h2');
         sensitiveHeading.textContent = 'Sensitive quarantine';
@@ -142,7 +146,7 @@
         const forgottenForm = document.createElement('form');
         forgottenForm.innerHTML = '<div class="field"><label for="forgotten-memory">Forgotten memory</label><select id="forgotten-memory" required></select></div><div class="field"><label for="forgotten-commit">Allowed history revision</label><select id="forgotten-commit" required></select></div><button type="submit">Restore as new transaction</button><p id="forgotten-message"></p>';
         historyDiff.className = 'diff';
-        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, candidateHeading, candidateStatus, candidateLayout, sensitiveHeading, sensitiveLayout, editorHeading, editorLibrary, editorLayout, reconciliationHeading, reconciliationLayout, historyHeading, history, restoreAction, historyDiff, forgottenHeading, forgottenForm);
+        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, retentionHeading, retentionForm, candidateHeading, candidateStatus, candidateLayout, sensitiveHeading, sensitiveLayout, editorHeading, editorLibrary, editorLayout, reconciliationHeading, reconciliationLayout, historyHeading, history, restoreAction, historyDiff, forgottenHeading, forgottenForm);
 
         let projectLibraries = [];
         let projectBindings = [];
@@ -177,6 +181,7 @@
           allLibraries = libraries;
           projectLibraries = libraries.filter((library) => library.kind === 'project');
           fillSelect(editorLibrary, libraries, (library) => library.id, (library) => `${library.canonical_path} (${library.kind})`);
+          fillSelect(retentionForm.querySelector('#retention-library'), libraries, (library) => library.id, (library) => `${library.canonical_path} (${library.kind})`);
           fillSelect(bindingForm.querySelector('#project-library'), projectLibraries, (library) => library.id, (library) => `${library.canonical_path} (${library.id})`);
           const body = table.querySelector('tbody');
           body.replaceChildren();
@@ -192,9 +197,42 @@
           }
           await refreshBindings();
           await refreshCandidates();
+          await refreshRetention();
           await refreshSensitiveQuarantine();
           await refreshDocuments();
           await refreshReconciliation();
+        }
+
+        async function refreshRetention() {
+          const libraryId = retentionForm.querySelector('#retention-library').value;
+          if (!libraryId) return;
+          const [policyResponse, recycleResponse] = await Promise.all([
+            fetch(`/api/v1/libraries/${libraryId}/retention-policy`, {headers: {Authorization: `Bearer ${key}`}}),
+            fetch(`/api/v1/libraries/${libraryId}/candidate-recycle-bin`, {headers: {Authorization: `Bearer ${key}`}}),
+          ]);
+          if (!policyResponse.ok || !recycleResponse.ok) return;
+          const policy = await policyResponse.json();
+          for (const field of ['inbox_days', 'candidate_days', 'recycle_days', 'diagnostic_days']) retentionForm.querySelector(`#${field.replaceAll('_', '-')}`).value = policy[field];
+          retentionForm.querySelector('#early-inbox-cleanup').checked = policy.early_inbox_cleanup;
+          retentionForm.querySelector('#diagnostics-enabled').checked = policy.diagnostics_enabled;
+          const recycleBin = retentionForm.querySelector('#candidate-recycle-bin');
+          recycleBin.replaceChildren();
+          for (const item of await recycleResponse.json()) {
+            const button = recycleBin.appendChild(document.createElement('button'));
+            button.type = 'button';
+            button.textContent = `Restore ${item.candidate.suggested_type} · ${item.candidate.id}`;
+            button.addEventListener('click', async () => {
+              await fetch(`/api/v1/candidates/${item.candidate.id}/restore`, {method: 'POST', headers: {Authorization: `Bearer ${key}`}});
+              await refreshRetention();
+              await refreshCandidates();
+            });
+          }
+        }
+
+        async function previewRetention() {
+          const libraryId = retentionForm.querySelector('#retention-library').value;
+          const response = await fetch(`/api/v1/libraries/${libraryId}/retention-cleanup/preview`, {headers: {Authorization: `Bearer ${key}`}});
+          retentionForm.querySelector('#retention-impact').textContent = response.ok ? JSON.stringify(await response.json(), null, 2) : 'Preview unavailable.';
         }
 
         async function refreshReconciliation(selectedId = activeReconciliation?.id) {
@@ -299,7 +337,7 @@
           candidateDetail.querySelector('#candidate-title').textContent = 'Select a candidate';
           candidateDetail.querySelector('#candidate-sources').textContent = '';
           candidateDetail.querySelector('#candidate-body').value = '';
-          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = true;
+          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-pin', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = true;
         }
 
         async function showCandidate(candidate) {
@@ -310,7 +348,7 @@
           candidateDetail.querySelector('#candidate-body').value = candidate.body;
           candidateDetail.querySelector('#candidate-operator').value = candidate.operator || '';
           candidateDetail.querySelector('#candidate-reason').value = candidate.reason || '';
-          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = !pending;
+          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-pin', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = !pending;
           candidateDetail.querySelector('#candidate-message').textContent = candidate.published_path ? `Published as ${candidate.published_path} in ${candidate.commit}` : '';
           const response = await fetch(`/api/v1/candidates/${candidate.id}/governance`, {headers: {Authorization: `Bearer ${key}`}});
           if (!response.ok || activeCandidate?.id !== candidate.id) return;
@@ -707,6 +745,39 @@
           }
         });
         candidateStatus.addEventListener('change', () => refreshCandidates());
+        candidateDetail.querySelector('#candidate-pin').addEventListener('click', async () => {
+          if (!activeCandidate) return;
+          const response = await fetch(`/api/v1/candidates/${activeCandidate.id}/pin`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({pinned: true})});
+          candidateDetail.querySelector('#candidate-message').textContent = response.ok ? 'Candidate pinned.' : 'Could not pin candidate.';
+        });
+        retentionForm.querySelector('#retention-library').addEventListener('change', refreshRetention);
+        retentionForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const libraryId = retentionForm.querySelector('#retention-library').value;
+          const payload = {
+            inbox_days: Number(retentionForm.querySelector('#inbox-days').value),
+            candidate_days: Number(retentionForm.querySelector('#candidate-days').value),
+            recycle_days: Number(retentionForm.querySelector('#recycle-days').value),
+            early_inbox_cleanup: retentionForm.querySelector('#early-inbox-cleanup').checked,
+            diagnostics_enabled: retentionForm.querySelector('#diagnostics-enabled').checked,
+            diagnostic_days: Number(retentionForm.querySelector('#diagnostic-days').value),
+          };
+          const response = await fetch(`/api/v1/libraries/${libraryId}/retention-policy`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          retentionForm.querySelector('#retention-message').textContent = response.ok ? 'Retention policy saved.' : 'Could not save retention policy.';
+          if (response.ok) await previewRetention();
+        });
+        retentionForm.querySelector('#retention-preview').addEventListener('click', previewRetention);
+        retentionForm.querySelector('#retention-run').addEventListener('click', async () => {
+          const libraryId = retentionForm.querySelector('#retention-library').value;
+          const response = await fetch(`/api/v1/libraries/${libraryId}/retention-cleanup`, {method: 'POST', headers: {Authorization: `Bearer ${key}`}});
+          retentionForm.querySelector('#retention-impact').textContent = response.ok ? JSON.stringify(await response.json(), null, 2) : 'Cleanup failed.';
+          await refreshRetention();
+          await refreshCandidates();
+        });
+        retentionForm.querySelector('#diagnostics-clear').addEventListener('click', async () => {
+          await fetch('/api/v1/diagnostics', {method: 'DELETE', headers: {Authorization: `Bearer ${key}`}});
+          retentionForm.querySelector('#retention-message').textContent = 'Diagnostics cleared.';
+        });
         candidateDetail.querySelector('#candidate-save').addEventListener('click', () => candidateAction('edit'));
         candidateDetail.querySelector('#candidate-approve').addEventListener('click', () => candidateAction('approve'));
         candidateDetail.querySelector('#candidate-resolve').addEventListener('click', resolveCandidate);
