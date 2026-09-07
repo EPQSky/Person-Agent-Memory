@@ -3,17 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import httpx
+import uvicorn
+from fastapi import Request
 from fastapi.testclient import TestClient
+from starlette.responses import Response
 
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import Settings
@@ -307,16 +312,28 @@ def test_transient_extraction_retries_after_restart_without_duplicate_candidate(
 
 class CaptureHandler(BaseHTTPRequestHandler):
     events: list[dict[str, object]] = []
+    persistence_deadlines: list[str | None] = []
+    request_received_at: list[int] = []
     response_delay = 0.0
     permanent_contents: set[str] = set()
+    transient_contents: set[str] = set()
 
     def do_POST(self) -> None:  # noqa: N802
         size = int(self.headers.get("content-length", "0"))
         payload = json.loads(self.rfile.read(size))
         if self.path.endswith("/events"):
             type(self).events.append(payload)
+            type(self).persistence_deadlines.append(
+                self.headers.get("x-personal-agent-memory-persistence-deadline-ms")
+            )
+            type(self).request_received_at.append(int(time.time() * 1000))
         time.sleep(type(self).response_delay)
-        status = 422 if payload.get("content") in type(self).permanent_contents else 202
+        if payload.get("content") in type(self).permanent_contents:
+            status = 422
+        elif payload.get("content") in type(self).transient_contents:
+            status = 503
+        else:
+            status = 202
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.end_headers()
@@ -328,11 +345,16 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
 @contextmanager
 def capture_server(
-    response_delay: float = 0.0, permanent_contents: set[str] | None = None
+    response_delay: float = 0.0,
+    permanent_contents: set[str] | None = None,
+    transient_contents: set[str] | None = None,
 ) -> Iterator[str]:
     CaptureHandler.events = []
+    CaptureHandler.persistence_deadlines = []
+    CaptureHandler.request_received_at = []
     CaptureHandler.response_delay = response_delay
     CaptureHandler.permanent_contents = permanent_contents or set()
+    CaptureHandler.transient_contents = transient_contents or set()
     server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -344,10 +366,16 @@ def capture_server(
         thread.join()
         CaptureHandler.response_delay = 0.0
         CaptureHandler.permanent_contents = set()
+        CaptureHandler.transient_contents = set()
 
 
 def _run_hook(
-    event: dict[str, object], url: str, plugin_data: Path
+    event: dict[str, object],
+    url: str,
+    plugin_data: Path,
+    *,
+    timeout_ms: int = 100,
+    api_key: str = "capture-test-key",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["node", str(CAPTURE_HOOK)],
@@ -358,12 +386,57 @@ def _run_hook(
         env={
             **os.environ,
             "PERSONAL_AGENT_MEMORY_URL": url,
-            "PERSONAL_AGENT_MEMORY_API_KEY": "capture-test-key",
-            "PERSONAL_AGENT_MEMORY_TIMEOUT_MS": "100",
+            "PERSONAL_AGENT_MEMORY_API_KEY": api_key,
+            "PERSONAL_AGENT_MEMORY_TIMEOUT_MS": str(timeout_ms),
             "PLUGIN_DATA": str(plugin_data),
         },
         check=False,
     )
+
+
+@contextmanager
+def live_capture_app(
+    tmp_path: Path, *, request_delay: float = 0.0
+) -> Iterator[tuple[object, str, dict[str, str], Path]]:
+    state_dir = tmp_path / "state"
+    libraries = tmp_path / "libraries"
+    project = tmp_path / "project"
+    libraries.mkdir()
+    project.mkdir()
+    app = create_app(Settings(state_dir=state_dir, library_roots=(libraries,)))
+    if request_delay:
+        @app.middleware("http")
+        async def delay_capture_request(
+            request: Request, call_next: Callable[[Request], Awaitable[Response]]
+        ) -> Response:
+            if request.url.path == "/api/v1/capture/events":
+                await asyncio.sleep(request_delay)
+            return await call_next(request)
+    with socket.socket() as available:
+        available.bind(("127.0.0.1", 0))
+        port = int(available.getsockname()[1])
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and time.monotonic() < deadline:
+        if not thread.is_alive():
+            raise RuntimeError("capture test daemon exited during startup")
+        time.sleep(0.01)
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=5)
+        raise RuntimeError("capture test daemon did not become ready")
+    key = (state_dir / "api-key").read_text().strip()
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        yield app, f"http://127.0.0.1:{port}", headers, project
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 def test_real_hook_spools_replays_and_quarantines_without_transcript_capture(
@@ -404,6 +477,337 @@ def test_real_hook_spools_replays_and_quarantines_without_transcript_capture(
     assert len(CaptureHandler.events) == 2
     assert not list(spool.glob("event-*.json"))
     assert (plugin_data / "capture" / "quarantine" / "event-bad.json").is_file()
+
+
+def test_real_hook_spools_transient_service_unavailable_response(tmp_path: Path) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    event = {
+        "session_id": "transient-hook-session",
+        "turn_id": "transient-hook-turn",
+        "cwd": str(tmp_path),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "Retry capture after unstable project binding.",
+        "timestamp": "2026-09-07T00:00:00Z",
+    }
+
+    with capture_server(transient_contents={event["prompt"]}) as url:
+        result = _run_hook(event, url, plugin_data)
+
+    assert result.returncode == 0
+    assert result.stdout == result.stderr == ""
+    spool = list((plugin_data / "capture" / "spool").glob("event-*.json"))
+    assert len(spool) == 1
+    assert json.loads(spool[0].read_text())["content"] == event["prompt"]
+
+
+def test_hook_sends_absolute_deadline_for_each_request(
+    tmp_path: Path,
+) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    common = {
+        "session_id": "capture-budget-header-session",
+        "cwd": str(tmp_path),
+        "hook_event_name": "UserPromptSubmit",
+    }
+    with capture_server() as url:
+        short = _run_hook({**common, "prompt": "Short budget"}, url, plugin_data)
+        large = _run_hook(
+            {**common, "prompt": "Larger configured budget"},
+            url,
+            plugin_data,
+            timeout_ms=750,
+        )
+    assert short.returncode == large.returncode == 0
+    deadlines = [int(value or "0") for value in CaptureHandler.persistence_deadlines]
+    assert len(deadlines) == len(CaptureHandler.request_received_at) == 2
+    remaining = [
+        deadline - received
+        for deadline, received in zip(
+            deadlines, CaptureHandler.request_received_at, strict=True
+        )
+    ]
+    assert 0 < remaining[0] <= 100
+    assert 500 < remaining[1] <= 750
+
+
+def test_real_hook_budget_prevents_late_persistence_and_replays_once(
+    tmp_path: Path,
+) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    with live_capture_app(tmp_path) as (app, url, headers, project), httpx.Client(
+        base_url=url, headers=headers, timeout=5, trust_env=False
+    ) as client:
+        library_path = tmp_path / "libraries" / "project-memory"
+        library = client.post(
+            "/api/v1/libraries",
+            json={"path": str(library_path), "kind": "project"},
+        ).json()
+        bound = client.post(
+            "/api/v1/project-bindings",
+            json={"project_root": str(project), "library_id": library["id"]},
+        )
+        assert bound.status_code == 201, bound.text
+
+        state = app.state.platform_state
+        key_id = state.active_tombstone_key_id
+        with sqlite3.connect(tmp_path / "state" / "platform.sqlite3") as connection:
+            connection.executemany(
+                """INSERT INTO memory_tombstones
+                       (id, library_id, path, fingerprint, match_fingerprint, key_id,
+                        source_scope_json, deleted_at, marker_path)
+                       VALUES (?, ?, ?, ?, ?, ?, '{}', CURRENT_TIMESTAMP, ?)""",
+                (
+                    (
+                        f"hook-large-tombstone-{index}",
+                        library["id"],
+                        f"forgotten-{index}.md",
+                        f"hmac-sha256:{index:064x}",
+                        f"hmac-sha256:{index + 1:064x}",
+                        key_id,
+                        f".memory-tombstones/hook-large-{index}.json",
+                    )
+                    for index in range(4000)
+                ),
+            )
+
+        actual_normalize = state._normalized_tombstone_match_content
+
+        def delayed_normalize(content: str, *, reject_invalid_formal: bool) -> str:
+            time.sleep(0.15)
+            return actual_normalize(
+                content, reject_invalid_formal=reject_invalid_formal
+            )
+
+        state._normalized_tombstone_match_content = delayed_normalize
+        prompt = "# Hook deadline\n\n" + "HookDeadlineCaptureBody " * 2500
+        event = {
+            "session_id": "hook-deadline-session",
+            "turn_id": "hook-deadline-turn",
+            "cwd": str(project),
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+            "timestamp": "2026-09-07T00:00:00Z",
+        }
+        api_key = headers["Authorization"].removeprefix("Bearer ")
+        result = _run_hook(event, url, plugin_data, api_key=api_key)
+        assert result.returncode == 0
+        assert result.stdout == result.stderr == ""
+        spool = list((plugin_data / "capture" / "spool").glob("event-*.json"))
+        assert len(spool) == 1
+        assert json.loads(spool[0].read_text())["content"] == prompt
+        time.sleep(0.6)
+        assert client.get(
+            "/api/v1/capture/events",
+            params={"session_id": event["session_id"]},
+        ).json() == []
+        state._normalized_tombstone_match_content = actual_normalize
+        replay = _run_hook(
+            {
+                "session_id": event["session_id"],
+                "cwd": str(project),
+                "hook_event_name": "PreCompact",
+            },
+            url,
+            plugin_data,
+            timeout_ms=500,
+            api_key=api_key,
+        )
+        assert replay.returncode == 0
+        assert not list((plugin_data / "capture" / "spool").glob("event-*.json"))
+        stored = client.get(
+            "/api/v1/capture/events",
+            params={"session_id": event["session_id"]},
+        ).json()
+        assert [item["content"] for item in stored] == [prompt]
+
+
+def test_real_hook_absolute_deadline_survives_inbound_queueing(
+    tmp_path: Path,
+) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    with live_capture_app(tmp_path, request_delay=0.075) as (
+        app,
+        url,
+        headers,
+        project,
+    ), httpx.Client(base_url=url, headers=headers, timeout=5, trust_env=False) as client:
+        library_path = tmp_path / "libraries" / "project-memory"
+        library = client.post(
+            "/api/v1/libraries",
+            json={"path": str(library_path), "kind": "project"},
+        ).json()
+        assert client.post(
+            "/api/v1/project-bindings",
+            json={"project_root": str(project), "library_id": library["id"]},
+        ).status_code == 201
+
+        state = app.state.platform_state
+        actual_normalize = state._normalized_tombstone_match_content
+
+        def delayed_normalize(content: str, *, reject_invalid_formal: bool) -> str:
+            time.sleep(0.03)
+            return actual_normalize(
+                content, reject_invalid_formal=reject_invalid_formal
+            )
+
+        state._normalized_tombstone_match_content = delayed_normalize
+        event = {
+            "session_id": "queued-hook-deadline-session",
+            "turn_id": "queued-hook-deadline-turn",
+            "cwd": str(project),
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Queued hook deadline must not commit late.",
+            "timestamp": "2026-09-07T00:00:00Z",
+        }
+        api_key = headers["Authorization"].removeprefix("Bearer ")
+        result = _run_hook(event, url, plugin_data, api_key=api_key)
+        assert result.returncode == 0
+        assert result.stdout == result.stderr == ""
+        spool = list((plugin_data / "capture" / "spool").glob("event-*.json"))
+        assert len(spool) == 1
+        time.sleep(0.4)
+        assert client.get(
+            "/api/v1/capture/events",
+            params={"session_id": event["session_id"]},
+        ).json() == []
+        with sqlite3.connect(tmp_path / "state" / "platform.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM sensitive_quarantine WHERE source_kind = 'capture'"
+            ).fetchone() == (0,)
+
+        state._normalized_tombstone_match_content = actual_normalize
+        replay = _run_hook(
+            {
+                "session_id": event["session_id"],
+                "cwd": str(project),
+                "hook_event_name": "PreCompact",
+            },
+            url,
+            plugin_data,
+            timeout_ms=500,
+            api_key=api_key,
+        )
+        assert replay.returncode == 0
+        assert not list((plugin_data / "capture" / "spool").glob("event-*.json"))
+        stored = client.get(
+            "/api/v1/capture/events",
+            params={"session_id": event["session_id"]},
+        ).json()
+        assert [item["content"] for item in stored] == [event["prompt"]]
+
+
+def test_real_hook_fast_capture_succeeds_with_100ms_deadline(tmp_path: Path) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    with live_capture_app(tmp_path) as (
+        _app,
+        url,
+        headers,
+        project,
+    ), httpx.Client(base_url=url, headers=headers, timeout=5, trust_env=False) as client:
+        library = client.post(
+            "/api/v1/libraries",
+            json={
+                "path": str(tmp_path / "libraries" / "fast-project-memory"),
+                "kind": "project",
+            },
+        ).json()
+        assert client.post(
+            "/api/v1/project-bindings",
+            json={"project_root": str(project), "library_id": library["id"]},
+        ).status_code == 201
+        event = {
+            "session_id": "fast-hook-deadline-session",
+            "turn_id": "fast-hook-deadline-turn",
+            "cwd": str(project),
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Fast capture remains accepted.",
+            "timestamp": "2026-09-07T00:00:00Z",
+        }
+        result = _run_hook(
+            event,
+            url,
+            plugin_data,
+            api_key=headers["Authorization"].removeprefix("Bearer "),
+        )
+        assert result.returncode == 0
+        assert result.stdout == result.stderr == ""
+        assert not list((plugin_data / "capture" / "spool").glob("event-*.json"))
+        stored = client.get(
+            "/api/v1/capture/events",
+            params={"session_id": event["session_id"]},
+        ).json()
+        assert [item["content"] for item in stored] == [event["prompt"]]
+
+
+def test_real_hook_consolidation_timeout_does_not_block_health_or_queue_late(
+    tmp_path: Path,
+) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    with live_capture_app(tmp_path) as (
+        app,
+        url,
+        headers,
+        _project,
+    ), httpx.Client(base_url=url, headers=headers, timeout=5, trust_env=False) as client:
+        library = client.post(
+            "/api/v1/libraries",
+            json={
+                "path": str(tmp_path / "libraries" / "consolidation-memory"),
+                "kind": "project",
+            },
+        ).json()
+        database = tmp_path / "state" / "platform.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "INSERT INTO capture_rounds (session_id, turn_id, library_id) VALUES (?, ?, ?)",
+                ("slow-consolidation-session", "slow-turn", library["id"]),
+            )
+            connection.commit()
+
+        state = app.state.platform_state
+        actual_queue = state._queue_capture_consolidation
+        queue_entered = threading.Event()
+
+        def slow_queue(*args: object, **kwargs: object) -> int:
+            queue_entered.set()
+            time.sleep(0.45)
+            return actual_queue(*args, **kwargs)
+
+        state._queue_capture_consolidation = slow_queue
+        event = {
+            "session_id": "slow-consolidation-session",
+            "cwd": str(tmp_path),
+            "hook_event_name": "PreCompact",
+        }
+        api_key = headers["Authorization"].removeprefix("Bearer ")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            started = time.monotonic()
+            hook = executor.submit(
+                _run_hook,
+                event,
+                url,
+                plugin_data,
+                timeout_ms=100,
+                api_key=api_key,
+            )
+            assert queue_entered.wait(timeout=1)
+            health_started = time.monotonic()
+            health = client.get("/health/live")
+            health_elapsed = time.monotonic() - health_started
+            result = hook.result(timeout=2)
+            hook_elapsed = time.monotonic() - started
+
+        assert result.returncode == 0
+        assert result.stdout == "{}\n"
+        assert result.stderr == ""
+        assert hook_elapsed < 0.3
+        assert health.status_code == 200
+        assert health_elapsed < 0.2
+        time.sleep(0.5)
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM background_jobs WHERE kind = 'capture_consolidation'"
+            ).fetchone() == (0,)
 
 
 def test_real_hook_spools_behind_fresh_maintenance_lock_and_replays_after_takeover(

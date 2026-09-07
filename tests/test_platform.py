@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -9,8 +10,11 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 import pytest
@@ -18,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from personal_agent_memory import markdown_index
 from personal_agent_memory import state as state_module
-from personal_agent_memory.app import create_app
+from personal_agent_memory.app import capture_request_budget_seconds, create_app
 from personal_agent_memory.config import ConfigurationError, Settings
 from personal_agent_memory.git_history import GitHistoryError, GitRepository
 from personal_agent_memory.markdown_index import (
@@ -33,6 +37,175 @@ from personal_agent_memory.state import MemoryMutationError, PlatformState
 def auth_headers(state_dir: Path) -> dict[str, str]:
     key = (state_dir / "api-key").read_text(encoding="utf-8").strip()
     return {"Authorization": f"Bearer {key}"}
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (None, 0.25),
+        ("1000100", 0.1),
+        ("1000250", 0.25),
+        ("999999999999999999999999", 0.25),
+        ("0", 0.0),
+        ("-20", 0.0),
+        ("not-a-deadline", 0.0),
+    ],
+)
+def test_capture_request_budget_is_fail_closed_and_never_extends_default(
+    header: str | None, expected: float
+) -> None:
+    assert capture_request_budget_seconds(
+        header, now_epoch_seconds=1000.0
+    ) == pytest.approx(expected)
+
+
+def test_capture_deadline_header_rejects_invalid_values_and_clamps_large_values(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    library_root = tmp_path / "libraries"
+    library_path = library_root / "project-memory"
+    project_root = tmp_path / "project"
+    library_path.mkdir(parents=True)
+    project_root.mkdir()
+    with TestClient(
+        create_app(Settings(state_dir=state_dir, library_roots=(library_root,)))
+    ) as client:
+        headers = auth_headers(state_dir)
+        library = client.post(
+            "/api/v1/libraries",
+            headers=headers,
+            json={"path": str(library_path), "kind": "project"},
+        ).json()
+        bound = client.post(
+            "/api/v1/project-bindings",
+            headers=headers,
+            json={"project_root": str(project_root), "library_id": library["id"]},
+        )
+        assert bound.status_code == 201, bound.text
+        event = {
+            "event_id": "capture-budget-invalid",
+            "session_id": "capture-budget-session",
+            "turn_id": "turn-one",
+            "event_kind": "user",
+            "content": "Capture only with a bounded valid persistence deadline.",
+            "occurred_at": "2026-09-07T00:00:00Z",
+            "cwd": str(project_root),
+        }
+        for value in ("not-an-integer", "-1", "0"):
+            response = client.post(
+                "/api/v1/capture/events",
+                headers={
+                    **headers,
+                    "X-Personal-Agent-Memory-Persistence-Deadline-Ms": value,
+                },
+                json=event,
+            )
+            assert response.status_code == 503, response.text
+
+        accepted = client.post(
+            "/api/v1/capture/events",
+            headers={
+                **headers,
+                "X-Personal-Agent-Memory-Persistence-Deadline-Ms": "999999999999999999999999",
+            },
+            json={**event, "event_id": "capture-budget-clamped"},
+        )
+        assert accepted.status_code == 202, accepted.text
+        stored = client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": event["session_id"]},
+        ).json()
+        assert [item["event_id"] for item in stored] == ["capture-budget-clamped"]
+
+
+def test_sensitive_capture_deadline_rolls_back_slow_quarantine_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    app = create_app(Settings(state_dir=state_dir))
+    with TestClient(app) as client:
+        headers = {
+            **auth_headers(state_dir),
+            "X-Personal-Agent-Memory-Persistence-Deadline-Ms": str(
+                int(time.time() * 1000) + 100
+            ),
+        }
+        state = app.state.platform_state
+        actual_prune = state._prune_sensitive_quarantine
+
+        def slow_prune(connection: sqlite3.Connection) -> None:
+            time.sleep(0.12)
+            actual_prune(connection)
+
+        monkeypatch.setattr(state, "_prune_sensitive_quarantine", slow_prune)
+        started = time.monotonic()
+        response = client.post(
+            "/api/v1/capture/events",
+            headers=headers,
+            json={
+                "event_id": "sensitive-capture-deadline",
+                "session_id": "sensitive-capture-session",
+                "turn_id": "turn-one",
+                "event_kind": "user",
+                "content": "password=DeadlineSensitiveSecretValue123456",
+                "occurred_at": "2026-09-07T00:00:00Z",
+                "cwd": str(project_root),
+            },
+        )
+        assert response.status_code == 503, response.text
+        assert time.monotonic() - started < 0.25
+        assert client.portal is not None
+        assert client.portal.call(
+            lambda: state.connection_or_raise.execute(
+                "SELECT COUNT(*) FROM sensitive_quarantine WHERE source_kind = 'capture'"
+            ).fetchone()
+        ) == (0,)
+
+
+def test_capture_consolidation_is_fail_fast_when_sqlite_writer_is_busy(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    library_root = tmp_path / "libraries"
+    library_path = library_root / "project-memory"
+    library_path.mkdir(parents=True)
+    app = create_app(Settings(state_dir=state_dir, library_roots=(library_root,)))
+    with TestClient(app) as client:
+        headers = auth_headers(state_dir)
+        library = client.post(
+            "/api/v1/libraries",
+            headers=headers,
+            json={"path": str(library_path), "kind": "project"},
+        ).json()
+        database = state_dir / "platform.sqlite3"
+        with sqlite3.connect(database, timeout=0) as writer:
+            writer.execute(
+                "INSERT INTO capture_rounds (session_id, turn_id, library_id) VALUES (?, ?, ?)",
+                ("busy-consolidation-session", "busy-turn", library["id"]),
+            )
+            writer.commit()
+            writer.execute("BEGIN IMMEDIATE")
+            started = time.monotonic()
+            response = client.post(
+                "/api/v1/capture/consolidate",
+                headers={
+                    **headers,
+                    "X-Personal-Agent-Memory-Persistence-Deadline-Ms": str(
+                        int(time.time() * 1000) + 250
+                    ),
+                },
+                json={"session_id": "busy-consolidation-session"},
+            )
+            elapsed = time.monotonic() - started
+            assert response.status_code == 503, response.text
+            assert elapsed < 0.2
+            assert writer.execute(
+                "SELECT COUNT(*) FROM background_jobs WHERE kind = 'capture_consolidation'"
+            ).fetchone() == (0,)
 
 
 def import_external_changes(
@@ -72,6 +245,558 @@ def require_relative_worktrees(repository: Path) -> None:
     )
     if "--[no-]relative-paths" not in help_result.stdout + help_result.stderr:
         pytest.skip("installed Git does not support worktree add --relative-paths")
+
+
+def test_library_lock_context_does_not_grant_reentry_to_child_task(tmp_path: Path) -> None:
+    (tmp_path / "state").mkdir()
+    state = PlatformState(tmp_path / "state" / "platform.db")
+
+    async def exercise() -> None:
+        child_entered = asyncio.Event()
+
+        async def child() -> None:
+            async with state.library_write_lock("library-one"):
+                child_entered.set()
+
+        async with state.library_write_lock("library-one"):
+            with state._library_lock("library-one"):
+                pass
+            child_task = asyncio.create_task(child())
+            await asyncio.sleep(0.05)
+            assert not child_entered.is_set()
+        await asyncio.wait_for(child_task, timeout=1)
+        assert child_entered.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_waiting_library_edit_does_not_block_another_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    library_root = tmp_path / "libraries"
+    first_library = library_root / "first"
+    second_library = library_root / "second"
+    first_library.mkdir(parents=True)
+    second_library.mkdir()
+    first_note = first_library / "note.md"
+    preview_note = first_library / "preview.md"
+    second_note = second_library / "note.md"
+    first_note.write_text("# First\n\nBaseline A.\n", encoding="utf-8")
+    preview_note.write_text("# Preview\n\nDeletion preview baseline.\n", encoding="utf-8")
+    second_note.write_text("# Second\n\nBaseline B.\n", encoding="utf-8")
+
+    app = create_app(Settings(state_dir=state_dir, library_roots=(library_root,)))
+    with TestClient(app) as client:
+        headers = auth_headers(state_dir)
+        first = client.post(
+            "/api/v1/libraries",
+            headers=headers,
+            json={"path": str(first_library), "kind": "project"},
+        ).json()
+        second = client.post(
+            "/api/v1/libraries",
+            headers=headers,
+            json={"path": str(second_library), "kind": "project"},
+        ).json()
+        first_loaded = client.get(
+            f"/api/v1/libraries/{first['id']}/document",
+            headers=headers,
+            params={"path": first_note.name},
+        ).json()
+        second_loaded = client.get(
+            f"/api/v1/libraries/{second['id']}/document",
+            headers=headers,
+            params={"path": second_note.name},
+        ).json()
+        preview_loaded = client.get(
+            f"/api/v1/libraries/{first['id']}/document",
+            headers=headers,
+            params={"path": preview_note.name},
+        ).json()
+        first_payload = {
+            "path": first_note.name,
+            "content": "# First\n\nUpdated A.\n",
+            "expected_source_version": first_loaded["source_version"],
+            "operation_id": "async-library-lock-first",
+            "actor_type": "user",
+            "source": "test",
+        }
+        second_payload = {
+            "path": second_note.name,
+            "content": "# Second\n\nUpdated B.\n",
+            "expected_source_version": second_loaded["source_version"],
+            "operation_id": "async-library-lock-second",
+            "actor_type": "user",
+            "source": "test",
+        }
+        candidate_payload = {
+            "library_id": first["id"],
+            "suggested_type": "decision",
+            "body": "# Decision\n\nSerialized after the document edit.\n",
+            "source_references": ["test-session:lock-order#assistant-final"],
+            "creator": "test",
+            "idempotency_key": "async-library-lock-candidate",
+        }
+        approval_candidate = client.post(
+            "/mcp/candidates",
+            headers=headers,
+            json={
+                **candidate_payload,
+                "body": "# Decision\n\nApprove after the held library lock.\n",
+                "idempotency_key": "async-library-lock-approval-candidate",
+            },
+        )
+        assert approval_candidate.status_code == 201, approval_candidate.text
+        approval_payload = {
+            "operator": "test-operator",
+            "reason": "Verify cross-library independence for governance writes.",
+            "operation_id": "async-library-lock-approve",
+        }
+
+        lock_path = state_dir / "locks" / f"{uuid.UUID(str(first['id']))}.lock"
+        original_flock = fcntl.flock
+        first_lock_attempted = threading.Event()
+
+        def observed_flock(lock: object, operation: int) -> None:
+            if operation & fcntl.LOCK_NB:
+                first_lock_attempted.set()
+            original_flock(lock, operation)
+
+        delete_preview_payload = {
+            "path": preview_note.name,
+            "expected_source_version": preview_loaded["source_version"],
+            "operation_id": "async-library-lock-delete-preview",
+        }
+
+        with lock_path.open("rb") as held_lock, ThreadPoolExecutor(max_workers=6) as executor:
+            original_flock(held_lock, fcntl.LOCK_EX)
+            monkeypatch.setattr(state_module.fcntl, "flock", observed_flock)
+            first_future = executor.submit(
+                client.put,
+                f"/api/v1/libraries/{first['id']}/document",
+                headers=headers,
+                json=first_payload,
+            )
+            try:
+                assert first_lock_attempted.wait(5)
+                with pytest.raises(FutureTimeoutError):
+                    first_future.result(timeout=0.1)
+                candidate_future = executor.submit(
+                    client.post,
+                    "/mcp/candidates",
+                    headers=headers,
+                    json=candidate_payload,
+                )
+                with pytest.raises(FutureTimeoutError):
+                    candidate_future.result(timeout=0.1)
+                approval_future = executor.submit(
+                    client.post,
+                    f"/api/v1/candidates/{approval_candidate.json()['id']}/approve",
+                    headers=headers,
+                    json=approval_payload,
+                )
+                with pytest.raises(FutureTimeoutError):
+                    approval_future.result(timeout=0.1)
+                delete_preview_future = executor.submit(
+                    client.post,
+                    f"/api/v1/libraries/{first['id']}/document/delete-preview",
+                    headers=headers,
+                    json=delete_preview_payload,
+                )
+                with pytest.raises(FutureTimeoutError):
+                    delete_preview_future.result(timeout=0.1)
+                retention_preview_future = executor.submit(
+                    client.get,
+                    f"/api/v1/libraries/{first['id']}/retention-cleanup/preview",
+                    headers=headers,
+                )
+                with pytest.raises(FutureTimeoutError):
+                    retention_preview_future.result(timeout=0.1)
+                second_future = executor.submit(
+                    client.put,
+                    f"/api/v1/libraries/{second['id']}/document",
+                    headers=headers,
+                    json=second_payload,
+                )
+                second_response = second_future.result(timeout=5)
+                assert second_response.status_code == 200, second_response.text
+                assert not first_future.done()
+                assert not candidate_future.done()
+                assert not approval_future.done()
+                assert not delete_preview_future.done()
+                assert not retention_preview_future.done()
+            finally:
+                original_flock(held_lock, fcntl.LOCK_UN)
+            first_response = first_future.result(timeout=5)
+            candidate_response = candidate_future.result(timeout=5)
+            approval_response = approval_future.result(timeout=5)
+            delete_preview_response = delete_preview_future.result(timeout=5)
+            retention_preview_response = retention_preview_future.result(timeout=5)
+
+        assert first_response.status_code == 200, first_response.text
+        assert candidate_response.status_code == 201, candidate_response.text
+        assert approval_response.status_code == 200, approval_response.text
+        assert delete_preview_response.status_code == 200, delete_preview_response.text
+        assert retention_preview_response.status_code == 200, retention_preview_response.text
+        assert first_note.read_text(encoding="utf-8") == first_payload["content"]
+        assert second_note.read_text(encoding="utf-8") == second_payload["content"]
+
+
+def test_capture_binding_revalidation_is_bounded_and_retries_a_single_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    library_root = tmp_path / "libraries"
+    project_root = tmp_path / "project"
+    first_library = library_root / "first"
+    second_library = library_root / "second"
+    first_library.mkdir(parents=True)
+    second_library.mkdir()
+    project_root.mkdir()
+
+    app = create_app(Settings(state_dir=state_dir, library_roots=(library_root,)))
+    with TestClient(app) as client:
+        headers = auth_headers(state_dir)
+        libraries = [
+            client.post(
+                "/api/v1/libraries",
+                headers=headers,
+                json={"path": str(path), "kind": "project"},
+            ).json()
+            for path in (first_library, second_library)
+        ]
+        binding = client.post(
+            "/api/v1/project-bindings",
+            headers=headers,
+            json={"project_root": str(project_root), "library_id": libraries[0]["id"]},
+        ).json()
+        state = app.state.platform_state
+        actual_resolve = state.resolve_project_binding
+
+        def resolved(library_index: int) -> dict[str, str]:
+            return {
+                "status": "bound",
+                "project_id": binding["project_id"],
+                "binding_id": binding["id"],
+                "library_id": libraries[library_index]["id"],
+            }
+
+        changing_once = iter((resolved(0), resolved(1), resolved(1), resolved(1)))
+
+        def resolve_after_one_change(cwd: str) -> dict[str, str]:
+            try:
+                return next(changing_once)
+            except StopIteration:
+                return resolved(1)
+
+        monkeypatch.setattr(state, "resolve_project_binding", resolve_after_one_change)
+        accepted = client.post(
+            "/api/v1/capture/events",
+            headers=headers,
+            json={
+                "event_id": "capture-binding-one-change",
+                "session_id": "capture-binding-session",
+                "turn_id": "turn-one",
+                "event_kind": "user",
+                "content": "Persist after one binding change.",
+                "occurred_at": "2026-09-07T00:00:00Z",
+                "cwd": str(project_root),
+            },
+        )
+        assert accepted.status_code == 202, accepted.text
+        stored = client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": "capture-binding-session"},
+        ).json()
+        assert len(stored) == 1
+        assert stored[0]["library_id"] == libraries[1]["id"]
+
+        calls = 0
+
+        def continuously_rebound(cwd: str) -> dict[str, str]:
+            nonlocal calls
+            result = resolved(calls % 2)
+            calls += 1
+            return result
+
+        monkeypatch.setattr(state, "resolve_project_binding", continuously_rebound)
+        started = time.monotonic()
+        rejected = client.post(
+            "/api/v1/capture/events",
+            headers=headers,
+            json={
+                "event_id": "capture-binding-continuous-change",
+                "session_id": "capture-binding-session",
+                "turn_id": "turn-two",
+                "event_kind": "user",
+                "content": "This event must spool instead of reaching the wrong library.",
+                "occurred_at": "2026-09-07T00:00:01Z",
+                "cwd": str(project_root),
+            },
+        )
+        elapsed = time.monotonic() - started
+        assert rejected.status_code == 503, rejected.text
+        assert calls == 24
+        assert elapsed < 1
+        assert client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": "capture-binding-session"},
+        ).json() == stored
+        monkeypatch.setattr(state, "resolve_project_binding", actual_resolve)
+
+        lock_path = state_dir / "locks" / f"{uuid.UUID(str(libraries[0]['id']))}.lock"
+        with lock_path.open("rb") as held_lock, ThreadPoolExecutor(max_workers=1) as executor:
+            fcntl.flock(held_lock, fcntl.LOCK_EX)
+            blocked = executor.submit(
+                client.post,
+                "/api/v1/capture/events",
+                headers=headers,
+                json={
+                    "event_id": "capture-binding-held-lock",
+                    "session_id": "capture-binding-session",
+                    "turn_id": "turn-three",
+                    "event_kind": "user",
+                    "content": "Timeout safely while the target library is unavailable.",
+                    "occurred_at": "2026-09-07T00:00:02Z",
+                    "cwd": str(project_root),
+                },
+            )
+            blocked_response = blocked.result(timeout=1)
+            assert blocked_response.status_code == 503, blocked_response.text
+            fcntl.flock(held_lock, fcntl.LOCK_UN)
+        time.sleep(0.1)
+        assert client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": "capture-binding-session"},
+        ).json() == stored
+
+
+def test_capture_sqlite_write_lock_returns_503_without_late_persistence(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    library_root = tmp_path / "libraries"
+    library_path = library_root / "project-memory"
+    project_root = tmp_path / "project"
+    library_path.mkdir(parents=True)
+    project_root.mkdir()
+
+    app = create_app(Settings(state_dir=state_dir, library_roots=(library_root,)))
+    with TestClient(app) as client:
+        headers = auth_headers(state_dir)
+        library = client.post(
+            "/api/v1/libraries",
+            headers=headers,
+            json={"path": str(library_path), "kind": "project"},
+        ).json()
+        bound = client.post(
+            "/api/v1/project-bindings",
+            headers=headers,
+            json={"project_root": str(project_root), "library_id": library["id"]},
+        )
+        assert bound.status_code == 201, bound.text
+        event = {
+            "event_id": "capture-sqlite-busy",
+            "session_id": "capture-sqlite-busy-session",
+            "turn_id": "turn-one",
+            "event_kind": "user",
+            "content": "Spool this event while SQLite is busy.",
+            "occurred_at": "2026-09-07T00:00:00Z",
+            "cwd": str(project_root),
+        }
+        database_path = state_dir / "platform.sqlite3"
+
+        with sqlite3.connect(database_path, check_same_thread=False) as blocker:
+            blocker.execute("BEGIN IMMEDIATE")
+
+            def delayed_release() -> None:
+                time.sleep(0.5)
+                blocker.rollback()
+
+            release = threading.Thread(target=delayed_release)
+            release.start()
+            started = time.monotonic()
+            response = client.post(
+                "/api/v1/capture/events", headers=headers, json=event
+            )
+            elapsed = time.monotonic() - started
+            assert response.status_code == 503, response.text
+            assert elapsed < 0.25
+            release.join(timeout=1)
+            assert not release.is_alive()
+
+        time.sleep(0.1)
+        assert client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": event["session_id"]},
+        ).json() == []
+        def capture_connection_state() -> tuple[bool, tuple[int] | None]:
+            state_connection = app.state.platform_state.connection_or_raise
+            return (
+                state_connection.in_transaction,
+                state_connection.execute("PRAGMA busy_timeout").fetchone(),
+            )
+
+        assert client.portal is not None
+        assert client.portal.call(capture_connection_state) == (False, (5000,))
+
+        with sqlite3.connect(database_path) as blocker:
+            blocker.execute("BEGIN IMMEDIATE")
+            started = time.monotonic()
+            response = client.post(
+                "/api/v1/capture/events",
+                headers=headers,
+                json={**event, "event_id": "capture-sqlite-still-busy"},
+            )
+            assert response.status_code == 503, response.text
+            assert time.monotonic() - started < 0.25
+            health_started = time.monotonic()
+            health = client.get("/health/live", headers=headers)
+            assert health.status_code == 200, health.text
+            assert time.monotonic() - health_started < 0.25
+            blocker.rollback()
+
+        accepted = client.post(
+            "/api/v1/capture/events",
+            headers=headers,
+            json={**event, "event_id": "capture-sqlite-normal"},
+        )
+        duplicate = client.post(
+            "/api/v1/capture/events",
+            headers=headers,
+            json={**event, "event_id": "capture-sqlite-normal"},
+        )
+        assert accepted.status_code == duplicate.status_code == 202
+        assert accepted.json()["duplicate"] is False
+        assert duplicate.json()["duplicate"] is True
+
+
+def test_capture_large_tombstone_set_stays_within_deadline_and_is_indexed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    library_root = tmp_path / "libraries"
+    first_library_path = library_root / "first"
+    second_library_path = library_root / "second"
+    project_root = tmp_path / "project"
+    first_library_path.mkdir(parents=True)
+    second_library_path.mkdir()
+    project_root.mkdir()
+
+    app = create_app(Settings(state_dir=state_dir, library_roots=(library_root,)))
+    with TestClient(app) as client:
+        headers = auth_headers(state_dir)
+        libraries = [
+            client.post(
+                "/api/v1/libraries",
+                headers=headers,
+                json={"path": str(path), "kind": "project"},
+            ).json()
+            for path in (first_library_path, second_library_path)
+        ]
+        bound = client.post(
+            "/api/v1/project-bindings",
+            headers=headers,
+            json={"project_root": str(project_root), "library_id": libraries[0]["id"]},
+        )
+        assert bound.status_code == 201, bound.text
+
+        def seed_tombstones() -> str:
+            state = app.state.platform_state
+            connection = state.connection_or_raise
+            key_id = state.active_tombstone_key_id
+            connection.executemany(
+                """INSERT INTO memory_tombstones
+                   (id, library_id, path, fingerprint, match_fingerprint, key_id,
+                    source_scope_json, deleted_at, marker_path)
+                   VALUES (?, ?, ?, ?, ?, ?, '{}', CURRENT_TIMESTAMP, ?)""",
+                (
+                    (
+                        f"large-tombstone-{index}",
+                        libraries[0]["id"],
+                        f"forgotten-{index}.md",
+                        f"hmac-sha256:{index:064x}",
+                        f"hmac-sha256:{index + 1:064x}",
+                        key_id,
+                        f".memory-tombstones/large-{index}.json",
+                    )
+                    for index in range(4000)
+                ),
+            )
+            connection.commit()
+            query_plan = connection.execute(
+                """EXPLAIN QUERY PLAN SELECT 1 FROM memory_tombstones
+                   WHERE library_id = ? AND key_id = ? AND match_fingerprint = ? LIMIT 1""",
+                (libraries[0]["id"], key_id, "not-present"),
+            ).fetchall()
+            return " ".join(str(row) for row in query_plan)
+
+        assert client.portal is not None
+        assert "memory_tombstone_match" in client.portal.call(seed_tombstones)
+        large_content = "# Large capture\n\n" + "DeadlineSafeCaptureBody " * 2600
+        event = {
+            "event_id": "capture-large-tombstone-set",
+            "session_id": "capture-large-tombstone-session",
+            "turn_id": "turn-one",
+            "event_kind": "user",
+            "content": large_content,
+            "occurred_at": "2026-09-07T00:00:00Z",
+            "cwd": str(project_root),
+        }
+        started = time.monotonic()
+        response = client.post("/api/v1/capture/events", headers=headers, json=event)
+        elapsed = time.monotonic() - started
+        assert response.status_code in {202, 503}, response.text
+        assert elapsed < 0.25
+        time.sleep(0.35)
+        stored = client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": event["session_id"]},
+        ).json()
+        if response.status_code == 503:
+            assert stored == []
+        else:
+            assert [item["event_id"] for item in stored] == [event["event_id"]]
+
+        state = app.state.platform_state
+        actual_normalize = state._normalized_tombstone_match_content
+
+        def slow_normalize(content: str, *, reject_invalid_formal: bool) -> str:
+            time.sleep(0.21)
+            return actual_normalize(
+                content, reject_invalid_formal=reject_invalid_formal
+            )
+
+        monkeypatch.setattr(state, "_normalized_tombstone_match_content", slow_normalize)
+        delayed_event = {
+            **event,
+            "event_id": "capture-expired-before-write",
+            "turn_id": "turn-two",
+        }
+        started = time.monotonic()
+        delayed = client.post(
+            "/api/v1/capture/events", headers=headers, json=delayed_event
+        )
+        assert delayed.status_code == 503, delayed.text
+        assert time.monotonic() - started < 0.25
+        time.sleep(0.25)
+        after_deadline = client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": event["session_id"]},
+        ).json()
+        assert all(item["event_id"] != delayed_event["event_id"] for item in after_deadline)
+
+        health_started = time.monotonic()
+        health = client.get("/health/live", headers=headers)
+        assert health.status_code == 200, health.text
+        assert time.monotonic() - health_started < 0.25
 
 
 def test_first_start_creates_protected_key_and_authenticated_surfaces(tmp_path: Path) -> None:

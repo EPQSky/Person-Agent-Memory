@@ -29,6 +29,9 @@ library-specific exclusions and incrementally reconcile additions, changes and d
 `GET`/`PUT /api/v1/libraries/{library_id}/ignore-rules` and
 `POST /api/v1/libraries/{library_id}/scan`.
 
+Release-style native installation, global Codex plugin setup, model configuration, backup
+responsibilities, and MVP limitations are documented in `docs/release.md`.
+
 Direct keyword search is available through `POST /api/v1/search`, `POST /mcp/search`, and the Web
 interface. Both APIs accept `cwd`, `query`, and an optional `limit`; the daemon resolves `cwd`
 through explicit project bindings and searches only that project's memory library. Unbound
@@ -122,3 +125,11 @@ Docker acceptance uses a deterministic local OpenAI-compatible fake model and no
 
 The verifier uses a unique Compose project for every run and removes its containers,
 networks, and named volumes on success, failure, or interruption.
+
+Native package and global plugin installation use a separate isolated acceptance check. It builds
+and installs the wheel, installs the Codex plugin, starts the daemon, and executes a real Hook
+without changing the current user's home directory or Codex configuration:
+
+```bash
+./scripts/verify-native-install.sh
+```

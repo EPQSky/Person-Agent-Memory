@@ -28,6 +28,7 @@ const MAX_STATE_FILES = 256;
 const MAX_STATE_BYTES = 1024 * 1024;
 const TURN_TTL_MS = 24 * 60 * 60 * 1000;
 const IDENTITY_TTL_MS = 60 * 60 * 1000;
+const PERSISTENCE_DEADLINE_HEADER = "x-personal-agent-memory-persistence-deadline-ms";
 
 function inspectSensitive(content) {
   const patterns = [
@@ -309,11 +310,17 @@ function requestTimeout() {
 }
 
 async function request(path, body, key, timeout = requestTimeout()) {
+  const effectiveTimeout = Math.max(1, Math.min(Math.floor(timeout), requestTimeout()));
+  const persistenceDeadline = Date.now() + effectiveTimeout;
   const response = await fetch(daemonUrl(path), {
     method: "POST",
-    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${key}`,
+      "content-type": "application/json",
+      [PERSISTENCE_DEADLINE_HEADER]: String(persistenceDeadline),
+    },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(Math.max(1, Math.min(timeout, requestTimeout()))),
+    signal: AbortSignal.timeout(effectiveTimeout),
   });
   if (response.ok) return "accepted";
   if ([400, 404, 409, 413, 422].includes(response.status)) return "permanent";

@@ -1,0 +1,20 @@
+{
+  "name": "personal-agent-memory",
+  "interface": {
+    "displayName": "Personal Agent Memory"
+  },
+  "plugins": [
+    {
+      "name": "personal-agent-memory",
+      "source": {
+        "source": "local",
+        "path": "./plugins/personal-agent-memory"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

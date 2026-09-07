@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +22,7 @@ from personal_agent_memory.model_client import OpenAICompatibleClient
 from personal_agent_memory.security import ApiKeyStore
 from personal_agent_memory.state import (
     CandidateGovernanceError,
+    CapturePersistenceBusyError,
     DuplicateLibraryError,
     DuplicateProjectBindingError,
     LibraryKind,
@@ -28,6 +31,27 @@ from personal_agent_memory.state import (
     PlatformState,
     ProjectBindingError,
 )
+
+CAPTURE_BINDING_RETRY_LIMIT = 12
+CAPTURE_BINDING_DEADLINE_SECONDS = 0.25
+CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS = 0.06
+CAPTURE_PERSISTENCE_DEADLINE_HEADER = "X-Personal-Agent-Memory-Persistence-Deadline-Ms"
+
+
+def capture_request_budget_seconds(
+    client_deadline_ms: str | None, *, now_epoch_seconds: float | None = None
+) -> float:
+    if client_deadline_ms is None:
+        return CAPTURE_BINDING_DEADLINE_SECONDS
+    try:
+        deadline_ms = int(client_deadline_ms.strip())
+    except ValueError:
+        return 0.0
+    now = time.time() if now_epoch_seconds is None else now_epoch_seconds
+    remaining = deadline_ms / 1000 - now
+    if remaining <= 0:
+        return 0.0
+    return min(CAPTURE_BINDING_DEADLINE_SECONDS, remaining)
 
 
 class LibraryRegistration(BaseModel):
@@ -308,7 +332,8 @@ def create_app(settings: Settings) -> FastAPI:
                     "bulk external acceptance is disabled; resolve each out-of-band "
                     "change explicitly"
                 )
-            return platform_state.reconcile_library(library_id)
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.reconcile_library(library_id)
         except (LibraryRegistrationError, MemoryMutationError) as error:
             status_code = (
                 status.HTTP_404_NOT_FOUND
@@ -345,16 +370,17 @@ def create_app(settings: Settings) -> FastAPI:
         library_id: str, change_id: str, resolution: OutOfBandResolution
     ) -> dict[str, str]:
         try:
-            return platform_state.resolve_out_of_band_change(
-                library_id,
-                change_id,
-                resolution.action,
-                resolution.operation_id,
-                resolution.actor_type,
-                resolution.source,
-                resolution.final_content,
-                resolution.external_path,
-            )
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.resolve_out_of_band_change(
+                    library_id,
+                    change_id,
+                    resolution.action,
+                    resolution.operation_id,
+                    resolution.actor_type,
+                    resolution.source,
+                    resolution.final_content,
+                    resolution.external_path,
+                )
         except MemoryMutationError as error:
             raise mutation_error(error) from error
 
@@ -365,7 +391,8 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def rebuild_vector_index(library_id: str) -> dict[str, object]:
         try:
-            job_id = platform_state.enqueue_vector_rebuild(library_id)
+            async with platform_state.library_write_lock(library_id):
+                job_id = platform_state.enqueue_vector_rebuild(library_id)
         except LibraryRegistrationError as error:
             code = (
                 status.HTTP_404_NOT_FOUND
@@ -382,7 +409,8 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def rebuild_graph_index(library_id: str) -> dict[str, object]:
         try:
-            job_id = platform_state.enqueue_graph_rebuild(library_id)
+            async with platform_state.library_write_lock(library_id):
+                job_id = platform_state.enqueue_graph_rebuild(library_id)
         except LibraryRegistrationError as error:
             code = (
                 status.HTTP_404_NOT_FOUND
@@ -420,9 +448,10 @@ def create_app(settings: Settings) -> FastAPI:
     @app.put("/api/v1/libraries/{library_id}/ignore-rules", dependencies=[Depends(authenticate)])
     async def update_ignore_rules(library_id: str, update: IgnoreRulesUpdate) -> dict[str, object]:
         try:
-            patterns = platform_state.update_library_ignore_patterns(
-                library_id, tuple(update.patterns)
-            )
+            async with platform_state.library_write_lock(library_id):
+                patterns = platform_state.update_library_ignore_patterns(
+                    library_id, tuple(update.patterns)
+                )
         except LibraryRegistrationError as error:
             status_code = (
                 status.HTTP_404_NOT_FOUND
@@ -602,37 +631,107 @@ def create_app(settings: Settings) -> FastAPI:
             code = status.HTTP_422_UNPROCESSABLE_CONTENT
         return HTTPException(status_code=code, detail=detail)
 
-    def create_candidate_payload(candidate: CandidateCreate) -> dict[str, object]:
+    async def create_candidate_payload(candidate: CandidateCreate) -> dict[str, object]:
         try:
-            return platform_state.create_candidate(
-                candidate.library_id,
-                candidate.suggested_type,
-                candidate.body,
-                tuple(candidate.source_references),
-                candidate.creator,
-                candidate.idempotency_key,
-            )
+            async with platform_state.library_write_lock(candidate.library_id):
+                return platform_state.create_candidate(
+                    candidate.library_id,
+                    candidate.suggested_type,
+                    candidate.body,
+                    tuple(candidate.source_references),
+                    candidate.creator,
+                    candidate.idempotency_key,
+                )
         except (CandidateGovernanceError, MemoryMutationError) as error:
             if isinstance(error, MemoryMutationError):
                 raise mutation_error(error) from error
             raise candidate_error(error) from error
+
+    async def candidate_write_payload(
+        candidate_id: str, operation: Callable[[], dict[str, object]]
+    ) -> dict[str, object]:
+        library_id = platform_state.candidate_library_id(candidate_id)
+        async with platform_state.library_write_lock(library_id):
+            if platform_state.candidate_library_id(candidate_id) != library_id:
+                raise CandidateGovernanceError("candidate memory changed libraries")
+            return operation()
 
     @app.post(
         "/api/v1/capture/events",
         status_code=status.HTTP_202_ACCEPTED,
         dependencies=[Depends(authenticate)],
     )
-    async def capture_event(event: CaptureEvent) -> dict[str, object]:
+    async def capture_event(
+        event: CaptureEvent,
+        client_deadline_ms: str | None = Header(
+            default=None, alias=CAPTURE_PERSISTENCE_DEADLINE_HEADER
+        ),
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        monotonic_before_wall_sample = loop.time()
+        request_budget = capture_request_budget_seconds(
+            client_deadline_ms, now_epoch_seconds=time.time()
+        )
+        request_deadline = monotonic_before_wall_sample + request_budget
+        persistence_deadline = (
+            request_deadline - CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS
+        )
         try:
-            return platform_state.ingest_capture_event(
-                event.event_id,
-                event.session_id,
-                event.turn_id,
-                event.event_kind,
-                event.content,
-                event.occurred_at,
-                event.cwd,
+            async with asyncio.timeout_at(request_deadline):
+                for _ in range(CAPTURE_BINDING_RETRY_LIMIT):
+                    try:
+                        binding = platform_state.resolve_project_binding(event.cwd)
+                    except ProjectBindingError:
+                        return platform_state.ingest_capture_event(
+                            event.event_id,
+                            event.session_id,
+                            event.turn_id,
+                            event.event_kind,
+                            event.content,
+                            event.occurred_at,
+                            event.cwd,
+                            persistence_deadline,
+                        )
+                    if binding["status"] != "bound":
+                        return platform_state.ingest_capture_event(
+                            event.event_id,
+                            event.session_id,
+                            event.turn_id,
+                            event.event_kind,
+                            event.content,
+                            event.occurred_at,
+                            event.cwd,
+                            persistence_deadline,
+                        )
+                    library_id = str(binding["library_id"])
+                    async with platform_state.library_write_lock(library_id):
+                        current = platform_state.resolve_project_binding(event.cwd)
+                        if current.get("library_id") != library_id:
+                            continue
+                        return platform_state.ingest_capture_event(
+                            event.event_id,
+                            event.session_id,
+                            event.turn_id,
+                            event.event_kind,
+                            event.content,
+                            event.occurred_at,
+                            event.cwd,
+                            persistence_deadline,
+                        )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="project binding remained unstable while capturing event",
             )
+        except TimeoutError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="capture timed out while waiting for a stable project binding",
+            ) from error
+        except CapturePersistenceBusyError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="capture persistence is temporarily unavailable",
+            ) from error
         except (CandidateGovernanceError, ProjectBindingError) as error:
             raise candidate_error(CandidateGovernanceError(str(error))) from error
 
@@ -690,15 +789,18 @@ def create_app(settings: Settings) -> FastAPI:
         candidate_id: str, resolution: CandidateResolution
     ) -> dict[str, object]:
         try:
-            return platform_state.resolve_candidate(
+            return await candidate_write_payload(
                 candidate_id,
-                resolution.action,
-                resolution.operator,
-                resolution.reason,
-                resolution.operation_id,
-                merged_body=resolution.merged_body,
-                effective_at=resolution.effective_at,
-                condition=resolution.condition,
+                lambda: platform_state.resolve_candidate(
+                    candidate_id,
+                    resolution.action,
+                    resolution.operator,
+                    resolution.reason,
+                    resolution.operation_id,
+                    merged_body=resolution.merged_body,
+                    effective_at=resolution.effective_at,
+                    condition=resolution.condition,
+                ),
             )
         except (CandidateGovernanceError, MemoryMutationError) as error:
             if isinstance(error, MemoryMutationError):
@@ -710,8 +812,34 @@ def create_app(settings: Settings) -> FastAPI:
         status_code=status.HTTP_202_ACCEPTED,
         dependencies=[Depends(authenticate)],
     )
-    async def consolidate_capture(request: CaptureConsolidation) -> dict[str, int]:
-        return {"queued": platform_state.trigger_capture_consolidation(request.session_id)}
+    async def consolidate_capture(
+        request: CaptureConsolidation,
+        client_deadline_ms: str | None = Header(
+            default=None, alias=CAPTURE_PERSISTENCE_DEADLINE_HEADER
+        ),
+    ) -> dict[str, int]:
+        loop = asyncio.get_running_loop()
+        monotonic_before_wall_sample = loop.time()
+        request_budget = capture_request_budget_seconds(
+            client_deadline_ms, now_epoch_seconds=time.time()
+        )
+        request_deadline = monotonic_before_wall_sample + request_budget
+        persistence_deadline = (
+            request_deadline - CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS
+        )
+        try:
+            async with asyncio.timeout_at(request_deadline):
+                queued = await asyncio.to_thread(
+                    platform_state.trigger_capture_consolidation,
+                    request.session_id,
+                    persistence_deadline,
+                )
+            return {"queued": queued}
+        except (TimeoutError, CapturePersistenceBusyError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="capture consolidation is temporarily unavailable",
+            ) from error
 
     @app.get(
         "/api/v1/libraries/{library_id}/retention-policy",
@@ -731,7 +859,8 @@ def create_app(settings: Settings) -> FastAPI:
         library_id: str, policy: RetentionPolicyUpdate
     ) -> dict[str, object]:
         try:
-            return platform_state.update_retention_policy(library_id, **policy.model_dump())
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.update_retention_policy(library_id, **policy.model_dump())
         except LibraryRegistrationError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
@@ -741,7 +870,8 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def preview_retention_cleanup(library_id: str) -> dict[str, object]:
         try:
-            return platform_state.preview_retention_cleanup(library_id)
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.preview_retention_cleanup(library_id)
         except LibraryRegistrationError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
@@ -751,7 +881,8 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def run_retention_cleanup(library_id: str) -> dict[str, object]:
         try:
-            return platform_state.run_retention_cleanup(library_id)
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.run_retention_cleanup(library_id)
         except LibraryRegistrationError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
@@ -761,7 +892,10 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def pin_candidate(candidate_id: str, update: CandidatePinUpdate) -> dict[str, object]:
         try:
-            return platform_state.set_candidate_pinned(candidate_id, update.pinned)
+            return await candidate_write_payload(
+                candidate_id,
+                lambda: platform_state.set_candidate_pinned(candidate_id, update.pinned),
+            )
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
 
@@ -781,7 +915,10 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def restore_recycled_candidate(candidate_id: str) -> dict[str, object]:
         try:
-            return platform_state.restore_recycled_candidate(candidate_id)
+            return await candidate_write_payload(
+                candidate_id,
+                lambda: platform_state.restore_recycled_candidate(candidate_id),
+            )
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
 
@@ -795,7 +932,7 @@ def create_app(settings: Settings) -> FastAPI:
         status_code=status.HTTP_201_CREATED,
     )
     async def mcp_create_candidate(candidate: CandidateCreate) -> dict[str, object]:
-        return create_candidate_payload(candidate)
+        return await create_candidate_payload(candidate)
 
     @app.get("/mcp/candidates", dependencies=[Depends(authenticate)])
     async def mcp_list_candidates(
@@ -836,8 +973,11 @@ def create_app(settings: Settings) -> FastAPI:
     @app.put("/api/v1/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
     async def edit_candidate(candidate_id: str, edit: CandidateEdit) -> dict[str, object]:
         try:
-            return platform_state.edit_candidate(
-                candidate_id, edit.body, edit.operator, edit.reason
+            return await candidate_write_payload(
+                candidate_id,
+                lambda: platform_state.edit_candidate(
+                    candidate_id, edit.body, edit.operator, edit.reason
+                ),
             )
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
@@ -850,8 +990,11 @@ def create_app(settings: Settings) -> FastAPI:
         candidate_id: str, decision: CandidateDecision
     ) -> dict[str, object]:
         try:
-            return platform_state.approve_candidate(
-                candidate_id, decision.operator, decision.reason, decision.operation_id
+            return await candidate_write_payload(
+                candidate_id,
+                lambda: platform_state.approve_candidate(
+                    candidate_id, decision.operator, decision.reason, decision.operation_id
+                ),
             )
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
@@ -864,8 +1007,11 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def reject_candidate(candidate_id: str, decision: CandidateDecision) -> dict[str, object]:
         try:
-            return platform_state.reject_candidate(
-                candidate_id, decision.operator, decision.reason, decision.operation_id
+            return await candidate_write_payload(
+                candidate_id,
+                lambda: platform_state.reject_candidate(
+                    candidate_id, decision.operator, decision.reason, decision.operation_id
+                ),
             )
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
@@ -922,15 +1068,16 @@ def create_app(settings: Settings) -> FastAPI:
     @app.put("/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)])
     async def edit_document(library_id: str, edit: DocumentEdit) -> dict[str, str]:
         try:
-            return platform_state.edit_document(
-                library_id,
-                edit.path,
-                edit.content,
-                edit.expected_source_version,
-                edit.operation_id,
-                edit.actor_type,
-                edit.source,
-            )
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.edit_document(
+                    library_id,
+                    edit.path,
+                    edit.content,
+                    edit.expected_source_version,
+                    edit.operation_id,
+                    edit.actor_type,
+                    edit.source,
+                )
         except MemoryMutationError as error:
             raise mutation_error(error) from error
 
@@ -942,9 +1089,10 @@ def create_app(settings: Settings) -> FastAPI:
         library_id: str, deletion: DocumentDeletePreview
     ) -> dict[str, object]:
         try:
-            return platform_state.preview_document_deletion(
-                library_id, deletion.path, deletion.expected_source_version
-            )
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.preview_document_deletion(
+                    library_id, deletion.path, deletion.expected_source_version
+                )
         except MemoryMutationError as error:
             raise mutation_error(error) from error
 
@@ -954,15 +1102,16 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def delete_document(library_id: str, deletion: DocumentDelete) -> dict[str, str]:
         try:
-            return platform_state.delete_document(
-                library_id,
-                deletion.path,
-                deletion.expected_source_version,
-                deletion.operation_id,
-                deletion.actor_type,
-                deletion.source,
-                deletion.preview_token,
-            )
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.delete_document(
+                    library_id,
+                    deletion.path,
+                    deletion.expected_source_version,
+                    deletion.operation_id,
+                    deletion.actor_type,
+                    deletion.source,
+                    deletion.preview_token,
+                )
         except MemoryMutationError as error:
             raise mutation_error(error) from error
 
@@ -984,14 +1133,15 @@ def create_app(settings: Settings) -> FastAPI:
         library_id: str, restore: ForgottenMemoryRestore
     ) -> dict[str, str]:
         try:
-            return platform_state.restore_forgotten_memory(
-                library_id,
-                restore.tombstone_id,
-                restore.commit,
-                restore.operation_id,
-                restore.actor_type,
-                restore.source,
-            )
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.restore_forgotten_memory(
+                    library_id,
+                    restore.tombstone_id,
+                    restore.commit,
+                    restore.operation_id,
+                    restore.actor_type,
+                    restore.source,
+                )
         except MemoryMutationError as error:
             raise mutation_error(error) from error
 
@@ -1018,15 +1168,16 @@ def create_app(settings: Settings) -> FastAPI:
     )
     async def restore_document(library_id: str, restore: DocumentRestore) -> dict[str, str]:
         try:
-            return platform_state.restore_document(
-                library_id,
-                restore.path,
-                restore.commit,
-                restore.expected_source_version,
-                restore.operation_id,
-                restore.actor_type,
-                restore.source,
-            )
+            async with platform_state.library_write_lock(library_id):
+                return platform_state.restore_document(
+                    library_id,
+                    restore.path,
+                    restore.commit,
+                    restore.expected_source_version,
+                    restore.operation_id,
+                    restore.actor_type,
+                    restore.source,
+                )
         except MemoryMutationError as error:
             raise mutation_error(error) from error
 
@@ -1108,7 +1259,7 @@ def create_app(settings: Settings) -> FastAPI:
             path = str(arguments.get("path", ""))
             return platform_state.read_document(library_id, path)
         if name == "candidate_create":
-            return create_candidate_payload(CandidateCreate.model_validate(arguments))
+            return await create_candidate_payload(CandidateCreate.model_validate(arguments))
         if name == "candidate_list":
             filter_library_id = arguments.get("library_id")
             candidate_status = arguments.get("candidate_status")

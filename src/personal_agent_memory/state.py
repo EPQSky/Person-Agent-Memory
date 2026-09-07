@@ -18,13 +18,14 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager, suppress
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from time import monotonic
-from typing import Literal, cast
+from typing import BinaryIO, Literal, cast
 
 from personal_agent_memory.git_history import (
     TOMBSTONE_DIRECTORY,
@@ -134,6 +135,10 @@ class MemoryMutationError(ValueError):
 
 class CandidateGovernanceError(ValueError):
     """Raised when candidate memory governance cannot be completed safely."""
+
+
+class CapturePersistenceBusyError(RuntimeError):
+    """Raised when capture persistence cannot acquire SQLite's write lock immediately."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,7 +358,10 @@ class PlatformState:
         self.sensitive_dedupe_key = b""
         self.tombstone_keys: dict[str, bytes] = {}
         self.active_tombstone_key_id = ""
-        self._library_lock_state = threading.local()
+        self._library_lock_state: ContextVar[tuple[tuple[str, object, int], ...]] = (
+            ContextVar(f"library_lock_state_{id(self)}", default=())
+        )
+        self._async_library_locks: dict[str, asyncio.Lock] = {}
         self.model_client = model_client or OpenAICompatibleClient(None, None)
         self.graph_adapter = graph_adapter
         self._last_reconciliation_check = 0.0
@@ -798,6 +806,10 @@ class PlatformState:
                     "ALTER TABLE memory_tombstones "
                     "ADD COLUMN match_fingerprint TEXT NOT NULL DEFAULT ''"
                 )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS memory_tombstone_match "
+                "ON memory_tombstones(library_id, key_id, match_fingerprint)"
+            )
             cleanup_columns = {
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(graph_cleanup_intents)")
@@ -961,21 +973,25 @@ class PlatformState:
                 for library in self.list_libraries():
                     if library.availability != "available":
                         continue
-                    with suppress(LibraryRegistrationError, MemoryMutationError, OSError):
-                        self.reconcile_library(library.id)
+                    async with self.library_write_lock(library.id):
+                        with suppress(LibraryRegistrationError, MemoryMutationError, OSError):
+                            self.reconcile_library(library.id)
+                    await asyncio.sleep(0)
                 if monotonic() - self._last_retention_check >= 60.0:
                     self._last_retention_check = monotonic()
                     retention_generation = self._retention_generation
                     for library in self.list_libraries():
                         if library.availability == "available":
-                            with suppress(
-                                LibraryRegistrationError,
-                                MemoryMutationError,
-                                sqlite3.DatabaseError,
-                            ):
-                                self._run_scheduled_retention_cleanup(
-                                    library.id, retention_generation
-                                )
+                            async with self.library_write_lock(library.id):
+                                with suppress(
+                                    LibraryRegistrationError,
+                                    MemoryMutationError,
+                                    sqlite3.DatabaseError,
+                                ):
+                                    self._run_scheduled_retention_cleanup(
+                                        library.id, retention_generation
+                                    )
+                            await asyncio.sleep(0)
             try:
                 await asyncio.wait_for(self.stop_worker.wait(), timeout=0.1)
             except TimeoutError:
@@ -2492,54 +2508,97 @@ class PlatformState:
         content: str,
         occurred_at: str,
         cwd: str,
+        deadline: float | None = None,
     ) -> dict[str, object]:
-        for value, label, maximum in (
-            (event_id, "event_id", 200),
-            (session_id, "session_id", 1000),
-            (turn_id, "turn_id", 200),
-            (occurred_at, "occurred_at", 100),
-        ):
-            if not value.strip() or len(value) > maximum or "\x00" in value:
-                raise CandidateGovernanceError(f"invalid {label}")
-        if event_kind not in {"user", "assistant"}:
-            raise CandidateGovernanceError("invalid capture event kind")
-        if not content.strip() or len(content.encode()) > 64 * 1024 or "\x00" in content:
-            raise CandidateGovernanceError("invalid capture content")
-        persisted_input = "\n".join(
-            (event_id, session_id, turn_id, event_kind, content, occurred_at, cwd)
-        )
-        finding = inspect_sensitive_text(persisted_input)
-        if finding is not None:
-            return self._quarantine_capture_event(
-                finding,
-                persisted_input,
-                dedupe_material=content if inspect_sensitive_text(content) is not None else None,
+        with self._fail_fast_capture_persistence():
+            self._require_capture_deadline(deadline)
+            for value, label, maximum in (
+                (event_id, "event_id", 200),
+                (session_id, "session_id", 1000),
+                (turn_id, "turn_id", 200),
+                (occurred_at, "occurred_at", 100),
+            ):
+                if not value.strip() or len(value) > maximum or "\x00" in value:
+                    raise CandidateGovernanceError(f"invalid {label}")
+            if event_kind not in {"user", "assistant"}:
+                raise CandidateGovernanceError("invalid capture event kind")
+            if not content.strip() or len(content.encode()) > 64 * 1024 or "\x00" in content:
+                raise CandidateGovernanceError("invalid capture content")
+            persisted_input = "\n".join(
+                (event_id, session_id, turn_id, event_kind, content, occurred_at, cwd)
             )
-        binding = self.resolve_project_binding(cwd)
-        if binding["status"] != "bound":
-            return {"status": "unbound", "event_id": event_id}
-        library_id = str(binding["library_id"])
-        project_id = str(binding["project_id"])
-        persisted_input = "\n".join((persisted_input, project_id, library_id))
-        finding = inspect_sensitive_text(persisted_input)
-        if finding is not None:
-            return self._quarantine_capture_event(
-                finding,
-                persisted_input,
-                library_id,
-                content if inspect_sensitive_text(content) is not None else None,
-            )
-        with self._library_lock(library_id):
-            return self._ingest_capture_event_locked(
-                event_id,
-                session_id,
-                turn_id,
-                event_kind,
-                content,
-                occurred_at,
-                project_id,
-                library_id,
-            )
+            finding = inspect_sensitive_text(persisted_input)
+            self._require_capture_deadline(deadline)
+            if finding is not None:
+                return self._quarantine_capture_event(
+                    finding,
+                    persisted_input,
+                    dedupe_material=(
+                        content if inspect_sensitive_text(content) is not None else None
+                    ),
+                    deadline=deadline,
+                )
+            binding = self.resolve_project_binding(cwd)
+            self._require_capture_deadline(deadline)
+            if binding["status"] != "bound":
+                return {"status": "unbound", "event_id": event_id}
+            library_id = str(binding["library_id"])
+            project_id = str(binding["project_id"])
+            persisted_input = "\n".join((persisted_input, project_id, library_id))
+            finding = inspect_sensitive_text(persisted_input)
+            self._require_capture_deadline(deadline)
+            if finding is not None:
+                return self._quarantine_capture_event(
+                    finding,
+                    persisted_input,
+                    library_id,
+                    content if inspect_sensitive_text(content) is not None else None,
+                    deadline,
+                )
+            with self._library_lock(library_id):
+                return self._ingest_capture_event_locked(
+                    event_id,
+                    session_id,
+                    turn_id,
+                    event_kind,
+                    content,
+                    occurred_at,
+                    project_id,
+                    library_id,
+                    deadline,
+                )
+
+    @contextmanager
+    def _fail_fast_capture_persistence(self) -> Iterator[None]:
+        connection = self.connection_or_raise
+        if connection.in_transaction:
+            raise RuntimeError("capture persistence requires an idle SQLite connection")
+        row = connection.execute("PRAGMA busy_timeout").fetchone()
+        previous_timeout = int(row[0]) if row is not None else 5000
+        connection.execute("PRAGMA busy_timeout = 0")
+        try:
+            yield
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            error_code = getattr(error, "sqlite_errorcode", None)
+            if isinstance(error_code, int) and error_code & 0xFF in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                raise CapturePersistenceBusyError(
+                    "capture persistence is temporarily unavailable"
+                ) from error
+            raise
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.execute(f"PRAGMA busy_timeout = {previous_timeout}")
+
+    @staticmethod
+    def _require_capture_deadline(deadline: float | None) -> None:
+        if deadline is not None and monotonic() >= deadline:
+            raise CapturePersistenceBusyError("capture persistence deadline expired")
 
     def _ingest_capture_event_locked(
         self,
@@ -2551,11 +2610,14 @@ class PlatformState:
         occurred_at: str,
         project_id: str,
         library_id: str,
+        deadline: float | None = None,
     ) -> dict[str, object]:
+        self._require_capture_deadline(deadline)
         if self._matches_active_tombstone(
             library_id, content, reject_invalid_formal=True
         ):
             raise CandidateGovernanceError("capture event matches forgotten memory")
+        self._require_capture_deadline(deadline)
         request_hash = hashlib.sha256(
             json.dumps(
                 {
@@ -2572,12 +2634,15 @@ class PlatformState:
         existing = self.connection_or_raise.execute(
             "SELECT request_hash FROM capture_inbox WHERE event_id = ?", (event_id,)
         ).fetchone()
+        self._require_capture_deadline(deadline)
         if existing is not None:
             if str(existing[0]) != request_hash:
                 raise CandidateGovernanceError("event_id was already used for another event")
             return {"status": "accepted", "event_id": event_id, "duplicate": True}
         try:
+            self._require_capture_deadline(deadline)
             self.connection_or_raise.execute("BEGIN IMMEDIATE")
+            self._require_capture_deadline(deadline)
             self.connection_or_raise.execute(
                 """INSERT INTO capture_inbox
                    (event_id, request_hash, session_id, project_id, library_id, turn_id,
@@ -2596,6 +2661,7 @@ class PlatformState:
                     self._now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
+            self._require_capture_deadline(deadline)
             self.connection_or_raise.execute(
                 """INSERT INTO capture_rounds (session_id, turn_id, library_id)
                    VALUES (?, ?, ?)
@@ -2605,7 +2671,9 @@ class PlatformState:
                      updated_at = CURRENT_TIMESTAMP""",
                 (session_id, turn_id, library_id),
             )
+            self._require_capture_deadline(deadline)
             self._queue_capture_consolidation(session_id, turn_id, True)
+            self._require_capture_deadline(deadline)
             self.connection_or_raise.commit()
         except sqlite3.IntegrityError as error:
             self.connection_or_raise.rollback()
@@ -2620,7 +2688,9 @@ class PlatformState:
         inspected_text: str,
         library_id: str | None = None,
         dedupe_material: str | None = None,
+        deadline: float | None = None,
     ) -> dict[str, object]:
+        self._require_capture_deadline(deadline)
         disposition = "discarded" if finding.disposition == "discard" else "quarantined"
         self._record_sensitive_quarantine(
             "capture",
@@ -2631,23 +2701,63 @@ class PlatformState:
             controlled_sensitive_summary(finding, inspected_text),
             finding.fingerprint,
             dedupe_material or inspected_text,
+            deadline,
         )
         return {"status": disposition, "event_id": "withheld", "duplicate": False}
 
-    def trigger_capture_consolidation(self, session_id: str | None = None) -> int:
-        rows = self.connection_or_raise.execute(
-            """SELECT session_id, turn_id FROM capture_rounds
-               WHERE status IN ('pending', 'error')
-                 AND (? IS NULL OR session_id = ?)
-               ORDER BY updated_at""",
-            (session_id, session_id),
-        ).fetchall()
-        queued = 0
-        for row in rows:
-            if self._queue_capture_consolidation(str(row[0]), str(row[1]), True):
-                queued += 1
-        self.connection_or_raise.commit()
-        return queued
+    def trigger_capture_consolidation(
+        self, session_id: str | None = None, deadline: float | None = None
+    ) -> int:
+        self._require_capture_deadline(deadline)
+        connection = sqlite3.connect(self.database_path, timeout=0)
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=0")
+        try:
+            self._require_capture_deadline(deadline)
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_capture_deadline(deadline)
+            rows = connection.execute(
+                """SELECT session_id, turn_id FROM capture_rounds
+                   WHERE status IN ('pending', 'error')
+                     AND (? IS NULL OR session_id = ?)
+                   ORDER BY updated_at""",
+                (session_id, session_id),
+            ).fetchall()
+            self._require_capture_deadline(deadline)
+            queued = 0
+            for row in rows:
+                self._require_capture_deadline(deadline)
+                if self._queue_capture_consolidation(
+                    str(row[0]),
+                    str(row[1]),
+                    True,
+                    connection=connection,
+                    deadline=deadline,
+                ):
+                    queued += 1
+                self._require_capture_deadline(deadline)
+            self._require_capture_deadline(deadline)
+            connection.commit()
+            self._require_capture_deadline(deadline)
+            return queued
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            error_code = getattr(error, "sqlite_errorcode", None)
+            if isinstance(error_code, int) and error_code & 0xFF in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                raise CapturePersistenceBusyError(
+                    "capture persistence is temporarily unavailable"
+                ) from error
+            raise
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def list_capture_events(self, session_id: str | None = None) -> list[dict[str, object]]:
         rows = self.connection_or_raise.execute(
@@ -2744,6 +2854,7 @@ class PlatformState:
         summary: str,
         fingerprint: str,
         dedupe_material: str,
+        deadline: float | None = None,
     ) -> None:
         encoded_summary = summary.encode()
         bounded_summary = encoded_summary[:1024].decode("utf-8", errors="ignore")
@@ -2752,9 +2863,12 @@ class PlatformState:
             f"{source_kind}\0{disposition}\0{dedupe_material}".encode(),
             hashlib.sha256,
         ).hexdigest()
+        self._require_capture_deadline(deadline)
         connection = self.connection_or_raise
         try:
+            self._require_capture_deadline(deadline)
             connection.execute("BEGIN IMMEDIATE")
+            self._require_capture_deadline(deadline)
             connection.execute(
                 """INSERT INTO sensitive_quarantine
                    (id, source_kind, source_id, library_id, disposition, categories_json,
@@ -2786,7 +2900,9 @@ class PlatformState:
                     ),
                 ),
             )
+            self._require_capture_deadline(deadline)
             self._prune_sensitive_quarantine(connection)
+            self._require_capture_deadline(deadline)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -6992,11 +7108,19 @@ class PlatformState:
         *,
         reject_invalid_formal: bool = False,
     ) -> str:
+        normalized = self._normalized_tombstone_match_content(
+            content, reject_invalid_formal=reject_invalid_formal
+        )
+        return self._tombstone_match_fingerprint_for_normalized(
+            library_id, normalized, key_id
+        )
+
+    def _tombstone_match_fingerprint_for_normalized(
+        self, library_id: str, normalized: str, key_id: str
+    ) -> str:
         key = self.tombstone_keys.get(key_id)
         if key is None:
             raise MemoryMutationError("tombstone key is unavailable")
-        semantic = self._memory_semantic_body(content, reject_invalid_formal=reject_invalid_formal)
-        normalized = "\n".join(line.rstrip() for line in semantic.splitlines()).strip().casefold()
         material = b"personal-agent-memory:tombstone-semantic-body:v2\0" + json.dumps(
             {"library_id": library_id, "content": normalized},
             ensure_ascii=False,
@@ -7004,6 +7128,14 @@ class PlatformState:
             separators=(",", ":"),
         ).encode("utf-8")
         return "hmac-sha256:" + hmac.new(key, material, hashlib.sha256).hexdigest()
+
+    def _normalized_tombstone_match_content(
+        self, content: str, *, reject_invalid_formal: bool
+    ) -> str:
+        semantic = self._memory_semantic_body(
+            content, reject_invalid_formal=reject_invalid_formal
+        )
+        return "\n".join(line.rstrip() for line in semantic.splitlines()).strip().casefold()
 
     def _forgotten_documents(
         self, library_id: str, path: str, key_id: str
@@ -7258,26 +7390,25 @@ class PlatformState:
         *,
         reject_invalid_formal: bool = False,
     ) -> bool:
-        if reject_invalid_formal:
-            self._memory_semantic_body(content, reject_invalid_formal=True)
-        rows = self.connection_or_raise.execute(
-            """SELECT match_fingerprint, key_id FROM memory_tombstones
-               WHERE library_id = ?""",
+        normalized = self._normalized_tombstone_match_content(
+            content, reject_invalid_formal=reject_invalid_formal
+        )
+        key_ids = self.connection_or_raise.execute(
+            "SELECT DISTINCT key_id FROM memory_tombstones WHERE library_id = ?",
             (library_id,),
         ).fetchall()
-        return any(
-            hmac.compare_digest(
-                str(row[0]),
-                self._tombstone_match_fingerprint(
-                    library_id,
-                    content,
-                    str(row[1]),
-                    reject_invalid_formal=reject_invalid_formal,
-                ),
+        for row in key_ids:
+            key_id = str(row[0])
+            fingerprint = self._tombstone_match_fingerprint_for_normalized(
+                library_id, normalized, key_id
             )
-            for row in rows
-            if str(row[0])
-        )
+            if self.connection_or_raise.execute(
+                """SELECT 1 FROM memory_tombstones
+                   WHERE library_id = ? AND key_id = ? AND match_fingerprint = ? LIMIT 1""",
+                (library_id, key_id, fingerprint),
+            ).fetchone() is not None:
+                return True
+        return False
 
     def _mutate_document(
         self,
@@ -9351,31 +9482,18 @@ class PlatformState:
             os.close(descriptor)
             raise
 
-    @contextmanager
-    def _library_lock(self, library_id: str) -> Iterator[None]:
+    @staticmethod
+    def _normalized_library_lock_id(library_id: str) -> str:
         if not isinstance(library_id, str) or re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", library_id
         ) is None:
             raise MemoryMutationError("invalid memory library identifier")
         try:
-            normalized_library_id = str(uuid.UUID(library_id))
+            return str(uuid.UUID(library_id))
         except ValueError:
-            normalized_library_id = library_id
-        depths = getattr(self._library_lock_state, "depths", None)
-        if depths is None:
-            depths = {}
-            self._library_lock_state.depths = depths
-        depth = int(depths.get(normalized_library_id, 0))
-        if depth:
-            depths[normalized_library_id] = depth + 1
-            try:
-                yield
-            finally:
-                if depths[normalized_library_id] == 1:
-                    del depths[normalized_library_id]
-                else:
-                    depths[normalized_library_id] -= 1
-            return
+            return library_id
+
+    def _open_library_lock(self, normalized_library_id: str) -> BinaryIO:
         lock_directory = self.database_path.parent / "locks"
         lock_directory.mkdir(mode=0o700, exist_ok=True)
         directory_fd = os.open(
@@ -9390,15 +9508,121 @@ class PlatformState:
             )
         finally:
             os.close(directory_fd)
-        with os.fdopen(lock_fd, "a+b") as lock:
-            if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
-                raise MemoryMutationError("memory library lock is not a regular file")
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            depths[normalized_library_id] = 1
+        lock = os.fdopen(lock_fd, "a+b")
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+            lock.close()
+            raise MemoryMutationError("memory library lock is not a regular file")
+        return lock
+
+    @staticmethod
+    def _library_lock_owner() -> object:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        return task if task is not None else threading.current_thread()
+
+    @staticmethod
+    def _library_lock_depth(
+        state: tuple[tuple[str, object, int], ...],
+        normalized_library_id: str,
+        owner: object,
+    ) -> int:
+        return next(
+            (
+                depth
+                for lock_id, lock_owner, depth in state
+                if lock_id == normalized_library_id and lock_owner is owner
+            ),
+            0,
+        )
+
+    @staticmethod
+    def _updated_library_lock_state(
+        state: tuple[tuple[str, object, int], ...],
+        normalized_library_id: str,
+        owner: object,
+        depth: int,
+    ) -> tuple[tuple[str, object, int], ...]:
+        updated = tuple(
+            entry
+            for entry in state
+            if not (entry[0] == normalized_library_id and entry[1] is owner)
+        )
+        if depth:
+            updated += ((normalized_library_id, owner, depth),)
+        return updated
+
+    @asynccontextmanager
+    async def library_write_lock(self, library_id: str) -> AsyncIterator[None]:
+        normalized_library_id = self._normalized_library_lock_id(library_id)
+        owner = self._library_lock_owner()
+        state = self._library_lock_state.get()
+        depth = self._library_lock_depth(state, normalized_library_id, owner)
+        if depth:
+            token = self._library_lock_state.set(
+                self._updated_library_lock_state(
+                    state, normalized_library_id, owner, depth + 1
+                )
+            )
             try:
                 yield
             finally:
-                del depths[normalized_library_id]
+                self._library_lock_state.reset(token)
+            return
+        async_lock = self._async_library_locks.setdefault(
+            normalized_library_id, asyncio.Lock()
+        )
+        async with async_lock:
+            lock = self._open_library_lock(normalized_library_id)
+            try:
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(0.01)
+                token = self._library_lock_state.set(
+                    self._updated_library_lock_state(
+                        self._library_lock_state.get(), normalized_library_id, owner, 1
+                    )
+                )
+                try:
+                    yield
+                finally:
+                    self._library_lock_state.reset(token)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            finally:
+                lock.close()
+
+    @contextmanager
+    def _library_lock(self, library_id: str) -> Iterator[None]:
+        normalized_library_id = self._normalized_library_lock_id(library_id)
+        owner = self._library_lock_owner()
+        state = self._library_lock_state.get()
+        depth = self._library_lock_depth(state, normalized_library_id, owner)
+        if depth:
+            token = self._library_lock_state.set(
+                self._updated_library_lock_state(
+                    state, normalized_library_id, owner, depth + 1
+                )
+            )
+            try:
+                yield
+            finally:
+                self._library_lock_state.reset(token)
+            return
+        with self._open_library_lock(normalized_library_id) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            token = self._library_lock_state.set(
+                self._updated_library_lock_state(
+                    state, normalized_library_id, owner, 1
+                )
+            )
+            try:
+                yield
+            finally:
+                self._library_lock_state.reset(token)
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _candidate_library_id(self, candidate_id: str) -> str:
@@ -9408,6 +9632,9 @@ class PlatformState:
         if row is None:
             raise CandidateGovernanceError("candidate memory not found")
         return str(row[0])
+
+    def candidate_library_id(self, candidate_id: str) -> str:
+        return self._candidate_library_id(candidate_id)
 
     async def search_project(
         self,
@@ -10345,7 +10572,7 @@ class PlatformState:
                     ).fetchone()
                     if round_row is not None:
                         capture_library_id = str(round_row[0])
-                        with self._library_lock(capture_library_id):
+                        async with self.library_write_lock(capture_library_id):
                             rows = self._capture_round_rows(
                                 capture_session_id,
                                 capture_turn_id,
@@ -10402,23 +10629,34 @@ class PlatformState:
         self.connection.commit()
 
     def _queue_capture_consolidation(
-        self, session_id: str, turn_id: str, participate_in_transaction: bool
+        self,
+        session_id: str,
+        turn_id: str,
+        participate_in_transaction: bool,
+        *,
+        connection: sqlite3.Connection | None = None,
+        deadline: float | None = None,
     ) -> int:
-        pending = self.connection_or_raise.execute(
+        target = self.connection_or_raise if connection is None else connection
+        self._require_capture_deadline(deadline)
+        pending = target.execute(
             """SELECT id FROM background_jobs WHERE kind = 'capture_consolidation'
                AND status = 'pending'
                AND json_extract(payload, '$.session_id') = ?
                AND json_extract(payload, '$.turn_id') = ? LIMIT 1""",
             (session_id, turn_id),
         ).fetchone()
+        self._require_capture_deadline(deadline)
         if pending is not None:
             return 0
-        cursor = self.connection_or_raise.execute(
+        cursor = target.execute(
             "INSERT INTO background_jobs (kind, payload) VALUES ('capture_consolidation', ?)",
             (json.dumps({"session_id": session_id, "turn_id": turn_id}),),
         )
+        self._require_capture_deadline(deadline)
         if not participate_in_transaction:
-            self.connection_or_raise.commit()
+            target.commit()
+            self._require_capture_deadline(deadline)
         assert cursor.lastrowid is not None
         return int(cursor.lastrowid)
 
@@ -10430,7 +10668,7 @@ class PlatformState:
         if round_row is None:
             return
         library_id = str(round_row[0])
-        with self._library_lock(library_id):
+        async with self.library_write_lock(library_id):
             rows = self._capture_round_rows(session_id, turn_id, library_id)
             by_kind = {str(row[2]): row for row in rows}
             if set(by_kind) != {"user", "assistant"}:
@@ -10453,7 +10691,7 @@ class PlatformState:
             "reusable_experience",
             "external_reference",
         }
-        with self._library_lock(library_id):
+        async with self.library_write_lock(library_id):
             rows = self._capture_round_rows(session_id, turn_id, library_id)
             by_kind = {str(row[2]): row for row in rows}
             if set(by_kind) != {"user", "assistant"}:
@@ -10597,7 +10835,7 @@ class PlatformState:
         adapter = self.graph_adapter
         if adapter is None:
             raise GraphAdapterError("graph projection is not configured")
-        with self._library_lock(library_id):
+        async with self.library_write_lock(library_id):
             documents = self._graph_source_documents(library_id)
             self.connection_or_raise.execute(
                 "UPDATE memory_graph_indexes SET total_documents = ?, "
@@ -10709,7 +10947,7 @@ class PlatformState:
         endpoint = self.model_client.embedding
         if endpoint is None:
             raise ModelServiceError("embedding is not configured")
-        with self._library_lock(library_id):
+        async with self.library_write_lock(library_id):
             rows = self.connection_or_raise.execute(
                 "SELECT id, content, source_version FROM memory_chunks "
                 "WHERE library_id = ? ORDER BY id",
@@ -10737,7 +10975,7 @@ class PlatformState:
                 )
                 for row, vector in zip(batch, vectors, strict=True)
             )
-        with self._library_lock(library_id):
+        async with self.library_write_lock(library_id):
             self.connection_or_raise.execute("BEGIN IMMEDIATE")
             current = {
                 (str(row[0]), str(row[1]))

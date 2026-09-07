@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -14,6 +15,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
@@ -31,7 +34,7 @@ def request(
     payload: dict[str, object] | None = None,
     method: str | None = None,
     *,
-    timeout: float = 10,
+    timeout: float = 30,
 ) -> tuple[int, dict[str, object]]:
     headers = {} if key is None else {"Authorization": f"Bearer {key}"}
     data = None
@@ -3387,15 +3390,11 @@ try:
     )
     wait.until(
         lambda driver: driver.execute_script(
-            "return [...document.querySelectorAll('.candidate-list button')]"
-            ".some(item => item.textContent.includes('decisions.md') && "
-            "item.textContent.includes('edit'));"
+            "const item = [...document.querySelectorAll('.candidate-list button')]"
+            ".find(item => item.textContent.includes('decisions.md') && "
+            "item.textContent.includes('edit')); "
+            "if (!item) return false; item.click(); return true;"
         )
-    )
-    browser.execute_script(
-        "const item = [...document.querySelectorAll('.candidate-list button')]"
-        ".find(item => item.textContent.includes('decisions.md') && "
-        "item.textContent.includes('edit')); item.click();"
     )
     final_input = browser.find_element(By.ID, "reconciliation-final")
     import_button = browser.find_element(By.ID, "reconciliation-import")
@@ -4004,6 +4003,404 @@ try:
 finally:
     retention_restart_process.send_signal(signal.SIGINT)
     assert retention_restart_process.wait(timeout=10) == 0
+
+# Multiple Codex sessions exercise event idempotency and library-scoped coordination.
+# Same-document compare-and-swap admits one complete winner, while independent libraries
+# both remain writable under concurrent requests.
+concurrency_state = Path("/tmp/ticket17-concurrency-state")
+concurrency_libraries = Path("/tmp/ticket17-concurrency-libraries")
+concurrency_projects = Path("/tmp/ticket17-concurrency-projects")
+for path in (concurrency_state, concurrency_libraries, concurrency_projects):
+    shutil.rmtree(path, ignore_errors=True)
+for path in (concurrency_libraries, concurrency_projects):
+    path.mkdir()
+concurrency_command = [
+    "personal-agent-memory",
+    "serve",
+    "--state-dir",
+    str(concurrency_state),
+    "--library-root",
+    str(concurrency_libraries),
+    "--library-root",
+    str(concurrency_projects),
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "47331",
+]
+concurrency_daemon = subprocess.Popen(
+    concurrency_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+)
+concurrency_base = "http://127.0.0.1:47331"
+concurrency_deadline = time.monotonic() + 30
+while time.monotonic() < concurrency_deadline:
+    if concurrency_daemon.poll() is not None:
+        raise RuntimeError("concurrency daemon exited during startup")
+    if (concurrency_state / "api-key").is_file():
+        concurrency_key = (concurrency_state / "api-key").read_text().strip()
+        try:
+            if request(concurrency_base + "/health/live", concurrency_key)[0] == 200:
+                break
+        except OSError:
+            pass
+    time.sleep(0.05)
+else:
+    concurrency_daemon.terminate()
+    concurrency_daemon.wait(timeout=5)
+    raise RuntimeError("concurrency daemon did not become ready")
+
+concurrent_library_path_one = concurrency_libraries / "concurrency-one"
+concurrent_library_path_two = concurrency_libraries / "concurrency-two"
+concurrent_library_path_one.mkdir()
+concurrent_library_path_two.mkdir()
+same_library_note = concurrent_library_path_one / "atomic.md"
+preview_note = concurrent_library_path_one / "preview.md"
+replacement_note = concurrent_library_path_two / "atomic.md"
+atomic_old_content = (
+    "# Concurrency baseline\n\n"
+    + "AtomicOldVisibilitySentinel " * 8192
+    + "\n"
+)
+same_library_note.write_text(atomic_old_content, encoding="utf-8")
+replacement_note.write_text(
+    "# Independent baseline\n\nCross-library write evidence.\n", encoding="utf-8"
+)
+preview_note.write_text(
+    "# Preview baseline\n\nIndependent deletion preview evidence.\n", encoding="utf-8"
+)
+concurrent_library_one_code, concurrent_library_one = request(
+    concurrency_base + "/api/v1/libraries",
+    concurrency_key,
+    {"path": str(concurrent_library_path_one), "kind": "project"},
+)
+concurrent_library_two_code, concurrent_library_two = request(
+    concurrency_base + "/api/v1/libraries",
+    concurrency_key,
+    {"path": str(concurrent_library_path_two), "kind": "project"},
+)
+assert concurrent_library_one_code == concurrent_library_two_code == 201
+concurrent_project_one = concurrency_projects / "one"
+concurrent_project_two = concurrency_projects / "two"
+for path in (concurrent_project_one / "src", concurrent_project_two / "src"):
+    path.mkdir(parents=True)
+for project_root, library in (
+    (concurrent_project_one, concurrent_library_one),
+    (concurrent_project_two, concurrent_library_two),
+):
+    code, _ = request(
+        concurrency_base + "/api/v1/project-bindings",
+        concurrency_key,
+        {"project_root": str(project_root), "library_id": library["id"]},
+    )
+    assert code == 201
+same_library_url = (
+    f"{concurrency_base}/api/v1/libraries/{concurrent_library_one['id']}/document"
+)
+same_library_loaded_code, same_library_loaded = request(
+    same_library_url + "?" + urllib.parse.urlencode({"path": same_library_note.name}),
+    concurrency_key,
+)
+assert same_library_loaded_code == 200
+same_library_payloads = [
+    {
+        "path": same_library_note.name,
+        "content": (
+            f"# Concurrent winner {index}\n\n"
+            + f"AtomicNewVisibilitySentinel{index} " * 8192
+            + "\n"
+        ),
+        "expected_source_version": same_library_loaded["source_version"],
+        "operation_id": f"docker-concurrent-same-{index}",
+        "actor_type": "user",
+        "source": "docker-concurrency",
+    }
+    for index in range(2)
+]
+atomic_inode_before = same_library_note.stat().st_ino
+atomic_observer_ready = threading.Event()
+atomic_observer_stop = threading.Event()
+atomic_observations: set[str] = set()
+atomic_observation_count = 0
+
+
+def observe_atomic_document() -> None:
+    global atomic_observation_count
+    atomic_observer_ready.set()
+    while not atomic_observer_stop.is_set():
+        try:
+            observed = same_library_note.read_text(encoding="utf-8")
+        except (FileNotFoundError, UnicodeError):
+            observed = "__missing_or_partial__"
+        atomic_observations.add(observed)
+        atomic_observation_count += 1
+
+
+atomic_observer = threading.Thread(target=observe_atomic_document)
+atomic_observer.start()
+assert atomic_observer_ready.wait(timeout=1)
+time.sleep(0.01)
+try:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        same_library_results = list(
+            executor.map(
+                lambda payload: request(
+                    same_library_url, concurrency_key, payload, method="PUT"
+                ),
+                same_library_payloads,
+            )
+        )
+    time.sleep(0.01)
+finally:
+    atomic_observer_stop.set()
+    atomic_observer.join(timeout=5)
+assert not atomic_observer.is_alive()
+assert sorted(code for code, _ in same_library_results) == [200, 409]
+atomic_new_content = same_library_note.read_text(encoding="utf-8")
+assert atomic_new_content in {str(payload["content"]) for payload in same_library_payloads}
+assert atomic_observation_count >= 10
+assert atomic_old_content in atomic_observations
+assert atomic_new_content in atomic_observations
+assert atomic_observations <= {atomic_old_content, atomic_new_content}
+assert same_library_note.stat().st_ino != atomic_inode_before
+assert list(concurrent_library_path_one.glob(f".{same_library_note.name}.*.tmp")) == []
+
+replacement_url = (
+    f"{concurrency_base}/api/v1/libraries/{concurrent_library_two['id']}/document"
+)
+second_warm_loaded = request(
+    replacement_url + "?" + urllib.parse.urlencode({"path": replacement_note.name}),
+    concurrency_key,
+)[1]
+second_write_payload = {
+    "path": replacement_note.name,
+    "content": "# Independent second library\n\nCrossLibrarySecond.\n",
+    "expected_source_version": second_warm_loaded["source_version"],
+    "operation_id": "docker-concurrent-cross-second",
+    "actor_type": "user",
+    "source": "docker-concurrency",
+}
+second_warm_result = request(
+    replacement_url,
+    concurrency_key,
+    second_write_payload,
+    method="PUT",
+    timeout=120,
+)
+assert second_warm_result[0] == 200, second_warm_result
+
+first_loaded = request(
+    same_library_url + "?" + urllib.parse.urlencode({"path": same_library_note.name}),
+    concurrency_key,
+)[1]
+preview_loaded = request(
+    same_library_url + "?" + urllib.parse.urlencode({"path": preview_note.name}),
+    concurrency_key,
+)[1]
+cross_library_operations = [
+    (
+        same_library_url,
+        {
+            "path": same_library_note.name,
+            "content": "# Independent first library\n\nCrossLibraryFirst.\n",
+            "expected_source_version": first_loaded["source_version"],
+            "operation_id": "docker-concurrent-cross-first",
+            "actor_type": "user",
+            "source": "docker-concurrency",
+        },
+    ),
+    (replacement_url, second_write_payload),
+]
+same_library_candidate = {
+    "library_id": concurrent_library_one["id"],
+    "suggested_type": "decision",
+    "body": "# Decision\n\nSerialized after the Docker document edit.\n",
+    "source_references": ["docker-session:lock-order#assistant-final"],
+    "creator": "docker-mcp",
+    "idempotency_key": "docker-concurrent-same-library-candidate",
+}
+approval_candidate_code, approval_candidate = request(
+    concurrency_base + "/mcp/candidates",
+    concurrency_key,
+    {
+        **same_library_candidate,
+        "body": "# Decision\n\nApprove after the held Docker library lock.\n",
+        "idempotency_key": "docker-concurrent-approval-candidate",
+    },
+)
+assert approval_candidate_code == 201, approval_candidate
+approval_payload = {
+    "operator": "docker-operator",
+    "reason": "Verify governance writes do not block another library.",
+    "operation_id": "docker-concurrent-approve",
+}
+delete_preview_payload = {
+    "path": preview_note.name,
+    "expected_source_version": preview_loaded["source_version"],
+    "operation_id": "docker-concurrent-delete-preview",
+}
+library_one_lock = concurrency_state / "locks" / (
+    f"{uuid.UUID(str(concurrent_library_one['id']))}.lock"
+)
+lock_fd = os.open(
+    library_one_lock,
+    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+)
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        library_one_started = threading.Event()
+
+        def write_library_one() -> tuple[int, dict[str, object]]:
+            library_one_started.set()
+            return request(
+                cross_library_operations[0][0],
+                concurrency_key,
+                cross_library_operations[0][1],
+                method="PUT",
+                timeout=180,
+            )
+
+        library_one_future = executor.submit(write_library_one)
+        assert library_one_started.wait(5)
+        try:
+            try:
+                library_one_future.result(timeout=1)
+            except FutureTimeoutError:
+                pass
+            else:
+                raise AssertionError("library A write did not block on its library lock")
+            candidate_future = executor.submit(
+                request,
+                concurrency_base + "/mcp/candidates",
+                concurrency_key,
+                same_library_candidate,
+            )
+            try:
+                candidate_future.result(timeout=0.1)
+            except FutureTimeoutError:
+                pass
+            else:
+                raise AssertionError("same-library candidate write bypassed the held lock")
+            approval_future = executor.submit(
+                request,
+                concurrency_base
+                + f"/api/v1/candidates/{approval_candidate['id']}/approve",
+                concurrency_key,
+                approval_payload,
+            )
+            try:
+                approval_future.result(timeout=0.1)
+            except FutureTimeoutError:
+                pass
+            else:
+                raise AssertionError("same-library approval bypassed the held lock")
+            delete_preview_future = executor.submit(
+                request,
+                concurrency_base
+                + f"/api/v1/libraries/{concurrent_library_one['id']}/document/delete-preview",
+                concurrency_key,
+                delete_preview_payload,
+            )
+            try:
+                delete_preview_future.result(timeout=0.1)
+            except FutureTimeoutError:
+                pass
+            else:
+                raise AssertionError("same-library deletion preview bypassed the held lock")
+            retention_preview_future = executor.submit(
+                request,
+                concurrency_base
+                + f"/api/v1/libraries/{concurrent_library_one['id']}"
+                "/retention-cleanup/preview",
+                concurrency_key,
+            )
+            try:
+                retention_preview_future.result(timeout=0.1)
+            except FutureTimeoutError:
+                pass
+            else:
+                raise AssertionError("same-library retention preview bypassed the held lock")
+            # The replay still crosses B's route-level flock without repeating indexing work.
+            library_two_result = request(
+                cross_library_operations[1][0],
+                concurrency_key,
+                cross_library_operations[1][1],
+                method="PUT",
+                timeout=5,
+            )
+            assert library_two_result[0] == 200, library_two_result
+            assert not library_one_future.done()
+            assert not candidate_future.done()
+            assert not approval_future.done()
+            assert not delete_preview_future.done()
+            assert not retention_preview_future.done()
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        library_one_result = library_one_future.result(timeout=180)
+        candidate_result = candidate_future.result(timeout=30)
+        approval_result = approval_future.result(timeout=30)
+        delete_preview_result = delete_preview_future.result(timeout=30)
+        retention_preview_result = retention_preview_future.result(timeout=30)
+finally:
+    os.close(lock_fd)
+assert library_one_result[0] == 200, library_one_result
+assert candidate_result[0] == 201, candidate_result
+assert approval_result[0] == 200, approval_result
+assert delete_preview_result[0] == 200, delete_preview_result
+assert retention_preview_result[0] == 200, retention_preview_result
+assert (
+    same_library_note.read_text(encoding="utf-8")
+    == cross_library_operations[0][1]["content"]
+)
+assert replacement_note.read_text(encoding="utf-8") == cross_library_operations[1][1]["content"]
+
+# Exercise session fan-out only after the bounded lock-independence probe. Capture
+# processing is intentionally asynchronous and must not add unrelated scheduler
+# load to the five-second library B assertion above.
+concurrent_events = [
+    {
+        "event_id": f"docker-concurrent-event-{index}",
+        "session_id": f"docker-concurrent-session-{index}",
+        "turn_id": "turn-1",
+        "event_kind": "user",
+        "content": f"Concurrent session evidence {index}.",
+        "occurred_at": "2026-09-07T00:00:00Z",
+        "cwd": str(
+            concurrent_project_one / "src"
+            if index < 4
+            else concurrent_project_two / "src"
+        ),
+    }
+    for index in range(8)
+]
+with ThreadPoolExecutor(max_workers=10) as executor:
+    event_results = list(
+        executor.map(
+            lambda payload: request(
+                concurrency_base + "/api/v1/capture/events", concurrency_key, payload
+            ),
+            [*concurrent_events, concurrent_events[0], concurrent_events[4]],
+        )
+    )
+assert all(code == 202 for code, _ in event_results), event_results
+for original_index, replay_index in ((0, 8), (4, 9)):
+    original = event_results[original_index][1]
+    replay = event_results[replay_index][1]
+    assert original["event_id"] == replay["event_id"]
+    assert {original["duplicate"], replay["duplicate"]} == {False, True}
+for index, payload in enumerate(concurrent_events):
+    session_events = request(
+        concurrency_base + "/api/v1/capture/events?session_id="
+        + urllib.parse.quote(str(payload["session_id"])),
+        concurrency_key,
+    )[1]
+    assert len(session_events) == 1
+    expected_library = (
+        concurrent_library_one["id"] if index < 4 else concurrent_library_two["id"]
+    )
+    assert session_events[0]["library_id"] == expected_library
+concurrency_daemon.send_signal(signal.SIGINT)
+assert concurrency_daemon.wait(timeout=10) == 0
 
 assert request("http://127.0.0.1:18080/v1/models")[1]["data"]
 assert request(
