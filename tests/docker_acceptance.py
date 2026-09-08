@@ -22,10 +22,12 @@ from pathlib import Path
 from typing import cast
 
 from selenium import webdriver
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import Select, WebDriverWait
 
 
 def request(
@@ -3196,6 +3198,35 @@ finally:
     forget_process.send_signal(signal.SIGINT)
     assert forget_process.wait(timeout=20) == 0
 
+browser_document_root = Path("/memory-libraries/browser-document-workflow")
+browser_document_root.mkdir()
+browser_document_path = "治理/这是一个用于验证窄屏长路径不会遮挡操作的权威记忆文档.md"
+(browser_document_root / "治理").mkdir()
+browser_document = browser_document_root / browser_document_path
+browser_document_original = "# 浏览器文档\n\nBrowserDocumentOriginal\n"
+browser_document_updated = "# 浏览器文档\n\nBrowserDocumentUpdated\n"
+browser_document_during_save = browser_document_updated + "\nBrowserEditedDuringSave\n"
+browser_document_narrow = browser_document_during_save + "\nBrowserNarrowSave\n"
+browser_document.write_text(browser_document_original, encoding="utf-8")
+browser_document_code, browser_document_library = request(
+    "http://127.0.0.1:7331/api/v1/libraries",
+    key,
+    {"path": str(browser_document_root), "kind": "project"},
+)
+assert browser_document_code == 201
+browser_document_library_id = str(browser_document_library["id"])
+browser_search_root = Path("/project-roots/browser-search-workflow")
+browser_search_root.mkdir()
+browser_search_binding_code, _ = request(
+    "http://127.0.0.1:7331/api/v1/project-bindings",
+    key,
+    {
+        "project_root": str(browser_search_root),
+        "library_id": browser_document_library_id,
+    },
+)
+assert browser_search_binding_code == 201
+
 browser_approve_code, browser_approve_candidate = request(
     "http://127.0.0.1:7331/mcp/candidates",
     key,
@@ -3214,11 +3245,20 @@ browser_reject_code, browser_reject_candidate = request(
         "idempotency_key": "docker-browser-reject",
     },
 )
+browser_narrow_code, browser_narrow_candidate = request(
+    "http://127.0.0.1:7331/mcp/candidates",
+    key,
+    {
+        **candidate_payload,
+        "body": "# Narrow rejection\n\nBrowserNarrowCandidate\n",
+        "idempotency_key": "docker-browser-narrow-reject",
+    },
+)
 browser_conflict_candidate = governance_candidate(
     "ticket14-browser-conflict",
     "# Database\n\nThe application database is CockroachDB.\n",
 )
-assert browser_approve_code == browser_reject_code == 201
+assert browser_approve_code == browser_reject_code == browser_narrow_code == 201
 browser_history_before = request(
     f"http://127.0.0.1:7331/api/v1/libraries/{history_id}/history", key
 )[1]
@@ -3284,10 +3324,157 @@ for argument in (
 browser = webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=options)
 wait = WebDriverWait(browser, 15)
 try:
+    screenshot_dir = Path(os.environ.get("BROWSER_SCREENSHOT_DIR", "/tmp/pam-browser-screenshots"))
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_browser_screenshot(name: str) -> Path:
+        path = screenshot_dir / name
+        assert browser.save_screenshot(str(path))
+        assert path.stat().st_size > 10_000
+        return path
+
+    def assert_browser_layout() -> None:
+        layout = browser.execute_script(
+            "const doc = document.documentElement; "
+            "const visible = [...document.querySelectorAll('button,input,select,textarea')].filter("
+            "item => { const style = getComputedStyle(item); "
+            "const box = item.getBoundingClientRect(); "
+            "return style.visibility !== 'hidden' && style.display !== 'none' "
+            "&& !item.closest('[inert]') && box.width && box.height; }); "
+            "return {scrollX, scrollWidth: doc.scrollWidth, clientWidth: doc.clientWidth, "
+            "workspaceHeight: document.querySelector('.view:not([hidden])')"
+            "?.getBoundingClientRect().height || 0, "
+            "clippedControls: visible.filter(item => { const box = item.getBoundingClientRect(); "
+            "return box.left < -1 || box.right > innerWidth + 1; }).length};"
+        )
+        assert layout["scrollX"] == 0
+        assert layout["scrollWidth"] <= layout["clientWidth"] + 1
+        assert layout["workspaceHeight"] > 40
+        assert layout["clippedControls"] == 0
+
+    def scroll_control_into_view(element: object) -> None:
+        browser.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", element
+        )
+        wait.until(
+            lambda driver: driver.execute_script(
+                "const box = arguments[0].getBoundingClientRect(); "
+                "return box.left >= 0 && box.right <= innerWidth "
+                "&& box.top >= 56 && box.bottom <= innerHeight;",
+                element,
+            )
+        )
+
     browser.get("http://127.0.0.1:7331/")
+    browser.find_element(By.ID, "key").send_keys("not-the-api-key", Keys.ENTER)
+    wait.until(lambda driver: "认证失败" in driver.find_element(By.ID, "message").text)
+    assert browser.find_element(By.ID, "connect").is_enabled()
+    assert browser.current_url == "http://127.0.0.1:7331/"
+    assert browser.execute_script("return [localStorage.length, sessionStorage.length]") == [0, 0]
+    browser.find_element(By.ID, "key").clear()
     browser.find_element(By.ID, "key").send_keys(key)
-    browser.find_element(By.ID, "connect").click()
+    browser.find_element(By.ID, "key").send_keys(Keys.ENTER)
     wait.until(lambda driver: driver.find_elements(By.ID, "candidate-title"))
+    assert key not in browser.current_url
+    assert key not in browser.page_source
+    assert browser.execute_script("return [localStorage.length, sessionStorage.length]") == [0, 0]
+    assert browser.get_cookies() == []
+    assert browser.find_element(By.CSS_SELECTOR, '[data-view-panel="overview"]').is_displayed()
+    assert browser.find_element(By.ID, "connection-status").text == "服务已连接"
+    assert browser.find_element(By.ID, "metric-service").text == "可用"
+
+    def open_browser_view(name: str) -> None:
+        navigation_items = browser.find_elements(By.CSS_SELECTOR, f'[data-view="{name}"]')
+        navigation = next(
+            (
+                item
+                for item in navigation_items
+                if item.is_displayed()
+                and browser.execute_script(
+                    "const box = arguments[0].getBoundingClientRect(); "
+                    "return !arguments[0].closest('[inert]') && box.left >= 0 "
+                    "&& box.right <= innerWidth;",
+                    item,
+                )
+            ),
+            None,
+        )
+        if navigation is None:
+            browser.find_element(By.ID, "nav-toggle").click()
+            navigation = wait.until(
+                lambda driver: next(
+                    (
+                        item
+                        for item in driver.find_elements(
+                            By.CSS_SELECTOR, f'[data-view="{name}"]'
+                        )
+                        if item.is_displayed()
+                    ),
+                    None,
+                )
+            )
+        navigation.click()
+        heading = browser.find_element(By.CSS_SELECTOR, f'[data-view-panel="{name}"] > h2')
+        wait.until(lambda driver: heading == driver.switch_to.active_element)
+        browser.execute_script("window.scrollTo(0, 0)")
+        wait.until(lambda driver: driver.execute_script("return scrollY") == 0)
+
+    expected_views = {
+        "overview": "概览",
+        "search": "记忆检索",
+        "candidates": "候选审核",
+        "documents": "文档管理",
+        "libraries": "记忆库",
+        "bindings": "项目绑定",
+        "sensitive": "敏感隔离",
+        "history": "历史恢复",
+        "privacy": "隐私设置",
+    }
+    for view_name, heading_text in expected_views.items():
+        open_browser_view(view_name)
+        assert browser.find_element(
+            By.CSS_SELECTOR, f'[data-view-panel="{view_name}"] > h2'
+        ).text == heading_text
+    open_browser_view("overview")
+    assert_browser_layout()
+    desktop_overview_screenshot = save_browser_screenshot("desktop-overview.png")
+
+    open_browser_view("libraries")
+    wait.until(
+        lambda driver: browser_document_root.name
+        in driver.find_element(
+            By.CSS_SELECTOR, '[data-view-panel="libraries"] .table-scroll'
+        ).text
+    )
+    assert_browser_layout()
+    desktop_libraries_screenshot = save_browser_screenshot("desktop-libraries-table.png")
+
+    open_browser_view("search")
+    search_cwd = browser.find_element(By.ID, "search-cwd")
+    search_query = browser.find_element(By.ID, "search-query")
+    search_cwd.send_keys(str(browser_search_root))
+    search_query.send_keys("BrowserDocumentOriginal")
+    search_button = browser.find_element(
+        By.CSS_SELECTOR, '[data-view-panel="search"] button[type="submit"]'
+    )
+    browser.execute_script("arguments[0].click();", search_button)
+    assert not search_button.is_enabled()
+    wait.until(lambda driver: "找到" in driver.find_element(By.ID, "search-message").text)
+    result_text = browser.find_element(By.ID, "search-results").text
+    assert browser_document_path in result_text
+    assert "BrowserDocumentOriginal" in result_text
+    assert ":3-3" in result_text
+    search_query.clear()
+    search_query.send_keys("BrowserNoResultNeedle")
+    search_button.click()
+    wait.until(lambda driver: "没有找到" in driver.find_element(By.ID, "search-message").text)
+    search_cwd.clear()
+    search_cwd.send_keys(str(unbound_same_name / "src"))
+    search_query.clear()
+    search_query.send_keys("BrowserDocumentOriginal")
+    search_button.click()
+    wait.until(lambda driver: "尚未绑定" in driver.find_element(By.ID, "search-message").text)
+
     documents_navigation = wait.until(
         lambda driver: next(
             (
@@ -3299,27 +3486,166 @@ try:
         )
     )
     documents_navigation.click()
-    def open_browser_view(name: str) -> None:
-        navigation = next(
-            item
-            for item in browser.find_elements(By.CSS_SELECTOR, f'[data-view="{name}"]')
-            if item.is_displayed()
-        )
-        navigation.click()
 
     def accept_browser_confirmation() -> None:
         dialog = wait.until(lambda driver: driver.find_element(By.CSS_SELECTOR, "dialog[open]"))
         dialog.find_element(By.ID, "confirm-accept").click()
 
     def select_browser_library(library_id: str | None = None) -> None:
-        browser.execute_script(
-            "const select = document.querySelector("
-            "'[data-view-panel=\"documents\"] select[aria-label=\"要编辑的记忆库\"]'"
-            "); "
-            "if (arguments[0] !== null) select.value = arguments[0]; "
-            "select.dispatchEvent(new Event('change'));",
-            library_id,
+        select = browser.find_element(
+            By.CSS_SELECTOR,
+            '[data-view-panel="documents"] select[aria-label="要编辑的记忆库"]',
         )
+        if library_id is not None:
+            Select(select).select_by_value(library_id)
+        else:
+            browser.execute_script(
+                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                select,
+            )
+        select.send_keys(Keys.TAB)
+
+    select_browser_library(browser_document_library_id)
+    browser_document_button = wait.until(
+        lambda driver: next(
+            (
+                button
+                for button in driver.find_elements(By.CSS_SELECTOR, ".document-tree button")
+                if browser_document_path in button.text
+            ),
+            None,
+        )
+    )
+    browser_document_button.click()
+    browser_document_source = wait.until(
+        lambda driver: (
+            source
+            if not (source := driver.find_element(By.ID, "document-source")).get_attribute(
+                "disabled"
+            )
+            else False
+        )
+    )
+    browser_document_source.clear()
+    browser_document_source.send_keys(browser_document_updated)
+    browser.find_element(By.ID, "preview-tab").click()
+    wait.until(lambda driver: "预览已更新" in driver.find_element(By.ID, "editor-message").text)
+    assert "BrowserDocumentUpdated" in browser.find_element(
+        By.ID, "document-preview"
+    ).get_attribute("srcdoc")
+    browser.find_element(By.ID, "diff-tab").click()
+    wait.until(
+        lambda driver: (
+            not (diff := driver.find_element(By.ID, "document-diff")).get_attribute(
+                "hidden"
+            )
+            and "+BrowserDocumentUpdated" in (diff.get_attribute("textContent") or "")
+        )
+    )
+    browser.find_element(By.ID, "source-tab").send_keys(Keys.ARROW_RIGHT)
+    wait.until(
+        lambda driver: driver.find_element(By.ID, "preview-tab").get_attribute(
+            "aria-selected"
+        )
+        == "true"
+    )
+    assert browser.switch_to.active_element.get_attribute("id") == "preview-tab"
+    browser.find_element(By.ID, "source-tab").click()
+    document_history_before = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{browser_document_library_id}/history",
+        key,
+    )[1]
+    save_button = browser.find_element(By.ID, "save-change")
+    browser.execute_cdp_cmd("Network.enable", {})
+    browser.execute_cdp_cmd(
+        "Network.emulateNetworkConditions",
+        {
+            "offline": False,
+            "latency": 600,
+            "downloadThroughput": -1,
+            "uploadThroughput": -1,
+        },
+    )
+    save_button.click()
+    assert not save_button.is_enabled()
+    browser_document_source.send_keys(Keys.END, "\nBrowserEditedDuringSave\n")
+    wait.until(lambda driver: driver.find_element(By.ID, "save-change").is_enabled())
+    assert browser_document.read_text(encoding="utf-8") == browser_document_original
+    assert request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{browser_document_library_id}/history",
+        key,
+    )[1] == document_history_before
+    browser.execute_cdp_cmd(
+        "Network.emulateNetworkConditions",
+        {
+            "offline": False,
+            "latency": 0,
+            "downloadThroughput": -1,
+            "uploadThroughput": -1,
+        },
+    )
+    browser.execute_script("arguments[0].click(); arguments[0].click();", save_button)
+    assert not save_button.is_enabled()
+    wait.until(lambda driver: "文档已保存" in driver.find_element(By.ID, "editor-message").text)
+    document_history_after = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{browser_document_library_id}/history",
+        key,
+    )[1]
+    assert len(document_history_after) == len(document_history_before) + 1
+    assert browser_document.read_text(encoding="utf-8") == browser_document_during_save
+    assert_browser_layout()
+    desktop_document_screenshot = save_browser_screenshot("desktop-document-editor.png")
+
+    open_browser_view("history")
+    history_library_select = browser.find_element(By.ID, "history-library")
+    Select(history_library_select).select_by_value(browser_document_library_id)
+    history_library_select.send_keys(Keys.TAB)
+    def history_document_ready(driver: webdriver.Chrome) -> object:
+        select = driver.find_element(By.ID, "history-document")
+        return (
+            select
+            if browser_document_path in [option.text for option in Select(select).options]
+            else False
+        )
+
+    history_document_select = wait.until(history_document_ready)
+    Select(history_document_select).select_by_value(browser_document_path)
+    history_document_select.send_keys(Keys.TAB)
+    oldest_commit = str(document_history_before[-1]["commit"])
+    oldest_history_button = wait.until(
+        lambda driver: next(
+            (
+                button
+                for button in driver.find_elements(By.CSS_SELECTOR, ".history button")
+                if oldest_commit[:12] in button.text
+            ),
+            None,
+        )
+    )
+    oldest_history_button.click()
+    restore_history_button = wait.until(
+        lambda driver: next(
+            (
+                button
+                for button in driver.find_elements(
+                    By.CSS_SELECTOR, '[data-view-panel="history"] div > button'
+                )
+                if button.text.startswith("从 ") and browser_document_path in button.text
+            ),
+            None,
+        )
+    )
+    restore_history_button.click()
+    accept_browser_confirmation()
+    wait.until(lambda driver: "已从" in driver.find_element(By.ID, "history-message").text)
+    assert browser_document.read_text(encoding="utf-8") == browser_document_original
+    restored_document_history = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{browser_document_library_id}/history",
+        key,
+    )[1]
+    assert len(restored_document_history) == len(document_history_after) + 1
+
+    open_browser_view("documents")
 
     select_browser_library(browser_ambiguous_id)
     wait.until(
@@ -3344,6 +3670,21 @@ try:
     )
     wait.until(lambda _driver: browser_import_button.is_enabled())
     wait.until(lambda _driver: browser_restore_button.is_enabled())
+    browser_ambiguous_history_before = request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{browser_ambiguous_id}/history", key
+    )[1]
+    browser_restore_button.click()
+    confirmation_dialog = wait.until(
+        lambda driver: driver.find_element(By.CSS_SELECTOR, "dialog[open]")
+    )
+    assert confirmation_dialog.get_attribute("aria-labelledby") == "confirm-title"
+    desktop_dialog_screenshot = save_browser_screenshot("desktop-confirmation-dialog.png")
+    confirmation_dialog.find_element(By.ID, "confirm-cancel").click()
+    wait.until(lambda driver: not driver.find_elements(By.CSS_SELECTOR, "dialog[open]"))
+    assert request(
+        f"http://127.0.0.1:7331/api/v1/libraries/{browser_ambiguous_id}/history", key
+    )[1] == browser_ambiguous_history_before
+    assert browser_restore_button == browser.switch_to.active_element
     browser_restore_button.click()
     accept_browser_confirmation()
     wait.until(
@@ -3516,19 +3857,26 @@ try:
     )
 
     def select_candidate(candidate_id: str) -> None:
-        item = wait.until(
-            lambda driver: next(
-                (
-                    button
-                    for button in driver.find_elements(
-                        By.CSS_SELECTOR, "nav.candidate-list button"
-                    )
-                    if candidate_id in button.text
-                ),
-                None,
-            )
-        )
-        item.click()
+        def click_candidate(driver: webdriver.Chrome) -> bool:
+            try:
+                item = next(
+                    (
+                        button
+                        for button in driver.find_elements(
+                            By.CSS_SELECTOR, "nav.candidate-list button"
+                        )
+                        if candidate_id in button.text
+                    ),
+                    None,
+                )
+                if item is None:
+                    return False
+                item.click()
+                return True
+            except StaleElementReferenceException:
+                return False
+
+        wait.until(click_candidate)
 
     def submit_candidate(
         candidate_id: str,
@@ -3545,17 +3893,18 @@ try:
                 else False
             )
         )
-        browser.execute_script(
+        disabled_after_click = browser.execute_script(
             "const body = document.querySelector('#candidate-body'); "
             "if (arguments[0] !== null) body.value = arguments[0]; "
             "document.querySelector('#candidate-operator').value = arguments[1]; "
             "document.querySelector('#candidate-reason').value = arguments[2]; "
-            "arguments[3].click();",
+            "arguments[3].click(); arguments[3].click(); return arguments[3].disabled;",
             body,
             operator,
             reason,
             action_button,
         )
+        assert disabled_after_click is True
 
     open_browser_view("candidates")
     approve_id = str(browser_approve_candidate["id"])
@@ -3603,6 +3952,8 @@ try:
     browser_conflict_id = str(browser_conflict_candidate["id"])
 
     select_candidate(browser_conflict_id)
+    assert_browser_layout()
+    save_browser_screenshot("desktop-candidate-detail.png")
     resolve_button = wait.until(
         lambda driver: (
             button
@@ -3625,6 +3976,168 @@ try:
             == "rejected"
         )
     )
+
+    browser.set_window_size(390, 844)
+    open_browser_view("candidates")
+    nav_toggle = browser.find_element(By.ID, "nav-toggle")
+    sidebar = browser.find_element(By.ID, "workspace-sidebar")
+    assert nav_toggle.get_attribute("aria-expanded") == "false"
+    wait.until(lambda driver: sidebar.get_dom_attribute("inert") is not None)
+    assert sidebar.get_attribute("aria-hidden") == "true"
+    nav_toggle.click()
+    wait.until(lambda driver: sidebar.get_dom_attribute("inert") is None)
+    wait.until(
+        lambda driver: driver.execute_script(
+            "return arguments[0].contains(document.activeElement);", sidebar
+        )
+    )
+    browser.switch_to.active_element.send_keys(Keys.TAB)
+    assert browser.execute_script(
+        "return arguments[0].contains(document.activeElement);", sidebar
+    )
+    browser.switch_to.active_element.send_keys(Keys.SHIFT, Keys.TAB)
+    assert browser.execute_script(
+        "return arguments[0].contains(document.activeElement);", sidebar
+    )
+    browser.find_element(By.CSS_SELECTOR, '.nav-button[data-view="candidates"]').click()
+    wait.until(lambda driver: sidebar.get_dom_attribute("inert") is not None)
+    browser.execute_script("arguments[0].focus();", nav_toggle)
+    nav_toggle.send_keys(Keys.SHIFT, Keys.TAB)
+    assert not browser.execute_script(
+        "return arguments[0].contains(document.activeElement);", sidebar
+    )
+    browser.execute_script("arguments[0].focus();", nav_toggle)
+    nav_toggle.send_keys(Keys.TAB)
+    assert not browser.execute_script(
+        "return arguments[0].contains(document.activeElement);", sidebar
+    )
+    assert_browser_layout()
+    save_browser_screenshot("narrow-candidate-workspace.png")
+    select_candidate(str(browser_narrow_candidate["id"]))
+    narrow_reject = wait.until(
+        lambda driver: (
+            button
+            if (button := driver.find_element(By.ID, "candidate-reject")).is_enabled()
+            else False
+        )
+    )
+    scroll_control_into_view(narrow_reject)
+    assert_browser_layout()
+    save_browser_screenshot("narrow-candidate-actions.png")
+    browser.execute_script(
+        "document.querySelector('#candidate-operator').value = 'narrow-user'; "
+        "document.querySelector('#candidate-reason').value = '窄屏底部操作可达'; "
+        "arguments[0].click();",
+        narrow_reject,
+    )
+    wait.until(
+        lambda _: request(
+            f"http://127.0.0.1:7331/api/v1/candidates/{browser_narrow_candidate['id']}",
+            key,
+        )[1]["status"]
+        == "rejected"
+    )
+    open_browser_view("documents")
+    select_browser_library(browser_document_library_id)
+    narrow_document_button = wait.until(
+        lambda driver: next(
+            (
+                button
+                for button in driver.find_elements(By.CSS_SELECTOR, ".document-tree button")
+                if browser_document_path in button.text
+            ),
+            None,
+        )
+    )
+    narrow_document_button.click()
+    narrow_source = wait.until(
+        lambda driver: (
+            source
+            if (source := driver.find_element(By.ID, "document-source")).is_enabled()
+            else False
+        )
+    )
+    browser.execute_script(
+        "arguments[0].value = arguments[1]; "
+        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+        narrow_source,
+        browser_document_narrow,
+    )
+    browser.execute_script("window.scrollTo(0, 0)")
+    wait.until(lambda driver: driver.execute_script("return scrollY") == 0)
+    assert_browser_layout()
+    save_browser_screenshot("narrow-document-workspace.png")
+    narrow_save = browser.find_element(By.ID, "save-change")
+    scroll_control_into_view(narrow_save)
+    assert_browser_layout()
+    save_browser_screenshot("narrow-document-actions.png")
+    narrow_save.click()
+    wait.until(lambda driver: "文档已保存" in driver.find_element(By.ID, "editor-message").text)
+    assert browser_document.read_text(encoding="utf-8") == browser_document_narrow
+    narrow_forget_preview = browser.find_element(By.ID, "preview-delete")
+    scroll_control_into_view(narrow_forget_preview)
+    narrow_forget_preview.click()
+    narrow_forget = wait.until(
+        lambda driver: (
+            button
+            if (button := driver.find_element(By.ID, "confirm-delete")).is_enabled()
+            else False
+        )
+    )
+    scroll_control_into_view(narrow_forget)
+    assert_browser_layout()
+    save_browser_screenshot("narrow-document-forgetting-actions.png")
+    narrow_forget.click()
+    confirmation_input = wait.until(
+        lambda driver: driver.find_element(By.CSS_SELECTOR, "dialog[open] #confirm-input")
+    )
+    confirmation_input.send_keys(browser_document_path)
+    browser.find_element(By.CSS_SELECTOR, "dialog[open] #confirm-accept").click()
+    wait.until(lambda driver: "记忆已遗忘" in driver.find_element(By.ID, "editor-message").text)
+    assert not browser_document.exists()
+    open_browser_view("libraries")
+    table_dimensions = browser.execute_script(
+        "const viewport = document.querySelector("
+        "'[data-view-panel=\"libraries\"] .table-scroll'); "
+        "return [viewport.clientWidth, viewport.scrollWidth, "
+        "document.documentElement.scrollWidth, innerWidth];"
+    )
+    assert table_dimensions[1] > table_dimensions[0]
+    assert table_dimensions[2] <= table_dimensions[3] + 1
+    nav_toggle.click()
+    assert nav_toggle.get_attribute("aria-expanded") == "true"
+    wait.until(
+        lambda driver: driver.switch_to.active_element.get_attribute("aria-current")
+        == "page"
+    )
+    wait.until(
+        lambda driver: abs(
+            driver.find_element(By.ID, "workspace-sidebar").rect["x"]
+        ) < 1
+    )
+    save_browser_screenshot("narrow-navigation-and-table.png")
+    browser.find_element(By.CSS_SELECTOR, '.nav-button[data-view="libraries"]').click()
+    assert nav_toggle.get_attribute("aria-expanded") == "false"
+
+    browser.execute_cdp_cmd(
+        "Emulation.setEmulatedMedia",
+        {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]},
+    )
+    reduced_motion = browser.execute_script(
+        "const sidebar = document.querySelector('.sidebar'); "
+        "return [matchMedia('(prefers-reduced-motion: reduce)').matches, "
+        "getComputedStyle(sidebar).transitionDuration, "
+        "getComputedStyle(sidebar).animationDuration];"
+    )
+    assert reduced_motion == [True, "0s", "0s"]
+    print(
+        "Browser screenshots:",
+        desktop_overview_screenshot,
+        desktop_document_screenshot,
+        desktop_dialog_screenshot,
+        desktop_libraries_screenshot,
+        *sorted(screenshot_dir.glob("narrow-*.png")),
+    )
 finally:
     browser.quit()
 
@@ -3634,11 +4147,17 @@ browser_approved = request(
 browser_rejected = request(
     f"http://127.0.0.1:7331/api/v1/candidates/{browser_reject_candidate['id']}", key
 )[1]
+browser_narrow_rejected = request(
+    f"http://127.0.0.1:7331/api/v1/candidates/{browser_narrow_candidate['id']}", key
+)[1]
 assert browser_approved["operator"] == "browser-user"
 assert browser_approved["reason"] == "Approved through the Web page"
 assert browser_rejected["operator"] == "browser-user"
 assert browser_rejected["reason"] == "Rejected through the Web page"
 assert browser_rejected["published_path"] is None
+assert browser_narrow_rejected["operator"] == "narrow-user"
+assert browser_narrow_rejected["reason"] == "窄屏底部操作可达"
+assert browser_narrow_rejected["published_path"] is None
 browser_published = history_library / str(browser_approved["published_path"])
 assert "The Web approval fixture uses Cobalt Canary." in browser_published.read_text(
     encoding="utf-8"

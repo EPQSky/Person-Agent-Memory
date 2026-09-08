@@ -98,11 +98,12 @@
     </style>
   </head>
   <body>
-    <main class="login-shell" id="login-shell"><section id="root" class="login-panel"><div class="brand-mark" aria-hidden="true">记</div><h1>个人智能体记忆</h1><p class="subtitle">Personal Agent Memory</p><label for="key">API 密钥</label><input id="key" type="password" autocomplete="off" aria-describedby="message"><button id="connect">进入管理工作台</button><p id="message" class="hint">请输入平台状态目录中保存的 API 密钥。密钥仅保留在当前页面内存中。</p></section></main>
+    <main class="login-shell" id="login-shell"><form id="root" class="login-panel"><div class="brand-mark" aria-hidden="true">记</div><h1>个人智能体记忆</h1><p class="subtitle">Personal Agent Memory</p><label for="key">API 密钥</label><input id="key" type="password" autocomplete="off" aria-describedby="message"><button id="connect" type="submit">进入管理工作台</button><p id="message" class="hint" aria-live="polite">请输入平台状态目录中保存的 API 密钥。密钥仅保留在当前页面内存中。</p></form></main>
     <script src="/editor-history.js"></script>
     <script>
       const root = document.querySelector('#root');
-      document.querySelector('#connect').addEventListener('click', async () => {
+      document.querySelector('#root').addEventListener('submit', async (event) => {
+        event.preventDefault();
         const key = document.querySelector('#key').value;
         const connect = document.querySelector('#connect');
         const loginMessage = document.querySelector('#message');
@@ -210,10 +211,11 @@
         historyDiff.className = 'diff';
         const sidebar = document.createElement('aside');
         sidebar.className = 'sidebar';
+        sidebar.id = 'workspace-sidebar';
         sidebar.innerHTML = '<div class="sidebar-brand">个人智能体记忆<small>Personal Agent Memory</small></div><nav aria-label="工作台导航"><button class="nav-button" data-view="overview" aria-current="page">概览</button><button class="nav-button" data-view="search">记忆检索</button><button class="nav-button" data-view="candidates">候选审核</button><button class="nav-button" data-view="documents">文档管理</button><div class="nav-group">管理与治理</div><button class="nav-button" data-view="libraries">记忆库</button><button class="nav-button" data-view="bindings">项目绑定</button><button class="nav-button" data-view="sensitive">敏感隔离</button><button class="nav-button" data-view="history">历史恢复</button><button class="nav-button" data-view="privacy">隐私设置</button></nav>';
         const topbar = document.createElement('header');
         topbar.className = 'topbar';
-        topbar.innerHTML = '<button type="button" id="nav-toggle" class="secondary" aria-label="展开或收起导航" title="展开或收起导航">☰</button><span class="connection ok" id="connection-status">服务已连接</span>';
+        topbar.innerHTML = '<button type="button" id="nav-toggle" class="secondary" aria-label="展开或收起导航" aria-controls="workspace-sidebar" aria-expanded="false" title="展开或收起导航">☰</button><span class="connection ok" id="connection-status" role="status" aria-live="polite">服务已连接</span>';
         const workspace = document.createElement('div');
         workspace.className = 'workspace';
         const makeView = (name, title, nodes) => {
@@ -223,6 +225,7 @@
           view.hidden = name !== 'overview';
           const viewTitle = document.createElement('h2');
           viewTitle.textContent = title;
+          viewTitle.tabIndex = -1;
           view.append(viewTitle, ...nodes);
           workspace.append(view);
           return view;
@@ -427,15 +430,39 @@
         function openView(name) {
           for (const panel of workspace.querySelectorAll('[data-view-panel]')) panel.hidden = panel.dataset.viewPanel !== name;
           for (const button of loginShell.querySelectorAll('[data-view]')) {
-            if (button.classList.contains('nav-button')) button.toggleAttribute('aria-current', button.dataset.view === name);
+            if (!button.classList.contains('nav-button')) continue;
+            if (button.dataset.view === name) button.setAttribute('aria-current', 'page');
+            else button.removeAttribute('aria-current');
           }
           loginShell.classList.remove('nav-open');
+          topbar.querySelector('#nav-toggle').setAttribute('aria-expanded', 'false');
+          syncSidebarAccessibility();
           workspace.querySelector(`[data-view-panel="${name}"]`)?.querySelector('h2')?.focus?.();
         }
+        const narrowNavigation = window.matchMedia('(max-width: 860px)');
+        function syncSidebarAccessibility() {
+          const hidden = narrowNavigation.matches && !loginShell.classList.contains('nav-open');
+          sidebar.toggleAttribute('inert', hidden);
+          if (hidden) sidebar.setAttribute('aria-hidden', 'true');
+          else sidebar.removeAttribute('aria-hidden');
+        }
+        narrowNavigation.addEventListener('change', syncSidebarAccessibility);
+        syncSidebarAccessibility();
         loginShell.addEventListener('click', (event) => { const target = event.target.closest('[data-view]'); if (target) openView(target.dataset.view); });
-        topbar.querySelector('#nav-toggle').addEventListener('click', () => loginShell.classList.toggle('nav-open'));
+        topbar.querySelector('#nav-toggle').addEventListener('click', (event) => {
+          const expanded = loginShell.classList.toggle('nav-open');
+          event.currentTarget.setAttribute('aria-expanded', String(expanded));
+          syncSidebarAccessibility();
+          if (expanded) {
+            requestAnimationFrame(() => {
+              sidebar.querySelector('.nav-button[aria-current="page"]')?.focus();
+            });
+          }
+        });
 
         const confirmDialog = document.createElement('dialog');
+        confirmDialog.setAttribute('aria-labelledby', 'confirm-title');
+        confirmDialog.setAttribute('aria-describedby', 'confirm-description');
         confirmDialog.innerHTML = '<div class="dialog-body"><h2 id="confirm-title">确认操作</h2><p id="confirm-description"></p><div class="field" id="confirm-input-field" hidden><label for="confirm-input">请输入确认短语</label><input id="confirm-input" autocomplete="off"></div></div><div class="dialog-actions"><button type="button" id="confirm-cancel" class="secondary">取消</button><button type="button" id="confirm-accept" class="danger">确认</button></div>';
         document.body.append(confirmDialog);
         function confirmAction(title, description, phrase = '') {
@@ -1056,10 +1083,15 @@
           editor.querySelector('#document-source').hidden = panel !== 'source';
           editor.querySelector('#document-preview').hidden = panel !== 'preview';
           editor.querySelector('#document-diff').hidden = panel !== 'diff';
-          for (const name of ['source', 'preview', 'diff']) editor.querySelector(`#${name}-tab`).setAttribute('aria-selected', String(name === panel));
+          for (const name of ['source', 'preview', 'diff']) {
+            const tab = editor.querySelector(`#${name}-tab`);
+            const selected = name === panel;
+            tab.setAttribute('aria-selected', String(selected));
+            tab.tabIndex = selected ? 0 : -1;
+          }
         }
 
-        async function previewChange(context = editorContext.snapshot()) {
+        async function previewChange(context = editorContext.snapshot(), panel = 'diff') {
           if (!context || !context.path || !context.sourceVersion) return false;
           const button = editor.querySelector('#preview-change');
           if (pending.has(`preview-${context.token}`)) return false;
@@ -1076,7 +1108,7 @@
           editor.querySelector('#document-preview').srcdoc = preview.rendered_html;
           editor.querySelector('#document-diff').textContent = preview.diff || '没有变更。';
           setMessage(message, '预览已更新。', 'success');
-          showEditorPanel('diff');
+          showEditorPanel(panel);
           return true;
         }
 
@@ -1214,9 +1246,10 @@
 
         async function saveDocument() {
           const context = editorContext.snapshot();
-          if (!context || !(await previewChange(context)) || !documentContextIsCurrent(context)) return;
+          if (!context) return;
           const button = editor.querySelector('#save-change');
           await performOnce(`save-${context.token}`, button, '正在保存...', async () => {
+            if (!(await previewChange(context)) || !documentContextIsCurrent(context)) return;
             const saveRequest = PamHistory.saveRequest(context, crypto.randomUUID());
             const response = await request(saveRequest.url, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(saveRequest.body)});
             const message = editor.querySelector('#editor-message');
@@ -1225,6 +1258,8 @@
             const loadedContext = await loadDocument(context.path);
             if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === context.libraryId && loadedContext.path === context.path) setMessage(message, '文档已保存。', 'success');
           }, null, () => documentContextIsCurrent(context));
+          const current = editorContext.snapshot();
+          button.disabled = !documentContextIsCurrent(current);
         }
 
         function invalidateForgottenSelection(messageText = '') {
@@ -1500,9 +1535,20 @@
           reconciliationDetail.querySelector('#reconciliation-restore').disabled = !event.target.value;
         });
         editor.querySelector('#source-tab').addEventListener('click', () => showEditorPanel('source'));
-        editor.querySelector('#preview-tab').addEventListener('click', async () => { if (await previewChange()) showEditorPanel('preview'); });
-        editor.querySelector('#diff-tab').addEventListener('click', previewChange);
-        editor.querySelector('#preview-change').addEventListener('click', previewChange);
+        editor.querySelector('#preview-tab').addEventListener('click', () => previewChange(editorContext.snapshot(), 'preview'));
+        editor.querySelector('#diff-tab').addEventListener('click', () => previewChange());
+        const editorTabs = [...editor.querySelectorAll('[role="tab"]')];
+        for (const [index, tab] of editorTabs.entries()) {
+          tab.tabIndex = index === 0 ? 0 : -1;
+          tab.addEventListener('keydown', (event) => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+            event.preventDefault();
+            const targetIndex = event.key === 'Home' ? 0 : event.key === 'End' ? editorTabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + editorTabs.length) % editorTabs.length;
+            editorTabs[targetIndex].focus();
+            editorTabs[targetIndex].click();
+          });
+        }
+        editor.querySelector('#preview-change').addEventListener('click', () => previewChange());
         editor.querySelector('#preview-delete').addEventListener('click', previewForgetting);
         editor.querySelector('#confirm-delete').addEventListener('click', forgetDocument);
         editor.querySelector('#document-source').addEventListener('input', () => {

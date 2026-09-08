@@ -12,9 +12,11 @@ ENTRYPOINT ["personal-agent-memory"]
 
 FROM runtime AS acceptance
 
-RUN apt-get -o Acquire::Retries=5 update \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=5 update \
     && apt-get -o Acquire::Retries=5 install --no-install-recommends -y \
-        chromium chromium-driver nodejs \
+        chromium chromium-driver fonts-noto-cjk nodejs \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir '.[acceptance]'
 COPY plugins ./plugins
