@@ -2,8 +2,9 @@
 
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+
+import { apiKey } from "./auth.mjs";
 
 const MAX_INPUT_BYTES = 256 * 1024;
 const MAX_RESPONSE_BYTES = 512 * 1024;
@@ -44,17 +45,6 @@ function daemonUrl() {
   }
   url.pathname = `${url.pathname.replace(/\/$/, "")}/api/v1/search`;
   return url;
-}
-
-async function apiKey() {
-  const fromEnvironment = process.env.PERSONAL_AGENT_MEMORY_API_KEY?.trim();
-  if (fromEnvironment) return fromEnvironment;
-  const path =
-    process.env.PERSONAL_AGENT_MEMORY_API_KEY_FILE ??
-    join(homedir(), ".local", "share", "personal-agent-memory", "api-key");
-  const value = await readFile(path, { encoding: "utf8" });
-  if (Buffer.byteLength(value) > 4096) throw new Error("API key file too large");
-  return value.trim();
 }
 
 async function boundedJson(response) {

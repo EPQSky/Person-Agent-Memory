@@ -3,12 +3,22 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 service_name="personal-agent-memory.service"
-state_dir="$HOME/.local/share/personal-agent-memory"
-library_root="$HOME/memory-libraries"
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+install_config_dir="$config_home/personal-agent-memory"
+install_config_path="$install_config_dir/install.json"
 unit_path="$config_home/systemd/user/$service_name"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 check_only=false
+installer_arguments=()
+
+if [[ "${PAM_INSTALL_ACCEPTANCE_CUSTOM_DIRS:-}" == "1" ]]; then
+  state_dir="$HOME/installer acceptance/platform state"
+  library_root="$HOME/installer acceptance/memory libraries"
+  installer_arguments=(--state-dir "$state_dir" --library-root "$library_root")
+else
+  state_dir="$HOME/.local/share/personal-agent-memory"
+  library_root="$HOME/memory-libraries"
+fi
 
 [[ "${1:-}" == "--check" ]] && check_only=true
 
@@ -32,6 +42,7 @@ account_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
 systemctl --user show-environment >/dev/null 2>&1 || skip "a working systemd user bus is required"
 [[ ! -e "$state_dir" ]] || skip "state directory already exists: $state_dir"
 [[ ! -e "$library_root" ]] || skip "memory library root already exists: $library_root"
+[[ ! -e "$install_config_path" ]] || skip "install metadata already exists: $install_config_path"
 [[ ! -e "$unit_path" ]] || skip "user service already exists: $unit_path"
 [[ ! -e "$codex_home" ]] || skip "Codex configuration already exists: $codex_home"
 command -v personal-agent-memory >/dev/null 2>&1 &&
@@ -55,16 +66,66 @@ cleanup() {
   codex plugin remove personal-agent-memory@personal-agent-memory --json >/dev/null 2>&1 || true
   codex plugin marketplace remove personal-agent-memory --json >/dev/null 2>&1 || true
   uv tool uninstall personal-agent-memory >/dev/null 2>&1 || true
-  rm -rf "$state_dir" "$library_root" "$codex_home" "$work_root"
+  rm -rf "$state_dir" "$library_root" "$install_config_dir" "$codex_home" "$work_root"
+  rmdir "$HOME/installer acceptance" >/dev/null 2>&1 || true
   exit "$status"
 }
 trap cleanup EXIT INT TERM
 
-"$repo_root/install.sh" >"$work_root/install.out"
+"$repo_root/install.sh" "${installer_arguments[@]}" >"$work_root/install.out"
 systemctl --user is-enabled "$service_name" | grep -qx enabled
 systemctl --user is-active "$service_name" | grep -qx active
 
 key_file="$state_dir/api-key"
+python3 - "$install_config_path" "$unit_path" "$state_dir" "$library_root" "$key_file" <<'PY'
+import json
+from pathlib import Path
+import stat
+import sys
+
+config_path, unit_path, state_dir, library_root, key_file = map(Path, sys.argv[1:])
+metadata = json.loads(config_path.read_text(encoding="utf-8"))
+assert metadata == {
+    "schema_version": 1,
+    "state_dir": str(state_dir),
+    "library_root": str(library_root),
+    "library_root_ownership": "user-content-never-delete",
+}
+assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+assert key_file.read_text(encoding="utf-8").strip() not in config_path.read_text(
+    encoding="utf-8"
+)
+unit = unit_path.read_text(encoding="utf-8")
+assert f'--state-dir "{state_dir}"' in unit
+assert f'--library-root "{library_root}"' in unit
+PY
+
+systemctl --user restart "$service_name"
+python3 - "$key_file" <<'PY'
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
+
+key = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+request = urllib.request.Request(
+    "http://127.0.0.1:7331/health/live",
+    headers={"Authorization": f"Bearer {key}"},
+)
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(request, timeout=1) as response:
+            if response.status == 200:
+                break
+    except (OSError, urllib.error.URLError):
+        pass
+    time.sleep(0.1)
+else:
+    raise SystemExit("daemon did not become healthy after service restart")
+PY
+
 project_root="$work_root/project"
 memory_path="$library_root/installer-acceptance"
 mkdir -p "$project_root" "$memory_path"

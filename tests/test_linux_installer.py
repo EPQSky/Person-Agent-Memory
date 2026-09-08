@@ -28,7 +28,7 @@ def preflight_test_environment(
     commands = {
         "uname": """case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n""",
         "systemctl": "exit 0\n",
-        "python3": """[ "$1" = '-c' ] && exit 0\nexit 97\n""",
+        "python3": f'exec "{sys.executable}" "$@"\n',
         "python3.13": "exit 1\n",
         "python3.12": "exit 1\n",
         "python3.11": "exit 1\n",
@@ -81,12 +81,32 @@ esac
 
 
 @pytest.mark.parametrize(
-    ("uv_mode", "python_fallback"),
-    [("existing", False), ("missing", False), ("trimmed", False), ("existing", True)],
-    ids=["existing-uv", "bootstrapped-uv", "trimmed-uv", "versioned-python"],
+    ("uv_mode", "python_fallback", "directory_mode"),
+    [
+        ("existing", False, "default"),
+        ("missing", False, "default"),
+        ("trimmed", False, "default"),
+        ("existing", True, "default"),
+        ("existing", False, "state-only"),
+        ("existing", False, "library-only"),
+        ("existing", False, "both"),
+        ("existing", False, "literal-dollar"),
+        ("existing", False, "empty-xdg-custom-state"),
+    ],
+    ids=[
+        "existing-uv",
+        "bootstrapped-uv",
+        "trimmed-uv",
+        "versioned-python",
+        "custom-state",
+        "custom-library",
+        "custom-both",
+        "literal-dollar",
+        "empty-xdg-custom-state",
+    ],
 )
 def test_supported_environment_installs_service_plugin_and_healthy_hook(
-    tmp_path: Path, uv_mode: str, python_fallback: bool
+    tmp_path: Path, uv_mode: str, python_fallback: bool, directory_mode: str
 ) -> None:
     repo_status = subprocess.run(
         ["git", "status", "--porcelain=v1", "--untracked-files=all"],
@@ -268,8 +288,10 @@ set -eu
 printf 'systemctl %s\\n' "$*" >>"{command_log}"
 case "$*" in
   '--user enable --now personal-agent-memory.service')
-    unit="${{XDG_CONFIG_HOME}}/systemd/user/personal-agent-memory.service"
+    config_home="${{XDG_CONFIG_HOME:-${{HOME}}/.config}}"
+    unit="${{config_home}}/systemd/user/personal-agent-memory.service"
     command=$(sed -n 's/^ExecStart=//p' "$unit")
+    command=$(printf '%s\n' "$command" | sed 's/[$][$]/$/g')
     sh -c "$command" >"{tmp_path}/daemon.log" 2>&1 &
     echo $! >"{tmp_path}/daemon.pid"
     ;;
@@ -286,9 +308,24 @@ esac
         "XDG_BIN_HOME": str(fake_bin),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
     }
+    state_dir = home / ".local/share/personal-agent-memory"
+    library_root = home / "memory-libraries"
+    installer_arguments: list[str] = []
+    if directory_mode in {"state-only", "both", "empty-xdg-custom-state"}:
+        state_dir = home / "custom platform state"
+        installer_arguments.extend(["--state-dir", "~/custom platform state"])
+    elif directory_mode == "literal-dollar":
+        state_dir = home / "${PAM_LITERAL}" / "state"
+        installer_arguments.extend(["--state-dir", "~/${PAM_LITERAL}/state"])
+        environment["PAM_LITERAL"] = "${PAM_LITERAL}"
+    if directory_mode == "empty-xdg-custom-state":
+        environment["XDG_CONFIG_HOME"] = ""
+    if directory_mode in {"library-only", "both"}:
+        library_root = tmp_path / "custom memory libraries"
+        installer_arguments.extend(["--library-root", str(library_root)])
     try:
         result = subprocess.run(
-            [str(ROOT / "install.sh")],
+            [str(ROOT / "install.sh"), *installer_arguments],
             cwd=tmp_path,
             env=environment,
             text=True,
@@ -298,16 +335,26 @@ esac
         )
 
         assert result.returncode == 0, result.stderr
-        state_dir = home / ".local/share/personal-agent-memory"
-        library_root = home / "memory-libraries"
         assert (home / ".codex").is_dir()
         unit = home / ".config/systemd/user/personal-agent-memory.service"
         assert state_dir.is_dir()
         assert library_root.is_dir()
         unit_text = unit.read_text(encoding="utf-8")
-        assert f'--state-dir "{state_dir}"' in unit_text
+        expected_state_argument = str(state_dir).replace("$", "$$")
+        assert f'--state-dir "{expected_state_argument}"' in unit_text
         assert f'--library-root "{library_root}"' in unit_text
         assert '--host "127.0.0.1" --port "7331"' in unit_text
+        install_metadata_path = home / ".config/personal-agent-memory/install.json"
+        install_metadata = json.loads(install_metadata_path.read_text(encoding="utf-8"))
+        assert install_metadata == {
+            "schema_version": 1,
+            "state_dir": str(state_dir),
+            "library_root": str(library_root),
+            "library_root_ownership": "user-content-never-delete",
+        }
+        assert install_metadata_path.stat().st_mode & 0o777 == 0o600
+        assert not install_metadata_path.is_relative_to(library_root)
+        assert "installer-test-secret" not in install_metadata_path.read_text(encoding="utf-8")
         log = command_log.read_text(encoding="utf-8")
         assert (
             len([line for line in log.splitlines() if line.startswith("uv tool install --python")])
@@ -353,10 +400,7 @@ esac
                     "prompt": "health check",
                 }
             ),
-            env={
-                **environment,
-                "PERSONAL_AGENT_MEMORY_API_KEY_FILE": str(state_dir / "api-key"),
-            },
+            env=environment,
             text=True,
             capture_output=True,
             timeout=5,
@@ -365,11 +409,34 @@ esac
         assert hook.returncode == 0
         assert hook.stdout == ""
         assert hook.stderr == ""
+        capture = subprocess.run(
+            ["node", str(plugin_install / "scripts/capture.mjs")],
+            input=json.dumps(
+                {
+                    "session_id": "installer-check",
+                    "cwd": str(library_root),
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": "remember this installation",
+                }
+            ),
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        assert capture.returncode == 0
+        assert capture.stdout == ""
+        assert capture.stderr == ""
         assert [json.loads(line) for line in request_log.read_text().splitlines()] == [
             {
                 "path": "/api/v1/search",
                 "authorization": "Bearer installer-test-secret",
-            }
+            },
+            {
+                "path": "/api/v1/capture/events",
+                "authorization": "Bearer installer-test-secret",
+            },
         ]
         assert (
             subprocess.run(
@@ -395,6 +462,381 @@ esac
         pid_file = tmp_path / "daemon.pid"
         if pid_file.exists():
             subprocess.run(["kill", pid_file.read_text().strip()], check=False)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--state-dir", "~/same", "--library-root", "~/same"], "non-overlapping"),
+        (
+            ["--state-dir", "~/state", "--library-root", "~/state/libraries"],
+            "non-overlapping",
+        ),
+        (
+            ["--state-dir", "/opt/personal-agent-memory", "--library-root", "~"],
+            "install metadata location",
+        ),
+        (["--state-dir", "~pam-no-such-user/state"], "could not be expanded"),
+    ],
+)
+def test_invalid_custom_directories_fail_before_installation(
+    tmp_path: Path, arguments: list[str], message: str
+) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    executable(
+        fake_bin / "python3",
+        f"#!/bin/sh\nexec {sys.executable!s} \"$@\"\n",
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh"), *arguments],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not (home / ".local/share/personal-agent-memory").exists()
+    assert not (home / ".codex").exists()
+    assert "uv tool install --python" not in command_log.read_text(encoding="utf-8")
+
+
+def test_unusable_custom_directory_does_not_report_partial_success(tmp_path: Path) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    executable(fake_bin / "python3", f"#!/bin/sh\nexec {sys.executable!s} \"$@\"\n")
+    unusable_state = tmp_path / "not-a-directory"
+    unusable_state.write_text("occupied", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(ROOT / "install.sh"),
+            "--state-dir",
+            str(unusable_state),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert str(unusable_state) in result.stderr
+    assert "Could not create or write the selected install directories" in result.stderr
+    assert "installation complete" not in result.stdout
+    assert not (home / ".codex").exists()
+    assert not (home / ".config/systemd/user/personal-agent-memory.service").exists()
+    assert not (home / ".config/personal-agent-memory/install.json").exists()
+    assert not any(
+        line.startswith("uv tool install --python") and not line.endswith("--help")
+        for line in command_log.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_saved_directories_are_reused_when_arguments_are_omitted(tmp_path: Path) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    executable(fake_bin / "python3", f"#!/bin/sh\nexec {sys.executable!s} \"$@\"\n")
+    custom_state = tmp_path / "saved-state-file"
+    custom_state.write_text("occupied", encoding="utf-8")
+    custom_library_root = tmp_path / "saved-memory-root"
+    metadata_dir = home / ".config/personal-agent-memory"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "install.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "state_dir": str(custom_state),
+                "library_root": str(custom_library_root),
+                "library_root_ownership": "user-content-never-delete",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert str(custom_state) in result.stderr
+    assert "Could not create or write the selected install directories" in result.stderr
+    assert not (home / ".local/share/personal-agent-memory").exists()
+    assert not (home / "memory-libraries").exists()
+    assert not any(
+        line.startswith("uv tool install --python") and not line.endswith("--help")
+        for line in command_log.read_text(encoding="utf-8").splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"schema_version": 99},
+        {"schema_version": True},
+        {"schema_version": 1.0},
+        {"schema_version": "1"},
+        {"schema_version": None},
+        {
+            "schema_version": 1,
+            "state_dir": "/tmp/state",
+            "library_root": "/tmp/memory",
+            "library_root_ownership": "platform-state",
+        },
+    ],
+)
+def test_invalid_install_metadata_is_rejected_before_installation(
+    tmp_path: Path, metadata: dict[str, object]
+) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    metadata_dir = home / ".config/personal-agent-memory"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "install.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "existing install metadata" in result.stderr
+    assert "uv tool install --python" not in command_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("field", ["state_dir", "library_root"])
+@pytest.mark.parametrize("invalid_kind", ["missing", "null", "empty", "relative"])
+def test_invalid_persisted_directory_is_rejected_before_installation(
+    tmp_path: Path, field: str, invalid_kind: str
+) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    metadata: dict[str, object] = {
+        "schema_version": 1,
+        "state_dir": str(tmp_path / "state"),
+        "library_root": str(tmp_path / "memory"),
+        "library_root_ownership": "user-content-never-delete",
+    }
+    if invalid_kind == "missing":
+        del metadata[field]
+    elif invalid_kind == "null":
+        metadata[field] = None
+    elif invalid_kind == "empty":
+        metadata[field] = ""
+    else:
+        metadata[field] = "relative/path"
+    metadata_dir = home / ".config/personal-agent-memory"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "install.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert f"existing install metadata has an invalid {field}" in result.stderr
+    assert "uv tool install --python" not in command_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("field", ["state_dir", "library_root"])
+def test_explicit_option_replaces_only_its_invalid_persisted_directory(
+    tmp_path: Path, field: str
+) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    blocker = tmp_path / "other-persisted-directory"
+    blocker.write_text("occupied", encoding="utf-8")
+    metadata: dict[str, object] = {
+        "schema_version": 1,
+        "state_dir": str(tmp_path / "state"),
+        "library_root": str(tmp_path / "memory"),
+        "library_root_ownership": "user-content-never-delete",
+    }
+    metadata[field] = "relative/invalid"
+    if field == "state_dir":
+        metadata["library_root"] = str(blocker)
+        arguments = ["--state-dir", str(tmp_path / "replacement-state")]
+    else:
+        metadata["state_dir"] = str(blocker)
+        arguments = ["--library-root", str(tmp_path / "replacement-memory")]
+    metadata_dir = home / ".config/personal-agent-memory"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "install.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh"), *arguments],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Could not create or write the selected install directories" in result.stderr
+    assert f"invalid {field}" not in result.stderr
+    assert not any(
+        line.startswith("uv tool install --python") and not line.endswith("--help")
+        for line in command_log.read_text(encoding="utf-8").splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata_kind", "message"),
+    [
+        ("fifo", "must be a regular file"),
+        ("device", "must be a regular file"),
+        ("oversized", "exceeds the 65536-byte limit"),
+    ],
+)
+def test_unsafe_install_metadata_is_rejected_without_blocking(
+    tmp_path: Path, metadata_kind: str, message: str
+) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    metadata_dir = home / ".config/personal-agent-memory"
+    metadata_dir.mkdir(parents=True)
+    metadata_path = metadata_dir / "install.json"
+    if metadata_kind == "fifo":
+        os.mkfifo(metadata_path)
+    elif metadata_kind == "device":
+        metadata_path.symlink_to("/dev/null")
+    else:
+        metadata_path.write_bytes(b" " * (64 * 1024 + 1))
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not any(
+        line.startswith("uv tool install --python") and not line.endswith("--help")
+        for line in command_log.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_directory_option_requires_a_path(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh"), "--state-dir"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "Missing path for --state-dir" in result.stderr
+    assert "unbound variable" not in result.stderr
+
+
+def test_relative_xdg_config_home_is_rejected_before_installation(tmp_path: Path) -> None:
+    environment, home, _ = preflight_test_environment(tmp_path)
+    environment["XDG_CONFIG_HOME"] = "relative-config"
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh"), "--state-dir", str(tmp_path / "state")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "XDG_CONFIG_HOME must be an absolute path" in result.stderr
+    assert not (tmp_path / "relative-config").exists()
+    assert not (home / ".codex").exists()
+
+
+@pytest.mark.parametrize("hook_name", ["recall.mjs", "capture.mjs"])
+@pytest.mark.parametrize(
+    "unsafe_input",
+    ["metadata-fifo", "metadata-oversized", "key-fifo", "key-oversized", "relative-xdg"],
+)
+def test_installed_hooks_fail_open_for_unsafe_config_files(
+    tmp_path: Path, hook_name: str, unsafe_input: str
+) -> None:
+    home = tmp_path / "home"
+    config_home = home / ".config"
+    metadata_dir = config_home / "personal-agent-memory"
+    state_dir = tmp_path / "custom-state"
+    home.mkdir()
+    metadata_dir.mkdir(parents=True)
+    state_dir.mkdir()
+    metadata_path = metadata_dir / "install.json"
+    metadata = json.dumps(
+        {
+            "schema_version": 1,
+            "state_dir": str(state_dir),
+            "library_root": str(tmp_path / "memory"),
+            "library_root_ownership": "user-content-never-delete",
+        }
+    )
+    if unsafe_input == "metadata-fifo":
+        os.mkfifo(metadata_path)
+    elif unsafe_input == "metadata-oversized":
+        metadata_path.write_text(" " * (64 * 1024 + 1), encoding="utf-8")
+    else:
+        metadata_path.write_text(metadata, encoding="utf-8")
+        key_path = state_dir / "api-key"
+        if unsafe_input == "key-fifo":
+            os.mkfifo(key_path)
+        elif unsafe_input == "key-oversized":
+            key_path.write_text("k" * 4097, encoding="utf-8")
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PERSONAL_AGENT_MEMORY_")
+    }
+    environment["HOME"] = str(home)
+    environment["XDG_CONFIG_HOME"] = (
+        "relative-config" if unsafe_input == "relative-xdg" else str(config_home)
+    )
+    event = {
+        "session_id": "unsafe-config",
+        "cwd": str(tmp_path),
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "bounded hook check",
+    }
+
+    result = subprocess.run(
+        ["node", str(ROOT / "plugins/personal-agent-memory/scripts" / hook_name)],
+        input=json.dumps(event),
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
 
 
 def test_installer_never_contains_privileged_or_system_service_operations() -> None:
@@ -538,8 +980,11 @@ def test_real_lifecycle_verifier_reports_reproducible_skip_gate() -> None:
 
     script = (ROOT / "scripts/verify-linux-installer.sh").read_text(encoding="utf-8")
     assert '"$repo_root/install.sh"' in script
+    assert "PAM_INSTALL_ACCEPTANCE_CUSTOM_DIRS" in script
     assert "systemctl --user is-enabled" in script
     assert "systemctl --user is-active" in script
+    assert 'systemctl --user restart "$service_name"' in script
+    assert '"library_root_ownership": "user-content-never-delete"' in script
     assert "codex plugin list --json" in script
     assert 'node "$plugin_root/scripts/recall.mjs"' in script
     assert "grep -q 'Installer acceptance fact'" in script

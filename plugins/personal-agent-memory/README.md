@@ -4,7 +4,10 @@ Install this plugin once for the user. It never writes configuration into a proj
 Codex to the loopback-only Personal Agent Memory daemon through lifecycle Hooks and MCP.
 
 Set `PERSONAL_AGENT_MEMORY_API_KEY` to the daemon API key, or leave it unset to read the default
-`~/.local/share/personal-agent-memory/api-key` file. Optional global settings are:
+`~/.local/share/personal-agent-memory/api-key` file. Installations with a custom state directory
+discover the key location from `~/.config/personal-agent-memory/install.json` (or the matching
+`XDG_CONFIG_HOME` path). `PERSONAL_AGENT_MEMORY_API_KEY_FILE` explicitly overrides that discovery.
+Optional global settings are:
 
 - `PERSONAL_AGENT_MEMORY_URL` (default `http://127.0.0.1:7331`)
 - `PERSONAL_AGENT_MEMORY_TIMEOUT_MS` (default `2000`, clamped to `100`-`2000`)

@@ -13,6 +13,8 @@ import {
 } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
+import { apiKey } from "./auth.mjs";
+
 const MAX_INPUT_BYTES = 256 * 1024;
 const MAX_CONTENT_BYTES = 64 * 1024;
 const MAX_SPOOL_BYTES = 4 * 1024 * 1024;
@@ -149,21 +151,6 @@ async function readStdin() {
   }
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    return;
-  }
-}
-
-async function apiKey() {
-  const direct = process.env.PERSONAL_AGENT_MEMORY_API_KEY;
-  if (direct?.trim()) return direct.trim();
-  const path =
-    process.env.PERSONAL_AGENT_MEMORY_API_KEY_FILE ??
-    join(process.env.HOME ?? "", ".local", "share", "personal-agent-memory", "api-key");
-  if (!isAbsolute(path)) return;
-  try {
-    const key = (await readFile(path, "utf8")).trim();
-    return key || undefined;
   } catch {
     return;
   }
