@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).parents[1]
 
@@ -13,7 +16,78 @@ def executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-def test_supported_environment_installs_service_plugin_and_healthy_hook(tmp_path: Path) -> None:
+def preflight_test_environment(
+    tmp_path: Path, *, failure: str | None = None
+) -> tuple[dict[str, str], Path, Path]:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    command_log = tmp_path / "commands.log"
+    home.mkdir()
+    fake_bin.mkdir()
+
+    commands = {
+        "uname": """case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n""",
+        "systemctl": "exit 0\n",
+        "python3": """[ "$1" = '-c' ] && exit 0\nexit 97\n""",
+        "python3.13": "exit 1\n",
+        "python3.12": "exit 1\n",
+        "python3.11": "exit 1\n",
+        "git": "echo 'git version 2.43.0'\n",
+        "node": "echo 'v20.0.0'\n",
+        "codex": """case "$*" in
+  '--version') echo 'codex-cli 1.0.00' ;;
+  'plugin add --help'|'plugin marketplace add --help') echo 'Usage: --json' ;;
+esac
+""",
+        "uv": "echo 'uv 0.8.0'\n",
+    }
+    if failure == "operating-system":
+        commands["uname"] = """case "$1" in -s) echo Darwin ;; -m) echo x86_64 ;; esac\n"""
+    elif failure == "architecture":
+        commands["uname"] = """case "$1" in -s) echo Linux ;; -m) echo aarch64 ;; esac\n"""
+    elif failure == "node-capabilities":
+        commands["node"] = """[ "$1" = '--version' ] && exit 0\nexit 1\n"""
+    elif failure == "codex-plugin":
+        commands["codex"] = """case "$*" in
+  '--version'|'plugin --help'|'plugin marketplace --help') exit 0 ;;
+  *) exit 1 ;;
+esac
+"""
+    elif failure in commands:
+        commands[failure] = "exit 1\n"
+
+    for name, body in commands.items():
+        executable(
+            fake_bin / name,
+            f'#!/bin/sh\nprintf \'{name} %s\\n\' "$*" >>"{command_log}"\n{body}',
+        )
+    for name in ("sudo", "apt", "apt-get", "dnf", "yum", "pacman", "zypper"):
+        executable(
+            fake_bin / name,
+            f'#!/bin/sh\nprintf \'{name} %s\\n\' "$*" >>"{command_log}"\nexit 99\n',
+        )
+
+    return (
+        {
+            **os.environ,
+            "HOME": str(home),
+            "CODEX_HOME": str(home / ".codex"),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+        },
+        home,
+        command_log,
+    )
+
+
+@pytest.mark.parametrize(
+    ("uv_mode", "python_fallback"),
+    [("existing", False), ("missing", False), ("trimmed", False), ("existing", True)],
+    ids=["existing-uv", "bootstrapped-uv", "trimmed-uv", "versioned-python"],
+)
+def test_supported_environment_installs_service_plugin_and_healthy_hook(
+    tmp_path: Path, uv_mode: str, python_fallback: bool
+) -> None:
     repo_status = subprocess.run(
         ["git", "status", "--porcelain=v1", "--untracked-files=all"],
         cwd=ROOT,
@@ -36,6 +110,22 @@ def test_supported_environment_installs_service_plugin_and_healthy_hook(tmp_path
     daemon_script = tmp_path / "daemon.py"
     home.mkdir()
     fake_bin.mkdir()
+    for name in ("sudo", "apt", "apt-get", "dnf", "yum", "pacman", "zypper"):
+        executable(
+            fake_bin / name,
+            f'#!/bin/sh\nprintf \'{name} %s\\n\' "$*" >>"{command_log}"\nexit 99\n',
+        )
+    if python_fallback:
+        executable(fake_bin / "python3", "#!/bin/sh\nexit 1\n")
+        executable(fake_bin / "python3.13", "#!/bin/sh\nexit 1\n")
+        executable(fake_bin / "python3.12", "#!/bin/sh\nexit 1\n")
+        executable(
+            fake_bin / "python3.11",
+            f"""#!/bin/sh
+printf 'python3.11 %s\n' "$*" >>"{command_log}"
+exec "{sys.executable}" "$@"
+""",
+        )
 
     daemon_script.write_text(
         """
@@ -85,33 +175,89 @@ ThreadingHTTPServer(('127.0.0.1', 7331), Handler).serve_forever()
 """.lstrip().replace("{request_log}", str(request_log)),
         encoding="utf-8",
     )
-    executable(
-        fake_bin / "uv",
-        f"""#!/bin/sh
+    uv_script = f"""#!/bin/sh
 set -eu
 printf 'uv %s\\n' "$*" >>"{command_log}"
+if [ "$*" = '--version' ]; then
+  printf 'uv 0.8.0\\n'
+  exit 0
+fi
+if [ "${{1:-}} ${{2:-}} ${{3:-}} ${{5:-}} ${{6:-}} ${{8:-}} ${{9:-}}" = \
+  'tool install --python --force --from personal-agent-memory --help' ]; then
+  exit 0
+fi
 if [ "$*" = 'tool dir --bin' ]; then
   printf '%s\\n' "{fake_bin}"
   exit 0
 fi
 cat >"{fake_bin}/personal-agent-memory" <<'EOF'
 #!/bin/sh
-exec "{os.environ.get('PYTHON', 'python3')}" "{daemon_script}" "$@"
+exec "{sys.executable}" "{daemon_script}" "$@"
 EOF
 chmod +x "{fake_bin}/personal-agent-memory"
+"""
+    if uv_mode == "existing":
+        executable(fake_bin / "uv", uv_script)
+    else:
+        if uv_mode == "missing":
+            executable(fake_bin / "uv", "#!/bin/sh\nexit 1\n")
+        else:
+            executable(
+                fake_bin / "uv",
+                f"""#!/bin/sh
+printf 'trimmed-uv %s\n' "$*" >>"{command_log}"
+case "$*" in
+  '--version'|'tool install --help') exit 0 ;;
+esac
+if [ "${{1:-}} ${{2:-}} ${{3:-}} ${{5:-}} ${{7:-}}" = \
+  'tool install --python --from --help' ]; then
+  exit 0
+fi
+exit 1
 """,
-    )
+            )
+        executable(
+            fake_bin / "curl",
+            f"""#!/bin/sh
+set -eu
+printf 'curl %s\\n' "$*" >>"{command_log}"
+output=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then
+    output=$2
+    break
+  fi
+  shift
+done
+cat >"$output" <<'INSTALLER_EOF'
+#!/bin/sh
+set -eu
+cat >"${{UV_INSTALL_DIR}}/uv" <<'UVEOF'
+{uv_script}
+UVEOF
+chmod +x "${{UV_INSTALL_DIR}}/uv"
+INSTALLER_EOF
+""",
+        )
     executable(
         fake_bin / "codex",
         f"""#!/bin/sh
 set -eu
 printf 'codex %s\\n' "$*" >>"{command_log}"
+if [ "$*" = '--version' ]; then
+  printf 'codex-cli 1.0.0\\n'
+  exit 0
+fi
+if [ "$*" = 'plugin add --help' ] || [ "$*" = 'plugin marketplace add --help' ]; then
+  printf 'Usage: codex %s [--json]\\n' "$*"
+  exit 0
+fi
 if [ "$1 $2 $3" = 'plugin marketplace add' ]; then
   mkdir -p "{plugin_install.parent}"
 fi
 if [ "$1 $2" = 'plugin add' ]; then
   rm -rf "{plugin_install}"
-  cp -R "{ROOT / 'plugins' / 'personal-agent-memory'}" "{plugin_install}"
+  cp -R "{ROOT / "plugins" / "personal-agent-memory"}" "{plugin_install}"
 fi
 """,
     )
@@ -163,13 +309,27 @@ esac
         assert f'--library-root "{library_root}"' in unit_text
         assert '--host "127.0.0.1" --port "7331"' in unit_text
         log = command_log.read_text(encoding="utf-8")
-        assert log.count("uv tool install") == 1
+        assert (
+            len([line for line in log.splitlines() if line.startswith("uv tool install --python")])
+            == 2
+        )
         assert log.count("uv tool dir --bin") == 1
+        assert log.count("uv --version") >= 1
+        assert ("curl " in log) is (uv_mode != "existing")
+        if uv_mode == "trimmed":
+            assert "trimmed-uv tool install --python" in log
+        if python_fallback:
+            assert f"uv tool install --python {fake_bin / 'python3.11'}" in log
+            assert "python3.11 -c" in log
+            assert f"python3.11 - {home / '.local/share/personal-agent-memory/api-key'}" in log
         assert log.count(f"codex plugin marketplace add {ROOT}") == 1
         assert log.count("codex plugin add personal-agent-memory@personal-agent-memory") == 1
         assert "systemctl --user daemon-reload" in log
         assert "systemctl --user enable --now personal-agent-memory.service" in log
-        assert "sudo" not in log
+        assert not any(
+            line.startswith(("sudo ", "apt ", "apt-get ", "dnf ", "yum ", "pacman ", "zypper "))
+            for line in log.splitlines()
+        )
         assert "installer-test-secret" not in result.stdout
         for expected in (
             "Service status: active",
@@ -243,6 +403,121 @@ def test_installer_never_contains_privileged_or_system_service_operations() -> N
     assert "sudo" not in script
     assert "/etc/systemd" not in script
     assert "systemctl --user" in script
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("operating-system", "requires Linux"),
+        ("architecture", "requires x86_64"),
+        ("systemctl", "working systemd user service manager"),
+        ("python3", "Python 3.11, 3.12, or 3.13"),
+        ("git", "working Git"),
+        ("node", "compatible Node.js"),
+        ("node-capabilities", "fetch and AbortSignal.timeout"),
+        ("codex", "compatible Codex CLI"),
+        ("codex-plugin", "plugin and plugin marketplace commands"),
+    ],
+)
+def test_dependency_failure_precedes_all_persistent_installation(
+    tmp_path: Path, failure: str, message: str
+) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path, failure=failure)
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not (home / ".local/share/personal-agent-memory").exists()
+    assert not (home / "memory-libraries").exists()
+    assert not (home / ".codex").exists()
+    assert not (home / ".config/systemd/user/personal-agent-memory.service").exists()
+    log = command_log.read_text(encoding="utf-8")
+    if failure == "codex-plugin":
+        assert "codex plugin add --help" in log
+    assert "uv tool install --python" not in log
+    assert "codex plugin marketplace add" not in log
+    assert "codex plugin add personal-agent-memory" not in log
+    assert not any(
+        line.startswith(("sudo ", "apt ", "apt-get ", "dnf ", "yum ", "pacman ", "zypper "))
+        for line in log.splitlines()
+    )
+
+
+def test_uv_bootstrap_failure_leaves_no_partial_installation(tmp_path: Path) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    executable(
+        fake_bin / "uv",
+        f"""#!/bin/sh
+echo "trimmed-uv $*" >>"{command_log}"
+case "$*" in
+  '--version'|'tool install --help') exit 0 ;;
+esac
+if [ "${{1:-}} ${{2:-}} ${{3:-}} ${{5:-}} ${{7:-}}" = \
+  'tool install --python --from --help' ]; then
+  exit 0
+fi
+exit 1
+""",
+    )
+    executable(fake_bin / "curl", f"#!/bin/sh\necho 'curl $*' >>\"{command_log}\"\nexit 23\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Could not install uv in the user environment" in result.stderr
+    assert not (home / ".local/share/personal-agent-memory").exists()
+    assert not (home / "memory-libraries").exists()
+    assert not (home / ".codex").exists()
+    log = command_log.read_text(encoding="utf-8")
+    assert "trimmed-uv tool install --python" in log
+    assert "curl " in log
+    assert not any(
+        line.startswith("uv tool install --python") and not line.endswith("--help")
+        for line in log.splitlines()
+    )
+    assert not any(
+        line.startswith(("sudo ", "apt ", "apt-get ", "dnf ", "yum ", "pacman ", "zypper "))
+        for line in log.splitlines()
+    )
+
+
+def test_uv_bootstrap_temp_file_failure_is_actionable(tmp_path: Path) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    executable(fake_bin / "uv", f"#!/bin/sh\necho 'uv $*' >>\"{command_log}\"\nexit 1\n")
+    executable(fake_bin / "mktemp", "#!/bin/sh\nexit 1\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Could not install uv in the user environment" in result.stderr
+    assert not (home / ".local/share/personal-agent-memory").exists()
+    assert not (home / "memory-libraries").exists()
+    assert not (home / ".codex").exists()
+    assert "curl " not in command_log.read_text(encoding="utf-8")
 
 
 def test_real_lifecycle_verifier_reports_reproducible_skip_gate() -> None:
