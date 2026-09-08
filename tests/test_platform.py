@@ -1009,14 +1009,23 @@ def test_management_interface_is_available(tmp_path: Path) -> None:
         assert str(tmp_path) not in response.text
         assert "localStorage" not in response.text
         assert "URLSearchParams" not in response.text
-        assert "Service ready" in response.text
-        assert "Memory libraries" in response.text
-        assert "Register library" in response.text
-        assert "Project bindings" in response.text
-        assert "Bind project" in response.text
-        assert "Associate worktree" in response.text
-        assert "Search project memory" in response.text
+        assert 'lang="zh-CN"' in response.text
+        assert "个人智能体记忆" in response.text
+        assert "服务状态" in response.text
+        assert "记忆库" in response.text
+        assert "注册记忆库" in response.text
+        assert "项目绑定" in response.text
+        assert "绑定项目" in response.text
+        assert "关联 Worktree" in response.text
+        assert "记忆检索" in response.text
         assert "/api/v1/search" in response.text
+        assert "historyDocument.id = 'history-document'" in response.text
+        assert "historyMessage.id = 'history-message'" in response.text
+        assert "retentionPreviewContext" in response.text
+        assert "bindingIntents" in response.text
+        assert "networkError: true" in response.text
+        for label in ("决策", "约束", "偏好", "领域事实", "流程", "经验"):
+            assert label in response.text
 
         assert client.get("/api/v1/status").status_code == 401
         authenticated = client.get("/api/v1/status", headers={"Authorization": f"Bearer {key}"})
@@ -5047,3 +5056,1725 @@ console.log(JSON.stringify({
         },
     }
     assert payload["current"]["libraryId"] == "library-two"
+
+
+def test_management_ui_state_machines_reject_stale_async_results() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the executable management UI regression")
+    html_path = (
+        Path(__file__).parents[1]
+        / "src"
+        / "personal_agent_memory"
+        / "static"
+        / "index.html"
+    )
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+function section(startMarker, endMarker) {
+  const start = html.indexOf(startMarker);
+  const end = html.indexOf(endMarker, start);
+  if (start < 0 || end < 0) throw new Error(`missing function section: ${startMarker}`);
+  return html.slice(start, end);
+}
+
+async function candidateFailureState() {
+  const candidateNodes = new Map();
+  for (const id of [
+    'candidate-title', 'candidate-sources', 'candidate-body', 'candidate-operator',
+    'candidate-reason', 'candidate-resolution', 'candidate-effective',
+    'candidate-condition', 'candidate-pin', 'candidate-save', 'candidate-approve',
+    'candidate-resolve', 'candidate-reject', 'candidate-message',
+    'candidate-governance', 'candidate-current', 'candidate-conflict-diff'
+  ]) candidateNodes.set(`#${id}`, {
+    textContent: 'stale', value: 'stale', hidden: false, disabled: false
+  });
+  const candidateDetail = {querySelector: (selector) => candidateNodes.get(selector)};
+  const generations = {candidateGovernance: 0};
+  let activeCandidate = null;
+  const display = (value) => value;
+  const setMessage = (node, text, kind) => { node.textContent = text; node.kind = kind; };
+  const describeError = (_failure, context) => `${context}：网络连接失败，请稍后重试。`;
+  const request = async () => ({ok: false, json: async () => ({detail: 'network'})});
+  eval(section(
+    'function clearCandidateGovernance()', '\n\n        async function candidateAction'
+  ));
+  await showCandidate({
+    id: 'candidate-one', status: 'pending', suggested_type: 'decision',
+    creator: 'test', created_at: 'now', source_references: [], body: 'body'
+  });
+  return Object.fromEntries([...candidateNodes].map(([key, value]) => [key, value]));
+}
+
+const bindingIntents = new Map();
+const key = 'test-key';
+const sent = [];
+const deferred = [];
+const request = async (_url, options) => {
+  sent.push(JSON.parse(options.body).library_id);
+  return await new Promise((resolve) => deferred.push(resolve));
+};
+const messages = [];
+const bindingForm = {querySelector: () => ({})};
+const setMessage = (_node, text) => messages.push(text);
+const describeError = () => 'failed';
+let refreshCount = 0;
+const refreshBindings = async () => { refreshCount += 1; };
+eval(section(
+  'async function queueBindingUpdate(bindingId, select)',
+  '\n\n        form.addEventListener'
+));
+async function run() {
+  const candidateState = await candidateFailureState();
+  const select = {value: 'library-b', disabled: false};
+  const first = queueBindingUpdate('binding-one', select);
+  select.value = 'library-c';
+  const second = queueBindingUpdate('binding-one', select);
+  await Promise.resolve();
+  deferred.shift()({ok: true});
+  await new Promise(setImmediate);
+  deferred.shift()({ok: true});
+  await Promise.all([first, second]);
+  const reconciliationNodes = new Map();
+  for (const id of [
+    'reconciliation-title', 'reconciliation-status', 'reconciliation-base',
+    'reconciliation-platform', 'reconciliation-external', 'reconciliation-final',
+    'reconciliation-path', 'reconciliation-path-field', 'reconciliation-import',
+    'reconciliation-restore', 'reconciliation-message'
+  ]) reconciliationNodes.set(`#${id}`, {
+    textContent: 'stale', value: 'stale', hidden: false, disabled: false,
+    replaceChildren() { this.children = []; }
+  });
+  const reconciliationDetail = {querySelector: (selector) => reconciliationNodes.get(selector)};
+  const reconciliationList = {children: ['stale'], replaceChildren() { this.children = []; }};
+  const generations = {reconciliation: 4};
+  const editorLibrary = {value: 'library-new'};
+  let activeReconciliation = {id: 'old-change'};
+  const setMessage = (node, text) => { node.textContent = text; };
+  eval(section(
+    'function clearReconciliation(invalidate = true)',
+    '\n\n        function showReconciliation'
+  ));
+  const staleContext = {libraryId: 'library-old', generation: 4};
+  clearReconciliation();
+  console.log(JSON.stringify({
+    sent, refreshCount, selectDisabled: select.disabled, messages,
+    candidateState,
+    reconciliation: {
+      activeReconciliation,
+      generation: generations.reconciliation,
+      staleAccepted: reconciliationContextIsCurrent(staleContext),
+      title: reconciliationNodes.get('#reconciliation-title').textContent,
+      importDisabled: reconciliationNodes.get('#reconciliation-import').disabled,
+      listChildren: reconciliationList.children,
+    },
+  }));
+}
+run();
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["sent"] == ["library-b", "library-c"]
+    assert payload["refreshCount"] == 1
+    assert payload["selectDisabled"] is False
+    assert payload["candidateState"]["#candidate-governance"]["textContent"] == ""
+    assert payload["candidateState"]["#candidate-current"]["hidden"] is True
+    assert payload["candidateState"]["#candidate-conflict-diff"]["hidden"] is True
+    assert payload["candidateState"]["#candidate-resolve"]["disabled"] is True
+    assert payload["candidateState"]["#candidate-message"]["kind"] == "error"
+    assert "候选治理信息加载失败" in payload["candidateState"]["#candidate-message"][
+        "textContent"
+    ]
+    assert payload["reconciliation"] == {
+        "activeReconciliation": None,
+        "generation": 5,
+        "staleAccepted": False,
+        "title": "请选择带外变更",
+        "importDisabled": True,
+        "listChildren": [],
+    }
+
+
+def test_reconciliation_success_feedback_survives_refresh_but_not_library_switch() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the reconciliation feedback regression")
+    html_path = (
+        Path(__file__).parents[1]
+        / "src"
+        / "personal_agent_memory"
+        / "static"
+        / "index.html"
+    )
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const start = html.indexOf('async function resolveReconciliation(action)');
+const end = html.indexOf('\n\n        async function refreshCandidates', start);
+const implementation = html.slice(start, end);
+
+async function scenario(switchLibrary) {
+  const context = {libraryId: 'library-one', generation: 7};
+  const editorLibrary = {value: 'library-one'};
+  const generations = {reconciliation: 7};
+  let activeReconciliation = {
+    id: 'change-one', base_path: 'note.md', status: 'pending',
+    external_withheld: false, uiContext: context
+  };
+  const nodes = {
+    '#reconciliation-import': {disabled: false, dataset: {}},
+    '#reconciliation-restore': {disabled: false, dataset: {}},
+    '#reconciliation-final': {value: ''},
+    '#reconciliation-path': {value: ''},
+    '#reconciliation-message': {textContent: '', kind: ''},
+  };
+  const reconciliationDetail = {querySelector: (selector) => nodes[selector]};
+  const reconciliationContextIsCurrent = (candidate) => (
+    candidate.libraryId === editorLibrary.value
+      && candidate.generation === generations.reconciliation
+  );
+  const confirmAction = async () => true;
+  const performOnce = async (_name, _button, _label, action) => await action();
+  const PamHistory = {reconciliationRequest: (libraryId, change) => ({
+    url: `/libraries/${libraryId}/changes/${change.id}`,
+    body: {},
+  })};
+  const key = 'test-key';
+  const request = async () => ({ok: true});
+  const describeError = () => 'failed';
+  const setMessage = (node, text, kind) => {
+    node.textContent = text;
+    node.kind = kind;
+  };
+  const refreshDocuments = async () => {
+    nodes['#reconciliation-message'].textContent = '';
+    if (switchLibrary) editorLibrary.value = 'library-two';
+  };
+  eval(implementation);
+  await resolveReconciliation('restore');
+  return nodes['#reconciliation-message'];
+}
+
+Promise.all([scenario(false), scenario(true)]).then(([same, switched]) => {
+  console.log(JSON.stringify({same, switched}));
+});
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["same"] == {"textContent": "已恢复平台版本。", "kind": "success"}
+    assert payload["switched"]["textContent"] == ""
+
+
+def test_management_ui_renders_known_backend_states_as_chinese_badges() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the status badge regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const start = html.indexOf('const labels = {');
+const end = html.indexOf('const displaySensitiveSummary', start);
+const document = {createElement: () => ({className: '', dataset: {}, textContent: ''})};
+let result;
+eval(html.slice(start, end) + `
+  result = Object.fromEntries([
+    'not_started', 'scanning', 'building', 'missing', 'replaced',
+    'available', 'ready', 'error', 'reusable_experience', 'external_reference'
+  ].map((value) => {
+    const badge = createStatusBadge(value);
+    return [value, {
+      text: badge.textContent,
+      className: badge.className,
+      raw: badge.dataset.status
+    }];
+  }));
+  result.degradation = Object.fromEntries([
+    'vector_index_unavailable', 'embedding_unavailable', 'reranker_unavailable',
+    'tokenizer_fallback'
+  ].map((value) => [value, degradationLabels[value]]));
+  result.searchStatus = formatSearchStatus({
+    status: 'bound', results: [], graph_index_status: 'ready', degraded: true,
+    degradation: [
+      'tokenizer_fallback', 'vector_index_unavailable',
+      'embedding_unavailable', 'reranker_unavailable'
+    ]
+  });
+`);
+console.log(JSON.stringify(result));
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert {
+        key: value["text"]
+        for key, value in payload.items()
+        if key not in {"degradation", "searchStatus"}
+    } == {
+        "not_started": "尚未开始",
+        "scanning": "扫描中",
+        "building": "构建中",
+        "missing": "路径缺失",
+        "replaced": "路径已替换",
+        "available": "可用",
+        "ready": "就绪",
+        "error": "错误",
+        "reusable_experience": "可复用经验",
+        "external_reference": "外部参考",
+    }
+    assert payload["degradation"] == {
+        "vector_index_unavailable": "向量索引不可用",
+        "embedding_unavailable": "嵌入服务不可用",
+        "reranker_unavailable": "重排序服务不可用",
+        "tokenizer_fallback": "分词器回退",
+    }
+    assert payload["searchStatus"] == {
+        "text": (
+            "没有找到匹配的记忆 · 图索引就绪 · 已降级：分词器回退、"
+            "向量索引不可用、嵌入服务不可用、重排序服务不可用。"
+        ),
+        "kind": "error",
+    }
+    assert payload["available"]["className"] == "badge ok"
+    assert payload["scanning"]["className"] == "badge warn"
+    assert payload["missing"]["className"] == "badge bad"
+    assert all(
+        value["raw"] == key
+        for key, value in payload.items()
+        if key not in {"degradation", "searchStatus"}
+    )
+
+
+def test_management_ui_connection_status_tracks_transport_and_auth_only() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the connection status regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const start = html.indexOf("const connectionStatus = topbar.querySelector('#connection-status')");
+const end = html.indexOf('async function performOnce', start);
+const connection = {className: '', textContent: ''};
+const topbar = {querySelector: () => connection};
+const pending = [];
+const window = {
+  fetch: (name) => new Promise(
+    (resolve, reject) => pending.push({name, resolve, reject})
+  )
+};
+eval(html.slice(start, end) + '\nglobalThis.requestUnderTest = request;');
+
+async function run() {
+  const older = requestUnderTest('older-network');
+  const newer = requestUnderTest('newer-success');
+  pending.find((item) => item.name === 'newer-success').resolve({ok: true, status: 200});
+  await newer;
+  pending.find((item) => item.name === 'older-network').reject(new Error('offline'));
+  await older;
+  const afterStaleFailure = {...connection};
+
+  const business = requestUnderTest('business');
+  pending.find((item) => item.name === 'business').resolve({ok: false, status: 409});
+  await business;
+  const afterBusinessFailure = {...connection};
+
+  const unauthorized = requestUnderTest('unauthorized');
+  pending.find((item) => item.name === 'unauthorized').resolve({ok: false, status: 401});
+  await unauthorized;
+  const afterUnauthorized = {...connection};
+
+  const recovered = requestUnderTest('recovered');
+  pending.find((item) => item.name === 'recovered').resolve({ok: true, status: 200});
+  await recovered;
+  const afterRecovery = {...connection};
+
+  const olderAfterBusiness = requestUnderTest('older-after-business');
+  const newerBusiness = requestUnderTest('newer-business');
+  pending.find((item) => item.name === 'newer-business').resolve({ok: false, status: 409});
+  await newerBusiness;
+  pending.find((item) => item.name === 'older-after-business').reject(new Error('offline'));
+  await olderAfterBusiness;
+  const afterBusinessSupersedesTransport = {...connection};
+
+  const olderAfterValidation = requestUnderTest('older-after-validation');
+  const newerValidation = requestUnderTest('newer-validation');
+  pending.find((item) => item.name === 'newer-validation').resolve({ok: false, status: 422});
+  await newerValidation;
+  pending.find((item) => item.name === 'older-after-validation').reject(new Error('offline'));
+  await olderAfterValidation;
+  const afterValidationSupersedesTransport = {...connection};
+
+  const failed = requestUnderTest('failed');
+  pending.find((item) => item.name === 'failed').reject(new Error('offline'));
+  const fallback = await failed;
+  console.log(JSON.stringify({
+    afterStaleFailure,
+    afterBusinessFailure,
+    afterUnauthorized,
+    afterRecovery,
+    afterBusinessSupersedesTransport,
+    afterValidationSupersedesTransport,
+    failed: {...connection},
+    networkError: fallback.networkError
+  }));
+}
+run();
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["afterStaleFailure"] == {
+        "className": "connection ok",
+        "textContent": "服务已连接",
+    }
+    assert payload["afterBusinessFailure"] == payload["afterStaleFailure"]
+    assert payload["afterUnauthorized"] == {
+        "className": "connection warn",
+        "textContent": "认证已失效",
+    }
+    assert payload["afterRecovery"] == payload["afterStaleFailure"]
+    assert payload["afterBusinessSupersedesTransport"] == payload["afterRecovery"]
+    assert payload["afterValidationSupersedesTransport"] == payload["afterRecovery"]
+    assert payload["failed"] == {
+        "className": "connection bad",
+        "textContent": "服务连接中断",
+    }
+    assert payload["networkError"] is True
+
+
+def test_management_ui_success_feedback_survives_refresh_with_context_guards() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the success feedback regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+function section(startMarker, endMarker) {
+  const start = html.indexOf(startMarker);
+  const end = html.indexOf(endMarker, start);
+  if (start < 0 || end < 0) throw new Error(`missing section ${startMarker}`);
+  return html.slice(start, end);
+}
+const setMessage = (node, text, kind) => { node.textContent = text; node.kind = kind; };
+const performOnce = async (_name, _button, _label, action) => await action();
+const describeError = () => 'failed';
+const key = 'test-key';
+
+async function candidateScenario(action, switchCandidate) {
+  const message = {textContent: '', kind: ''};
+  const nodes = new Map([
+    ['#candidate-message', message], ['#candidate-save', {dataset: {}}],
+    ['#candidate-approve', {dataset: {}}], ['#candidate-reject', {dataset: {}}],
+    ['#candidate-operator', {value: 'operator'}], ['#candidate-reason', {value: 'reason'}],
+    ['#candidate-body', {value: 'body'}],
+  ]);
+  const candidateDetail = {querySelector: (selector) => nodes.get(selector)};
+  let candidateSelectionGeneration = 4;
+  let activeCandidate = {id: 'candidate-one', status: 'pending'};
+  const request = async () => ({
+    ok: true,
+    json: async () => ({
+      id: 'candidate-one',
+      status: action === 'edit' ? 'pending' : `${action}d`
+    })
+  });
+  const refreshCandidates = async () => {
+    message.textContent = '';
+    if (switchCandidate) {
+      ++candidateSelectionGeneration;
+      activeCandidate = {id: 'candidate-two'};
+    }
+    else if (action !== 'edit') activeCandidate = null;
+  };
+  const refreshDocuments = async () => { message.textContent = ''; };
+  eval(section(
+    'async function candidateAction(action)',
+    '\n\n        async function resolveCandidate'
+  ));
+  await candidateAction(action);
+  return {...message};
+}
+
+async function pinScenario(switchCandidate) {
+  const message = {textContent: '', kind: ''};
+  const pin = {dataset: {}};
+  const candidateDetail = {
+    querySelector: (selector) => selector === '#candidate-pin' ? pin : message
+  };
+  let candidateSelectionGeneration = 2;
+  let activeCandidate = {id: 'candidate-one'};
+  const request = async () => ({ok: true});
+  const refreshCandidates = async () => {
+    message.textContent = '';
+    if (switchCandidate) {
+      ++candidateSelectionGeneration;
+      activeCandidate = {id: 'candidate-two'};
+    }
+  };
+  eval(section(
+    'async function pinCandidate()',
+    '\n\n        async function refreshSensitiveQuarantine'
+  ));
+  await pinCandidate();
+  return {...message};
+}
+
+async function forgetScenario(switchLibrary) {
+  const message = {textContent: '', kind: ''};
+  const context = {token: 1, libraryId: 'library-one', path: 'note.md', sourceVersion: 'v1'};
+  let current = context;
+  const editorContext = {snapshot: () => current, isCurrent: (candidate) => candidate === current};
+  const editorLibrary = {value: 'library-one'};
+  const editor = {
+    querySelector: (selector) => (
+      selector === '#editor-message' ? message : {dataset: {}}
+    )
+  };
+  const confirmAction = async () => true;
+  const request = async () => ({ok: true});
+  const refreshDocuments = async () => {
+    message.textContent = '';
+    if (switchLibrary) {
+      editorLibrary.value = 'library-two';
+      current = {libraryId: 'library-two', path: null};
+    }
+    else current = {libraryId: 'library-one', path: null};
+  };
+  const crypto = {randomUUID: () => 'operation'};
+  let deletionPreviewVersion = 'v1';
+  let deletionPreviewToken = 'preview';
+  eval(section('async function forgetDocument()', '\n\n        async function refreshForgotten'));
+  await forgetDocument();
+  return {...message};
+}
+
+Promise.all([
+  candidateScenario('edit', false), candidateScenario('approve', false),
+  candidateScenario('reject', false), candidateScenario('edit', true),
+  pinScenario(false), pinScenario(true), forgetScenario(false), forgetScenario(true)
+]).then(([edit, approve, reject, staleCandidate, pin, stalePin, forget, staleForget]) => {
+  console.log(JSON.stringify({
+    edit, approve, reject, staleCandidate, pin, stalePin, forget, staleForget
+  }));
+});
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["edit"]["textContent"] == "候选记忆已保存。"
+    assert payload["approve"]["textContent"] == "候选记忆已批准。"
+    assert payload["reject"]["textContent"] == "候选记忆已拒绝。"
+    assert payload["pin"]["textContent"] == "候选记忆已置顶。"
+    assert payload["forget"]["textContent"] == "记忆已遗忘。"
+    for key in ("edit", "approve", "reject", "pin", "forget"):
+        assert payload[key]["kind"] == "success"
+    assert payload["staleCandidate"]["textContent"] == ""
+    assert payload["stalePin"]["textContent"] == ""
+    assert payload["staleForget"]["textContent"] == ""
+
+
+def test_management_ui_candidate_busy_state_stays_with_its_selection() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the candidate busy-state regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+function section(startMarker, endMarker) {
+  const start = html.indexOf(startMarker);
+  const end = html.indexOf(endMarker, start);
+  if (start < 0 || end < 0) throw new Error(`missing section ${startMarker}`);
+  return html.slice(start, end);
+}
+const makeButton = (textContent) => ({
+  dataset: {}, disabled: false, textContent,
+  closest: () => null
+});
+const buttons = {
+  save: makeButton('保存编辑'), approve: makeButton('批准'),
+  reject: makeButton('拒绝'), resolve: makeButton('提交裁决'),
+  pin: makeButton('置顶')
+};
+const fields = {
+  '#candidate-save': buttons.save, '#candidate-approve': buttons.approve,
+  '#candidate-reject': buttons.reject, '#candidate-resolve': buttons.resolve,
+  '#candidate-pin': buttons.pin,
+  '#candidate-operator': {value: 'operator'}, '#candidate-reason': {value: 'reason'},
+  '#candidate-body': {value: 'body'}, '#candidate-resolution': {value: 'keep'},
+  '#candidate-effective': {value: ''}, '#candidate-condition': {value: ''},
+  '#candidate-message': {textContent: ''}
+};
+const candidateDetail = {querySelector: (selector) => fields[selector]};
+const pending = new Set();
+const buttonOperations = new WeakMap();
+const setBusy = (button, busy, label) => {
+  if (!button.dataset.label) button.dataset.label = button.textContent;
+  button.disabled = busy;
+  button.textContent = busy ? label : button.dataset.label;
+};
+const setMessage = () => {};
+const describeError = () => 'failed';
+const key = 'test-key';
+const crypto = {randomUUID: () => 'operation'};
+let candidateSelectionGeneration = 1;
+let activeCandidate = {id: 'candidate-a', status: 'pending'};
+const requests = [];
+const request = (url) => new Promise((resolve) => requests.push({url, resolve}));
+const refreshCandidates = async () => {};
+const refreshDocuments = async () => {};
+eval(section('async function performOnce(', '\n        function openView'));
+eval(section('async function candidateAction(action)', '\n\n        async function pinCandidate'));
+
+async function scenario(status) {
+  activeCandidate = {id: 'candidate-a', status: 'pending'};
+  for (const button of Object.values(buttons)) button.disabled = false;
+  const requestStart = requests.length;
+  const first = candidateAction('approve');
+  await Promise.resolve();
+  ++candidateSelectionGeneration;
+  activeCandidate = {id: 'candidate-b', status};
+  for (const button of Object.values(buttons)) button.disabled = true;
+  requests[requestStart].resolve({
+    ok: true,
+    json: async () => ({id: 'candidate-a', status: 'approved'})
+  });
+  await first;
+  await candidateAction('edit');
+  await candidateAction('approve');
+  await candidateAction('reject');
+  await resolveCandidate();
+  return {
+    requestCount: requests.length - requestStart,
+    disabled: Object.fromEntries(
+      Object.entries(buttons).map(([name, button]) => [name, button.disabled])
+    ),
+    labels: Object.fromEntries(
+      Object.entries(buttons).map(([name, button]) => [name, button.textContent])
+    )
+  };
+}
+async function run() {
+  console.log(JSON.stringify({
+    approved: await scenario('approved'),
+    rejected: await scenario('rejected')
+  }));
+}
+run();
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    for status in ("approved", "rejected"):
+        assert payload[status]["requestCount"] == 1
+        assert payload[status]["disabled"] == {
+            "save": True,
+            "approve": True,
+            "reject": True,
+            "resolve": True,
+            "pin": True,
+        }
+        assert payload[status]["labels"]["approve"] == "批准"
+
+
+def test_management_ui_failure_feedback_stays_with_original_candidate_and_document() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the stale failure regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+function section(startMarker, endMarker) {
+  const start = html.indexOf(startMarker);
+  const end = html.indexOf(endMarker, start);
+  return html.slice(start, end);
+}
+const setMessage = (node, text, kind) => { node.textContent = text; node.kind = kind; };
+const performOnce = async (_name, _button, _label, action) => await action();
+const describeError = (_failure, context) => `${context}：测试失败`;
+const key = 'test-key';
+const crypto = {randomUUID: () => 'operation'};
+
+async function candidateFailure(switchCandidate) {
+  const message = {textContent: '', kind: ''};
+  const nodes = new Map([
+    ['#candidate-message', message], ['#candidate-save', {dataset: {}}],
+    ['#candidate-operator', {value: 'operator'}], ['#candidate-reason', {value: 'reason'}],
+    ['#candidate-body', {value: 'body'}],
+  ]);
+  const candidateDetail = {querySelector: (selector) => nodes.get(selector)};
+  let candidateSelectionGeneration = 1;
+  let activeCandidate = {id: 'candidate-one', status: 'pending'};
+  let finish;
+  const request = async () => await new Promise((resolve) => { finish = resolve; });
+  const refreshCandidates = async () => {};
+  const refreshDocuments = async () => {};
+  eval(section(
+    'async function candidateAction(action)',
+    '\n\n        async function resolveCandidate'
+  ));
+  const action = candidateAction('edit');
+  await Promise.resolve();
+  if (switchCandidate) {
+    ++candidateSelectionGeneration;
+    activeCandidate = {id: 'candidate-two', status: 'pending'};
+  }
+  finish({ok: false, json: async () => ({detail: 'failed'})});
+  await action;
+  return message;
+}
+
+async function pinFailure(switchCandidate) {
+  const message = {textContent: '', kind: ''};
+  const pin = {dataset: {}};
+  const candidateDetail = {
+    querySelector: (selector) => selector === '#candidate-pin' ? pin : message
+  };
+  let candidateSelectionGeneration = 1;
+  let activeCandidate = {id: 'candidate-one'};
+  let finish;
+  const request = async () => await new Promise((resolve) => { finish = resolve; });
+  const refreshCandidates = async () => {};
+  eval(section(
+    'async function pinCandidate()',
+    '\n\n        async function refreshSensitiveQuarantine'
+  ));
+  const action = pinCandidate();
+  await Promise.resolve();
+  if (switchCandidate) {
+    ++candidateSelectionGeneration;
+    activeCandidate = {id: 'candidate-two'};
+  }
+  finish({ok: false});
+  await action;
+  return message;
+}
+
+async function forgetFailure(switchDocument) {
+  const message = {textContent: '', kind: ''};
+  const original = {token: 1, libraryId: 'library-one', path: 'note.md', sourceVersion: 'v1'};
+  let current = original;
+  const editorContext = {snapshot: () => current, isCurrent: (candidate) => candidate === current};
+  const editorLibrary = {value: 'library-one'};
+  const editor = {
+    querySelector: (selector) => selector === '#editor-message' ? message : {dataset: {}}
+  };
+  const confirmAction = async () => true;
+  let finish;
+  const request = async () => await new Promise((resolve) => { finish = resolve; });
+  const refreshDocuments = async () => {};
+  let deletionPreviewVersion = 'v1';
+  let deletionPreviewToken = 'preview';
+  eval(section('async function forgetDocument()', '\n\n        async function refreshForgotten'));
+  const action = forgetDocument();
+  await Promise.resolve();
+  await Promise.resolve();
+  if (switchDocument) {
+    current = {token: 2, libraryId: 'library-one', path: 'other.md', sourceVersion: 'v2'};
+  }
+  finish({ok: false, json: async () => ({detail: 'failed'})});
+  await action;
+  return message;
+}
+
+async function forgottenRestoreFailure(switchLibrary) {
+  const message = {textContent: '', kind: ''};
+  const tombstone = {
+    value: 'tombstone-one', selectedIndex: 0,
+    options: [{textContent: 'note.md · 遗忘于今天'}],
+    dataset: {libraryId: 'library-one', generation: '4'},
+  };
+  const commit = {
+    value: 'commit-one', dataset: {libraryId: 'library-one', generation: '4'}
+  };
+  const submit = {dataset: {}};
+  let submitHandler;
+  const forgottenForm = {
+    addEventListener: (_type, handler) => { submitHandler = handler; },
+    querySelector: (selector) => selector === '#forgotten-memory' ? tombstone
+      : selector === '#forgotten-commit' ? commit
+      : selector === '#forgotten-message' ? message : submit,
+  };
+  const editorLibrary = {value: 'library-one'};
+  const generations = {forgotten: 4};
+  const editorContext = {snapshot: () => ({libraryId: editorLibrary.value, path: null})};
+  const confirmAction = async () => true;
+  const refreshDocuments = async () => {};
+  let finish;
+  const request = async () => await new Promise((resolve) => { finish = resolve; });
+  eval(section(
+    "forgottenForm.addEventListener('submit'",
+    "\n        editor.querySelector('#save-change')"
+  ));
+  const action = submitHandler({preventDefault() {}});
+  await Promise.resolve();
+  await Promise.resolve();
+  if (switchLibrary) editorLibrary.value = 'library-two';
+  finish({ok: false, json: async () => ({detail: 'failed'})});
+  await action;
+  return message;
+}
+
+Promise.all([
+  candidateFailure(false), candidateFailure(true),
+  pinFailure(false), pinFailure(true),
+  forgetFailure(false), forgetFailure(true),
+  forgottenRestoreFailure(false), forgottenRestoreFailure(true),
+]).then(([
+  candidate, staleCandidate, pin, stalePin, forget, staleForget, restore, staleRestore
+]) => {
+  console.log(JSON.stringify({
+    candidate, staleCandidate, pin, stalePin, forget, staleForget, restore, staleRestore
+  }));
+});
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["candidate"] == {
+        "textContent": "候选操作失败：测试失败",
+        "kind": "error",
+    }
+    assert payload["forget"] == {
+        "textContent": "记忆遗忘失败：测试失败",
+        "kind": "error",
+    }
+    assert payload["pin"] == {
+        "textContent": "候选记忆置顶失败。",
+        "kind": "error",
+    }
+    assert payload["restore"] == {
+        "textContent": "遗忘记忆恢复失败：测试失败",
+        "kind": "error",
+    }
+    assert payload["staleCandidate"]["textContent"] == ""
+    assert payload["stalePin"]["textContent"] == ""
+    assert payload["staleForget"]["textContent"] == ""
+    assert payload["staleRestore"]["textContent"] == ""
+
+
+def test_management_ui_forgotten_restore_rejects_stale_library_context() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the forgotten restore regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+function section(startMarker, endMarker) {
+  const start = html.indexOf(startMarker);
+  const end = html.indexOf(endMarker, start);
+  return html.slice(start, end);
+}
+const refreshImplementation = section(
+  'function invalidateForgottenSelection(',
+  '\n\n        async function refreshBindings'
+);
+const submitImplementation = section(
+  "forgottenForm.addEventListener('submit'",
+  "\n        editor.querySelector('#save-change')"
+);
+const makeSelect = () => ({
+  value: '', dataset: {}, options: [], selectedIndex: 0,
+  append(option) { this.options.push(option); if (!this.value) this.value = option.value; },
+  replaceChildren() { this.options = []; this.value = ''; },
+});
+const memory = makeSelect();
+const commit = makeSelect();
+const submit = {disabled: false, dataset: {}};
+const message = {textContent: '', kind: ''};
+let submitHandler;
+const forgottenForm = {
+  addEventListener: (_type, handler) => { submitHandler = handler; },
+  querySelector: (selector) => selector === '#forgotten-memory' ? memory
+    : selector === '#forgotten-commit' ? commit
+    : selector === '#forgotten-message' ? message : submit,
+};
+let libraryChangeHandler;
+const editorLibrary = {
+  value: 'library-one',
+  addEventListener: (_type, handler) => { libraryChangeHandler = handler; },
+};
+const historyLibrary = {value: ''};
+const generations = {forgotten: 0};
+const key = 'test-key';
+const document = {createElement: () => ({value: '', textContent: ''})};
+const setMessage = (node, value, kind = '') => { node.textContent = value; node.kind = kind; };
+const describeError = (_failure, context) => context;
+const crypto = {randomUUID: () => 'operation'};
+const editorContext = {snapshot: () => ({libraryId: editorLibrary.value, path: null})};
+const performOnce = async (_key, _button, _label, action) => await action();
+const requests = [];
+const request = (url) => new Promise((resolve) => requests.push({url, resolve}));
+let confirmResolve;
+const confirmAction = () => new Promise((resolve) => { confirmResolve = resolve; });
+const refreshDocuments = async () => { invalidateForgottenSelection('正在加载遗忘记忆...'); };
+eval(refreshImplementation);
+eval(submitImplementation);
+eval(html.match(/editorLibrary\.addEventListener\('change'.*$/m)[0]);
+
+async function staleListScenario() {
+  const oldLoad = refreshForgotten();
+  editorLibrary.value = 'library-two';
+  const switchAction = libraryChangeHandler();
+  const immediate = {
+    memoryCount: memory.options.length,
+    commitCount: commit.options.length,
+    disabled: submit.disabled,
+    generation: generations.forgotten,
+  };
+  requests[0].resolve({
+    ok: true,
+    json: async () => [{id: 'old', path: 'old.md', deleted_at: 'today'}],
+  });
+  requests[1].resolve({
+    ok: true,
+    json: async () => [{commit: 'old-commit', subject: 'old'}],
+  });
+  await Promise.all([oldLoad, switchAction]);
+  return {
+    immediate,
+    memoryCount: memory.options.length,
+    commitCount: commit.options.length,
+    disabled: submit.disabled,
+  };
+}
+
+async function staleSubmitScenario() {
+  editorLibrary.value = 'library-one';
+  const generation = ++generations.forgotten;
+  memory.value = 'tombstone-one';
+  memory.options = [{textContent: 'note.md'}];
+  memory.dataset = {libraryId: 'library-one', generation: String(generation)};
+  commit.value = 'commit-one';
+  commit.dataset = {libraryId: 'library-one', generation: String(generation)};
+  const before = requests.length;
+  const action = submitHandler({preventDefault() {}});
+  await Promise.resolve();
+  editorLibrary.value = 'library-two';
+  invalidateForgottenSelection('正在加载遗忘记忆...');
+  confirmResolve(true);
+  await action;
+  return {
+    requestCount: requests.length - before,
+    message: message.textContent,
+    disabled: submit.disabled,
+  };
+}
+
+(async () => {
+  const staleList = await staleListScenario();
+  const staleSubmit = await staleSubmitScenario();
+  console.log(JSON.stringify({staleList, staleSubmit, generation: generations.forgotten}));
+})();
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["staleList"] == {
+        "immediate": {
+            "memoryCount": 0,
+            "commitCount": 0,
+            "disabled": True,
+            "generation": 2,
+        },
+        "memoryCount": 0,
+        "commitCount": 0,
+        "disabled": True,
+    }
+    assert payload["staleSubmit"] == {
+        "requestCount": 0,
+        "message": "正在加载遗忘记忆...",
+        "disabled": True,
+    }
+    assert payload["generation"] == 4
+
+
+def test_management_ui_sensitive_refresh_preserves_new_selection() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the sensitive refresh regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const start = html.indexOf('async function refreshSensitiveQuarantine(');
+const end = html.indexOf('\n\n        async function refreshDocuments', start);
+const implementation = html.slice(start, end);
+const makeNode = () => ({
+  textContent: '', innerHTML: '', disabled: false, dataset: {}, children: [],
+  append(child) { this.children.push(child); return child; },
+  prepend(child) { this.children.unshift(child); },
+  appendChild(child) { this.children.push(child); return child; },
+  replaceChildren() { this.children = []; },
+  addEventListener() {},
+});
+const nodes = {
+  '#sensitive-title': makeNode(), '#sensitive-summary': makeNode(),
+  '#sensitive-metadata': makeNode(), '#sensitive-message': makeNode(),
+  '#sensitive-acknowledge': makeNode(), '#sensitive-discard': makeNode(),
+};
+const sensitiveDetail = {querySelector: (selector) => nodes[selector]};
+const sensitiveList = makeNode();
+const pageNodes = {
+  '#sensitive-previous': makeNode(), '#sensitive-next': makeNode(),
+  '#sensitive-page': makeNode(),
+};
+const sensitivePagination = {querySelector: (selector) => pageNodes[selector]};
+const document = {createElement: () => makeNode()};
+const display = (value) => value;
+const displaySensitiveSummary = (value) => value;
+const setMessage = () => {};
+const describeError = () => '';
+const confirmAction = async () => true;
+const performOnce = async (_key, _button, _label, action) => await action();
+const crypto = {randomUUID: () => 'operation'};
+const key = 'test-key';
+const generations = {sensitive: 0};
+let sensitiveOffset = 0;
+const sensitivePageSize = 25;
+let sensitiveSelectionGeneration = 0;
+let activeSensitiveRecord = null;
+const first = {
+  id: 'record-a', disposition: 'quarantined', summary: 'first',
+  categories: ['secret'], created_at: 'today', resolved_at: null,
+};
+const second = {
+  id: 'record-b', disposition: 'quarantined', summary: 'second',
+  categories: ['secret'], created_at: 'today', resolved_at: null,
+};
+let finish;
+const request = async () => await new Promise((resolve) => { finish = resolve; });
+eval(implementation
+  + '\nglobalThis.refreshUnderTest = refreshSensitiveQuarantine;'
+  + '\nglobalThis.showUnderTest = showSensitiveRecord;');
+showUnderTest(first);
+const selectionContext = {recordId: first.id, selectionGeneration: sensitiveSelectionGeneration};
+const refresh = refreshUnderTest(first.id, selectionContext);
+showUnderTest(second);
+finish({ok: true, json: async () => [first, second]});
+refresh.then(() => console.log(JSON.stringify({
+  activeId: activeSensitiveRecord.id,
+  title: nodes['#sensitive-title'].textContent,
+})));
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "activeId": "record-b",
+        "title": "quarantined · unresolved",
+    }
+
+
+def test_management_ui_sensitive_resolution_stays_with_original_selection() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the sensitive resolution regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const start = html.indexOf('function clearSensitiveRecord(');
+const end = html.indexOf('\n\n        async function refreshDocuments', start);
+const implementation = html.slice(start, end);
+const setMessage = (node, text, kind = '') => {
+  node.textContent = text;
+  node.kind = kind;
+};
+const describeError = (_failure, context) => `${context}：测试失败`;
+const performOnce = async (_name, _button, _label, action) => await action();
+const confirmAction = async () => true;
+const display = (value) => value;
+const displaySensitiveSummary = (value) => value;
+const key = 'test-key';
+
+async function scenario(outcome, switchAt) {
+  const message = {textContent: '', kind: ''};
+  const buttons = {
+    '#sensitive-acknowledge': {dataset: {}, disabled: false},
+    '#sensitive-discard': {dataset: {}, disabled: false},
+  };
+  const nodes = {
+    '#sensitive-title': {textContent: ''},
+    '#sensitive-summary': {textContent: ''},
+    '#sensitive-metadata': {textContent: ''},
+    '#sensitive-message': message,
+    ...buttons,
+  };
+  const sensitiveDetail = {querySelector: (selector) => nodes[selector]};
+  let activeSensitiveRecord = null;
+  let sensitiveSelectionGeneration = 0;
+  const first = {
+    id: 'record-a', disposition: 'quarantined', summary: 'first',
+    categories: ['secret'], created_at: 'today', resolved_at: null
+  };
+  const second = {
+    id: 'record-b', disposition: 'quarantined', summary: 'second',
+    categories: ['secret'], created_at: 'today', resolved_at: null
+  };
+  let requestedUrl = null;
+  let finish;
+  const request = async (url) => {
+    requestedUrl = url;
+    return await new Promise((resolve) => { finish = resolve; });
+  };
+  const refreshSensitiveQuarantine = async () => {
+    message.textContent = '';
+    message.kind = '';
+    if (switchAt === 'refresh') showSensitiveRecord(second);
+  };
+  eval(implementation + `
+    \nglobalThis.showSensitiveRecordUnderTest = showSensitiveRecord;
+    \nglobalThis.resolveSensitiveRecordUnderTest = resolveSensitiveRecord;
+  `);
+  showSensitiveRecordUnderTest(first);
+  const action = resolveSensitiveRecordUnderTest('acknowledge');
+  await Promise.resolve();
+  if (switchAt === 'response') showSensitiveRecordUnderTest(second);
+  finish(outcome === 'success'
+    ? {ok: true, json: async () => ({...first, resolved_at: 'later', resolution: 'acknowledge'})}
+    : {ok: false, json: async () => ({detail: 'failed'})});
+  await action;
+  return {message, requestedUrl, activeId: activeSensitiveRecord?.id};
+}
+
+Promise.all([
+  scenario('success', 'none'),
+  scenario('success', 'refresh'),
+  scenario('failure', 'none'),
+  scenario('failure', 'response'),
+]).then(([success, staleSuccess, failure, staleFailure]) => {
+  console.log(JSON.stringify({success, staleSuccess, failure, staleFailure}));
+});
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["success"]["requestedUrl"].endswith(
+        "/sensitive-quarantine/record-a/resolve"
+    )
+    assert payload["success"]["message"] == {
+        "textContent": "已知悉此敏感记录。",
+        "kind": "success",
+    }
+    assert payload["failure"]["message"] == {
+        "textContent": "敏感记录处理失败：测试失败",
+        "kind": "error",
+    }
+    assert payload["staleSuccess"]["activeId"] == "record-b"
+    assert payload["staleSuccess"]["message"]["textContent"] == ""
+    assert payload["staleFailure"]["activeId"] == "record-b"
+    assert payload["staleFailure"]["message"]["textContent"] == ""
+
+
+def test_management_ui_history_diff_selection_clears_stale_restore_and_handles_retry() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the history diff regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const start = html.indexOf('async function loadHistoryDiff(');
+const end = html.indexOf('\n\n        async function refreshHistory', start);
+const implementation = html.slice(start, end);
+const makeNode = () => ({
+  textContent: '', children: [],
+  addEventListener(type, listener) { this[type] = listener; },
+  append(child) { this.children.push(child); },
+  replaceChildren() { this.children = []; },
+});
+const historyDiff = makeNode();
+const restoreAction = makeNode();
+restoreAction.append({textContent: '旧恢复动作'});
+historyDiff.textContent = '旧提交差异';
+const historyMessage = {textContent: '', kind: ''};
+const setMessage = (node, text, kind = '') => { node.textContent = text; node.kind = kind; };
+const document = {createElement: () => makeNode()};
+const key = 'test-key';
+const generations = {historyDiff: 0};
+const context = {libraryId: 'library-one', path: 'note.md', sourceVersion: 'v1', token: 9};
+const editorContext = {isCurrent: (candidate) => candidate === context};
+const historySelection = {
+  clear() {},
+  select(libraryId, selected, commit) {
+    return {
+      libraryId, path: selected.path, sourceVersion: selected.source_version,
+      contextToken: selected.token, commit
+    };
+  },
+};
+const pending = new Set();
+const requests = [];
+const request = (url) => new Promise((resolve) => requests.push({url, resolve}));
+eval(implementation + '\nglobalThis.loadHistoryDiffUnderTest = loadHistoryDiff;');
+
+async function run() {
+  const firstEntry = {commit: '111111111111aaaa'};
+  const first = loadHistoryDiffUnderTest('library-one', firstEntry, context);
+  const duplicate = await loadHistoryDiffUnderTest('library-one', firstEntry, context);
+  const loading = {
+    diff: historyDiff.textContent,
+    actions: restoreAction.children.map((child) => child.textContent),
+    message: historyMessage.textContent,
+  };
+  const secondEntry = {commit: '222222222222bbbb'};
+  const second = loadHistoryDiffUnderTest('library-one', secondEntry, context);
+  requests[1].resolve({ok: true, json: async () => ({diff: '第二个差异'})});
+  await second;
+  requests[0].resolve({ok: true, json: async () => ({diff: '迟到的第一个差异'})});
+  await first;
+  const afterRace = {
+    diff: historyDiff.textContent,
+    actions: restoreAction.children.map((child) => child.textContent),
+  };
+
+  const failedEntry = {commit: '333333333333cccc'};
+  const failed = loadHistoryDiffUnderTest('library-one', failedEntry, context);
+  requests[2].resolve({ok: false});
+  await failed;
+  const afterFailure = {
+    diff: historyDiff.textContent,
+    message: historyMessage.textContent,
+    actions: restoreAction.children.map((child) => child.textContent),
+  };
+  const retry = restoreAction.children[0];
+  const retried = retry.click();
+  requests[3].resolve({ok: true, json: async () => ({diff: '重试后的差异'})});
+  await retried;
+  console.log(JSON.stringify({
+    duplicate, requestCount: requests.length, loading, afterRace, afterFailure,
+    afterRetry: {
+      diff: historyDiff.textContent,
+      message: historyMessage.textContent,
+      actions: restoreAction.children.map((child) => child.textContent),
+    },
+  }));
+}
+run();
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["duplicate"] is False
+    assert payload["requestCount"] == 4
+    assert payload["loading"] == {
+        "diff": "正在加载提交差异...",
+        "actions": [],
+        "message": "正在加载提交 111111111111 的差异...",
+    }
+    assert payload["afterRace"] == {
+        "diff": "第二个差异",
+        "actions": ["从 222222222222 恢复 note.md"],
+    }
+    assert payload["afterFailure"] == {
+        "diff": "提交差异加载失败。",
+        "message": "提交差异加载失败，请重试。",
+        "actions": ["重试加载差异"],
+    }
+    assert payload["afterRetry"] == {
+        "diff": "重试后的差异",
+        "message": "已加载提交 333333333333 的差异。",
+        "actions": ["从 333333333333 恢复 note.md"],
+    }
+
+
+def test_management_ui_load_document_returns_null_after_same_path_edit() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the document load regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    history_path = (
+        Path(__file__).parents[1]
+        / "src/personal_agent_memory/static/editor_history.js"
+    )
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const PamHistory = require(process.argv[2]);
+const start = html.indexOf('async function loadDocument(');
+const end = html.indexOf('\n\n        function showEditorPanel', start);
+const implementation = html.slice(start, end);
+const editorContext = PamHistory.contextStore();
+const editorLibrary = {value: 'library-one'};
+const key = 'test-key';
+const nodes = new Map();
+const node = (selector) => {
+  if (!nodes.has(selector)) nodes.set(selector, {
+    textContent: '', value: '', disabled: true, hidden: false,
+    setAttribute() {}, replaceChildren() {},
+  });
+  return nodes.get(selector);
+};
+const editor = {querySelector: node};
+const historyDocument = {value: ''};
+const restoreAction = {replaceChildren() {}};
+const historySelection = {clear() {}};
+const historyMessage = {textContent: '', kind: ''};
+const setMessage = (target, text, kind = '') => {
+  target.textContent = text;
+  target.kind = kind;
+};
+const documentContextIsCurrent = (context) => {
+  const current = editorContext.snapshot();
+  return Boolean(context && current && editorContext.isCurrent(context)
+    && editorLibrary.value === context.libraryId
+    && current.libraryId === context.libraryId
+    && current.path === context.path
+    && current.token === context.token);
+};
+const request = async () => ({
+  ok: true,
+  json: async () => ({path: 'same.md', source_version: 'v2', content: 'loaded'}),
+});
+const showEditorPanel = () => {};
+let activeDocument = null;
+let deletionPreviewVersion = null;
+let deletionPreviewToken = null;
+const refreshHistory = () => {
+  editorContext.edit('edited while history refresh waits');
+  return Promise.resolve();
+};
+eval(implementation + '\nglobalThis.loadDocumentUnderTest = loadDocument;');
+
+(async () => {
+  const result = await loadDocumentUnderTest('same.md');
+  const current = editorContext.snapshot();
+  console.log(JSON.stringify({
+    result: result === null ? null : result.token,
+    path: current.path,
+    content: current.content,
+  }));
+})();
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path), str(history_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "result": None,
+        "path": "same.md",
+        "content": "edited while history refresh waits",
+    }
+
+
+def test_management_ui_document_mutations_reject_same_path_in_another_library() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the document context regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+function section(startMarker, endMarker) {
+  const start = html.indexOf(startMarker);
+  const end = html.indexOf(endMarker, start);
+  return html.slice(start, end);
+}
+const restoreImplementation = section(
+  'async function restoreDocument(selection)',
+  '\n\n        async function previewForgetting'
+);
+const saveImplementation = section(
+  'async function saveDocument()',
+  '\n\n        async function refreshForgotten'
+);
+const setMessage = (node, text, kind = '') => { node.textContent = text; node.kind = kind; };
+const describeError = (_failure, context) => `${context}：测试失败`;
+const performOnce = async (_name, _button, _label, action) => await action();
+const confirmAction = async () => true;
+const crypto = {randomUUID: () => 'operation'};
+const key = 'test-key';
+
+async function restoreScenario(switchLibrary, editDuringHistory = false) {
+  const historyMessage = {textContent: '', kind: ''};
+  const restoreAction = {querySelector: () => ({dataset: {}}), replaceChildren() {}};
+  const historySelection = {clear() {}};
+  const editorLibrary = {value: 'library-one'};
+  const original = {libraryId: 'library-one', path: 'same.md', sourceVersion: 'v1', token: 7};
+  let current = original;
+  const editorContext = {
+    snapshot: () => current,
+    isCurrent: (candidate) => candidate.token === current.token
+  };
+  const documentContextIsCurrent = (context) => Boolean(
+    context && current && editorContext.isCurrent(context)
+    && editorLibrary.value === context.libraryId
+    && current.libraryId === context.libraryId
+    && current.path === context.path
+    && current.token === context.token
+  );
+  const selection = {
+    libraryId: 'library-one', path: 'same.md', expectedSourceVersion: 'v1',
+    contextToken: 7, commit: 'abcdef1234567890'
+  };
+  let finish;
+  const request = async () => await new Promise((resolve) => { finish = resolve; });
+  let loadCount = 0;
+  const loadDocument = async () => {
+    ++loadCount;
+    current = {libraryId: editorLibrary.value, path: 'same.md', sourceVersion: 'v2', token: 8};
+    if (editDuringHistory) {
+      current = {...current, content: 'edited while history loads', token: 9};
+      return null;
+    }
+    return current;
+  };
+  const PamHistory = {request: () => ({url: '/restore', body: {}})};
+  eval(restoreImplementation + '\nglobalThis.restoreUnderTest = restoreDocument;');
+  const action = restoreUnderTest(selection);
+  await Promise.resolve();
+  await Promise.resolve();
+  if (switchLibrary) editorLibrary.value = 'library-two';
+  finish({ok: true});
+  await action;
+  return {message: historyMessage, loadCount};
+}
+
+async function saveScenario(switchLibrary, editDuringHistory = false) {
+  const message = {textContent: '', kind: ''};
+  const editorLibrary = {value: 'library-one'};
+  const original = {libraryId: 'library-one', path: 'same.md', sourceVersion: 'v1', token: 11};
+  let current = original;
+  const editorContext = {
+    snapshot: () => current,
+    isCurrent: (candidate) => candidate.token === current.token
+  };
+  const documentContextIsCurrent = (context) => Boolean(
+    context && current && editorContext.isCurrent(context)
+    && editorLibrary.value === context.libraryId
+    && current.libraryId === context.libraryId
+    && current.path === context.path
+    && current.token === context.token
+  );
+  const editor = {
+    querySelector: (selector) => selector === '#editor-message' ? message : {dataset: {}}
+  };
+  const previewChange = async () => true;
+  let finish;
+  const request = async () => await new Promise((resolve) => { finish = resolve; });
+  let loadCount = 0;
+  const loadDocument = async () => {
+    ++loadCount;
+    current = {libraryId: editorLibrary.value, path: 'same.md', sourceVersion: 'v2', token: 12};
+    if (editDuringHistory) {
+      current = {...current, content: 'edited while history loads', token: 13};
+      return null;
+    }
+    return current;
+  };
+  const PamHistory = {saveRequest: () => ({url: '/save', body: {}})};
+  eval(saveImplementation + '\nglobalThis.saveUnderTest = saveDocument;');
+  const action = saveUnderTest();
+  await Promise.resolve();
+  await Promise.resolve();
+  if (switchLibrary) editorLibrary.value = 'library-two';
+  finish({ok: true});
+  await action;
+  return {message, loadCount};
+}
+
+Promise.all([
+  restoreScenario(false), restoreScenario(true),
+  restoreScenario(false, true), saveScenario(false), saveScenario(true),
+  saveScenario(false, true)
+]).then(([restore, staleRestore, editedRestore, save, staleSave, editedSave]) => {
+  console.log(JSON.stringify({restore, staleRestore, editedRestore, save, staleSave, editedSave}));
+});
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["restore"] == {
+        "message": {
+            "textContent": "已从 abcdef123456 恢复 same.md。",
+            "kind": "success",
+        },
+        "loadCount": 1,
+    }
+    assert payload["save"] == {
+        "message": {"textContent": "文档已保存。", "kind": "success"},
+        "loadCount": 1,
+    }
+    assert payload["staleRestore"] == {
+        "message": {"textContent": "", "kind": ""},
+        "loadCount": 0,
+    }
+    assert payload["staleSave"] == {
+        "message": {"textContent": "", "kind": ""},
+        "loadCount": 0,
+    }
+    assert payload["editedRestore"] == {
+        "message": {"textContent": "", "kind": ""},
+        "loadCount": 1,
+    }
+    assert payload["editedSave"] == {
+        "message": {"textContent": "", "kind": ""},
+        "loadCount": 1,
+    }
+
+
+def test_management_ui_forgetting_preview_deduplicates_and_rejects_stale_results() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the forgetting preview regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const start = html.indexOf('async function previewForgetting()');
+const end = html.indexOf('\n\n        async function forgetDocument', start);
+const implementation = html.slice(start, end);
+const message = {textContent: '', kind: ''};
+const diff = {textContent: ''};
+const previewButton = {dataset: {}, disabled: false, textContent: '预览遗忘影响'};
+const confirmButton = {disabled: true};
+const editor = {querySelector: (selector) => selector === '#editor-message' ? message
+  : selector === '#document-diff' ? diff
+  : selector === '#preview-delete' ? previewButton : confirmButton};
+const editorLibrary = {value: 'library-one'};
+const contexts = {
+  first: {libraryId: 'library-one', path: 'first.md', sourceVersion: 'v1', token: 1},
+  second: {libraryId: 'library-one', path: 'second.md', sourceVersion: 'v2', token: 2},
+};
+let current = contexts.first;
+const editorContext = {
+  snapshot: () => current,
+  isCurrent: (candidate) => candidate.token === current.token
+};
+const documentContextIsCurrent = (context) => Boolean(
+  context && current && editorContext.isCurrent(context)
+  && editorLibrary.value === context.libraryId
+  && current.libraryId === context.libraryId
+  && current.path === context.path
+  && current.token === context.token
+);
+const pending = new Set();
+const generations = {forgettingPreview: 0};
+const setBusy = (button, busy) => { button.disabled = busy; };
+const setMessage = (node, text, kind = '') => { node.textContent = text; node.kind = kind; };
+const describeError = (_failure, context) => context;
+const showEditorPanel = () => {};
+const crypto = {randomUUID: () => 'operation'};
+const key = 'test-key';
+let deletionPreviewVersion = null;
+let deletionPreviewToken = null;
+const requests = [];
+const request = (url) => new Promise((resolve) => requests.push({url, resolve}));
+eval(implementation + '\nglobalThis.previewForgettingUnderTest = previewForgetting;');
+
+async function run() {
+  const first = previewForgettingUnderTest();
+  const duplicate = await previewForgettingUnderTest();
+  current = contexts.second;
+  const second = previewForgettingUnderTest();
+  requests[1].resolve({
+    ok: true,
+    json: async () => ({preview_token: 'second-preview', marker: 'second'})
+  });
+  await second;
+  requests[0].resolve({
+    ok: true,
+    json: async () => ({preview_token: 'first-preview', marker: 'first'})
+  });
+  await first;
+  console.log(JSON.stringify({
+    duplicate, requestCount: requests.length, diff: diff.textContent,
+    token: deletionPreviewToken, version: deletionPreviewVersion,
+    confirmDisabled: confirmButton.disabled
+  }));
+}
+run();
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "duplicate": False,
+        "requestCount": 2,
+        "diff": json.dumps(
+            {"preview_token": "second-preview", "marker": "second"},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        "token": "second-preview",
+        "version": "v2",
+        "confirmDisabled": False,
+    }
+
+
+def test_management_ui_retention_actions_confirm_and_report_after_refresh() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the retention action regression")
+    html_path = Path(__file__).parents[1] / "src/personal_agent_memory/static/index.html"
+    program = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+function section(startMarker, endMarker) {
+  const start = html.indexOf(startMarker);
+  const end = html.indexOf(endMarker, start);
+  return html.slice(start, end);
+}
+const setMessage = (node, text, kind) => { node.textContent = text; node.kind = kind; };
+const performOnce = async (_name, _button, _label, action) => await action();
+const key = 'test-key';
+
+async function restoreScenario(switchLibrary) {
+  const message = {textContent: '', kind: ''};
+  const library = {value: 'library-one'};
+  const retentionForm = {
+    querySelector: (selector) => (
+      selector === '#retention-library' ? library : message
+    )
+  };
+  let retentionSelectionGeneration = 3;
+  let confirmation;
+  const confirmAction = async (title, description) => {
+    confirmation = {title, description};
+    return true;
+  };
+  const request = async () => ({ok: true});
+  const refreshRetention = async () => {
+    message.textContent = '';
+    if (switchLibrary) { ++retentionSelectionGeneration; library.value = 'library-two'; }
+  };
+  const refreshCandidates = async () => {};
+  eval(section(
+    'async function restoreRecycledCandidate(item, button)',
+    '\n\n        async function refreshRetention'
+  ));
+  await restoreRecycledCandidate({candidate: {id: 'candidate-one'}}, {dataset: {}});
+  return {message, confirmation};
+}
+
+async function cleanupScenario(switchLibrary) {
+  const message = {textContent: '', kind: ''};
+  const library = {value: 'library-one'};
+  const button = {dataset: {}};
+  const retentionForm = {
+    querySelector: (selector) => (
+      selector === '#retention-library'
+        ? library
+        : selector === '#retention-run' ? button : message
+    )
+  };
+  const generations = {retention: 8};
+  let retentionSelectionGeneration = 5;
+  let retentionPreviewContext = {
+    libraryId: 'library-one', generation: 8, selectionGeneration: 5,
+    affectedCount: 7, summary: '预计影响\n采集收件箱：2 条\n候选永久删除：5 条'
+  };
+  let confirmation;
+  const confirmAction = async (title, description) => {
+    confirmation = {title, description};
+    return true;
+  };
+  const request = async () => ({ok: true});
+  const refreshRetention = async () => {
+    message.textContent = '';
+    if (switchLibrary) { ++retentionSelectionGeneration; library.value = 'library-two'; }
+  };
+  const refreshCandidates = async () => {};
+  eval(section(
+    'async function runRetentionCleanup()',
+    '\n\n        async function refreshReconciliation'
+  ));
+  await runRetentionCleanup();
+  return {message, confirmation};
+}
+
+Promise.all([
+  restoreScenario(false), restoreScenario(true),
+  cleanupScenario(false), cleanupScenario(true)
+]).then(([restore, staleRestore, cleanup, staleCleanup]) => {
+  console.log(JSON.stringify({restore, staleRestore, cleanup, staleCleanup}));
+});
+"""
+    result = subprocess.run(
+        [node, "-e", program, str(html_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["restore"]["confirmation"] == {
+        "title": "确认恢复候选记忆",
+        "description": "将从记忆库 library-one 的回收站恢复候选 candidate-one。",
+    }
+    assert payload["restore"]["message"] == {
+        "textContent": "候选记忆已恢复。",
+        "kind": "success",
+    }
+    assert payload["staleRestore"]["message"]["textContent"] == ""
+    cleanup_confirmation = payload["cleanup"]["confirmation"]
+    assert cleanup_confirmation["title"] == "确认立即清理"
+    assert "library-one" in cleanup_confirmation["description"]
+    assert "预计影响 7 条" in cleanup_confirmation["description"]
+    assert "采集收件箱：2 条" in cleanup_confirmation["description"]
+    assert "候选永久删除：5 条" in cleanup_confirmation["description"]
+    assert payload["cleanup"]["message"] == {
+        "textContent": "保留数据清理完成。",
+        "kind": "success",
+    }
+    assert payload["staleCleanup"]["message"]["textContent"] == ""

@@ -1,107 +1,169 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Personal Agent Memory</title>
+    <title>个人智能体记忆 | Personal Agent Memory</title>
     <style>
-      :root { color: #17211b; background: #f4f6f5; font: 16px/1.5 system-ui, sans-serif; }
-      body { margin: 0; }
-      header { background: #143d2b; color: white; padding: 18px 28px; }
-      h1 { font-size: 20px; margin: 0; letter-spacing: 0; }
-      main { max-width: 920px; margin: 48px auto; padding: 0 24px; }
-      section { border: 1px solid #ccd5cf; background: white; border-radius: 8px; padding: 24px; }
-      section + section { margin-top: 20px; }
-      label { display: block; font-weight: 650; margin-bottom: 8px; }
-      input, select, textarea { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #8d9b92; }
+      :root { --blue: #1664ff; --blue-soft: #e8f0ff; --teal: #00a870; --orange: #ff8800; --red: #d54941; --ink: #1d2129; --muted: #646a73; --line: #dee0e3; --surface: #fff; --canvas: #f5f6f7; color: var(--ink); background: var(--canvas); font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 320px; }
+      button, input, select, textarea { font: inherit; }
+      button { min-height: 34px; margin-top: 12px; padding: 7px 14px; border: 1px solid transparent; border-radius: 6px; background: var(--blue); color: white; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; }
+      button:hover:not(:disabled) { background: #0f55d9; }
+      button:disabled { cursor: not-allowed; opacity: .5; }
+      button.secondary { border-color: var(--line); background: white; color: var(--ink); }
+      button.secondary:hover:not(:disabled) { background: #f2f3f5; }
+      button.danger { background: var(--red); }
+      button.danger:hover:not(:disabled) { background: #b83b34; }
+      button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid rgba(22,100,255,.24); outline-offset: 2px; }
+      .login-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #f5f6f7; }
+      .login-panel { width: min(420px, 100%); padding: 32px; border: 1px solid var(--line); border-radius: 8px; background: white; box-shadow: 0 10px 32px rgba(31,35,41,.08); }
+      .brand-mark { width: 40px; height: 40px; display: grid; place-items: center; margin-bottom: 20px; border-radius: 8px; background: var(--blue); color: white; font-size: 22px; font-weight: 700; }
+      h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
+      h2 { margin: 0 0 18px; font-size: 20px; letter-spacing: 0; }
+      h3 { margin: 22px 0 8px; font-size: 15px; letter-spacing: 0; }
+      .subtitle, .hint, .source { color: var(--muted); }
+      .subtitle { margin: 4px 0 24px; }
+      .app-shell { min-height: 100vh; display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+      .sidebar { position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 18px 12px; border-right: 1px solid var(--line); background: white; }
+      .sidebar-brand { padding: 0 10px 18px; font-weight: 700; font-size: 16px; }
+      .sidebar-brand small { display: block; color: var(--muted); font-weight: 400; font-size: 11px; }
+      .nav-group { margin: 14px 10px 6px; color: var(--muted); font-size: 12px; }
+      .nav-button { width: 100%; margin: 2px 0; text-align: left; background: transparent; color: var(--ink); }
+      .nav-button:hover:not(:disabled) { background: #f2f3f5; }
+      .nav-button[aria-current="page"] { background: var(--blue-soft); color: #0f55d9; font-weight: 650; }
+      .app-main { min-width: 0; }
+      .topbar { position: sticky; top: 0; z-index: 5; height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 24px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.96); }
+      .topbar button { margin: 0; }
+      .connection { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+      .connection::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #8b9097; }
+      .connection.ok::before { background: var(--teal); }
+      .connection.warn::before { background: #ad5f00; }
+      .connection.bad::before { background: var(--red); }
+      .workspace { width: min(1240px, 100%); margin: 0 auto; padding: 24px; }
+      .view[hidden] { display: none; }
+      .view-section { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--line); }
+      .view-section:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+      .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }
+      .metric { min-height: 106px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+      .metric span { color: var(--muted); }
+      .metric strong { display: block; margin-top: 10px; font-size: 25px; }
+      .quick-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      .quick-actions button { margin: 0; }
+      label { display: block; font-weight: 650; margin-bottom: 6px; }
+      input, select, textarea { width: 100%; padding: 8px 10px; border: 1px solid #bbbfc4; border-radius: 6px; background: white; color: var(--ink); }
       input[type="checkbox"] { width: auto; }
-      button { margin-top: 12px; padding: 10px 16px; border: 0; background: #176943; color: white; cursor: pointer; }
-      button.danger { background: #9d241d; margin: 0; }
       dl { display: grid; grid-template-columns: 180px 1fr; gap: 8px; }
-      dt { color: #526158; } dd { margin: 0; font-family: monospace; }
-      .error { color: #9d241d; }
+      dt { color: var(--muted); } dd { margin: 0; font-family: ui-monospace, monospace; }
+      .error { color: var(--red); }
+      .success { color: var(--teal); }
+      .notice { min-height: 22px; margin: 8px 0 0; }
       .field { margin-top: 14px; }
-      table { width: 100%; border-collapse: collapse; margin-top: 18px; }
-      th, td { padding: 10px 8px; border-bottom: 1px solid #dbe2de; text-align: left; vertical-align: top; }
-      th { color: #526158; font-size: 13px; text-transform: uppercase; }
+      .table-scroll { overflow-x: auto; }
+      table { width: 100%; min-width: 760px; border-collapse: collapse; margin-top: 14px; }
+      th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+      th { color: var(--muted); font-size: 12px; }
       td.path { overflow-wrap: anywhere; }
-      .search-result { border-top: 1px solid #dbe2de; padding: 14px 0; }
+      .badge { display: inline-flex; align-items: center; min-height: 24px; padding: 2px 8px; border-radius: 5px; background: #f2f3f5; color: var(--muted); white-space: nowrap; }
+      .badge.ok { background: #e8f8f2; color: #087f5b; }
+      .badge.warn { background: #fff3e0; color: #ad5f00; }
+      .badge.bad { background: #fdecea; color: #b83b34; }
+      .empty { padding: 28px 16px; text-align: center; color: var(--muted); border: 1px dashed #bbbfc4; border-radius: 6px; }
+      .search-result { border-top: 1px solid var(--line); padding: 14px 0; }
       .search-result pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-      .source { color: #526158; font: 13px/1.4 monospace; }
+      .source { font: 13px/1.4 ui-monospace, monospace; overflow-wrap: anywhere; }
       .editor-layout { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(0, 3fr); gap: 18px; }
-      .document-tree, .history { max-height: 520px; overflow: auto; border-right: 1px solid #dbe2de; padding-right: 12px; }
+      .document-tree, .history { max-height: 520px; overflow: auto; border-right: 1px solid var(--line); padding-right: 12px; }
       .document-tree button, .history button { display: block; width: 100%; margin: 0 0 6px; text-align: left; overflow-wrap: anywhere; }
-      textarea { min-height: 480px; resize: vertical; font: 14px/1.5 monospace; white-space: pre; overflow: auto; }
-      iframe { width: 100%; min-height: 480px; border: 1px solid #ccd5cf; background: white; }
+      textarea { min-height: 360px; resize: vertical; font: 14px/1.5 ui-monospace, monospace; white-space: pre; overflow: auto; }
+      iframe { width: 100%; min-height: 360px; border: 1px solid var(--line); background: white; }
       .editor-tabs { display: flex; gap: 8px; margin: 12px 0; }
       .editor-tabs button { margin: 0; }
-      .diff { max-height: 420px; overflow: auto; white-space: pre; font: 13px/1.5 monospace; background: #f4f6f5; padding: 12px; }
+      .editor-tabs button[aria-selected="true"] { background: var(--blue); color: white; border-color: var(--blue); }
+      .diff { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 ui-monospace, monospace; background: #f5f6f7; padding: 12px; border-radius: 6px; }
       .candidate-layout { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr); gap: 18px; }
-      .candidate-list { max-height: 420px; overflow: auto; border-right: 1px solid #dbe2de; padding-right: 12px; }
+      .candidate-list { min-height: 120px; max-height: 420px; overflow: auto; border-right: 1px solid var(--line); padding-right: 12px; }
       .candidate-list button { display: block; width: 100%; margin: 0 0 6px; text-align: left; overflow-wrap: anywhere; }
-      .candidate-actions { display: flex; gap: 8px; }
+      .candidate-actions { display: flex; flex-wrap: wrap; gap: 8px; }
       .candidate-actions button { flex: 0 0 auto; }
-      @media (max-width: 720px) { main { margin: 20px auto; } .editor-layout, .candidate-layout { grid-template-columns: 1fr; } .document-tree, .history, .candidate-list { border-right: 0; max-height: 220px; } }
+      dialog { width: min(480px, calc(100% - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 18px 50px rgba(31,35,41,.22); }
+      dialog::backdrop { background: rgba(31,35,41,.45); }
+      .dialog-body { padding: 22px; }
+      .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 22px; border-top: 1px solid var(--line); }
+      .dialog-actions button { margin: 0; }
+      @media (max-width: 860px) { .app-shell { grid-template-columns: 1fr; } .sidebar { position: fixed; z-index: 10; width: 232px; transform: translateX(-100%); transition: transform 160ms ease; } .app-shell.nav-open .sidebar { transform: translateX(0); box-shadow: 8px 0 24px rgba(31,35,41,.14); } .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+      @media (max-width: 720px) { .workspace { padding: 16px; } .topbar { padding: 0 16px; } .editor-layout, .candidate-layout { grid-template-columns: 1fr; } .document-tree, .history, .candidate-list { border-right: 0; max-height: 220px; } .metric-grid { grid-template-columns: 1fr; } dl { grid-template-columns: 1fr; } }
+      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; } }
     </style>
   </head>
   <body>
-    <header><h1>Personal Agent Memory</h1></header>
-    <main><section id="root"><label for="key">API key</label><input id="key" type="password" autocomplete="off"><button id="connect">Connect</button><p id="message">Enter the key stored in your platform state directory.</p></section></main>
+    <main class="login-shell" id="login-shell"><section id="root" class="login-panel"><div class="brand-mark" aria-hidden="true">记</div><h1>个人智能体记忆</h1><p class="subtitle">Personal Agent Memory</p><label for="key">API 密钥</label><input id="key" type="password" autocomplete="off" aria-describedby="message"><button id="connect">进入管理工作台</button><p id="message" class="hint">请输入平台状态目录中保存的 API 密钥。密钥仅保留在当前页面内存中。</p></section></main>
     <script src="/editor-history.js"></script>
     <script>
       const root = document.querySelector('#root');
       document.querySelector('#connect').addEventListener('click', async () => {
         const key = document.querySelector('#key').value;
-        const response = await fetch('/api/v1/status', {headers: {Authorization: `Bearer ${key}`}});
-        if (!response.ok) { document.querySelector('#message').className = 'error'; document.querySelector('#message').textContent = 'Authentication failed.'; return; }
+        const connect = document.querySelector('#connect');
+        const loginMessage = document.querySelector('#message');
+        if (!key) { loginMessage.className = 'error'; loginMessage.textContent = '请输入 API 密钥。'; return; }
+        connect.disabled = true;
+        connect.textContent = '正在连接...';
+        let response;
+        try { response = await fetch('/api/v1/status', {headers: {Authorization: `Bearer ${key}`}}); }
+        catch (_error) { loginMessage.className = 'error'; loginMessage.textContent = '无法连接服务，请检查服务状态后重试。'; connect.disabled = false; connect.textContent = '进入管理工作台'; return; }
+        if (!response.ok) { loginMessage.className = 'error'; loginMessage.textContent = '认证失败，请检查 API 密钥。'; connect.disabled = false; connect.textContent = '进入管理工作台'; return; }
         const data = await response.json();
+        const loginShell = document.querySelector('#login-shell');
+        loginShell.className = 'app-shell';
         root.replaceChildren();
+        root.className = 'app-main';
         const statusHeading = document.createElement('h2');
-        statusHeading.textContent = 'Service ready';
+        statusHeading.textContent = '服务状态';
         const statusList = document.createElement('dl');
-        for (const [label, value] of [['Database', data.database], ['Background worker', data.background_worker], ['API key fingerprint', data.api_key_fingerprint], ['Startup count', data.startup_count]]) {
+        for (const [label, value] of [['数据库', data.database], ['后台任务', data.background_worker], ['API 密钥指纹', data.api_key_fingerprint], ['启动次数', data.startup_count]]) {
           const term = document.createElement('dt');
           const detail = document.createElement('dd');
           term.textContent = label;
-          detail.textContent = value;
+          detail.textContent = ({ok: '正常', running: '运行中', error: '错误', not_configured: '未配置'}[value] || value);
           statusList.append(term, detail);
         }
         const heading = document.createElement('h2');
-        heading.textContent = 'Memory libraries';
+        heading.textContent = '记忆库';
         const form = document.createElement('form');
-        form.innerHTML = '<div class="field"><label for="path">Directory path</label><input id="path" required></div><div class="field"><label for="kind">Library type</label><select id="kind"><option value="project">Project</option><option value="user">User</option></select></div><div class="field"><label><input id="reuse-existing-git" type="checkbox"> Authorize this dedicated memory repository</label></div><button type="submit">Register library</button><p id="library-message"></p>';
+        form.innerHTML = '<div class="field"><label for="path">目录路径</label><input id="path" required></div><div class="field"><label for="kind">记忆库类型</label><select id="kind"><option value="project">项目记忆库</option><option value="user">用户记忆库</option></select></div><div class="field"><label><input id="reuse-existing-git" type="checkbox"> 授权使用此专用记忆仓库</label></div><button type="submit">注册记忆库</button><p id="library-message" class="notice" aria-live="polite"></p>';
         const table = document.createElement('table');
-        table.innerHTML = '<thead><tr><th>Identifier</th><th>Type</th><th>Path</th><th>Availability</th><th>Text</th><th>Graph</th><th>Graph progress</th><th>Graph error</th></tr></thead><tbody></tbody>';
+        table.innerHTML = '<thead><tr><th>标识符</th><th>类型</th><th>路径</th><th>可用性</th><th>文本索引</th><th>图索引</th><th>图索引进度</th><th>图索引错误</th></tr></thead><tbody></tbody>';
         const bindingHeading = document.createElement('h2');
-        bindingHeading.textContent = 'Project bindings';
+        bindingHeading.textContent = '项目绑定';
         const bindingForm = document.createElement('form');
-        bindingForm.innerHTML = '<div class="field"><label for="project-root">Project root</label><input id="project-root" required></div><div class="field"><label for="project-library">Project memory library</label><select id="project-library" required></select></div><button type="submit">Bind project</button><p id="binding-message"></p>';
+        bindingForm.innerHTML = '<div class="field"><label for="project-root">项目根目录</label><input id="project-root" required></div><div class="field"><label for="project-library">项目记忆库</label><select id="project-library" required></select></div><button type="submit">绑定项目</button><p id="binding-message" class="notice" aria-live="polite"></p>';
         const worktreeForm = document.createElement('form');
-        worktreeForm.innerHTML = '<div class="field"><label for="worktree-root">Worktree root</label><input id="worktree-root" required></div><div class="field"><label for="main-binding">Main project</label><select id="main-binding" required></select></div><button type="submit">Associate worktree</button><p id="worktree-message"></p>';
+        worktreeForm.innerHTML = '<div class="field"><label for="worktree-root">Worktree 根目录</label><input id="worktree-root" required></div><div class="field"><label for="main-binding">主项目</label><select id="main-binding" required></select></div><button type="submit">关联 Worktree</button><p id="worktree-message" class="notice" aria-live="polite"></p>';
         const bindingTable = document.createElement('table');
-        bindingTable.innerHTML = '<thead><tr><th>Project</th><th>Kind</th><th>Root</th><th>Library</th><th>Availability</th><th>Actions</th></tr></thead><tbody></tbody>';
+        bindingTable.innerHTML = '<thead><tr><th>项目</th><th>关系</th><th>根目录</th><th>记忆库</th><th>可用性</th><th>操作</th></tr></thead><tbody></tbody>';
         const searchHeading = document.createElement('h2');
-        searchHeading.textContent = 'Search project memory';
+        searchHeading.textContent = '记忆检索';
         const searchForm = document.createElement('form');
-        searchForm.innerHTML = '<div class="field"><label for="search-cwd">Project working directory</label><input id="search-cwd" required></div><div class="field"><label for="search-query">Keywords</label><input id="search-query" required></div><button type="submit">Search</button><p id="search-message"></p><div id="search-results"></div>';
+        searchForm.innerHTML = '<div class="field"><label for="search-cwd">项目工作目录</label><input id="search-cwd" required></div><div class="field"><label for="search-query">关键词</label><input id="search-query" required></div><button type="submit">检索</button><p id="search-message" class="notice" aria-live="polite"></p><div id="search-results"></div>';
         const retentionHeading = document.createElement('h2');
-        retentionHeading.textContent = 'Retention and privacy';
+        retentionHeading.textContent = '隐私设置';
         const retentionForm = document.createElement('form');
-        retentionForm.innerHTML = '<div class="field"><label for="retention-library">Memory library</label><select id="retention-library"></select></div><div class="field"><label for="inbox-days">Capture Inbox days</label><input id="inbox-days" type="number" min="0" max="3650"></div><div class="field"><label for="candidate-days">Candidate days</label><input id="candidate-days" type="number" min="0" max="3650"></div><div class="field"><label for="recycle-days">Recycle bin days</label><input id="recycle-days" type="number" min="0" max="3650"></div><div class="field"><label><input id="early-inbox-cleanup" type="checkbox"> Clean consolidated Inbox data early</label></div><div class="field"><label><input id="diagnostics-enabled" type="checkbox"> Retain bounded diagnostics</label></div><div class="field"><label for="diagnostic-days">Diagnostic days</label><input id="diagnostic-days" type="number" min="0" max="365"></div><div class="candidate-actions"><button type="submit">Save policy</button><button type="button" id="retention-preview">Preview cleanup</button><button type="button" id="retention-run" class="danger">Clean now</button><button type="button" id="diagnostics-clear" class="danger">Clear diagnostics</button></div><pre id="retention-impact" class="diff"></pre><div id="candidate-recycle-bin"></div><p id="retention-message"></p>';
+        retentionForm.innerHTML = '<div class="field"><label for="retention-library">记忆库</label><select id="retention-library"></select></div><div class="field"><label for="inbox-days">采集收件箱保留天数</label><input id="inbox-days" type="number" min="0" max="3650"></div><div class="field"><label for="candidate-days">候选记忆保留天数</label><input id="candidate-days" type="number" min="0" max="3650"></div><div class="field"><label for="recycle-days">回收站保留天数</label><input id="recycle-days" type="number" min="0" max="3650"></div><div class="field"><label><input id="early-inbox-cleanup" type="checkbox"> 提前清理已归并的收件箱数据</label></div><div class="field"><label><input id="diagnostics-enabled" type="checkbox"> 保留有界诊断数据</label></div><div class="field"><label for="diagnostic-days">诊断数据保留天数</label><input id="diagnostic-days" type="number" min="0" max="365"></div><div class="candidate-actions"><button type="submit">保存策略</button><button type="button" id="retention-preview" class="secondary">预览清理</button><button type="button" id="retention-run" class="danger">立即清理</button><button type="button" id="diagnostics-clear" class="danger">清除诊断</button></div><pre id="retention-impact" class="diff">选择记忆库后可预览清理影响。</pre><div id="candidate-recycle-bin"></div><p id="retention-message" class="notice" aria-live="polite"></p>';
         const candidateHeading = document.createElement('h2');
-        candidateHeading.textContent = 'Candidate memories';
+        candidateHeading.textContent = '候选审核';
         const candidateStatus = document.createElement('select');
-        candidateStatus.setAttribute('aria-label', 'Candidate status');
-        candidateStatus.innerHTML = '<option value="">All statuses</option><option value="pending">Pending</option><option value="approved">Approved</option><option value="rejected">Rejected</option>';
+        candidateStatus.setAttribute('aria-label', '候选记忆状态');
+        candidateStatus.innerHTML = '<option value="">全部状态</option><option value="pending">待处理</option><option value="approved">已批准</option><option value="rejected">已拒绝</option>';
         const candidateLayout = document.createElement('div');
         candidateLayout.className = 'candidate-layout';
         const candidateList = document.createElement('nav');
         candidateList.className = 'candidate-list';
         const candidateDetail = document.createElement('div');
-        candidateDetail.innerHTML = '<strong id="candidate-title">Select a candidate</strong><p id="candidate-sources" class="source"></p><p id="candidate-governance" class="source"></p><pre id="candidate-current" class="diff" hidden></pre><pre id="candidate-conflict-diff" class="diff" hidden></pre><textarea id="candidate-body" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">Operator</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">Reason</label><input id="candidate-reason" disabled></div><div class="field"><label for="candidate-resolution">Resolution</label><select id="candidate-resolution" disabled><option value="keep">Keep current</option><option value="adopt">Adopt candidate</option><option value="merge">Merge as new version</option><option value="scope">Different conditions</option></select></div><div class="field"><label for="candidate-effective">Effective at</label><input id="candidate-effective" type="datetime-local" disabled></div><div class="field"><label for="candidate-condition">Condition</label><input id="candidate-condition" disabled></div><div class="candidate-actions"><button type="button" id="candidate-pin" disabled>Pin</button><button type="button" id="candidate-save" disabled>Save</button><button type="button" id="candidate-approve" disabled>Approve</button><button type="button" id="candidate-resolve" disabled>Resolve</button><button type="button" id="candidate-reject" class="danger" disabled>Reject</button></div><p id="candidate-message"></p>';
+        candidateDetail.innerHTML = '<strong id="candidate-title">请选择候选记忆</strong><p id="candidate-sources" class="source"></p><p id="candidate-governance" class="source"></p><pre id="candidate-current" class="diff" hidden></pre><pre id="candidate-conflict-diff" class="diff" hidden></pre><textarea id="candidate-body" aria-label="候选记忆内容" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">操作人</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">裁决理由</label><input id="candidate-reason" disabled></div><div class="field"><label for="candidate-resolution">冲突裁决</label><select id="candidate-resolution" disabled><option value="keep">保留当前正式记忆</option><option value="adopt">采用候选记忆</option><option value="merge">合并为新版本</option><option value="scope">按不同条件并存</option></select></div><div class="field"><label for="candidate-effective">生效时间</label><input id="candidate-effective" type="datetime-local" disabled></div><div class="field"><label for="candidate-condition">适用条件</label><input id="candidate-condition" disabled></div><div class="candidate-actions"><button type="button" id="candidate-pin" class="secondary" disabled>置顶</button><button type="button" id="candidate-save" disabled>保存编辑</button><button type="button" id="candidate-approve" disabled>批准</button><button type="button" id="candidate-resolve" disabled>提交裁决</button><button type="button" id="candidate-reject" class="danger" disabled>拒绝</button></div><p id="candidate-message" class="notice" aria-live="polite"></p>';
         candidateLayout.append(candidateList, candidateDetail);
         const sensitiveHeading = document.createElement('h2');
-        sensitiveHeading.textContent = 'Sensitive quarantine';
+        sensitiveHeading.textContent = '敏感隔离';
         const sensitiveLayout = document.createElement('div');
         sensitiveLayout.className = 'candidate-layout';
         const sensitiveList = document.createElement('nav');
@@ -109,44 +171,115 @@
         sensitiveList.className = 'candidate-list';
         const sensitivePagination = document.createElement('div');
         sensitivePagination.className = 'candidate-actions';
-        sensitivePagination.innerHTML = '<button type="button" id="sensitive-previous">Previous</button><span id="sensitive-page"></span><button type="button" id="sensitive-next">Next</button><button type="button" id="sensitive-refresh">Refresh</button>';
+        sensitivePagination.innerHTML = '<button type="button" id="sensitive-previous" class="secondary">上一页</button><span id="sensitive-page"></span><button type="button" id="sensitive-next" class="secondary">下一页</button><button type="button" id="sensitive-refresh" class="secondary">刷新</button>';
         sensitiveList.append(sensitivePagination);
         const sensitiveDetail = document.createElement('div');
         sensitiveDetail.id = 'sensitive-quarantine-detail';
-        sensitiveDetail.innerHTML = '<strong id="sensitive-title">Select a quarantine record</strong><p id="sensitive-summary"></p><p id="sensitive-metadata" class="source"></p><div class="candidate-actions"><button type="button" id="sensitive-acknowledge" disabled>Acknowledge</button><button type="button" id="sensitive-discard" class="danger" disabled>Discard</button></div><p id="sensitive-message"></p>';
+        sensitiveDetail.innerHTML = '<strong id="sensitive-title">请选择隔离记录</strong><p id="sensitive-summary"></p><p id="sensitive-metadata" class="source"></p><div class="candidate-actions"><button type="button" id="sensitive-acknowledge" disabled>已知悉</button><button type="button" id="sensitive-discard" class="danger" disabled>丢弃</button></div><p id="sensitive-message" class="notice" aria-live="polite"></p>';
         sensitiveLayout.append(sensitiveList, sensitiveDetail);
         const editorHeading = document.createElement('h2');
-        editorHeading.textContent = 'Memory documents';
+        editorHeading.textContent = '文档管理';
         const editorLibrary = document.createElement('select');
-        editorLibrary.setAttribute('aria-label', 'Memory library to edit');
+        editorLibrary.setAttribute('aria-label', '要编辑的记忆库');
         const editorLayout = document.createElement('div');
         editorLayout.className = 'editor-layout';
         const documentTree = document.createElement('nav');
         documentTree.className = 'document-tree';
         const editor = document.createElement('div');
-        editor.innerHTML = '<strong id="document-path">Select a document</strong><div class="editor-tabs"><button type="button" id="source-tab">Source</button><button type="button" id="preview-tab">Preview</button><button type="button" id="diff-tab">Diff</button></div><textarea id="document-source" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Rendered Markdown preview"></iframe><pre id="document-diff" class="diff" hidden></pre><button type="button" id="preview-change" disabled>Preview changes</button><button type="button" id="save-change" disabled>Save</button><button type="button" id="preview-delete" class="danger" disabled>Preview forgetting</button><button type="button" id="confirm-delete" class="danger" disabled>Forget</button><p id="editor-message"></p>';
+        editor.innerHTML = '<strong id="document-path">请从文档列表选择内容</strong><div class="editor-tabs" role="tablist"><button type="button" id="source-tab" class="secondary" role="tab" aria-selected="true">Markdown 源文</button><button type="button" id="preview-tab" class="secondary" role="tab" aria-selected="false">渲染预览</button><button type="button" id="diff-tab" class="secondary" role="tab" aria-selected="false">差异</button></div><textarea id="document-source" aria-label="Markdown 源文" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Markdown 渲染预览"></iframe><pre id="document-diff" class="diff" hidden></pre><button type="button" id="preview-change" class="secondary" disabled>预览变更</button><button type="button" id="save-change" disabled>保存</button><button type="button" id="preview-delete" class="danger" disabled>预览遗忘影响</button><button type="button" id="confirm-delete" class="danger" disabled>确认遗忘</button><p id="editor-message" class="notice" aria-live="polite"></p>';
         editorLayout.append(documentTree, editor);
         const reconciliationHeading = document.createElement('h2');
-        reconciliationHeading.textContent = 'Out-of-band changes';
+        reconciliationHeading.textContent = '带外变更';
         const reconciliationLayout = document.createElement('div');
         reconciliationLayout.className = 'candidate-layout';
         const reconciliationList = document.createElement('nav');
         reconciliationList.className = 'candidate-list';
         const reconciliationDetail = document.createElement('div');
-        reconciliationDetail.innerHTML = '<strong id="reconciliation-title">Select a change</strong><p id="reconciliation-status" class="source"></p><h3>Base</h3><pre id="reconciliation-base" class="diff"></pre><h3>Platform</h3><pre id="reconciliation-platform" class="diff"></pre><h3>External</h3><pre id="reconciliation-external" class="diff"></pre><div class="field" id="reconciliation-path-field" hidden><label for="reconciliation-path">External path</label><select id="reconciliation-path"></select></div><div class="field"><label for="reconciliation-final">Final content for conflicts</label><textarea id="reconciliation-final" spellcheck="false" disabled></textarea></div><div class="candidate-actions"><button type="button" id="reconciliation-import" disabled>Import external</button><button type="button" id="reconciliation-restore" disabled>Restore platform</button></div><p id="reconciliation-message"></p>';
+        reconciliationDetail.innerHTML = '<strong id="reconciliation-title">请选择带外变更</strong><p id="reconciliation-status" class="source"></p><h3>基准内容</h3><pre id="reconciliation-base" class="diff"></pre><h3>平台内容</h3><pre id="reconciliation-platform" class="diff"></pre><h3>外部内容</h3><pre id="reconciliation-external" class="diff"></pre><div class="field" id="reconciliation-path-field" hidden><label for="reconciliation-path">外部路径</label><select id="reconciliation-path"></select></div><div class="field"><label for="reconciliation-final">冲突的最终内容</label><textarea id="reconciliation-final" spellcheck="false" disabled></textarea></div><div class="candidate-actions"><button type="button" id="reconciliation-import" disabled>导入外部版本</button><button type="button" id="reconciliation-restore" disabled>恢复平台版本</button></div><p id="reconciliation-message" class="notice" aria-live="polite"></p>';
         reconciliationLayout.append(reconciliationList, reconciliationDetail);
         const historyHeading = document.createElement('h2');
-        historyHeading.textContent = 'Local history';
+        historyHeading.textContent = '本地历史';
         const history = document.createElement('div');
         history.className = 'history';
         const restoreAction = document.createElement('div');
         const historyDiff = document.createElement('pre');
         const forgottenHeading = document.createElement('h2');
-        forgottenHeading.textContent = 'Forgotten memories';
+        forgottenHeading.textContent = '遗忘记忆恢复';
         const forgottenForm = document.createElement('form');
-        forgottenForm.innerHTML = '<div class="field"><label for="forgotten-memory">Forgotten memory</label><select id="forgotten-memory" required></select></div><div class="field"><label for="forgotten-commit">Allowed history revision</label><select id="forgotten-commit" required></select></div><button type="submit">Restore as new transaction</button><p id="forgotten-message"></p>';
+        forgottenForm.innerHTML = '<div class="field"><label for="forgotten-memory">遗忘记忆</label><select id="forgotten-memory" required></select></div><div class="field"><label for="forgotten-commit">允许恢复的历史版本</label><select id="forgotten-commit" required></select></div><button type="submit">作为新事务恢复</button><p id="forgotten-message" class="notice" aria-live="polite"></p>';
         historyDiff.className = 'diff';
-        root.append(statusHeading, statusList, heading, form, table, bindingHeading, bindingForm, worktreeForm, bindingTable, searchHeading, searchForm, retentionHeading, retentionForm, candidateHeading, candidateStatus, candidateLayout, sensitiveHeading, sensitiveLayout, editorHeading, editorLibrary, editorLayout, reconciliationHeading, reconciliationLayout, historyHeading, history, restoreAction, historyDiff, forgottenHeading, forgottenForm);
+        const sidebar = document.createElement('aside');
+        sidebar.className = 'sidebar';
+        sidebar.innerHTML = '<div class="sidebar-brand">个人智能体记忆<small>Personal Agent Memory</small></div><nav aria-label="工作台导航"><button class="nav-button" data-view="overview" aria-current="page">概览</button><button class="nav-button" data-view="search">记忆检索</button><button class="nav-button" data-view="candidates">候选审核</button><button class="nav-button" data-view="documents">文档管理</button><div class="nav-group">管理与治理</div><button class="nav-button" data-view="libraries">记忆库</button><button class="nav-button" data-view="bindings">项目绑定</button><button class="nav-button" data-view="sensitive">敏感隔离</button><button class="nav-button" data-view="history">历史恢复</button><button class="nav-button" data-view="privacy">隐私设置</button></nav>';
+        const topbar = document.createElement('header');
+        topbar.className = 'topbar';
+        topbar.innerHTML = '<button type="button" id="nav-toggle" class="secondary" aria-label="展开或收起导航" title="展开或收起导航">☰</button><span class="connection ok" id="connection-status">服务已连接</span>';
+        const workspace = document.createElement('div');
+        workspace.className = 'workspace';
+        const makeView = (name, title, nodes) => {
+          const view = document.createElement('section');
+          view.className = 'view';
+          view.dataset.viewPanel = name;
+          view.hidden = name !== 'overview';
+          const viewTitle = document.createElement('h2');
+          viewTitle.textContent = title;
+          view.append(viewTitle, ...nodes);
+          workspace.append(view);
+          return view;
+        };
+        const overviewMetrics = document.createElement('div');
+        overviewMetrics.className = 'metric-grid';
+        overviewMetrics.innerHTML = '<div class="metric"><span>服务</span><strong id="metric-service">可用</strong></div><div class="metric"><span>记忆库</span><strong id="metric-libraries">--</strong></div><div class="metric"><span>待审核候选</span><strong id="metric-candidates">--</strong></div><div class="metric"><span>敏感隔离</span><strong id="metric-sensitive">--</strong></div>';
+        const overviewAlert = document.createElement('p');
+        overviewAlert.id = 'overview-alert';
+        overviewAlert.className = 'notice';
+        overviewAlert.textContent = '正在加载概览...';
+        const quickActions = document.createElement('div');
+        quickActions.className = 'quick-actions';
+        quickActions.innerHTML = '<button type="button" data-view="search">开始检索</button><button type="button" data-view="candidates" class="secondary">审核候选</button><button type="button" data-view="documents" class="secondary">管理文档</button>';
+        const serviceSection = document.createElement('div');
+        serviceSection.className = 'view-section';
+        serviceSection.append(statusHeading, statusList);
+        makeView('overview', '概览', [overviewMetrics, overviewAlert, quickActions, serviceSection]);
+        makeView('search', '记忆检索', [searchForm]);
+        makeView('candidates', '候选审核', [candidateStatus, candidateLayout]);
+        const documentsSection = document.createElement('div');
+        documentsSection.className = 'view-section';
+        documentsSection.append(editorLibrary, editorLayout);
+        const reconciliationSection = document.createElement('div');
+        reconciliationSection.className = 'view-section';
+        reconciliationSection.append(reconciliationHeading, reconciliationLayout);
+        makeView('documents', '文档管理', [documentsSection, reconciliationSection]);
+        const tableScroll = document.createElement('div'); tableScroll.className = 'table-scroll'; tableScroll.append(table);
+        makeView('libraries', '记忆库', [form, tableScroll]);
+        const bindingScroll = document.createElement('div'); bindingScroll.className = 'table-scroll'; bindingScroll.append(bindingTable);
+        makeView('bindings', '项目绑定', [bindingForm, worktreeForm, bindingScroll]);
+        makeView('sensitive', '敏感隔离', [sensitiveLayout]);
+        const historyControls = document.createElement('div');
+        historyControls.className = 'view-section';
+        const historyLibraryLabel = document.createElement('label');
+        historyLibraryLabel.textContent = '记忆库';
+        const historyLibraryControl = editorLibrary.cloneNode(true);
+        historyLibraryControl.id = 'history-library';
+        historyLibraryLabel.htmlFor = historyLibraryControl.id;
+        const historyDocumentLabel = document.createElement('label');
+        historyDocumentLabel.textContent = '文档';
+        historyDocumentLabel.htmlFor = 'history-document';
+        const historyDocument = document.createElement('select');
+        historyDocument.id = 'history-document';
+        historyDocument.setAttribute('aria-label', '要恢复的文档');
+        const historyMessage = document.createElement('p');
+        historyMessage.id = 'history-message';
+        historyMessage.className = 'notice';
+        historyMessage.setAttribute('aria-live', 'polite');
+        historyControls.append(historyLibraryLabel, historyLibraryControl, historyDocumentLabel, historyDocument, historyMessage);
+        makeView('history', '历史恢复', [historyControls, historyHeading, history, restoreAction, historyDiff, forgottenHeading, forgottenForm]);
+        makeView('privacy', '隐私设置', [retentionForm]);
+        root.append(topbar, workspace);
+        loginShell.prepend(sidebar);
+        const historyLibrary = historyLibraryControl;
+        historyLibrary.addEventListener('change', () => { editorLibrary.value = historyLibrary.value; editorLibrary.dispatchEvent(new Event('change')); });
+        historyDocument.addEventListener('change', () => { if (historyDocument.value) loadDocument(historyDocument.value); });
 
         let projectLibraries = [];
         let projectBindings = [];
@@ -159,8 +292,168 @@
         let activeReconciliation = null;
         let sensitiveOffset = 0;
         const sensitivePageSize = 50;
+        const generations = {libraries: 0, candidates: 0, candidateGovernance: 0, sensitive: 0, retention: 0, reconciliation: 0, forgotten: 0, forgettingPreview: 0, history: 0, historyDiff: 0, bindings: 0};
+        const pending = new Set();
+        const buttonOperations = new WeakMap();
+        const bindingIntents = new Map();
+        let retentionPreviewContext = null;
+        let candidateSelectionGeneration = 0;
+        let sensitiveSelectionGeneration = 0;
+        let retentionSelectionGeneration = 0;
         const historySelection = PamHistory.selectionStore();
         const editorContext = PamHistory.contextStore();
+        const documentContextIsCurrent = (context) => {
+          const current = editorContext.snapshot();
+          return Boolean(
+            context && current && editorContext.isCurrent(context)
+            && editorLibrary.value === context.libraryId
+            && current.libraryId === context.libraryId
+            && current.path === context.path
+            && current.token === context.token
+          );
+        };
+
+        const labels = {
+          ok: '正常', running: '运行中', error: '错误', not_configured: '未配置',
+          not_started: '尚未开始', scanning: '扫描中', building: '构建中', processing: '处理中', done: '已完成',
+          new: '新增', edit: '编辑', move: '移动', delete: '删除', conflict: '冲突',
+          pending: '待处理', approved: '已批准', rejected: '已拒绝',
+          project: '项目记忆库', user: '用户记忆库', worktree: 'Worktree 关联',
+          available: '可用', unavailable: '不可用', missing: '路径缺失', replaced: '路径已替换', ready: '就绪', stale: '待更新',
+          accepted: '已接受', bound: '已绑定', unbound: '未绑定',
+          exact_duplicate: '完全重复', possible_duplicate: '可能重复', replacement: '替代版本', unrelated: '独立记忆',
+          keep: '保留当前', adopt: '采用候选', merge: '合并新版本', scope: '条件并存',
+          quarantined: '已隔离', discarded: '已丢弃', unresolved: '未处理', acknowledge: '已知悉', discard: '已丢弃',
+          direct: '直接命中', graph_expansion: '图扩展', lexical: '文本命中',
+          decision: '决策', constraint: '约束', preference: '偏好',
+          domain_fact: '领域事实', reusable_experience: '可复用经验', external_reference: '外部参考',
+          procedure: '流程', lesson: '经验',
+        };
+        const degradationLabels = {
+          graph_not_configured: '图索引未配置', graph_unavailable: '图索引不可用', graph_stale: '图索引待更新',
+          graph_error: '图索引异常', text_index_unavailable: '文本索引不可用', vector_index_unavailable: '向量索引不可用',
+          embedding_unavailable: '嵌入服务不可用', reranker_unavailable: '重排序服务不可用', tokenizer_fallback: '分词器回退',
+          budget_exhausted: '检索预算已用尽',
+        };
+        const display = (value) => labels[value] || value || '未知';
+        const formatSearchStatus = (payload) => {
+          if (payload.status === 'unbound') return {text: '此目录尚未绑定项目记忆库。', kind: 'error'};
+          const resultSummary = payload.results.length === 0 ? '没有找到匹配的记忆' : `找到 ${payload.results.length} 条结果`;
+          const degradation = (payload.degradation || []).map((reason) => degradationLabels[reason] || reason).join('、');
+          return {
+            text: `${resultSummary} · 图索引${display(payload.graph_index_status)}${payload.degraded ? ` · 已降级：${degradation}` : ''}。`,
+            kind: payload.degraded ? 'error' : 'success',
+          };
+        };
+        const statusTone = (value) => ['available', 'ready', 'ok', 'done', 'bound'].includes(value) ? 'ok' : ['error', 'unavailable', 'missing', 'replaced'].includes(value) ? 'bad' : 'warn';
+        const createStatusBadge = (value) => {
+          const badge = document.createElement('span');
+          badge.className = `badge ${statusTone(value)}`;
+          badge.dataset.status = value;
+          badge.textContent = display(value);
+          return badge;
+        };
+        const displaySensitiveSummary = (summary) => summary.replace(/^Sensitive content withheld/, '敏感内容已隐去');
+        const describeError = (failure, context) => {
+          const detail = failure?.detail;
+          const raw = typeof detail === 'string' ? detail : detail?.reason || JSON.stringify(detail || failure || '未知错误');
+          return `${context}：${raw}`;
+        };
+        const setMessage = (node, text, kind = '') => { node.className = `notice ${kind}`.trim(); node.textContent = text; };
+        const setBusy = (button, busy, label) => {
+          if (!button.dataset.label) button.dataset.label = button.textContent;
+          button.disabled = busy;
+          button.textContent = busy ? label : button.dataset.label;
+        };
+        const connectionStatus = topbar.querySelector('#connection-status');
+        let requestSequence = 0;
+        let connectionObservation = 0;
+        const setConnectionStatus = (requestId, state, text) => {
+          if (requestId < connectionObservation) return;
+          connectionObservation = requestId;
+          connectionStatus.className = `connection ${state}`;
+          connectionStatus.textContent = text;
+        };
+        const observeConnectionResponse = (requestId, response) => {
+          if (requestId < connectionObservation) return;
+          connectionObservation = requestId;
+          if (response.status === 401) {
+            connectionStatus.className = 'connection warn';
+            connectionStatus.textContent = '认证已失效';
+          }
+          else if (response.ok) {
+            connectionStatus.className = 'connection ok';
+            connectionStatus.textContent = '服务已连接';
+          }
+        };
+        const nativeFetch = window.fetch.bind(window);
+        const request = async (...args) => {
+          const requestId = ++requestSequence;
+          try {
+            const response = await nativeFetch(...args);
+            observeConnectionResponse(requestId, response);
+            return response;
+          }
+          catch (_error) {
+            setConnectionStatus(requestId, 'bad', '服务连接中断');
+            return {ok: false, networkError: true, json: async () => ({detail: '网络连接失败，请稍后重试。'})};
+          }
+        };
+        async function performOnce(name, button, busyLabel, action, messageNode = null, contextIsCurrent = () => true) {
+          if (pending.has(name)) return null;
+          const operation = Symbol(name);
+          pending.add(name); buttonOperations.set(button, operation); delete button.dataset.keepDisabled; setBusy(button, true, busyLabel);
+          try { return await action(); }
+          catch (_error) {
+            const nearbyMessage = messageNode || button.closest('form')?.querySelector('.notice') || button.closest('[data-view-panel]')?.querySelector('.notice');
+            if (nearbyMessage && contextIsCurrent()) setMessage(nearbyMessage, '操作失败：网络连接或响应异常，请重试。', 'error');
+            return null;
+          } finally {
+            pending.delete(name);
+            if (buttonOperations.get(button) === operation) {
+              buttonOperations.delete(button);
+              if (contextIsCurrent()) {
+                setBusy(button, false, busyLabel);
+                if (button.dataset.keepDisabled === 'true') button.disabled = true;
+              } else {
+                const currentDisabled = button.disabled;
+                button.textContent = button.dataset.label;
+                button.disabled = currentDisabled;
+              }
+              delete button.dataset.keepDisabled;
+            }
+          }
+        }
+        function openView(name) {
+          for (const panel of workspace.querySelectorAll('[data-view-panel]')) panel.hidden = panel.dataset.viewPanel !== name;
+          for (const button of loginShell.querySelectorAll('[data-view]')) {
+            if (button.classList.contains('nav-button')) button.toggleAttribute('aria-current', button.dataset.view === name);
+          }
+          loginShell.classList.remove('nav-open');
+          workspace.querySelector(`[data-view-panel="${name}"]`)?.querySelector('h2')?.focus?.();
+        }
+        loginShell.addEventListener('click', (event) => { const target = event.target.closest('[data-view]'); if (target) openView(target.dataset.view); });
+        topbar.querySelector('#nav-toggle').addEventListener('click', () => loginShell.classList.toggle('nav-open'));
+
+        const confirmDialog = document.createElement('dialog');
+        confirmDialog.innerHTML = '<div class="dialog-body"><h2 id="confirm-title">确认操作</h2><p id="confirm-description"></p><div class="field" id="confirm-input-field" hidden><label for="confirm-input">请输入确认短语</label><input id="confirm-input" autocomplete="off"></div></div><div class="dialog-actions"><button type="button" id="confirm-cancel" class="secondary">取消</button><button type="button" id="confirm-accept" class="danger">确认</button></div>';
+        document.body.append(confirmDialog);
+        function confirmAction(title, description, phrase = '') {
+          confirmDialog.querySelector('#confirm-title').textContent = title;
+          confirmDialog.querySelector('#confirm-description').textContent = description;
+          const field = confirmDialog.querySelector('#confirm-input-field');
+          const input = confirmDialog.querySelector('#confirm-input');
+          field.hidden = !phrase; input.value = '';
+          const accept = confirmDialog.querySelector('#confirm-accept');
+          accept.disabled = Boolean(phrase);
+          input.oninput = () => { accept.disabled = input.value !== phrase; };
+          confirmDialog.showModal();
+          return new Promise((resolve) => {
+            confirmDialog.querySelector('#confirm-cancel').onclick = () => { confirmDialog.close(); resolve(false); };
+            accept.onclick = () => { confirmDialog.close(); resolve(true); };
+            confirmDialog.oncancel = () => resolve(false);
+          });
+        }
 
         function fillSelect(select, options, valueFor, labelFor) {
           const selected = select.value;
@@ -175,96 +468,219 @@
         }
 
         async function refresh() {
-          const response = await fetch('/api/v1/libraries', {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok) return;
+          const generation = ++generations.libraries;
+          overviewAlert.textContent = '正在加载概览...';
+          const response = await request('/api/v1/libraries', {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok || generation !== generations.libraries) { overviewAlert.className = 'notice error'; overviewAlert.textContent = '概览加载失败。请刷新页面重试。'; return; }
           const libraries = await response.json();
+          if (generation !== generations.libraries) return;
           allLibraries = libraries;
           projectLibraries = libraries.filter((library) => library.kind === 'project');
-          fillSelect(editorLibrary, libraries, (library) => library.id, (library) => `${library.canonical_path} (${library.kind})`);
-          fillSelect(retentionForm.querySelector('#retention-library'), libraries, (library) => library.id, (library) => `${library.canonical_path} (${library.kind})`);
+          fillSelect(editorLibrary, libraries, (library) => library.id, (library) => `${library.canonical_path}（${display(library.kind)}）`);
+          fillSelect(historyLibrary, libraries, (library) => library.id, (library) => `${library.canonical_path}（${display(library.kind)}）`);
+          historyLibrary.value = editorLibrary.value;
+          fillSelect(retentionForm.querySelector('#retention-library'), libraries, (library) => library.id, (library) => `${library.canonical_path}（${display(library.kind)}）`);
           fillSelect(bindingForm.querySelector('#project-library'), projectLibraries, (library) => library.id, (library) => `${library.canonical_path} (${library.id})`);
           const body = table.querySelector('tbody');
           body.replaceChildren();
           for (const library of libraries) {
             const row = document.createElement('tr');
-            for (const value of [library.id, library.kind, library.canonical_path, library.availability, library.sync_status, library.graph_status, library.graph_progress, library.graph_last_error || 'None']) {
+            const values = [library.id, display(library.kind), library.canonical_path, library.availability, library.sync_status, library.graph_status, library.graph_progress, library.graph_last_error || '无'];
+            for (const [index, value] of values.entries()) {
               const cell = document.createElement('td');
-              cell.textContent = value;
+              if ([3, 4, 5].includes(index)) cell.append(createStatusBadge(value));
+              else cell.textContent = value;
               if (value === library.canonical_path) cell.className = 'path';
               row.append(cell);
             }
             body.append(row);
           }
-          await refreshBindings();
-          await refreshCandidates();
-          await refreshRetention();
-          await refreshSensitiveQuarantine();
-          await refreshDocuments();
-          await refreshReconciliation();
+          if (!libraries.length) { const row = body.insertRow(); const cell = row.insertCell(); cell.colSpan = 8; cell.className = 'empty'; cell.textContent = '还没有记忆库，请使用上方表单注册。'; }
+          document.querySelector('#metric-libraries').textContent = String(libraries.length);
+          const [candidateResponse, sensitiveCount] = await Promise.all([
+            request('/api/v1/candidates?candidate_status=pending', {headers: {Authorization: `Bearer ${key}`}}),
+            countSensitiveRecords(),
+          ]);
+          if (generation !== generations.libraries) return;
+          document.querySelector('#metric-candidates').textContent = candidateResponse.ok ? String((await candidateResponse.json()).length) : '加载失败';
+          document.querySelector('#metric-sensitive').textContent = sensitiveCount === null ? '加载失败' : String(sensitiveCount);
+          const indexProblems = libraries.filter((library) => ['error', 'unavailable'].includes(library.sync_status) || ['error', 'unavailable'].includes(library.graph_status));
+          overviewAlert.className = `notice ${indexProblems.length ? 'error' : 'success'}`;
+          overviewAlert.textContent = indexProblems.length ? `${indexProblems.length} 个记忆库存在索引异常，请进入记忆库查看详情。` : '服务、记忆库与索引状态已加载。';
+          await Promise.all([refreshBindings(), refreshCandidates(), refreshRetention(), refreshSensitiveQuarantine(), refreshDocuments()]);
+        }
+
+        async function countSensitiveRecords() {
+          let offset = 0; let total = 0;
+          while (true) {
+            const response = await request(`/api/v1/sensitive-quarantine?offset=${offset}&limit=${sensitivePageSize}`, {headers: {Authorization: `Bearer ${key}`}});
+            if (!response.ok) return null;
+            const page = await response.json(); total += page.length;
+            if (page.length < sensitivePageSize) return total;
+            offset += sensitivePageSize;
+          }
+        }
+
+        async function restoreRecycledCandidate(item, button) {
+          const libraryId = retentionForm.querySelector('#retention-library').value;
+          const context = {libraryId, candidateId: item.candidate.id, selectionGeneration: retentionSelectionGeneration};
+          if (!await confirmAction('确认恢复候选记忆', `将从记忆库 ${libraryId} 的回收站恢复候选 ${item.candidate.id}。`)) return;
+          const message = retentionForm.querySelector('#retention-message');
+          await performOnce(`restore-${item.candidate.id}`, button, '正在恢复...', async () => {
+            const response = await request(`/api/v1/candidates/${item.candidate.id}/restore`, {method: 'POST', headers: {Authorization: `Bearer ${key}`}});
+            if (context.selectionGeneration !== retentionSelectionGeneration || context.libraryId !== retentionForm.querySelector('#retention-library').value) return;
+            if (!response.ok) { setMessage(message, '候选记忆恢复失败。', 'error'); return; }
+            await Promise.all([refreshRetention(), refreshCandidates()]);
+            if (context.selectionGeneration === retentionSelectionGeneration && context.libraryId === retentionForm.querySelector('#retention-library').value) setMessage(message, '候选记忆已恢复。', 'success');
+          }, null, () => context.selectionGeneration === retentionSelectionGeneration && context.libraryId === retentionForm.querySelector('#retention-library').value);
         }
 
         async function refreshRetention() {
+          const generation = ++generations.retention;
           const libraryId = retentionForm.querySelector('#retention-library').value;
-          if (!libraryId) return;
+          const message = retentionForm.querySelector('#retention-message');
+          retentionPreviewContext = null;
+          retentionForm.querySelector('#retention-run').disabled = true;
+          retentionForm.querySelector('#retention-impact').textContent = '选择记忆库后可预览清理影响。';
+          if (!libraryId) { setMessage(message, '请先注册并选择记忆库。'); return; }
+          setMessage(message, '正在加载保留策略...');
           const [policyResponse, recycleResponse] = await Promise.all([
-            fetch(`/api/v1/libraries/${libraryId}/retention-policy`, {headers: {Authorization: `Bearer ${key}`}}),
-            fetch(`/api/v1/libraries/${libraryId}/candidate-recycle-bin`, {headers: {Authorization: `Bearer ${key}`}}),
+            request(`/api/v1/libraries/${libraryId}/retention-policy`, {headers: {Authorization: `Bearer ${key}`}}),
+            request(`/api/v1/libraries/${libraryId}/candidate-recycle-bin`, {headers: {Authorization: `Bearer ${key}`}}),
           ]);
-          if (!policyResponse.ok || !recycleResponse.ok) return;
+          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
+          if (!policyResponse.ok || !recycleResponse.ok) { setMessage(message, '保留策略加载失败，请重试。', 'error'); return; }
           const policy = await policyResponse.json();
+          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
           for (const field of ['inbox_days', 'candidate_days', 'recycle_days', 'diagnostic_days']) retentionForm.querySelector(`#${field.replaceAll('_', '-')}`).value = policy[field];
           retentionForm.querySelector('#early-inbox-cleanup').checked = policy.early_inbox_cleanup;
           retentionForm.querySelector('#diagnostics-enabled').checked = policy.diagnostics_enabled;
           const recycleBin = retentionForm.querySelector('#candidate-recycle-bin');
           recycleBin.replaceChildren();
-          for (const item of await recycleResponse.json()) {
+          const recycleItems = await recycleResponse.json();
+          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
+          for (const item of recycleItems) {
             const button = recycleBin.appendChild(document.createElement('button'));
             button.type = 'button';
-            button.textContent = `Restore ${item.candidate.suggested_type} · ${item.candidate.id}`;
-            button.addEventListener('click', async () => {
-              await fetch(`/api/v1/candidates/${item.candidate.id}/restore`, {method: 'POST', headers: {Authorization: `Bearer ${key}`}});
-              await refreshRetention();
-              await refreshCandidates();
-            });
+            button.className = 'secondary';
+            button.textContent = `恢复 ${display(item.candidate.suggested_type)} · ${item.candidate.id}`;
+            button.addEventListener('click', () => restoreRecycledCandidate(item, button));
           }
+          setMessage(message, '保留策略已加载。', 'success');
+        }
+
+        function invalidateRetentionPreview() {
+          retentionPreviewContext = null;
+          retentionForm.querySelector('#retention-run').disabled = true;
         }
 
         async function previewRetention() {
           const libraryId = retentionForm.querySelector('#retention-library').value;
-          const response = await fetch(`/api/v1/libraries/${libraryId}/retention-cleanup/preview`, {headers: {Authorization: `Bearer ${key}`}});
-          retentionForm.querySelector('#retention-impact').textContent = response.ok ? JSON.stringify(await response.json(), null, 2) : 'Preview unavailable.';
+          const generation = generations.retention;
+          const impact = retentionForm.querySelector('#retention-impact');
+          const runButton = retentionForm.querySelector('#retention-run');
+          retentionPreviewContext = null;
+          runButton.disabled = true;
+          impact.textContent = '正在计算清理影响...';
+          const response = await request(`/api/v1/libraries/${libraryId}/retention-cleanup/preview`, {headers: {Authorization: `Bearer ${key}`}});
+          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return false;
+          if (!response.ok) { impact.textContent = '清理预览不可用，请稍后重试。'; return false; }
+          const payload = await response.json();
+          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return false;
+          const counts = payload.counts || payload;
+          const count = (name) => Number(counts[name] || 0);
+          impact.textContent = `预计影响\n采集收件箱：${count('inbox_rows')} 条\n候选移入回收站：${count('candidates_to_recycle')} 条\n候选永久删除：${count('candidates_to_delete')} 条\n受保护候选：${count('protected_candidates')} 条\n诊断记录：${count('diagnostic_rows')} 条`;
+          retentionPreviewContext = {
+            libraryId,
+            generation,
+            selectionGeneration: retentionSelectionGeneration,
+            summary: impact.textContent,
+            affectedCount: count('inbox_rows') + count('candidates_to_recycle') + count('candidates_to_delete') + count('diagnostic_rows'),
+          };
+          runButton.disabled = false;
+          return true;
+        }
+
+        async function runRetentionCleanup() {
+          const libraryId = retentionForm.querySelector('#retention-library').value;
+          const generation = generations.retention;
+          if (!retentionPreviewContext || retentionPreviewContext.libraryId !== libraryId || retentionPreviewContext.generation !== generation) {
+            setMessage(retentionForm.querySelector('#retention-message'), '请先为当前记忆库完成清理预览。', 'error');
+            return;
+          }
+          const preview = retentionPreviewContext;
+          const previewSummary = preview.summary.replaceAll('\n', '；');
+          if (!await confirmAction('确认立即清理', `记忆库 ${libraryId} 将按照当前保留策略清理数据，预计影响 ${preview.affectedCount} 条。${previewSummary}`)) return;
+          if (!retentionPreviewContext || retentionPreviewContext.libraryId !== libraryId || retentionPreviewContext.generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
+          const button = retentionForm.querySelector('#retention-run');
+          await performOnce(`retention-run-${libraryId}`, button, '正在清理...', async () => {
+            const response = await request(`/api/v1/libraries/${libraryId}/retention-cleanup`, {method: 'POST', headers: {Authorization: `Bearer ${key}`}});
+            if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
+            if (response.ok) {
+              button.dataset.keepDisabled = 'true';
+              await Promise.all([refreshRetention(), refreshCandidates()]);
+              if (preview.selectionGeneration === retentionSelectionGeneration && libraryId === retentionForm.querySelector('#retention-library').value) setMessage(retentionForm.querySelector('#retention-message'), '保留数据清理完成。', 'success');
+            } else setMessage(retentionForm.querySelector('#retention-message'), '保留数据清理失败。', 'error');
+          }, null, () => generation === generations.retention && libraryId === retentionForm.querySelector('#retention-library').value);
         }
 
         async function refreshReconciliation(selectedId = activeReconciliation?.id) {
+          const generation = ++generations.reconciliation;
           const libraryId = editorLibrary.value;
-          reconciliationList.replaceChildren();
-          activeReconciliation = null;
-          if (!libraryId) return;
-          const response = await fetch(`/api/v1/libraries/${libraryId}/out-of-band-changes`, {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok) return;
+          clearReconciliation(false);
+          if (!libraryId) { reconciliationList.innerHTML = '<p class="empty">请先选择记忆库。</p>'; return; }
+          reconciliationList.innerHTML = '<p class="empty">正在加载带外变更...</p>';
+          const response = await request(`/api/v1/libraries/${libraryId}/out-of-band-changes`, {headers: {Authorization: `Bearer ${key}`}});
+          if (generation !== generations.reconciliation || libraryId !== editorLibrary.value) return;
+          if (!response.ok) { reconciliationList.innerHTML = '<p class="empty error">带外变更加载失败，请切换记忆库后重试。</p>'; return; }
           const changes = await response.json();
+          if (generation !== generations.reconciliation || libraryId !== editorLibrary.value) return;
+          reconciliationList.replaceChildren();
           for (const change of changes) {
             const button = reconciliationList.appendChild(document.createElement('button'));
             button.type = 'button';
-            button.textContent = `${change.status} · ${change.kind} · ${change.base_path}`;
-            button.addEventListener('click', () => showReconciliation(change));
+            button.className = 'secondary';
+            button.textContent = `${display(change.status)} · ${display(change.kind)} · ${change.base_path}`;
+            button.addEventListener('click', () => showReconciliation(change, {libraryId, generation}));
           }
           const selected = changes.find((change) => change.id === selectedId);
-          if (selected) showReconciliation(selected);
+          if (selected) showReconciliation(selected, {libraryId, generation});
+          if (!changes.length) reconciliationList.innerHTML = '<p class="empty">没有待处理的带外变更。</p>';
         }
 
-        function showReconciliation(change) {
-          activeReconciliation = change;
+        function clearReconciliation(invalidate = true) {
+          if (invalidate) ++generations.reconciliation;
+          activeReconciliation = null;
+          reconciliationList.replaceChildren();
+          reconciliationDetail.querySelector('#reconciliation-title').textContent = '请选择带外变更';
+          reconciliationDetail.querySelector('#reconciliation-status').textContent = '';
+          for (const id of ['reconciliation-base', 'reconciliation-platform', 'reconciliation-external']) reconciliationDetail.querySelector(`#${id}`).textContent = '';
+          reconciliationDetail.querySelector('#reconciliation-final').value = '';
+          reconciliationDetail.querySelector('#reconciliation-final').disabled = true;
+          reconciliationDetail.querySelector('#reconciliation-path').replaceChildren();
+          reconciliationDetail.querySelector('#reconciliation-path-field').hidden = true;
+          reconciliationDetail.querySelector('#reconciliation-import').disabled = true;
+          reconciliationDetail.querySelector('#reconciliation-restore').disabled = true;
+          setMessage(reconciliationDetail.querySelector('#reconciliation-message'), '');
+        }
+
+        function reconciliationContextIsCurrent(context) {
+          return context.generation === generations.reconciliation && context.libraryId === editorLibrary.value;
+        }
+
+        function showReconciliation(change, context) {
+          if (!reconciliationContextIsCurrent(context)) return;
+          activeReconciliation = {...change, uiContext: context};
           reconciliationDetail.querySelector('#reconciliation-title').textContent = change.base_path;
           const candidatePaths = change.external_candidates || [];
-          reconciliationDetail.querySelector('#reconciliation-status').textContent = `${change.status} · ${change.kind}${change.external_path ? ` · ${change.external_path}` : ''}${candidatePaths.length > 1 ? ` · candidates: ${candidatePaths.join(', ')}` : ''}`;
+          reconciliationDetail.querySelector('#reconciliation-status').textContent = `${display(change.status)} · ${display(change.kind)}${change.external_path ? ` · ${change.external_path}` : ''}${candidatePaths.length > 1 ? ` · 候选路径：${candidatePaths.join(', ')}` : ''}`;
           reconciliationDetail.querySelector('#reconciliation-base').textContent = change.base;
           reconciliationDetail.querySelector('#reconciliation-platform').textContent = change.platform;
           reconciliationDetail.querySelector('#reconciliation-external').textContent = change.external_withheld
-            ? '(withheld: sensitive content is not stored or displayed)'
+            ? '（敏感内容已隐去：不会存储或展示）'
             : candidatePaths.length > 1
-              ? `(ambiguous move: ${candidatePaths.join(', ')})`
-              : change.external || '(deleted)';
+              ? `（移动目标不明确：${candidatePaths.join(', ')}）`
+              : change.external || '（已删除）';
           const finalContent = reconciliationDetail.querySelector('#reconciliation-final');
           const externalPath = reconciliationDetail.querySelector('#reconciliation-path');
           const pathField = reconciliationDetail.querySelector('#reconciliation-path-field');
@@ -272,7 +688,7 @@
           if (candidatePaths.length > 1) {
             const placeholder = document.createElement('option');
             placeholder.value = '';
-            placeholder.textContent = 'Select a candidate';
+            placeholder.textContent = '请选择候选路径';
             externalPath.append(placeholder);
             for (const path of candidatePaths) {
               const option = document.createElement('option');
@@ -297,66 +713,103 @@
 
         async function resolveReconciliation(action) {
           if (!activeReconciliation) return;
+          const selected = activeReconciliation;
+          const context = selected.uiContext;
+          if (!context || !reconciliationContextIsCurrent(context)) return;
+          const button = reconciliationDetail.querySelector(action === 'import' ? '#reconciliation-import' : '#reconciliation-restore');
+          if (!await confirmAction(action === 'import' ? '确认导入外部版本' : '确认恢复平台版本', `将处理 ${selected.base_path}，并创建新的记忆变更事务。`)) return;
+          if (!reconciliationContextIsCurrent(context) || activeReconciliation?.id !== selected.id) return;
+          await performOnce(`reconciliation-${selected.id}`, button, '正在提交...', async () => {
           const resolution = PamHistory.reconciliationRequest(
-            editorLibrary.value,
-            activeReconciliation,
+            context.libraryId,
+            selected,
             action,
             crypto.randomUUID(),
             reconciliationDetail.querySelector('#reconciliation-final').value,
             reconciliationDetail.querySelector('#reconciliation-path').value,
           );
-          const response = await fetch(resolution.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(resolution.body)});
+          const response = await request(resolution.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(resolution.body)});
           const message = reconciliationDetail.querySelector('#reconciliation-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
-          message.className = '';
-          message.textContent = action === 'import' ? 'External version imported.' : 'Platform version restored.';
+          if (!reconciliationContextIsCurrent(context) || activeReconciliation?.id !== selected.id) return;
+          if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '带外变更处理失败'), 'error'); return; }
+          button.dataset.keepDisabled = 'true';
           activeReconciliation = null;
           await refreshDocuments();
-          await refreshReconciliation();
+          if (editorLibrary.value === context.libraryId) setMessage(message, action === 'import' ? '已导入外部版本。' : '已恢复平台版本。', 'success');
+          }, null, () => reconciliationContextIsCurrent(context) && activeReconciliation?.id === selected.id);
         }
 
         async function refreshCandidates(selectedId = activeCandidate?.id) {
+          const generation = ++generations.candidates;
           const statusQuery = candidateStatus.value ? `?candidate_status=${encodeURIComponent(candidateStatus.value)}` : '';
-          const response = await fetch(`/api/v1/candidates${statusQuery}`, {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok) return;
+          candidateList.innerHTML = '<p class="empty">正在加载候选记忆...</p>';
+          const response = await request(`/api/v1/candidates${statusQuery}`, {headers: {Authorization: `Bearer ${key}`}});
+          if (generation !== generations.candidates) return;
+          if (!response.ok) { candidateList.innerHTML = '<p class="empty error">候选记忆加载失败，请重试。</p>'; return; }
           const candidates = await response.json();
+          if (generation !== generations.candidates) return;
           candidateList.replaceChildren();
           for (const candidate of candidates) {
             const button = candidateList.appendChild(document.createElement('button'));
             button.type = 'button';
-            button.textContent = `${candidate.status} · ${candidate.suggested_type} · ${candidate.id}`;
-            button.addEventListener('click', () => showCandidate(candidate));
+            button.className = 'secondary';
+            button.textContent = `${display(candidate.status)} · ${display(candidate.suggested_type)} · ${candidate.id}`;
+            button.addEventListener('click', () => { ++candidateSelectionGeneration; showCandidate(candidate); });
           }
           const selected = candidates.find((candidate) => candidate.id === selectedId);
-          if (selected) showCandidate(selected);
+          if (selected) await showCandidate(selected);
           else if (activeCandidate && !selected) clearCandidate();
+          if (!candidates.length) candidateList.innerHTML = `<p class="empty">${candidateStatus.value ? '当前筛选条件下没有候选记忆。' : '还没有候选记忆。'}</p>`;
         }
 
         function clearCandidate() {
+          ++generations.candidateGovernance;
           activeCandidate = null;
-          candidateDetail.querySelector('#candidate-title').textContent = 'Select a candidate';
+          candidateDetail.querySelector('#candidate-title').textContent = '请选择候选记忆';
           candidateDetail.querySelector('#candidate-sources').textContent = '';
+          clearCandidateGovernance();
           candidateDetail.querySelector('#candidate-body').value = '';
+          candidateDetail.querySelector('#candidate-message').textContent = '';
           for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-pin', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = true;
         }
 
+        function clearCandidateGovernance() {
+          candidateDetail.querySelector('#candidate-governance').textContent = '';
+          const current = candidateDetail.querySelector('#candidate-current');
+          current.hidden = true;
+          current.textContent = '';
+          const diff = candidateDetail.querySelector('#candidate-conflict-diff');
+          diff.hidden = true;
+          diff.textContent = '';
+          candidateDetail.querySelector('#candidate-resolve').disabled = true;
+        }
+
         async function showCandidate(candidate) {
+          const governanceGeneration = ++generations.candidateGovernance;
           activeCandidate = candidate;
+          const candidateId = candidate.id;
           const pending = candidate.status === 'pending';
-          candidateDetail.querySelector('#candidate-title').textContent = `${candidate.suggested_type} · ${candidate.status}`;
-          candidateDetail.querySelector('#candidate-sources').textContent = `Candidate sources · created by ${candidate.creator} at ${candidate.created_at} · ${candidate.source_references.join(' · ')}`;
+          candidateDetail.querySelector('#candidate-title').textContent = `${display(candidate.suggested_type)} · ${display(candidate.status)}`;
+          candidateDetail.querySelector('#candidate-sources').textContent = `候选来源 · ${candidate.creator} 创建于 ${candidate.created_at} · ${candidate.source_references.join(' · ')}`;
           candidateDetail.querySelector('#candidate-body').value = candidate.body;
           candidateDetail.querySelector('#candidate-operator').value = candidate.operator || '';
           candidateDetail.querySelector('#candidate-reason').value = candidate.reason || '';
           for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-pin', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = !pending;
-          candidateDetail.querySelector('#candidate-message').textContent = candidate.published_path ? `Published as ${candidate.published_path} in ${candidate.commit}` : '';
-          const response = await fetch(`/api/v1/candidates/${candidate.id}/governance`, {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok || activeCandidate?.id !== candidate.id) return;
+          clearCandidateGovernance();
+          candidateDetail.querySelector('#candidate-message').textContent = candidate.published_path ? `已发布为 ${candidate.published_path}，提交 ${candidate.commit}` : '';
+          const response = await request(`/api/v1/candidates/${candidate.id}/governance`, {headers: {Authorization: `Bearer ${key}`}});
+          if (governanceGeneration !== generations.candidateGovernance || activeCandidate?.id !== candidateId) return;
+          if (!response.ok) {
+            const failure = await response.json();
+            if (governanceGeneration === generations.candidateGovernance && activeCandidate?.id === candidateId) setMessage(candidateDetail.querySelector('#candidate-message'), describeError(failure, '候选治理信息加载失败'), 'error');
+            return;
+          }
           const governance = await response.json();
-          candidateDetail.querySelector('#candidate-governance').textContent = `${governance.classification}${governance.target_path ? ` · ${governance.target_path}` : ''}${governance.effective_at ? ` · effective ${governance.effective_at}` : ''}`;
+          if (governanceGeneration !== generations.candidateGovernance || activeCandidate?.id !== candidateId) return;
+          candidateDetail.querySelector('#candidate-governance').textContent = `${display(governance.classification)}${governance.target_path ? ` · ${governance.target_path}` : ''}${governance.effective_at ? ` · 生效于 ${governance.effective_at}` : ''}`;
           const current = candidateDetail.querySelector('#candidate-current');
           current.hidden = !governance.current;
-          current.textContent = governance.current ? `Current (${governance.current.path})\nSources: ${governance.current.source_references.join(' · ')}\nSource created: ${governance.current.source_created_at || 'not available'}\nRecorded: ${governance.current.recorded_at}\nEffective: ${governance.current.effective_at || 'initial version'}\n\n${governance.current.content}` : '';
+          current.textContent = governance.current ? `当前正式记忆（${governance.current.path}）\n来源：${governance.current.source_references.join(' · ')}\n来源创建时间：${governance.current.source_created_at || '不可用'}\n记录时间：${governance.current.recorded_at}\n生效时间：${governance.current.effective_at || '初始版本'}\n\n${governance.current.content}` : '';
           const diff = candidateDetail.querySelector('#candidate-conflict-diff');
           diff.hidden = !governance.diff;
           diff.textContent = governance.diff || '';
@@ -364,24 +817,40 @@
         }
 
         async function candidateAction(action) {
-          if (!activeCandidate) return;
+          if (!activeCandidate || activeCandidate.status !== 'pending') return;
+          const candidateId = activeCandidate.id;
+          const selectionGeneration = candidateSelectionGeneration;
+          const contextIsCurrent = () => selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId;
+          const button = candidateDetail.querySelector(`#candidate-${action === 'edit' ? 'save' : action}`);
+          await performOnce(`candidate-${candidateId}`, button, '正在提交...', async () => {
+          if (!contextIsCurrent() || activeCandidate.status !== 'pending') return;
           const operator = candidateDetail.querySelector('#candidate-operator').value;
           const reason = candidateDetail.querySelector('#candidate-reason').value;
           const body = candidateDetail.querySelector('#candidate-body').value;
-          const url = action === 'edit' ? `/api/v1/candidates/${activeCandidate.id}` : `/api/v1/candidates/${activeCandidate.id}/${action}`;
+          const url = action === 'edit' ? `/api/v1/candidates/${candidateId}` : `/api/v1/candidates/${candidateId}/${action}`;
           const payload = action === 'edit' ? {body, operator, reason} : {operator, reason, operation_id: crypto.randomUUID()};
-          const response = await fetch(url, {method: action === 'edit' ? 'PUT' : 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          const response = await request(url, {method: action === 'edit' ? 'PUT' : 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
           const message = candidateDetail.querySelector('#candidate-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
-          message.className = '';
-          activeCandidate = await response.json();
-          showCandidate(activeCandidate);
+          if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
+          if (!response.ok) { const failure = await response.json(); if (selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId) setMessage(message, describeError(failure, '候选操作失败'), 'error'); return; }
+          const updatedCandidate = await response.json();
+          if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
+          activeCandidate = updatedCandidate;
+          if (activeCandidate.status !== 'pending') button.dataset.keepDisabled = 'true';
           await refreshCandidates(activeCandidate.id);
           if (action === 'approve') await refreshDocuments();
+          if (selectionGeneration === candidateSelectionGeneration && (!activeCandidate || activeCandidate.id === candidateId)) setMessage(message, action === 'edit' ? '候选记忆已保存。' : action === 'approve' ? '候选记忆已批准。' : '候选记忆已拒绝。', 'success');
+          }, null, contextIsCurrent);
         }
 
         async function resolveCandidate() {
-          if (!activeCandidate) return;
+          if (!activeCandidate || activeCandidate.status !== 'pending') return;
+          const candidateId = activeCandidate.id;
+          const selectionGeneration = candidateSelectionGeneration;
+          const contextIsCurrent = () => selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId;
+          const button = candidateDetail.querySelector('#candidate-resolve');
+          await performOnce(`candidate-${candidateId}`, button, '正在裁决...', async () => {
+          if (!contextIsCurrent() || activeCandidate.status !== 'pending') return;
           const action = candidateDetail.querySelector('#candidate-resolution').value;
           const effective = candidateDetail.querySelector('#candidate-effective').value;
           const payload = {
@@ -393,19 +862,46 @@
             effective_at: effective ? new Date(effective).toISOString() : null,
             condition: action === 'scope' ? candidateDetail.querySelector('#candidate-condition').value : null,
           };
-          const response = await fetch(`/api/v1/candidates/${activeCandidate.id}/resolve`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          const response = await request(`/api/v1/candidates/${candidateId}/resolve`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
           const message = candidateDetail.querySelector('#candidate-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
+          if (!response.ok) { const failure = await response.json(); if (selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId) setMessage(message, describeError(failure, '冲突裁决失败'), 'error'); return; }
           const result = await response.json();
+          if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
           activeCandidate = result.candidate;
+          button.dataset.keepDisabled = 'true';
           await refreshCandidates(activeCandidate.id);
           await refreshDocuments();
+          if (selectionGeneration === candidateSelectionGeneration && (!activeCandidate || activeCandidate.id === candidateId)) setMessage(message, '冲突裁决已提交。', 'success');
+          }, null, contextIsCurrent);
         }
 
-        async function refreshSensitiveQuarantine(selectedId = activeSensitiveRecord?.id) {
-          const response = await fetch(`/api/v1/sensitive-quarantine?offset=${sensitiveOffset}&limit=${sensitivePageSize + 1}`, {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok) return;
+        async function pinCandidate() {
+          if (!activeCandidate) return;
+          const candidateId = activeCandidate.id;
+          const selectionGeneration = candidateSelectionGeneration;
+          const contextIsCurrent = () => selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId;
+          const button = candidateDetail.querySelector('#candidate-pin');
+          await performOnce(`candidate-${candidateId}`, button, '正在置顶...', async () => {
+            if (!contextIsCurrent()) return;
+            const response = await request(`/api/v1/candidates/${candidateId}/pin`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({pinned: true})});
+            const message = candidateDetail.querySelector('#candidate-message');
+            if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
+            if (!response.ok) { setMessage(message, '候选记忆置顶失败。', 'error'); return; }
+            await refreshCandidates(candidateId);
+            if (selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId) setMessage(message, '候选记忆已置顶。', 'success');
+          }, null, contextIsCurrent);
+        }
+
+        async function refreshSensitiveQuarantine(selectedId = activeSensitiveRecord?.id, selectionContext = null) {
+          const generation = ++generations.sensitive;
+          sensitiveList.replaceChildren();
+          sensitiveList.innerHTML = '<p class="empty">正在加载敏感隔离记录...</p>';
+          const response = await request(`/api/v1/sensitive-quarantine?offset=${sensitiveOffset}&limit=${sensitivePageSize + 1}`, {headers: {Authorization: `Bearer ${key}`}});
+          if (generation !== generations.sensitive) return;
+          if (!response.ok) { sensitiveList.innerHTML = '<p class="empty error">敏感隔离记录加载失败，请重试。</p>'; sensitiveList.append(sensitivePagination); return; }
           const payload = await response.json();
+          if (generation !== generations.sensitive) return;
           const records = payload.slice(0, sensitivePageSize);
           const hasNextPage = payload.length > sensitivePageSize;
           sensitiveList.replaceChildren();
@@ -414,21 +910,25 @@
             button.type = 'button';
             button.dataset.recordId = record.id;
             const status = record.resolved_at ? record.resolution : 'unresolved';
-            button.textContent = `${record.disposition} · ${status} · ${record.created_at}`;
+            button.className = 'secondary';
+            button.textContent = `${display(record.disposition)} · ${display(status)} · ${record.created_at}`;
             button.addEventListener('click', () => showSensitiveRecord(record));
           }
           sensitivePagination.querySelector('#sensitive-previous').disabled = sensitiveOffset === 0;
           sensitivePagination.querySelector('#sensitive-next').disabled = !hasNextPage;
           sensitivePagination.querySelector('#sensitive-page').textContent = `${sensitiveOffset + 1}-${sensitiveOffset + records.length}`;
           sensitiveList.append(sensitivePagination);
+          if (selectionContext && (activeSensitiveRecord?.id !== selectionContext.recordId || sensitiveSelectionGeneration !== selectionContext.selectionGeneration)) return;
           const selected = records.find((record) => record.id === selectedId);
-          if (selected) showSensitiveRecord(selected);
+          if (selected) showSensitiveRecord(selected, selected.id !== activeSensitiveRecord?.id);
           else clearSensitiveRecord();
+          if (!records.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = sensitiveOffset ? '本页没有记录，请返回上一页。' : '没有敏感隔离记录。'; sensitiveList.prepend(empty); }
         }
 
-        function clearSensitiveRecord() {
+        function clearSensitiveRecord(invalidateSelection = true) {
+          if (invalidateSelection) ++sensitiveSelectionGeneration;
           activeSensitiveRecord = null;
-          sensitiveDetail.querySelector('#sensitive-title').textContent = 'Select a quarantine record';
+          sensitiveDetail.querySelector('#sensitive-title').textContent = '请选择隔离记录';
           sensitiveDetail.querySelector('#sensitive-summary').textContent = '';
           sensitiveDetail.querySelector('#sensitive-metadata').textContent = '';
           sensitiveDetail.querySelector('#sensitive-message').textContent = '';
@@ -436,32 +936,49 @@
           sensitiveDetail.querySelector('#sensitive-discard').disabled = true;
         }
 
-        function showSensitiveRecord(record) {
+        function showSensitiveRecord(record, invalidateSelection = true) {
+          if (invalidateSelection) ++sensitiveSelectionGeneration;
           activeSensitiveRecord = record;
           const open = !record.resolved_at;
-          sensitiveDetail.querySelector('#sensitive-title').textContent = `${record.disposition} · ${open ? 'unresolved' : record.resolution}`;
-          sensitiveDetail.querySelector('#sensitive-summary').textContent = record.summary;
-          sensitiveDetail.querySelector('#sensitive-metadata').textContent = `${record.categories.join(', ')} · created ${record.created_at}${record.resolved_at ? ` · resolved ${record.resolved_at}` : ''}`;
-          sensitiveDetail.querySelector('#sensitive-message').textContent = open ? '' : `Resolution: ${record.resolution}`;
+          sensitiveDetail.querySelector('#sensitive-title').textContent = `${display(record.disposition)} · ${display(open ? 'unresolved' : record.resolution)}`;
+          sensitiveDetail.querySelector('#sensitive-summary').textContent = displaySensitiveSummary(record.summary);
+          sensitiveDetail.querySelector('#sensitive-metadata').textContent = `${record.categories.join(', ')} · 创建于 ${record.created_at}${record.resolved_at ? ` · 处理于 ${record.resolved_at}` : ''}`;
+          sensitiveDetail.querySelector('#sensitive-message').textContent = open ? '' : `处理结果：${display(record.resolution)}`;
           sensitiveDetail.querySelector('#sensitive-acknowledge').disabled = !open;
           sensitiveDetail.querySelector('#sensitive-discard').disabled = !open;
         }
 
         async function resolveSensitiveRecord(resolution) {
           if (!activeSensitiveRecord || activeSensitiveRecord.resolved_at) return;
-          const response = await fetch(`/api/v1/sensitive-quarantine/${activeSensitiveRecord.id}/resolve`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({resolution})});
+          const recordId = activeSensitiveRecord.id;
+          const selectionGeneration = sensitiveSelectionGeneration;
+          if (resolution === 'discard' && !await confirmAction('确认丢弃敏感记录', `丢弃隔离记录 ${recordId} 后无法恢复。`)) return;
+          const contextIsCurrent = () => activeSensitiveRecord?.id === recordId && sensitiveSelectionGeneration === selectionGeneration;
+          if (!contextIsCurrent()) return;
+          const button = sensitiveDetail.querySelector(resolution === 'acknowledge' ? '#sensitive-acknowledge' : '#sensitive-discard');
+          await performOnce(`sensitive-${recordId}`, button, '正在处理...', async () => {
+          const response = await request(`/api/v1/sensitive-quarantine/${recordId}/resolve`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({resolution})});
           const message = sensitiveDetail.querySelector('#sensitive-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
-          message.className = '';
-          activeSensitiveRecord = await response.json();
-          showSensitiveRecord(activeSensitiveRecord);
-          await refreshSensitiveQuarantine(activeSensitiveRecord.id);
+          if (!contextIsCurrent()) return;
+          if (!response.ok) { const failure = await response.json(); if (contextIsCurrent()) setMessage(message, describeError(failure, '敏感记录处理失败'), 'error'); return; }
+          const resolvedRecord = await response.json();
+          if (!contextIsCurrent()) return;
+          activeSensitiveRecord = resolvedRecord;
+          showSensitiveRecord(resolvedRecord, false);
+          button.dataset.keepDisabled = 'true';
+          await refreshSensitiveQuarantine(recordId, {recordId, selectionGeneration});
+          if (contextIsCurrent()) setMessage(message, resolution === 'acknowledge' ? '已知悉此敏感记录。' : '敏感记录已丢弃。', 'success');
+          }, null, contextIsCurrent);
         }
 
         async function refreshDocuments() {
           const selectedLibrary = editorLibrary.value;
           const requestContext = editorContext.selectLibrary(selectedLibrary);
+          invalidateForgottenSelection(selectedLibrary ? '正在加载遗忘记忆...' : '请先选择记忆库。');
+          clearReconciliation();
+          reconciliationList.innerHTML = selectedLibrary ? '<p class="empty">正在加载带外变更...</p>' : '<p class="empty">请先选择记忆库。</p>';
           documentTree.replaceChildren();
+          historyDocument.replaceChildren();
           history.replaceChildren();
           restoreAction.replaceChildren();
           historySelection.clear();
@@ -469,26 +986,41 @@
           activeDocument = null;
           deletionPreviewVersion = null;
           deletionPreviewToken = null;
-          editor.querySelector('#document-path').textContent = 'Select a document';
+          editor.querySelector('#document-path').textContent = '请从文档列表选择内容';
           editor.querySelector('#document-source').value = '';
           editor.querySelector('#document-source').disabled = true;
           editor.querySelector('#preview-change').disabled = true;
           editor.querySelector('#save-change').disabled = true;
           editor.querySelector('#preview-delete').disabled = true;
           editor.querySelector('#confirm-delete').disabled = true;
+          editor.querySelector('#editor-message').textContent = selectedLibrary ? '正在加载文档...' : '请先选择记忆库。';
+          setMessage(historyMessage, selectedLibrary ? '正在加载文档列表...' : '请先选择记忆库。');
           if (!selectedLibrary) return;
-          const response = await fetch(`/api/v1/libraries/${selectedLibrary}/documents`, {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok) return;
+          const response = await request(`/api/v1/libraries/${selectedLibrary}/documents`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) { if (editorContext.isCurrent(requestContext)) setMessage(editor.querySelector('#editor-message'), '文档列表加载失败，请重试。', 'error'); return; }
           if (!editorContext.isCurrent(requestContext)) return;
-          for (const item of await response.json()) {
+          const documents = await response.json();
+          const placeholder = document.createElement('option');
+          placeholder.value = '';
+          placeholder.textContent = documents.length ? '请选择要恢复的文档' : '此记忆库还没有文档';
+          historyDocument.append(placeholder);
+          for (const item of documents) {
             if (!editorContext.isCurrent(requestContext)) return;
             const button = documentTree.appendChild(document.createElement('button'));
             button.type = 'button';
             button.textContent = item.path;
             button.addEventListener('click', () => loadDocument(item.path));
+            const option = document.createElement('option');
+            option.value = item.path;
+            option.textContent = item.path;
+            historyDocument.append(option);
           }
+          if (!documents.length) documentTree.innerHTML = '<p class="empty">此记忆库还没有文档。</p>';
+          setMessage(editor.querySelector('#editor-message'), documents.length ? '请选择文档进行查看或编辑。' : '此记忆库还没有文档。');
+          setMessage(historyMessage, documents.length ? '请选择文档，再查看可恢复的提交。' : '此记忆库还没有文档。');
           await refreshHistory();
           await refreshForgotten();
+          await refreshReconciliation();
         }
 
         async function loadDocument(path) {
@@ -496,12 +1028,14 @@
           historySelection.clear();
           const selectedLibrary = editorLibrary.value;
           const requestContext = editorContext.requestDocument(selectedLibrary, path);
-          const response = await fetch(`/api/v1/libraries/${selectedLibrary}/document?path=${encodeURIComponent(path)}`, {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok) return;
+          setMessage(editor.querySelector('#editor-message'), `正在加载 ${path}...`);
+          const response = await request(`/api/v1/libraries/${selectedLibrary}/document?path=${encodeURIComponent(path)}`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) { if (editorContext.isCurrent(requestContext)) setMessage(editor.querySelector('#editor-message'), `文档加载失败：${path}`, 'error'); return null; }
           const loaded = await response.json();
           const accepted = editorContext.acceptDocument(requestContext, loaded);
-          if (!accepted) return;
+          if (!accepted || selectedLibrary !== editorLibrary.value || accepted.libraryId !== selectedLibrary || accepted.path !== path) return null;
           activeDocument = loaded;
+          historyDocument.value = activeDocument.path;
           editor.querySelector('#document-path').textContent = activeDocument.path;
           editor.querySelector('#document-source').value = activeDocument.content;
           editor.querySelector('#document-source').disabled = false;
@@ -512,148 +1046,259 @@
           deletionPreviewVersion = null;
           deletionPreviewToken = null;
           showEditorPanel('source');
+          setMessage(editor.querySelector('#editor-message'), '文档已加载。', 'success');
+          setMessage(historyMessage, `已选择 ${activeDocument.path}。`, 'success');
           await refreshHistory();
+          return documentContextIsCurrent(accepted) ? accepted : null;
         }
 
         function showEditorPanel(panel) {
           editor.querySelector('#document-source').hidden = panel !== 'source';
           editor.querySelector('#document-preview').hidden = panel !== 'preview';
           editor.querySelector('#document-diff').hidden = panel !== 'diff';
+          for (const name of ['source', 'preview', 'diff']) editor.querySelector(`#${name}-tab`).setAttribute('aria-selected', String(name === panel));
         }
 
         async function previewChange(context = editorContext.snapshot()) {
           if (!context || !context.path || !context.sourceVersion) return false;
+          const button = editor.querySelector('#preview-change');
+          if (pending.has(`preview-${context.token}`)) return false;
+          pending.add(`preview-${context.token}`); setBusy(button, true, '正在预览...');
           const previewRequest = PamHistory.previewRequest(context);
-          const response = await fetch(previewRequest.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(previewRequest.body)});
+          let response;
+          try { response = await request(previewRequest.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(previewRequest.body)}); }
+          finally { pending.delete(`preview-${context.token}`); setBusy(button, false, '正在预览...'); }
           const message = editor.querySelector('#editor-message');
           if (!editorContext.isCurrent(context)) return false;
-          if (!response.ok) { const failure = await response.json(); if (!editorContext.isCurrent(context)) return false; message.className = 'error'; message.textContent = failure.detail; return false; }
+          if (!response.ok) { const failure = await response.json(); if (!editorContext.isCurrent(context)) return false; setMessage(message, describeError(failure, '变更预览失败'), 'error'); return false; }
           const preview = await response.json();
           if (!editorContext.isCurrent(context)) return false;
           editor.querySelector('#document-preview').srcdoc = preview.rendered_html;
-          editor.querySelector('#document-diff').textContent = preview.diff || 'No changes.';
-          message.className = '';
-          message.textContent = 'Preview updated.';
+          editor.querySelector('#document-diff').textContent = preview.diff || '没有变更。';
+          setMessage(message, '预览已更新。', 'success');
           showEditorPanel('diff');
           return true;
         }
 
+        async function loadHistoryDiff(selectedLibrary, entry, actionContext) {
+          const pendingKey = `history-diff-${selectedLibrary}-${entry.commit}-${actionContext.token}`;
+          if (pending.has(pendingKey)) return false;
+          const selectionGeneration = ++generations.historyDiff;
+          pending.add(pendingKey);
+          historyDiff.textContent = '正在加载提交差异...';
+          restoreAction.replaceChildren();
+          historySelection.clear();
+          setMessage(historyMessage, `正在加载提交 ${entry.commit.slice(0, 12)} 的差异...`);
+          let diffResponse;
+          try { diffResponse = await request(`/api/v1/libraries/${selectedLibrary}/history/${entry.commit}/diff`, {headers: {Authorization: `Bearer ${key}`}}); }
+          finally { pending.delete(pendingKey); }
+          if (!editorContext.isCurrent(actionContext) || selectionGeneration !== generations.historyDiff) return;
+          if (!diffResponse.ok) {
+            historyDiff.textContent = '提交差异加载失败。';
+            setMessage(historyMessage, '提交差异加载失败，请重试。', 'error');
+            const retry = document.createElement('button');
+            retry.type = 'button';
+            retry.textContent = '重试加载差异';
+            retry.addEventListener('click', () => loadHistoryDiff(selectedLibrary, entry, actionContext));
+            restoreAction.append(retry);
+            return;
+          }
+          const diffPayload = await diffResponse.json();
+          if (!editorContext.isCurrent(actionContext) || selectionGeneration !== generations.historyDiff) return;
+          historyDiff.textContent = diffPayload.diff || '该提交没有可显示的差异。';
+          const selection = historySelection.select(selectedLibrary, {
+            path: actionContext.path,
+            source_version: actionContext.sourceVersion,
+            token: actionContext.token,
+          }, entry.commit);
+          const restore = document.createElement('button');
+          restore.type = 'button';
+          restore.textContent = `从 ${selection.commit.slice(0, 12)} 恢复 ${selection.path}`;
+          restore.addEventListener('click', () => restoreDocument(selection));
+          restoreAction.append(restore);
+          setMessage(historyMessage, `已加载提交 ${selection.commit.slice(0, 12)} 的差异。`, 'success');
+        }
+
         async function refreshHistory() {
           const context = editorContext.snapshot();
+          const generation = ++generations.history;
+          ++generations.historyDiff;
           history.replaceChildren();
           if (!context || !context.libraryId) return;
+          history.innerHTML = '<p class="empty">正在加载本地历史...</p>';
           const selectedLibrary = context.libraryId;
-          const response = await fetch(`/api/v1/libraries/${selectedLibrary}/history`, {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok) return;
-          if (!editorContext.isCurrent(context)) return;
-          for (const entry of await response.json()) {
+          const response = await request(`/api/v1/libraries/${selectedLibrary}/history`, {headers: {Authorization: `Bearer ${key}`}});
+          if (!response.ok) { if (editorContext.isCurrent(context)) history.innerHTML = '<p class="empty error">本地历史加载失败，请重试。</p>'; return; }
+          if (!editorContext.isCurrent(context) || generation !== generations.history) return;
+          const entries = await response.json(); history.replaceChildren();
+          for (const entry of entries) {
             if (!editorContext.isCurrent(context)) return;
             const button = history.appendChild(document.createElement('button'));
             button.type = 'button';
             button.textContent = `${entry.commit.slice(0, 12)}  ${entry.subject}`;
-            button.title = `${entry.authored_at} · ${entry.actor_type || 'platform'} · ${entry.source || 'initialization'}`;
+            button.className = 'secondary';
+            button.title = `${entry.authored_at} · ${entry.actor_type || '平台'} · ${entry.source || '初始化'}`;
             button.addEventListener('click', async () => {
               const actionContext = editorContext.snapshot();
-              if (!actionContext || !actionContext.path) return;
-              const diffResponse = await fetch(`/api/v1/libraries/${selectedLibrary}/history/${entry.commit}/diff`, {headers: {Authorization: `Bearer ${key}`}});
-              if (!editorContext.isCurrent(actionContext)) return;
-              const diffPayload = diffResponse.ok ? await diffResponse.json() : null;
-              if (!editorContext.isCurrent(actionContext)) return;
-              if (diffPayload) historyDiff.textContent = diffPayload.diff;
-              restoreAction.replaceChildren();
-              const selection = historySelection.select(selectedLibrary, {
-                path: actionContext.path,
-                source_version: actionContext.sourceVersion,
-                token: actionContext.token,
-              }, entry.commit);
-              const restore = document.createElement('button');
-              restore.type = 'button';
-              restore.textContent = `Restore ${selection.path} from ${selection.commit.slice(0, 12)}`;
-              restore.addEventListener('click', () => restoreDocument(selection));
-              restoreAction.append(restore);
+              if (!actionContext || !actionContext.path) { setMessage(historyMessage, '请先选择要恢复的文档。', 'error'); return; }
+              await loadHistoryDiff(selectedLibrary, entry, actionContext);
             });
           }
+          if (!entries.length) history.innerHTML = '<p class="empty">还没有本地历史提交。</p>';
         }
 
         async function restoreDocument(selection) {
           const context = editorContext.snapshot();
-          if (!context || context.token !== selection.contextToken) return;
+          const selectionIsCurrent = () => documentContextIsCurrent(context)
+            && context.libraryId === selection.libraryId
+            && context.path === selection.path
+            && context.token === selection.contextToken;
+          if (!selectionIsCurrent()) return;
+          if (!await confirmAction('确认恢复历史版本', `将从提交 ${selection.commit.slice(0, 12)} 恢复 ${selection.path}，并创建新的记忆变更事务。`)) return;
+          if (!selectionIsCurrent()) return;
+          const restoreButton = restoreAction.querySelector('button');
+          await performOnce(`history-${selection.contextToken}`, restoreButton, '正在恢复...', async () => {
           const restore = PamHistory.request(selection, crypto.randomUUID());
-          const response = await fetch(restore.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(restore.body)});
-          if (!editorContext.isCurrent(context)) return;
-          if (!response.ok) { const failure = await response.json(); if (!editorContext.isCurrent(context)) return; editor.querySelector('#editor-message').className = 'error'; editor.querySelector('#editor-message').textContent = failure.detail; return; }
+          const response = await request(restore.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(restore.body)});
+          if (!selectionIsCurrent()) return;
+          if (!response.ok) { const failure = await response.json(); if (!selectionIsCurrent()) return; setMessage(historyMessage, describeError(failure, '历史版本恢复失败'), 'error'); return; }
           restoreAction.replaceChildren();
           historySelection.clear();
-          if (editorContext.isCurrent(context)) await loadDocument(selection.path);
+          if (!selectionIsCurrent()) return;
+          const loadedContext = await loadDocument(selection.path);
+          if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === selection.libraryId && loadedContext.path === selection.path) setMessage(historyMessage, `已从 ${selection.commit.slice(0, 12)} 恢复 ${selection.path}。`, 'success');
+          }, null, selectionIsCurrent);
         }
 
         async function previewForgetting() {
           const context = editorContext.snapshot();
           if (!context || !context.path || !context.sourceVersion) return;
-          const response = await fetch(`/api/v1/libraries/${context.libraryId}/document/delete-preview`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, operation_id: crypto.randomUUID()})});
-          if (!editorContext.isCurrent(context)) return;
+          const pendingKey = `forget-preview-${context.token}`;
+          if (pending.has(pendingKey)) return false;
+          const requestGeneration = ++generations.forgettingPreview;
+          const button = editor.querySelector('#preview-delete');
+          pending.add(pendingKey); setBusy(button, true, '正在预览...');
+          let response;
+          try { response = await request(`/api/v1/libraries/${context.libraryId}/document/delete-preview`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, operation_id: crypto.randomUUID()})}); }
+          finally { pending.delete(pendingKey); setBusy(button, false, '正在预览...'); }
+          if (!documentContextIsCurrent(context) || requestGeneration !== generations.forgettingPreview) return false;
           const message = editor.querySelector('#editor-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          if (!response.ok) { const failure = await response.json(); if (documentContextIsCurrent(context) && requestGeneration === generations.forgettingPreview) setMessage(message, describeError(failure, '遗忘影响预览失败'), 'error'); return false; }
           const preview = await response.json();
+          if (!documentContextIsCurrent(context) || requestGeneration !== generations.forgettingPreview) return false;
           editor.querySelector('#document-diff').textContent = JSON.stringify(preview, null, 2);
           showEditorPanel('diff');
           deletionPreviewVersion = context.sourceVersion;
           deletionPreviewToken = preview.preview_token;
           editor.querySelector('#confirm-delete').disabled = false;
-          message.className = '';
-          message.textContent = 'Review every affected source and derived store before forgetting.';
+          setMessage(message, '请检查所有受影响的权威来源和派生数据，再确认遗忘。');
+          return true;
         }
 
         async function forgetDocument() {
           const context = editorContext.snapshot();
           if (!context || deletionPreviewVersion !== context.sourceVersion || !deletionPreviewToken) return;
-          const response = await fetch(`/api/v1/libraries/${context.libraryId}/document`, {method: 'DELETE', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, preview_token: deletionPreviewToken, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-delete'})});
+          if (!await confirmAction('强化确认：遗忘记忆', `此操作会遗忘 ${context.path} 并清理关联派生数据。`, context.path)) return;
+          if (!editorContext.isCurrent(context)) return;
+          const button = editor.querySelector('#confirm-delete');
+          await performOnce(`forget-${context.token}`, button, '正在遗忘...', async () => {
+          const response = await request(`/api/v1/libraries/${context.libraryId}/document`, {method: 'DELETE', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, preview_token: deletionPreviewToken, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-delete'})});
           const message = editor.querySelector('#editor-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
-          message.className = '';
-          message.textContent = 'Memory forgotten.';
+          if (!editorContext.isCurrent(context)) return;
+          if (!response.ok) { const failure = await response.json(); if (editorContext.isCurrent(context)) setMessage(message, describeError(failure, '记忆遗忘失败'), 'error'); return; }
           await refreshDocuments();
+          const currentContext = editorContext.snapshot();
+          if (editorLibrary.value === context.libraryId && currentContext?.libraryId === context.libraryId && !currentContext.path) setMessage(message, '记忆已遗忘。', 'success');
+          }, null, () => documentContextIsCurrent(context));
+        }
+
+        async function saveDocument() {
+          const context = editorContext.snapshot();
+          if (!context || !(await previewChange(context)) || !documentContextIsCurrent(context)) return;
+          const button = editor.querySelector('#save-change');
+          await performOnce(`save-${context.token}`, button, '正在保存...', async () => {
+            const saveRequest = PamHistory.saveRequest(context, crypto.randomUUID());
+            const response = await request(saveRequest.url, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(saveRequest.body)});
+            const message = editor.querySelector('#editor-message');
+            if (!documentContextIsCurrent(context)) return;
+            if (!response.ok) { const failure = await response.json(); if (!documentContextIsCurrent(context)) return; setMessage(message, describeError(failure, '文档保存失败'), 'error'); return; }
+            const loadedContext = await loadDocument(context.path);
+            if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === context.libraryId && loadedContext.path === context.path) setMessage(message, '文档已保存。', 'success');
+          }, null, () => documentContextIsCurrent(context));
+        }
+
+        function invalidateForgottenSelection(messageText = '') {
+          ++generations.forgotten;
+          const memorySelect = forgottenForm.querySelector('#forgotten-memory');
+          const commitSelect = forgottenForm.querySelector('#forgotten-commit');
+          memorySelect.replaceChildren();
+          commitSelect.replaceChildren();
+          delete memorySelect.dataset.libraryId;
+          delete memorySelect.dataset.generation;
+          delete commitSelect.dataset.libraryId;
+          delete commitSelect.dataset.generation;
+          forgottenForm.querySelector('button[type="submit"]').disabled = true;
+          setMessage(forgottenForm.querySelector('#forgotten-message'), messageText);
         }
 
         async function refreshForgotten() {
+          const generation = ++generations.forgotten;
           const libraryId = editorLibrary.value;
           const memorySelect = forgottenForm.querySelector('#forgotten-memory');
           const commitSelect = forgottenForm.querySelector('#forgotten-commit');
           memorySelect.replaceChildren();
           commitSelect.replaceChildren();
+          const submitButton = forgottenForm.querySelector('button[type="submit"]');
+          submitButton.disabled = true;
           if (!libraryId) return;
+          const contextIsCurrent = () => generation === generations.forgotten && libraryId === editorLibrary.value;
           const [forgottenResponse, historyResponse] = await Promise.all([
-            fetch(`/api/v1/libraries/${libraryId}/forgotten`, {headers: {Authorization: `Bearer ${key}`}}),
-            fetch(`/api/v1/libraries/${libraryId}/history`, {headers: {Authorization: `Bearer ${key}`}}),
+            request(`/api/v1/libraries/${libraryId}/forgotten`, {headers: {Authorization: `Bearer ${key}`}}),
+            request(`/api/v1/libraries/${libraryId}/history`, {headers: {Authorization: `Bearer ${key}`}}),
           ]);
-          if (!forgottenResponse.ok || !historyResponse.ok) return;
-          for (const item of await forgottenResponse.json()) {
+          if (!contextIsCurrent()) return;
+          if (!forgottenResponse.ok || !historyResponse.ok) { if (contextIsCurrent()) setMessage(forgottenForm.querySelector('#forgotten-message'), '遗忘记忆列表加载失败，请重试。', 'error'); return; }
+          const [forgottenItems, historyEntries] = await Promise.all([forgottenResponse.json(), historyResponse.json()]);
+          if (!contextIsCurrent()) return;
+          for (const item of forgottenItems) {
             const option = document.createElement('option');
             option.value = item.id;
-            option.textContent = `${item.path} · deleted ${item.deleted_at}`;
+            option.textContent = `${item.path} · 遗忘于 ${item.deleted_at}`;
             memorySelect.append(option);
           }
-          for (const entry of await historyResponse.json()) {
+          for (const entry of historyEntries) {
             const option = document.createElement('option');
             option.value = entry.commit;
             option.textContent = `${entry.commit.slice(0, 12)} · ${entry.subject}`;
             commitSelect.append(option);
           }
+          if (!contextIsCurrent()) { memorySelect.replaceChildren(); commitSelect.replaceChildren(); return; }
+          memorySelect.dataset.libraryId = libraryId;
+          memorySelect.dataset.generation = String(generation);
+          commitSelect.dataset.libraryId = libraryId;
+          commitSelect.dataset.generation = String(generation);
+          submitButton.disabled = !memorySelect.value || !commitSelect.value;
         }
 
         async function refreshBindings() {
-          const response = await fetch('/api/v1/project-bindings', {headers: {Authorization: `Bearer ${key}`}});
-          if (!response.ok) return;
-          projectBindings = await response.json();
+          const generation = ++generations.bindings;
+          const response = await request('/api/v1/project-bindings', {headers: {Authorization: `Bearer ${key}`}});
+          if (generation !== generations.bindings) return;
+          if (!response.ok) { bindingTable.querySelector('tbody').innerHTML = '<tr><td colspan="6" class="empty error">项目绑定加载失败，请重试。</td></tr>'; return; }
+          const bindings = await response.json();
+          if (generation !== generations.bindings) return;
+          projectBindings = bindings;
           const directBindings = projectBindings.filter((binding) => binding.kind === 'project');
           fillSelect(worktreeForm.querySelector('#main-binding'), directBindings, (binding) => binding.id, (binding) => `${binding.canonical_root} (${binding.id})`);
           const body = bindingTable.querySelector('tbody');
           body.replaceChildren();
           for (const binding of projectBindings) {
             const row = document.createElement('tr');
-            for (const value of [binding.project_id, binding.kind, binding.canonical_root, binding.library_id, binding.availability]) {
+            const values = [binding.project_id, display(binding.kind), binding.canonical_root, binding.library_id, binding.availability];
+            for (const [index, value] of values.entries()) {
               const cell = document.createElement('td');
-              cell.textContent = value;
+              if (index === 4) cell.append(createStatusBadge(value));
+              else cell.textContent = value;
               if (value === binding.canonical_root) cell.className = 'path';
               row.append(cell);
             }
@@ -662,30 +1307,68 @@
               const librarySelect = document.createElement('select');
               fillSelect(librarySelect, projectLibraries, (library) => library.id, (library) => library.canonical_path);
               librarySelect.value = binding.library_id;
-              librarySelect.setAttribute('aria-label', `Memory library for ${binding.canonical_root}`);
-              librarySelect.addEventListener('change', async () => {
-                await fetch(`/api/v1/project-bindings/${binding.id}`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({library_id: librarySelect.value})});
-                await refreshBindings();
-              });
+              librarySelect.setAttribute('aria-label', `${binding.canonical_root} 的记忆库`);
+              librarySelect.addEventListener('change', () => queueBindingUpdate(binding.id, librarySelect));
               actions.append(librarySelect);
             }
             const remove = document.createElement('button');
             remove.type = 'button';
             remove.className = 'danger';
-            remove.textContent = binding.kind === 'project' ? 'Unbind' : 'Remove association';
+            remove.textContent = binding.kind === 'project' ? '解绑' : '移除关联';
             remove.addEventListener('click', async () => {
-              await fetch(`/api/v1/project-bindings/${binding.id}`, {method: 'DELETE', headers: {Authorization: `Bearer ${key}`}});
-              await refreshBindings();
+              if (!await confirmAction(binding.kind === 'project' ? '确认解绑项目' : '确认移除 Worktree 关联', `将移除 ${binding.canonical_root} 的当前关系。`)) return;
+              await performOnce(`binding-${binding.id}`, remove, '正在移除...', async () => {
+                const response = await request(`/api/v1/project-bindings/${binding.id}`, {method: 'DELETE', headers: {Authorization: `Bearer ${key}`}});
+                setMessage(bindingForm.querySelector('#binding-message'), response.ok ? '项目关系已移除。' : '项目关系移除失败。', response.ok ? 'success' : 'error');
+                if (response.ok) await refreshBindings();
+              });
             });
             actions.append(remove);
             row.append(actions);
             body.append(row);
           }
+          if (!projectBindings.length) body.innerHTML = '<tr><td colspan="6" class="empty">还没有项目绑定或 Worktree 关联。</td></tr>';
+        }
+
+        async function queueBindingUpdate(bindingId, select) {
+          let state = bindingIntents.get(bindingId);
+          if (!state) {
+            state = {desiredLibraryId: select.value, running: false, select};
+            bindingIntents.set(bindingId, state);
+          }
+          state.desiredLibraryId = select.value;
+          state.select = select;
+          select.disabled = true;
+          if (state.running) return;
+          state.running = true;
+          const message = bindingForm.querySelector('#binding-message');
+          try {
+            while (true) {
+              const libraryId = state.desiredLibraryId;
+              const response = await request(`/api/v1/project-bindings/${bindingId}`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({library_id: libraryId})});
+              if (libraryId !== state.desiredLibraryId) continue;
+              if (!response.ok) {
+                const failure = await response.json();
+                setMessage(message, describeError(failure, '项目记忆库更新失败'), 'error');
+                break;
+              }
+              setMessage(message, '项目记忆库已更新。', 'success');
+              await refreshBindings();
+              if (libraryId !== state.desiredLibraryId) continue;
+              break;
+            }
+          } finally {
+            state.running = false;
+            state.select.disabled = false;
+            bindingIntents.delete(bindingId);
+          }
         }
 
         form.addEventListener('submit', async (event) => {
           event.preventDefault();
-          const response = await fetch('/api/v1/libraries', {
+          const button = form.querySelector('button[type="submit"]');
+          await performOnce('register-library', button, '正在注册...', async () => {
+          const response = await request('/api/v1/libraries', {
             method: 'POST',
             headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'},
             body: JSON.stringify({path: form.querySelector('#path').value, kind: form.querySelector('#kind').value, reuse_existing_git: form.querySelector('#reuse-existing-git').checked}),
@@ -693,67 +1376,78 @@
           const message = form.querySelector('#library-message');
           if (!response.ok) {
             const failure = await response.json();
-            message.className = 'error';
-            message.textContent = typeof failure.detail === 'string' ? failure.detail : failure.detail.reason;
+            setMessage(message, describeError(failure, '记忆库注册失败'), 'error');
             return;
           }
-          message.className = '';
-          message.textContent = 'Library registered.';
+          setMessage(message, '记忆库已注册。', 'success');
           form.querySelector('#path').value = '';
           await refresh();
+          });
         });
         bindingForm.addEventListener('submit', async (event) => {
           event.preventDefault();
-          const response = await fetch('/api/v1/project-bindings', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({project_root: bindingForm.querySelector('#project-root').value, library_id: bindingForm.querySelector('#project-library').value})});
+          const button = bindingForm.querySelector('button[type="submit"]');
+          await performOnce('bind-project', button, '正在绑定...', async () => {
+          const response = await request('/api/v1/project-bindings', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({project_root: bindingForm.querySelector('#project-root').value, library_id: bindingForm.querySelector('#project-library').value})});
           const message = bindingForm.querySelector('#binding-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = typeof failure.detail === 'string' ? failure.detail : failure.detail.reason; return; }
-          message.className = '';
-          message.textContent = 'Project bound.';
+          if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '项目绑定失败'), 'error'); return; }
+          setMessage(message, '项目已绑定。', 'success');
           bindingForm.querySelector('#project-root').value = '';
           await refreshBindings();
+          });
         });
         worktreeForm.addEventListener('submit', async (event) => {
           event.preventDefault();
-          const response = await fetch('/api/v1/project-bindings/worktrees', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({worktree_root: worktreeForm.querySelector('#worktree-root').value, main_project_binding_id: worktreeForm.querySelector('#main-binding').value})});
+          const button = worktreeForm.querySelector('button[type="submit"]');
+          await performOnce('associate-worktree', button, '正在关联...', async () => {
+          const response = await request('/api/v1/project-bindings/worktrees', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({worktree_root: worktreeForm.querySelector('#worktree-root').value, main_project_binding_id: worktreeForm.querySelector('#main-binding').value})});
           const message = worktreeForm.querySelector('#worktree-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = typeof failure.detail === 'string' ? failure.detail : failure.detail.reason; return; }
-          message.className = '';
-          message.textContent = 'Worktree associated.';
+          if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, 'Worktree 关联失败'), 'error'); return; }
+          setMessage(message, 'Worktree 已关联。', 'success');
           worktreeForm.querySelector('#worktree-root').value = '';
           await refreshBindings();
+          });
         });
         searchForm.addEventListener('submit', async (event) => {
           event.preventDefault();
-          const response = await fetch('/api/v1/search', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({cwd: searchForm.querySelector('#search-cwd').value, query: searchForm.querySelector('#search-query').value})});
+          const button = searchForm.querySelector('button[type="submit"]');
+          const requestId = crypto.randomUUID(); searchForm.dataset.requestId = requestId;
+          await performOnce('search', button, '正在检索...', async () => {
+          setMessage(searchForm.querySelector('#search-message'), '正在检索记忆...');
+          const response = await request('/api/v1/search', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({cwd: searchForm.querySelector('#search-cwd').value, query: searchForm.querySelector('#search-query').value})});
+          if (searchForm.dataset.requestId !== requestId) return;
           const message = searchForm.querySelector('#search-message');
           const results = searchForm.querySelector('#search-results');
           results.replaceChildren();
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
+          if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '记忆检索失败'), 'error'); return; }
           const payload = await response.json();
-          message.className = '';
-          message.textContent = payload.status === 'unbound' ? 'No project memory library is bound to this directory.' : `${payload.results.length} result(s) · graph ${payload.graph_index_status}${payload.degraded ? ` · degraded: ${payload.degradation.join(', ')}` : ''}.`;
+          if (searchForm.dataset.requestId !== requestId) return;
+          const searchStatus = formatSearchStatus(payload);
+          setMessage(message, searchStatus.text, searchStatus.kind);
           for (const hit of payload.results) {
             const article = document.createElement('article');
             article.className = 'search-result';
             const source = document.createElement('div');
             source.className = 'source';
-            source.textContent = `${hit.path}:${hit.start_line}-${hit.end_line} · ${hit.heading || 'Untitled'} · ${hit.classification}${hit.graph_hop ? ` hop ${hit.graph_hop}` : ''} · ${hit.source_version}`;
+            source.textContent = `${hit.path}:${hit.start_line}-${hit.end_line} · ${hit.heading || '无标题'} · ${display(hit.classification)}${hit.graph_hop ? ` · 图跳数 ${hit.graph_hop}` : ''} · ${hit.source_version}`;
             const content = document.createElement('pre');
             content.textContent = hit.content;
             article.append(source, content);
             results.append(article);
           }
+          });
         });
-        candidateStatus.addEventListener('change', () => refreshCandidates());
-        candidateDetail.querySelector('#candidate-pin').addEventListener('click', async () => {
-          if (!activeCandidate) return;
-          const response = await fetch(`/api/v1/candidates/${activeCandidate.id}/pin`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({pinned: true})});
-          candidateDetail.querySelector('#candidate-message').textContent = response.ok ? 'Candidate pinned.' : 'Could not pin candidate.';
-        });
-        retentionForm.querySelector('#retention-library').addEventListener('change', refreshRetention);
+        candidateStatus.addEventListener('change', () => { ++candidateSelectionGeneration; refreshCandidates(); });
+        candidateDetail.querySelector('#candidate-pin').addEventListener('click', pinCandidate);
+        retentionForm.querySelector('#retention-library').addEventListener('change', () => { ++retentionSelectionGeneration; refreshRetention(); });
+        for (const control of retentionForm.querySelectorAll('input')) control.addEventListener('input', invalidateRetentionPreview);
         retentionForm.addEventListener('submit', async (event) => {
           event.preventDefault();
+          const button = retentionForm.querySelector('button[type="submit"]');
           const libraryId = retentionForm.querySelector('#retention-library').value;
+          const generation = generations.retention;
+          invalidateRetentionPreview();
+          await performOnce(`retention-policy-${libraryId}`, button, '正在保存...', async () => {
           const payload = {
             inbox_days: Number(retentionForm.querySelector('#inbox-days').value),
             candidate_days: Number(retentionForm.querySelector('#candidate-days').value),
@@ -762,21 +1456,24 @@
             diagnostics_enabled: retentionForm.querySelector('#diagnostics-enabled').checked,
             diagnostic_days: Number(retentionForm.querySelector('#diagnostic-days').value),
           };
-          const response = await fetch(`/api/v1/libraries/${libraryId}/retention-policy`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
-          retentionForm.querySelector('#retention-message').textContent = response.ok ? 'Retention policy saved.' : 'Could not save retention policy.';
+          const response = await request(`/api/v1/libraries/${libraryId}/retention-policy`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
+          setMessage(retentionForm.querySelector('#retention-message'), response.ok ? '保留策略已保存。' : '保留策略保存失败。', response.ok ? 'success' : 'error');
           if (response.ok) await previewRetention();
+          });
         });
-        retentionForm.querySelector('#retention-preview').addEventListener('click', previewRetention);
-        retentionForm.querySelector('#retention-run').addEventListener('click', async () => {
+        retentionForm.querySelector('#retention-preview').addEventListener('click', async (event) => {
           const libraryId = retentionForm.querySelector('#retention-library').value;
-          const response = await fetch(`/api/v1/libraries/${libraryId}/retention-cleanup`, {method: 'POST', headers: {Authorization: `Bearer ${key}`}});
-          retentionForm.querySelector('#retention-impact').textContent = response.ok ? JSON.stringify(await response.json(), null, 2) : 'Cleanup failed.';
-          await refreshRetention();
-          await refreshCandidates();
+          await performOnce(`retention-preview-${libraryId}`, event.currentTarget, '正在预览...', previewRetention, retentionForm.querySelector('#retention-message'));
         });
+        retentionForm.querySelector('#retention-run').addEventListener('click', runRetentionCleanup);
         retentionForm.querySelector('#diagnostics-clear').addEventListener('click', async () => {
-          await fetch('/api/v1/diagnostics', {method: 'DELETE', headers: {Authorization: `Bearer ${key}`}});
-          retentionForm.querySelector('#retention-message').textContent = 'Diagnostics cleared.';
+          if (!await confirmAction('确认清除诊断', '将删除当前保留的诊断数据。')) return;
+          const button = retentionForm.querySelector('#diagnostics-clear');
+          await performOnce('diagnostics-clear', button, '正在清除...', async () => {
+            const response = await request('/api/v1/diagnostics', {method: 'DELETE', headers: {Authorization: `Bearer ${key}`}});
+            setMessage(retentionForm.querySelector('#retention-message'), response.ok ? '诊断数据已清除。' : '诊断数据清除失败。', response.ok ? 'success' : 'error');
+          });
         });
         candidateDetail.querySelector('#candidate-save').addEventListener('click', () => candidateAction('edit'));
         candidateDetail.querySelector('#candidate-approve').addEventListener('click', () => candidateAction('approve'));
@@ -787,7 +1484,7 @@
         sensitivePagination.querySelector('#sensitive-previous').addEventListener('click', () => { sensitiveOffset = Math.max(0, sensitiveOffset - sensitivePageSize); refreshSensitiveQuarantine(); });
         sensitivePagination.querySelector('#sensitive-next').addEventListener('click', () => { sensitiveOffset += sensitivePageSize; refreshSensitiveQuarantine(); });
         sensitivePagination.querySelector('#sensitive-refresh').addEventListener('click', () => refreshSensitiveQuarantine());
-        editorLibrary.addEventListener('change', async () => { await refreshDocuments(); await refreshReconciliation(); });
+        editorLibrary.addEventListener('change', async () => { historyLibrary.value = editorLibrary.value; await refreshDocuments(); });
         reconciliationDetail.querySelector('#reconciliation-import').addEventListener('click', () => resolveReconciliation('import'));
         reconciliationDetail.querySelector('#reconciliation-restore').addEventListener('click', () => resolveReconciliation('restore'));
         reconciliationDetail.querySelector('#reconciliation-final').addEventListener('input', (event) => {
@@ -819,25 +1516,43 @@
         forgottenForm.addEventListener('submit', async (event) => {
           event.preventDefault();
           const libraryId = editorLibrary.value;
-          const response = await fetch(`/api/v1/libraries/${libraryId}/forgotten/restore`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({tombstone_id: forgottenForm.querySelector('#forgotten-memory').value, commit: forgottenForm.querySelector('#forgotten-commit').value, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-forgotten-history'})});
+          const tombstone = forgottenForm.querySelector('#forgotten-memory');
+          const commit = forgottenForm.querySelector('#forgotten-commit');
+          const tombstoneId = tombstone.value;
+          const selectedCommit = commit.value;
+          const restoreGeneration = generations.forgotten;
+          const restoreContextIsCurrent = () => editorLibrary.value === libraryId
+            && generations.forgotten === restoreGeneration
+            && tombstone.dataset.libraryId === libraryId
+            && Number(tombstone.dataset.generation) === restoreGeneration
+            && commit.dataset.libraryId === libraryId
+            && Number(commit.dataset.generation) === restoreGeneration
+            && tombstone.value === tombstoneId
+            && commit.value === selectedCommit;
+          if (!tombstoneId || !selectedCommit || !restoreContextIsCurrent()) return;
+          if (!await confirmAction('确认恢复遗忘记忆', `将恢复 ${tombstone.options[tombstone.selectedIndex].textContent}，并创建新的记忆变更事务。`)) return;
+          if (!restoreContextIsCurrent()) return;
+          const button = forgottenForm.querySelector('button[type="submit"]');
+          await performOnce('forgotten-restore', button, '正在恢复...', async () => {
+          if (!restoreContextIsCurrent()) return;
+          const response = await request(`/api/v1/libraries/${libraryId}/forgotten/restore`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({tombstone_id: tombstoneId, commit: selectedCommit, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-forgotten-history'})});
           const message = forgottenForm.querySelector('#forgotten-message');
-          if (!response.ok) { const failure = await response.json(); message.className = 'error'; message.textContent = failure.detail; return; }
-          message.className = '';
-          message.textContent = 'Forgotten memory restored in a new commit.';
+          if (!restoreContextIsCurrent()) return;
+          if (!response.ok) { const failure = await response.json(); if (restoreContextIsCurrent()) setMessage(message, describeError(failure, '遗忘记忆恢复失败'), 'error'); return; }
+          const expectedRefreshGeneration = restoreGeneration + 2;
           await refreshDocuments();
+          const currentContext = editorContext.snapshot();
+          if (editorLibrary.value === libraryId
+              && generations.forgotten === expectedRefreshGeneration
+              && tombstone.dataset.libraryId === libraryId
+              && Number(tombstone.dataset.generation) === expectedRefreshGeneration
+              && commit.dataset.libraryId === libraryId
+              && Number(commit.dataset.generation) === expectedRefreshGeneration
+              && currentContext?.libraryId === libraryId
+              && !currentContext.path) setMessage(message, '遗忘记忆已通过新事务恢复。', 'success');
+          }, null, restoreContextIsCurrent);
         });
-        editor.querySelector('#save-change').addEventListener('click', async () => {
-          const context = editorContext.snapshot();
-          if (!context || !(await previewChange(context)) || !editorContext.isCurrent(context)) return;
-          const saveRequest = PamHistory.saveRequest(context, crypto.randomUUID());
-          const response = await fetch(saveRequest.url, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(saveRequest.body)});
-          const message = editor.querySelector('#editor-message');
-          if (!editorContext.isCurrent(context)) return;
-          if (!response.ok) { const failure = await response.json(); if (!editorContext.isCurrent(context)) return; message.className = 'error'; message.textContent = failure.detail; return; }
-          message.className = '';
-          message.textContent = 'Document saved.';
-          await loadDocument(context.path);
-        });
+        editor.querySelector('#save-change').addEventListener('click', saveDocument);
         await refresh();
       });
     </script>

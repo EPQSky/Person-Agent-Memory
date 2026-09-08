@@ -542,6 +542,6 @@ def test_management_interface_exposes_candidate_governance_controls(tmp_path: Pa
     with TestClient(create_app(Settings(state_dir=tmp_path))) as client:
         page = client.get("/")
     assert page.status_code == 200
-    assert "Candidate memories" in page.text
+    assert "候选审核" in page.text
     assert 'id="candidate-approve"' in page.text
     assert 'id="candidate-reject"' in page.text

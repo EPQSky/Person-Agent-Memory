@@ -200,7 +200,8 @@ with urllib.request.urlopen("http://127.0.0.1:7331/", timeout=2) as response:
     assert response.status == 200
     login_shell = response.read()
     assert b"Personal Agent Memory" in login_shell
-    assert b"Candidate memories" in login_shell
+    assert "个人智能体记忆".encode() in login_shell
+    assert "候选审核".encode() in login_shell
     assert key.encode() not in login_shell
     fingerprint = f"sha256:{hashlib.sha256(key.encode()).hexdigest()[:12]}".encode()
     assert fingerprint not in login_shell
@@ -3287,22 +3288,51 @@ try:
     browser.find_element(By.ID, "key").send_keys(key)
     browser.find_element(By.ID, "connect").click()
     wait.until(lambda driver: driver.find_elements(By.ID, "candidate-title"))
-    browser.execute_script(
-        "const select = document.querySelector('[aria-label=\"Memory library to edit\"]'); "
-        "select.value = arguments[0]; select.dispatchEvent(new Event('change'));",
-        browser_ambiguous_id,
+    documents_navigation = wait.until(
+        lambda driver: next(
+            (
+                item
+                for item in driver.find_elements(By.CSS_SELECTOR, '[data-view="documents"]')
+                if item.is_displayed()
+            ),
+            None,
+        )
     )
+    documents_navigation.click()
+    def open_browser_view(name: str) -> None:
+        navigation = next(
+            item
+            for item in browser.find_elements(By.CSS_SELECTOR, f'[data-view="{name}"]')
+            if item.is_displayed()
+        )
+        navigation.click()
+
+    def accept_browser_confirmation() -> None:
+        dialog = wait.until(lambda driver: driver.find_element(By.CSS_SELECTOR, "dialog[open]"))
+        dialog.find_element(By.ID, "confirm-accept").click()
+
+    def select_browser_library(library_id: str | None = None) -> None:
+        browser.execute_script(
+            "const select = document.querySelector("
+            "'[data-view-panel=\"documents\"] select[aria-label=\"要编辑的记忆库\"]'"
+            "); "
+            "if (arguments[0] !== null) select.value = arguments[0]; "
+            "select.dispatchEvent(new Event('change'));",
+            library_id,
+        )
+
+    select_browser_library(browser_ambiguous_id)
     wait.until(
         lambda driver: driver.execute_script(
             "return [...document.querySelectorAll('.candidate-list button')]"
             ".some(item => item.textContent.includes('one.md') && "
-            "item.textContent.includes('move'));"
+            "item.textContent.includes('移动'));"
         )
     )
     browser.execute_script(
         "const item = [...document.querySelectorAll('.candidate-list button')]"
         ".find(item => item.textContent.includes('one.md') && "
-        "item.textContent.includes('move')); item.click();"
+        "item.textContent.includes('移动')); item.click();"
     )
     browser_import_button = browser.find_element(By.ID, "reconciliation-import")
     browser_restore_button = browser.find_element(By.ID, "reconciliation-restore")
@@ -3315,19 +3345,16 @@ try:
     wait.until(lambda _driver: browser_import_button.is_enabled())
     wait.until(lambda _driver: browser_restore_button.is_enabled())
     browser_restore_button.click()
+    accept_browser_confirmation()
     wait.until(
-        lambda driver: "Platform version restored"
+        lambda driver: "已恢复平台版本"
         in driver.find_element(By.ID, "reconciliation-message").text
     )
     assert (browser_ambiguous_library / "one.md").read_text(
         encoding="utf-8"
     ) == ambiguous_content
     assert not (browser_ambiguous_library / "moved-a.md").exists()
-    browser.execute_script(
-        "const select = document.querySelector('[aria-label=\"Memory library to edit\"]'); "
-        "select.value = arguments[0]; select.dispatchEvent(new Event('change'));",
-        history_id,
-    )
+    select_browser_library(history_id)
     wait.until(
         lambda driver: driver.execute_script(
             "return [...document.querySelectorAll('.candidate-list button')]"
@@ -3336,15 +3363,16 @@ try:
     )
     browser.execute_script(
         "const item = [...document.querySelectorAll('.candidate-list button')]"
-        ".find(item => item.textContent.includes('decisions.md') && "
-        "item.textContent.includes('edit')); item.click();"
+            ".find(item => item.textContent.includes('decisions.md') && "
+            "item.textContent.includes('编辑')); item.click();"
     )
     assert "BrowserOutOfBandConflict" in browser.find_element(
         By.ID, "reconciliation-external"
     ).text
     browser.find_element(By.ID, "reconciliation-restore").click()
+    accept_browser_confirmation()
     wait.until(
-        lambda driver: "Platform version restored"
+        lambda driver: "已恢复平台版本"
         in driver.find_element(By.ID, "reconciliation-message").text
     )
     browser_restore_commit = request(
@@ -3384,15 +3412,12 @@ try:
         assert history_document.read_text(encoding="utf-8").endswith(
             "AKIAIOSFODNN7EXAMPLE\n"
         )
-    browser.execute_script(
-        "const select = document.querySelector('[aria-label=\"Memory library to edit\"]'); "
-        "select.dispatchEvent(new Event('change'));"
-    )
+    select_browser_library()
     wait.until(
         lambda driver: driver.execute_script(
             "const item = [...document.querySelectorAll('.candidate-list button')]"
             ".find(item => item.textContent.includes('decisions.md') && "
-            "item.textContent.includes('edit')); "
+            "item.textContent.includes('编辑')); "
             "if (!item) return false; item.click(); return true;"
         )
     )
@@ -3403,8 +3428,9 @@ try:
     final_input.send_keys("# Docker decision\n\nBrowserSafeReplacement.\n")
     wait.until(lambda _driver: import_button.is_enabled())
     import_button.click()
+    accept_browser_confirmation()
     wait.until(
-        lambda driver: "External version imported"
+        lambda driver: "已导入外部版本"
         in driver.find_element(By.ID, "reconciliation-message").text
     )
     assert history_document.read_text(encoding="utf-8").endswith(
@@ -3423,6 +3449,7 @@ try:
     discard_record = next(
         record for record in unresolved_sensitive if record["disposition"] == "discarded"
     )
+    open_browser_view("sensitive")
 
     def click_sensitive_record(record: dict[str, object]) -> bool:
         selector = f'#sensitive-quarantine-list [data-record-id="{record["id"]}"]'
@@ -3437,7 +3464,7 @@ try:
     wait.until(lambda _: click_sensitive_record(acknowledge_record))
     sensitive_detail = browser.find_element(By.ID, "sensitive-quarantine-detail")
     assert docker_secret not in sensitive_detail.text
-    assert "Sensitive content withheld" in sensitive_detail.text
+    assert "敏感内容已隐去" in sensitive_detail.text
     browser.find_element(By.ID, "sensitive-acknowledge").click()
     wait.until(
         lambda _: (
@@ -3460,7 +3487,7 @@ try:
         lambda driver: bool(
             driver.execute_script(
                 "const item = document.querySelector(arguments[0]); "
-                "return item && item.textContent.includes('acknowledge');",
+                "return item && item.textContent.includes('已知悉');",
                 acknowledge_selector,
             )
         )
@@ -3469,10 +3496,11 @@ try:
     wait.until(lambda _: click_sensitive_record(discard_record))
     wait.until(
         lambda driver: (
-            "discarded \u00b7 unresolved" in driver.find_element(By.ID, "sensitive-title").text
+            "已丢弃 \u00b7 未处理" in driver.find_element(By.ID, "sensitive-title").text
         )
     )
     browser.find_element(By.ID, "sensitive-discard").click()
+    accept_browser_confirmation()
     wait.until(
         lambda _: (
             next(
@@ -3487,57 +3515,68 @@ try:
         )
     )
 
+    def select_candidate(candidate_id: str) -> None:
+        item = wait.until(
+            lambda driver: next(
+                (
+                    button
+                    for button in driver.find_elements(
+                        By.CSS_SELECTOR, "nav.candidate-list button"
+                    )
+                    if candidate_id in button.text
+                ),
+                None,
+            )
+        )
+        item.click()
+
     def submit_candidate(
         candidate_id: str,
         body: str | None,
         operator: str,
         reason: str,
         action: str,
-    ) -> bool:
-        return bool(
-            browser.execute_script(
-                "const item = [...document.querySelectorAll('nav.candidate-list button')]"
-                ".find((button) => button.textContent.includes(arguments[0])); "
-                "if (!item) return false; item.click(); "
-                "const body = document.querySelector('#candidate-body'); "
-                "const operator = document.querySelector('#candidate-operator'); "
-                "const reason = document.querySelector('#candidate-reason'); "
-                "const action = document.querySelector(`#candidate-${arguments[4]}`); "
-                "if (!action || action.disabled) return false; "
-                "if (arguments[1] !== null) body.value = arguments[1]; "
-                "operator.value = arguments[2]; reason.value = arguments[3]; "
-                "action.click(); return true;",
-                candidate_id,
-                body,
-                operator,
-                reason,
-                action,
+    ) -> None:
+        select_candidate(candidate_id)
+        action_button = wait.until(
+            lambda driver: (
+                button
+                if (button := driver.find_element(By.ID, f"candidate-{action}")).is_enabled()
+                else False
             )
         )
-
-    approve_id = str(browser_approve_candidate["id"])
-    wait.until(
-        lambda _: submit_candidate(
-            approve_id,
-            "# Browser approved\n\nThe Web approval fixture uses Cobalt Canary.\n",
-            "browser-user",
-            "Edited through the Web page",
-            "save",
+        browser.execute_script(
+            "const body = document.querySelector('#candidate-body'); "
+            "if (arguments[0] !== null) body.value = arguments[0]; "
+            "document.querySelector('#candidate-operator').value = arguments[1]; "
+            "document.querySelector('#candidate-reason').value = arguments[2]; "
+            "arguments[3].click();",
+            body,
+            operator,
+            reason,
+            action_button,
         )
+
+    open_browser_view("candidates")
+    approve_id = str(browser_approve_candidate["id"])
+    submit_candidate(
+        approve_id,
+        "# Browser approved\n\nThe Web approval fixture uses Cobalt Canary.\n",
+        "browser-user",
+        "Edited through the Web page",
+        "save",
     )
     wait.until(
         lambda _: request(f"http://127.0.0.1:7331/api/v1/candidates/{approve_id}", key)[1][
             "body"
         ].endswith("The Web approval fixture uses Cobalt Canary.\n")
     )
-    wait.until(
-        lambda _: submit_candidate(
-            approve_id,
-            None,
-            "browser-user",
-            "Approved through the Web page",
-            "approve",
-        )
+    submit_candidate(
+        approve_id,
+        None,
+        "browser-user",
+        "Approved through the Web page",
+        "approve",
     )
     wait.until(
         lambda _: (
@@ -3547,14 +3586,12 @@ try:
     )
 
     reject_id = str(browser_reject_candidate["id"])
-    wait.until(
-        lambda _: submit_candidate(
-            reject_id,
-            None,
-            "browser-user",
-            "Rejected through the Web page",
-            "reject",
-        )
+    submit_candidate(
+        reject_id,
+        None,
+        "browser-user",
+        "Rejected through the Web page",
+        "reject",
     )
     wait.until(
         lambda _: (
@@ -3565,23 +3602,21 @@ try:
 
     browser_conflict_id = str(browser_conflict_candidate["id"])
 
-    def resolve_browser_conflict() -> bool:
-        return bool(
-            browser.execute_script(
-                "const item = [...document.querySelectorAll('nav.candidate-list button')]"
-                ".find((button) => button.textContent.includes(arguments[0])); "
-                "if (!item) return false; item.click(); "
-                "const action = document.querySelector('#candidate-resolve'); "
-                "if (!action || action.disabled) return false; "
-                "document.querySelector('#candidate-operator').value = 'browser-user'; "
-                "document.querySelector('#candidate-reason').value = 'Keep current through Web'; "
-                "document.querySelector('#candidate-resolution').value = 'keep'; "
-                "action.click(); return true;",
-                browser_conflict_id,
-            )
+    select_candidate(browser_conflict_id)
+    resolve_button = wait.until(
+        lambda driver: (
+            button
+            if (button := driver.find_element(By.ID, "candidate-resolve")).is_enabled()
+            else False
         )
-
-    wait.until(lambda _: resolve_browser_conflict())
+    )
+    browser.execute_script(
+        "document.querySelector('#candidate-operator').value = 'browser-user'; "
+        "document.querySelector('#candidate-reason').value = 'Keep current through Web'; "
+        "document.querySelector('#candidate-resolution').value = 'keep'; "
+        "arguments[0].click();",
+        resolve_button,
+    )
     wait.until(
         lambda _: (
             request(f"http://127.0.0.1:7331/api/v1/candidates/{browser_conflict_id}", key)[1][
