@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 import uvicorn
 
+from personal_agent_memory import __version__
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import ConfigurationError, Settings
 from personal_agent_memory.model_client import ModelEndpoint
@@ -13,8 +14,21 @@ from personal_agent_memory.model_client import ModelEndpoint
 cli = typer.Typer(no_args_is_help=True, add_completion=False)
 
 
+def show_version(value: bool) -> None:
+    if value:
+        typer.echo(__version__)
+        raise typer.Exit
+
+
 @cli.callback()
-def root() -> None:
+def root(
+    version: bool = typer.Option(  # noqa: B008
+        False,
+        "--version",
+        callback=show_version,
+        is_eager=True,
+    ),
+) -> None:
     """Manage the local Personal Agent Memory daemon."""
 
 

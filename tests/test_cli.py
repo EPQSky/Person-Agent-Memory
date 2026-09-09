@@ -7,6 +7,13 @@ from typer.testing import CliRunner
 from personal_agent_memory.cli import cli, ensure_port_available
 
 
+def test_cli_reports_release_version() -> None:
+    result = CliRunner().invoke(cli, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.output == "0.1.0\n"
+
+
 def test_serve_requires_state_directory() -> None:
     result = CliRunner().invoke(cli, ["serve"])
     assert result.exit_code != 0
