@@ -44,7 +44,17 @@ done
 . /etc/os-release
 [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" =~ ^(22\.04|24\.04)$ ]] ||
   skip "Ubuntu 22.04 or 24.04 is required for this release acceptance entry"
-for command in uv git node codex systemctl; do
+
+# Keep the acceptance input auditable: scripts and package/plugin manifests must come from one
+# release checkout. The GitHub Release source archive is expected to contain these same files.
+for release_asset in install.sh uninstall.sh pyproject.toml uv.lock \
+  plugins/personal-agent-memory/.codex-plugin/plugin.json; do
+  [[ -f "$repo_root/$release_asset" ]] ||
+    skip "release asset is missing from the checkout: $release_asset"
+done
+[[ -x "$repo_root/install.sh" && -x "$repo_root/uninstall.sh" ]] ||
+  skip "release installer and uninstaller must be executable"
+for command in git node codex systemctl; do
   command -v "$command" >/dev/null || skip "required command is unavailable: $command"
 done
 target_version="$("$python_command" - "$repo_root/pyproject.toml" <<'PY'
@@ -74,6 +84,13 @@ case ":$PATH:" in
   *":$managed_bin_dir:"*) ;;
   *) PATH="$managed_bin_dir:$PATH"; export PATH ;;
 esac
+uv_initially_available=false
+command -v uv >/dev/null 2>&1 && uv_initially_available=true
+if [[ "${PAM_INSTALL_ACCEPTANCE_MISSING_UV:-}" == "1" &&
+  "${PAM_INSTALL_ACCEPTANCE_SCENARIO:-all}" == "all" &&
+  "$uv_initially_available" == true ]]; then
+  skip "PAM_INSTALL_ACCEPTANCE_MISSING_UV=1 requires uv to be absent before the acceptance run"
+fi
 
 if $check_only; then
   printf 'real Linux installer acceptance prerequisites satisfied\n'
@@ -153,6 +170,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 "$old_release/install.sh" "${installer_arguments[@]}" >"$work_root/install-old.out"
+if [[ "${PAM_INSTALL_ACCEPTANCE_MISSING_UV:-}" == "1" &&
+  "${PAM_INSTALL_ACCEPTANCE_SCENARIO:-all}" == "normal" ]]; then
+  [[ "$uv_initially_available" == false ]]
+  command -v uv >/dev/null 2>&1
+  printf 'missing uv bootstrap acceptance passed\n' >"$work_root/uv-bootstrap.out"
+fi
 systemctl --user is-enabled "$service_name" | grep -qx enabled
 systemctl --user is-active "$service_name" | grep -qx active
 uv tool list | grep -Eq "^personal-agent-memory v${old_version//./\\.}$"

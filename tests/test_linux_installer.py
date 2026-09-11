@@ -4167,3 +4167,52 @@ def test_real_lifecycle_verifier_selects_supported_versioned_python(
         f"python3 {version_check}",
         f"python3.11 {version_check}",
     ]
+
+
+def test_linux_release_contract_documents_assets_and_lifecycle() -> None:
+    release = (ROOT / "docs/release.md").read_text(encoding="utf-8")
+    required_sections = (
+        "## Support Matrix",
+        "## Release Assets",
+        "## Automatic Installation",
+        "## Manual `uv` Installation",
+        "## Service Management",
+        "## Upgrade and Reinstall",
+        "## Uninstall",
+        "## Release Verification",
+        "## Backup Responsibility",
+        "## Known Limitations",
+        "## Explicit Exclusions",
+    )
+    for section in required_sections:
+        assert section in release
+    for asset in ("install.sh", "uninstall.sh", "source archive"):
+        assert asset in release
+    for phrase in (
+        "Ubuntu 22.04",
+        "Ubuntu 24.04",
+        "systemd linger",
+        "never opens a browser",
+        "never require `sudo`",
+        "**never** removes the",
+        "RPM",
+        "AppImage",
+        "automatic background updates",
+    ):
+        assert phrase in release
+    assert "PAM_INSTALL_ACCEPTANCE_DEDICATED_USER=1" in release
+    assert "PAM_INSTALL_ACCEPTANCE_MISSING_UV=1" in release
+    assert "personal-agent-memory-uninstall --purge" in release
+
+
+def test_linux_lifecycle_verifier_checks_reviewable_release_assets() -> None:
+    script = (ROOT / "scripts/verify-linux-installer.sh").read_text(encoding="utf-8")
+    for asset in (
+        "install.sh uninstall.sh pyproject.toml uv.lock",
+        "plugins/personal-agent-memory/.codex-plugin/plugin.json",
+        '[[ -x "$repo_root/install.sh" && -x "$repo_root/uninstall.sh" ]]',
+        "release asset is missing from the checkout",
+        "PAM_INSTALL_ACCEPTANCE_MISSING_UV",
+        "missing uv bootstrap acceptance passed",
+    ):
+        assert asset in script
