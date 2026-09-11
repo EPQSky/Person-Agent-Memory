@@ -69,11 +69,36 @@ systemctl --user show-environment >/dev/null 2>&1 || skip "a working systemd use
 [[ ! -e "$codex_home" ]] || skip "Codex configuration already exists: $codex_home"
 command -v personal-agent-memory >/dev/null 2>&1 &&
   skip "Personal Agent Memory command already exists for this user"
+managed_bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
+case ":$PATH:" in
+  *":$managed_bin_dir:"*) ;;
+  *) PATH="$managed_bin_dir:$PATH"; export PATH ;;
+esac
 
 if $check_only; then
   printf 'real Linux installer acceptance prerequisites satisfied\n'
   exit 0
 fi
+
+acceptance_scenario=${PAM_INSTALL_ACCEPTANCE_SCENARIO:-all}
+case "$acceptance_scenario" in
+  all)
+    repo_status_before="$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)"
+    repo_remotes_before="$(git -C "$repo_root" remote -v)"
+    PAM_INSTALL_ACCEPTANCE_SCENARIO=normal "$0"
+    PAM_INSTALL_ACCEPTANCE_SCENARIO=purge "$0"
+    [[ "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)" == \
+      "$repo_status_before" ]]
+    [[ "$(git -C "$repo_root" remote -v)" == "$repo_remotes_before" ]]
+    printf 'real Linux installer acceptance passed\n'
+    exit 0
+    ;;
+  normal|purge) ;;
+  *)
+    printf 'Unknown internal acceptance scenario: %s\n' "$acceptance_scenario" >&2
+    exit 2
+    ;;
+esac
 
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/pam-linux-installer.XXXXXX")"
 repo_status_before="$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)"
@@ -275,32 +300,79 @@ for required in (
 output.write_text(json.dumps(snapshot, sort_keys=True), encoding="utf-8")
 PY
 
-"$repo_root/install.sh" --adopt-marketplace >"$work_root/install-upgrade.out"
+if [[ "$acceptance_scenario" == "normal" ]]; then
+  "$repo_root/install.sh" --adopt-marketplace >"$work_root/install-upgrade.out"
+else
+  codex plugin remove personal-agent-memory@personal-agent-memory --json >/dev/null
+  codex plugin marketplace remove personal-agent-memory --json >/dev/null
+  "$repo_root/install.sh" >"$work_root/install-upgrade.out"
+fi
 "$repo_root/install.sh" >"$work_root/install-reinstall.out"
 systemctl --user is-enabled "$service_name" | grep -qx enabled
 systemctl --user is-active "$service_name" | grep -qx active
 [[ "$(personal-agent-memory --version)" == "$target_version" ]]
 cmp "$work_root/api-key.before" "$state_dir/api-key"
 cmp "$work_root/memory.before" "$memory_path/memory.md"
-"$python_command" - "$install_config_path" "$state_dir" "$library_root" "$target_version" \
-  "$repo_root" "$old_release" <<'PY'
+mapfile -t managed_paths < <("$python_command" - "$install_config_path" \
+  "$state_dir" "$library_root" "$target_version" \
+  "$repo_root" "$old_release" "$(command -v uv)" "$(command -v personal-agent-memory)" \
+  "$unit_path" "$codex_home" "$acceptance_scenario" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert metadata == {
+uninstall_sha256 = metadata.pop("uninstall_sha256")
+uninstall_path = Path(metadata.pop("uninstall_path"))
+unit_sha256 = metadata.pop("unit_sha256")
+plugin_registration_source = Path(metadata.pop("plugin_registration_source"))
+plugin_install_path = Path(metadata.pop("plugin_install_path"))
+plugin_tree_sha256 = metadata.pop("plugin_tree_sha256")
+scenario = sys.argv[11]
+expected = {
     "schema_version": 1,
     "state_dir": sys.argv[2],
     "library_root": sys.argv[3],
     "library_root_ownership": "user-content-never-delete",
+    "state_dir_ownership": "legacy-managed-contents",
     "installed_version": sys.argv[4],
-    "marketplace_ownership": "preexisting",
+    "marketplace_ownership": (
+        "preexisting" if scenario == "normal" else "installer-managed"
+    ),
     "marketplace_source": sys.argv[5],
-    "marketplace_previous_source": sys.argv[6],
     "marketplace_update_pending": False,
+    "uninstall_ownership": "installer-managed",
+    "uv_path": sys.argv[7],
+    "daemon_path": sys.argv[8],
+    "unit_path": sys.argv[9],
+    "codex_home": sys.argv[10],
+    "plugin_id": "personal-agent-memory@personal-agent-memory",
+    "plugin_version": sys.argv[4],
 }
+if scenario == "normal":
+    expected["marketplace_previous_source"] = sys.argv[6]
+assert metadata == expected
+assert "state_ownership_token" not in metadata
+assert len(uninstall_sha256) == 64
+assert all(character in "0123456789abcdef" for character in uninstall_sha256)
+assert len(unit_sha256) == 64
+assert all(character in "0123456789abcdef" for character in unit_sha256)
+assert len(plugin_tree_sha256) == 64
+assert all(character in "0123456789abcdef" for character in plugin_tree_sha256)
+assert uninstall_path.is_file()
+assert uninstall_path.name == "personal-agent-memory-uninstall"
+assert plugin_registration_source.is_dir()
+assert plugin_install_path.is_dir()
+print(uninstall_path)
+print(metadata["uv_path"])
+print(plugin_registration_source)
+print(plugin_install_path)
 PY
+)
+uninstall_command=${managed_paths[0]}
+managed_uv_path=${managed_paths[1]}
+managed_plugin_registration_source=${managed_paths[2]}
+managed_plugin_install_path=${managed_paths[3]}
 
 codex plugin list --json >"$work_root/plugins.json"
 plugin_root="$("$python_command" - "$work_root/plugins.json" "$target_version" <<'PY'
@@ -320,8 +392,11 @@ assert Path(installed_path).is_dir()
 print(installed_path)
 PY
 )"
+[[ "$(readlink -f "$plugin_root")" == \
+  "$(readlink -f "$managed_plugin_registration_source")" ]]
 
-"$python_command" - "$project_root" <<'PY' | node "$plugin_root/scripts/recall.mjs" >"$work_root/hook.out"
+"$python_command" - "$project_root" <<'PY' | \
+  node "$managed_plugin_install_path/scripts/recall.mjs" >"$work_root/hook.out"
 import json
 import sys
 
@@ -371,6 +446,80 @@ print(json.dumps({
 PY
 test ! -s "$work_root/fail-open.out"
 
+if [[ "$acceptance_scenario" == "normal" ]]; then
+  "$uninstall_command" >"$work_root/uninstall.out"
+else
+  "$uninstall_command" --purge >"$work_root/purge.out"
+fi
+! systemctl --user is-enabled "$service_name" >/dev/null 2>&1
+! systemctl --user is-active "$service_name" >/dev/null 2>&1
+[[ ! -e "$unit_path" ]]
+! command -v personal-agent-memory >/dev/null 2>&1
+[[ ! -e "$uninstall_command" ]]
+if [[ "$acceptance_scenario" == "normal" ]]; then
+  [[ -e "$state_dir/api-key" ]]
+  [[ -e "$install_config_path" ]]
+  cmp "$work_root/api-key.before" "$state_dir/api-key"
+  "$python_command" - "$state_dir/platform.sqlite3" \
+    "$work_root/state.after-uninstall.json" <<'PY'
+import json
+import sqlite3
+from pathlib import Path
+import sys
+
+database, output = map(Path, sys.argv[1:])
+tables = (
+    "memory_libraries",
+    "project_bindings",
+    "candidate_memories",
+    "candidate_audit",
+    "capture_inbox",
+)
+with sqlite3.connect(database) as connection:
+    snapshot = {
+        table: connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
+        for table in tables
+    }
+output.write_text(json.dumps(snapshot, sort_keys=True), encoding="utf-8")
+PY
+  cmp "$work_root/state.before.json" "$work_root/state.after-uninstall.json"
+else
+  [[ ! -e "$state_dir" ]]
+  [[ ! -e "$install_config_path" ]]
+fi
+[[ -e "$library_root" ]]
+cmp "$work_root/memory.before" "$memory_path/memory.md"
+codex plugin list --json >"$work_root/plugins-after-uninstall.json"
+codex plugin marketplace list --json >"$work_root/marketplaces-after-uninstall.json"
+"$managed_uv_path" tool list >"$work_root/tools-after-uninstall.txt"
+"$python_command" - "$acceptance_scenario" \
+  "$work_root/plugins-after-uninstall.json" \
+  "$work_root/marketplaces-after-uninstall.json" \
+  "$work_root/tools-after-uninstall.txt" <<'PY'
+# lifecycle-post-uninstall-contract
+import json
+from pathlib import Path
+import sys
+
+scenario = sys.argv[1]
+installed = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))["installed"]
+assert not any(
+    item.get("pluginId") == "personal-agent-memory@personal-agent-memory"
+    for item in installed
+)
+marketplaces = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))["marketplaces"]
+marketplace_count = sum(
+    item.get("name") == "personal-agent-memory" for item in marketplaces
+)
+assert marketplace_count == (1 if scenario == "normal" else 0)
+tools = Path(sys.argv[4]).read_text(encoding="utf-8").splitlines()
+assert not any(
+    line.split(maxsplit=1)[0] == "personal-agent-memory"
+    for line in tools
+    if line.split()
+)
+PY
+
 [[ "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)" == "$repo_status_before" ]]
 [[ "$(git -C "$repo_root" remote -v)" == "$repo_remotes_before" ]]
-printf 'real Linux installer acceptance passed\n'
+printf 'real Linux installer %s acceptance scenario passed\n' "$acceptance_scenario"
