@@ -47,16 +47,55 @@ class ModelEndpoint:
             object.__setattr__(self, "api_key_file", self.api_key_file.expanduser().resolve())
 
 
+@dataclass(frozen=True, slots=True)
+class ModelTaskProfile:
+    """Generation settings for one structured extraction task."""
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+    max_tokens: int = 2048
+    top_k: int | None = None
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.temperature <= 2:
+            raise ValueError("model temperature must be between zero and two")
+        if not 0 < self.top_p <= 1:
+            raise ValueError("model top_p must be greater than zero and at most one")
+        if self.max_tokens < 1:
+            raise ValueError("model output limit must be positive")
+        if self.top_k is not None and self.top_k < 1:
+            raise ValueError("model top_k must be positive when configured")
+
+    def payload(self) -> dict[str, int | float]:
+        payload: dict[str, int | float] = {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": self.max_tokens,
+        }
+        if self.top_k is not None:
+            payload["top_k"] = self.top_k
+        return payload
+
+
+DEFAULT_GRAPH_TASK_PROFILE = ModelTaskProfile(max_tokens=4096)
+DEFAULT_CANDIDATE_TASK_PROFILE = ModelTaskProfile(max_tokens=2048)
+
+
 class OpenAICompatibleClient:
     def __init__(
         self,
         embedding: ModelEndpoint | None,
         reranker: ModelEndpoint | None,
         graph: ModelEndpoint | None = None,
+        *,
+        graph_profile: ModelTaskProfile | None = None,
+        candidate_profile: ModelTaskProfile | None = None,
     ) -> None:
         self.embedding = embedding
         self.reranker = reranker
         self.graph = graph
+        self.graph_profile = graph_profile or DEFAULT_GRAPH_TASK_PROFILE
+        self.candidate_profile = candidate_profile or DEFAULT_CANDIDATE_TASK_PROFILE
         self._limits = {
             "embedding": threading.BoundedSemaphore(
                 embedding.max_concurrency if embedding is not None else 1
@@ -153,6 +192,7 @@ class OpenAICompatibleClient:
                     {"role": "user", "content": document},
                 ],
                 "response_format": {"type": "json_object"},
+                **self.graph_profile.payload(),
             },
         )
         choices = response.get("choices")
@@ -199,6 +239,7 @@ class OpenAICompatibleClient:
                     {"role": "user", "content": conversation},
                 ],
                 "response_format": {"type": "json_object"},
+                **self.candidate_profile.payload(),
             },
         )
         choices = response.get("choices")
