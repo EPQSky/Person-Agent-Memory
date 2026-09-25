@@ -1,10 +1,62 @@
 # Personal Agent Memory
 
-Local-first memory platform for a single user and local Codex sessions.
+面向单个用户和本地 Codex 会话的本地优先记忆系统。
 
-## Run
+## 安装到用户目录
 
-Python 3.11 or newer, Git, and `uv` are required.
+项目内的 `.venv` 只用于开发和测试，不等于完成用户级安装。要把服务、数据目录、
+用户级 systemd 服务和 Codex 插件安装到当前用户目录，请在本项目目录执行：
+
+```bash
+chmod +x install.sh uninstall.sh
+./install.sh
+```
+
+安装器不使用 `sudo`，也不写入系统级服务。默认位置如下：
+
+- 平台状态和 API 密钥：`~/.local/share/personal-agent-memory`
+- 记忆库根目录：`~/memory-libraries`
+- 安装元数据：`~/.config/personal-agent-memory/install.json`
+- 用户级服务：`~/.config/systemd/user/personal-agent-memory.service`
+- 用户级可执行文件：`~/.local/bin` 或 `uv` 的工具 bin 目录
+
+安装完成后，服务由当前用户的 `systemd --user` 管理，并监听：
+`http://127.0.0.1:7331`。
+
+首次启动会生成权限为 `0600` 的 API 密钥：
+
+```bash
+cat ~/.local/share/personal-agent-memory/api-key
+```
+
+安装器不会自动打开浏览器，也不会打印 API 密钥。打开
+`http://127.0.0.1:7331` 后输入该密钥即可查看受保护的服务状态。
+
+自定义目录：
+
+```bash
+./install.sh \
+  --state-dir "$HOME/data/personal-agent-memory" \
+  --library-root "$HOME/documents/memory"
+```
+
+记忆库目录属于用户数据，安装、升级和卸载都不会删除它。卸载命令：
+
+```bash
+personal-agent-memory-uninstall
+```
+
+如需同时删除平台状态和安装元数据：
+
+```bash
+personal-agent-memory-uninstall --purge
+```
+
+`--purge` 仍然不会删除默认或自定义的记忆库目录。
+
+## 开发环境运行
+
+开发和测试需要 Python 3.11 或更高版本、Git 和 `uv`：
 
 ```bash
 uv sync --all-extras
@@ -13,103 +65,121 @@ uv run personal-agent-memory serve \
   --library-root ~/memory-libraries
 ```
 
-Open `http://127.0.0.1:7331` to load the public login shell, then enter the API key
-to retrieve protected service status. The login shell contains no service status or
-key material. The first startup writes the generated API key to
-`~/.local/share/personal-agent-memory/api-key` with mode `0600`; the key is kept only
-in the page's current input value and request header. The daemon rejects non-loopback
-listen addresses. Repeat `--library-root` to allow additional local directory trees;
-registration resolves symlinks and rejects paths outside those explicit boundaries.
-Existing Markdown is indexed at registration without rewriting the files. The scanner skips
-version-control, dependency, build, cache, virtual-environment and platform-state directories.
-Symbolic links and non-regular files are intentionally excluded. A Markdown file that cannot be
-read completely as UTF-8, or any transient filesystem inspection failure, makes the scan fail
-without removing prior index entries. Use the authenticated ignore-rule and scan endpoints to apply
-library-specific exclusions and incrementally reconcile additions, changes and deletions:
-`GET`/`PUT /api/v1/libraries/{library_id}/ignore-rules` and
-`POST /api/v1/libraries/{library_id}/scan`.
+开发环境命令不会创建用户级 systemd 服务，也不会自动安装全局 Codex 插件。
 
-Release-style native installation, global Codex plugin setup, model configuration, backup
-responsibilities, and MVP limitations are documented in `docs/release.md`.
+服务只允许监听回环地址。可以重复指定 `--library-root` 来允许多个本地目录树。
+注册时会索引已有 Markdown 文件，但不会改写源文件。扫描会跳过版本控制、依赖、
+构建产物、缓存、虚拟环境和平台状态目录，也会排除符号链接和非普通文件。
 
-Direct keyword search is available through `POST /api/v1/search`, `POST /mcp/search`, and the Web
-interface. Both APIs accept `cwd`, `query`, and an optional `limit`; the daemon resolves `cwd`
-through explicit project bindings and searches only that project's memory library. Unbound
-working directories return an explicit `unbound` response with no results.
+无法完整按 UTF-8 读取的 Markdown 文件，或扫描期间发生的临时文件系统错误，会使
+本次扫描失败，但不会删除已有索引。可以使用以下接口增量处理新增、修改和删除：
 
-The Web interface can browse indexed Markdown, edit source, render a sandboxed preview, inspect a
-save diff, and audit or restore local history. Equivalent authenticated REST endpoints live under
-`/api/v1/libraries/{library_id}/documents`, `/document`, and `/history`. Every edit or restore needs
-an expected source version and an idempotent operation identifier, replaces one document atomically,
-reindexes it, and creates one local commit with the fixed `Personal Agent Memory` service identity.
-Actor type and operation source are recorded separately in platform state.
+```text
+GET/PUT /api/v1/libraries/{library_id}/ignore-rules
+POST     /api/v1/libraries/{library_id}/scan
+```
 
-By default each library uses a bare sidecar repository below the platform state directory, with the
-memory directory only as its work tree; no nested `.git`, remote, pull, or push is created. An existing
-dedicated repository is reused only when registration explicitly sends `reuse_existing_git: true`.
-History commits are built with an isolated temporary Git index and track only Markdown, the portable
-library manifest, and reserved tombstone paths, so a containing project repository's index, branch,
-history, and unrelated working tree remain untouched. MCP exposes search and status but no direct
-document edit or history-restore operation.
+## 搜索和 Web 界面
 
-MCP clients can create candidate memories with `POST /mcp/candidates` and inspect them with
-`GET /mcp/candidates` or `GET /mcp/candidates/{candidate_id}`. A candidate carries a stable ID,
-allowed memory type, Markdown body, provenance references, creator, timestamp, and governance
-status, but it is excluded from text, vector, graph, and Codex retrieval. The Web interface is the
-only governance surface: it records an operator and reason when editing, approving, or rejecting.
-Approval publishes provenance-bearing Markdown through the same coordinator used for authoritative
-edits, refreshes direct search immediately, and creates one idempotent Git commit. Rejection keeps
-the SQLite audit record without creating any authoritative or derived projection.
+关键词搜索可通过以下接口或 Web 界面使用：
 
-Embedding and reranking are independently optional OpenAI-compatible services configured with
-`--embedding-url` and `--reranker-url`. API keys are read only from the corresponding
-`--embedding-api-key-file` and `--reranker-api-key-file`; they are not stored in a library, Git, or
-response payload. Vector data is a rebuildable SQLite projection. A scan invalidates vectors for
-changed chunks and schedules a bounded background rebuild. Search merges and deduplicates full-text
-and semantic candidates, while embedding failures retain full-text results and reranker failures
-retain the pre-rerank order with an explicit degradation marker. Model calls have configurable
-timeouts, concurrency limits, and at most three retries.
+```text
+POST /api/v1/search
+POST /mcp/search
+```
 
-Graph projection uses the pinned `JiuwenMemory==0.1.2` graph object contract through a
-project-owned adapter and stores each library in its own local Milvus Lite file under platform
-state. Configure its independent OpenAI-compatible extraction model with `--graph-url`,
-`--graph-model`, and optionally `--graph-api-key-file`. Published Markdown is projected
-asynchronously; every graph row carries the authoritative document identifier and source version.
-Graph expansion begins only after direct Markdown hits, uses one hop by default, and accepts at
-most two hops. Search validates every expanded result against the current SQLite Markdown index,
-so edits and deletions invalidate stale graph data immediately even while rebuilding. Graph or LLM
-failure leaves direct Markdown retrieval available and reports `graph_unavailable`.
+两个 API 都接受 `cwd`、`query` 和可选的 `limit`。服务会通过显式项目绑定解析
+`cwd`，只搜索该项目对应的记忆库。未绑定的工作目录会返回 `unbound`，不会返回
+搜索内容。
 
-Search returns a `memory-context-package/v1` response from both `POST /api/v1/search` and
-`POST /mcp/search`. Callers select exactly one scope: a project `cwd`, or an explicit
-`library_id` (required for user libraries). The server counts the complete JSON package with the
-requested `target_model` tokenizer, falls back to conservative UTF-8 byte counting when that
-tokenizer is unavailable, and enforces both `token_budget` and the absolute 10,000-token ceiling.
-The `budget.telemetry_accounting` field identifies the counting convention. Under
-`conservative_fixed_width_v1`, telemetry integers are normalized to fixed-width upper-bound
-placeholders before counting, so `used_tokens` is a stable conservative upper bound for the final
-serialized package rather than a self-referential exact count; the server separately verifies that
-the actual final JSON also fits the effective budget.
-Direct Markdown receives at least 60% of available result capacity, graph expansion receives at
-most 30%, and source/structure metadata receives at most 10%; unused graph capacity is returned to
-direct hits. Every result carries source and degradation metadata, and the package marks recalled
-content as untrusted data with no policy, tool-authorization, or command semantics.
+Web 界面支持浏览已索引 Markdown、编辑源文件、渲染隔离预览、查看保存差异，以及
+审计和恢复本地历史。对应的受保护 REST 接口位于：
 
-## Codex plugin
+```text
+/api/v1/libraries/{library_id}/documents
+/api/v1/libraries/{library_id}/document
+/api/v1/libraries/{library_id}/history
+```
 
-The globally installable plugin lives at `plugins/personal-agent-memory`. Install it once for the
-user and set `PERSONAL_AGENT_MEMORY_API_KEY` to the daemon key (or use the default protected key
-file). Codex then discovers lifecycle Hooks and the authenticated loopback MCP connection without
-writing files into individual projects. `UserPromptSubmit` recalls only the project memory library
-bound to the Hook event's `cwd`; unbound projects and daemon failures are silent and fail open.
-The same global plugin captures only the explicit user prompt and assistant final-message fields;
-it never reads transcript files, hidden reasoning, raw tool output, full file bodies, subagent traces,
-or recalled memory context. Events enter an idempotent SQLite Inbox and are consolidated by the
-daemon's background worker into governed candidates. During daemon outages the Hook uses a private,
-bounded seven-day spool below `PLUGIN_DATA`, then replays valid records and quarantines malformed
-records on a later Hook invocation without blocking Codex.
+每次编辑或恢复都需要期望的源版本和幂等操作 ID。系统会原子替换文档、重新索引，
+并创建一次本地 Git 提交。
 
-## Verify
+默认情况下，每个记忆库使用平台状态目录下的裸 Git 旁车仓库，记忆目录本身只是
+工作树，不会创建嵌套 `.git`，也不会配置远程、执行拉取或推送。
+
+## 候选记忆和治理
+
+MCP 客户端可以创建和查看候选记忆：
+
+```text
+POST /mcp/candidates
+GET  /mcp/candidates
+GET  /mcp/candidates/{candidate_id}
+```
+
+候选记忆在批准前不会进入文本、向量、图或 Codex 检索。Web 界面负责批准、拒绝和
+审计，并记录操作者和原因。批准后会发布带来源信息的 Markdown、刷新搜索并创建
+一次幂等 Git 提交；拒绝只保留审计记录。
+
+## 向量、重排和图
+
+嵌入和重排服务是可选的 OpenAI 兼容服务：
+
+```text
+--embedding-url
+--reranker-url
+```
+
+API 密钥只从对应的 `--embedding-api-key-file` 和 `--reranker-api-key-file` 读取，
+不会存入记忆库、Git 或响应内容。嵌入或重排服务不可用时，系统会保留全文结果并
+返回降级标记。
+
+图投影使用固定版本 `JiuwenMemory==0.1.2`，每个记忆库使用独立的 Milvus Lite 文件。
+可通过以下参数配置图抽取模型：
+
+```text
+--graph-url
+--graph-model
+--graph-api-key-file
+```
+
+图搜索默认扩展一跳，最多两跳，并且会先执行直接 Markdown 命中。图或模型不可用时，
+直接 Markdown 检索仍然可用，并报告 `graph_unavailable`。
+
+搜索接口返回 `memory-context-package/v1` 格式。调用方必须选择项目 `cwd` 或明确的
+`library_id`。服务会根据请求的 `target_model` tokenizer 统计完整 JSON 包，并执行
+`token_budget` 和 10,000 token 的绝对上限。
+
+召回内容会标记为不可信数据，不携带策略、工具授权或命令语义。
+
+## Codex 插件
+
+用户级安装器会自动注册 `plugins/personal-agent-memory`。Codex 可以发现生命周期
+Hook 和经过认证的本机 MCP 连接，不需要向每个项目写入文件。
+
+插件只捕获明确的用户提示词和助手最终消息，不读取 transcript 文件、隐藏推理、原始
+工具输出、完整文件内容、子代理轨迹或召回的记忆上下文。服务暂时不可用时，Hook
+会使用受限的本地 spool，后续再重放有效记录，不阻塞 Codex。
+
+## 服务管理
+
+```bash
+systemctl --user status personal-agent-memory.service
+systemctl --user start personal-agent-memory.service
+systemctl --user stop personal-agent-memory.service
+systemctl --user restart personal-agent-memory.service
+journalctl --user -u personal-agent-memory.service --no-pager
+```
+
+当前 shell 临时导出 API 密钥：
+
+```bash
+export PERSONAL_AGENT_MEMORY_API_KEY="$(cat ~/.local/share/personal-agent-memory/api-key)"
+```
+
+## 验证
+
+开发环境测试：
 
 ```bash
 uv run pytest
@@ -117,19 +187,27 @@ uv run ruff check .
 uv run mypy
 ```
 
-Docker acceptance uses a deterministic local OpenAI-compatible fake model and no paid service:
-
-```bash
-./scripts/verify-docker.sh
-```
-
-The verifier uses a unique Compose project for every run and removes its containers,
-networks, and named volumes on success, failure, or interruption.
-
-Native package and global plugin installation use a separate isolated acceptance check. It builds
-and installs the wheel, installs the Codex plugin, starts the daemon, and executes a real Hook
-without changing the current user's home directory or Codex configuration:
+原生安装和全局插件验收：
 
 ```bash
 ./scripts/verify-native-install.sh
 ```
+
+完整 Linux 安装器验收：
+
+```bash
+PAM_INSTALL_ACCEPTANCE_DEDICATED_USER=1 \
+  ./scripts/verify-linux-installer.sh
+```
+
+## 支持范围和限制
+
+原生安装目标是 Linux x86_64，已测试 Ubuntu 22.04 和 Ubuntu 24.04。需要 Python
+3.11-3.13、Git、Node.js、Codex CLI、`uv` 和可用的 `systemd --user`。
+
+当前系统只服务单个本地用户，服务仅监听回环地址。Windows、macOS、ARM、远程同步、
+多用户协作、公开或局域网服务、Codex Cloud、Git 自动推送拉取、系统级服务以及自动
+后台升级不在 MVP 范围内。
+
+用户需要自行备份所有权威 Markdown 记忆库和平台状态目录。Git 远程不会由系统自动
+配置或同步。
