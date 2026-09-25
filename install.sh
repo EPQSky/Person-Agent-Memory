@@ -3,6 +3,7 @@ set -euo pipefail
 
 service_name="personal-agent-memory.service"
 web_url="http://127.0.0.1:7331"
+web_port=7331
 source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
 codex_home="${CODEX_HOME:-${HOME}/.codex}"
@@ -13,6 +14,7 @@ unit_path="${unit_dir}/${service_name}"
 failed_stage="initialization"
 state_dir_argument=""
 library_root_argument=""
+port_argument=""
 adopt_marketplace=false
 
 on_error() {
@@ -55,6 +57,7 @@ persist_install_metadata() {
   local plugin_registration_source=${18}
   local plugin_install_path=${19}
   local plugin_tree_sha256=${20}
+  local port=${21}
 
   "$python_command" - "$install_config_path" "$state_dir" "$library_root" \
     "$installed_version" "$marketplace_ownership" "$marketplace_source" \
@@ -63,7 +66,7 @@ persist_install_metadata() {
     "$state_ownership_token" "$state_dir_ownership" "$uv_path" "$daemon_path" \
     "$managed_unit_path" "$managed_unit_sha256" "$managed_codex_home" \
     "$plugin_id" "$plugin_version" "$plugin_registration_source" \
-    "$plugin_install_path" "$plugin_tree_sha256" <<'PY'
+    "$plugin_install_path" "$plugin_tree_sha256" "$port" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -96,6 +99,9 @@ string_fields = {
     "plugin_install_path": sys.argv[22],
     "plugin_tree_sha256": sys.argv[23],
 }
+port = sys.argv[24]
+if not port.isdigit() or not 1 <= int(port) <= 65535:
+    raise SystemExit("invalid listen port")
 for name, value in string_fields.items():
     if any(character in value for character in "\r\n"):
         raise SystemExit(f"invalid line break in install metadata field: {name}")
@@ -119,6 +125,7 @@ payload = {
     "unit_path": sys.argv[16],
     "unit_sha256": sys.argv[17],
     "codex_home": sys.argv[18],
+    "port": int(port),
 }
 plugin_identity = (sys.argv[19], sys.argv[20], sys.argv[21], sys.argv[22])
 plugin_tree_sha256 = sys.argv[23]
@@ -166,10 +173,11 @@ PY
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--state-dir PATH] [--library-root PATH] [--adopt-marketplace]
+Usage: install.sh [--state-dir PATH] [--library-root PATH] [--port PORT] [--adopt-marketplace]
 
   --state-dir PATH     Directory for platform-owned state and credentials.
   --library-root PATH  Parent directory containing user-owned memory libraries.
+  --port PORT          Loopback TCP port for the local web service (default: 7331).
   --adopt-marketplace  Replace an unowned legacy marketplace with this release.
   -h, --help           Show this help text.
 EOF
@@ -188,6 +196,15 @@ while [[ $# -gt 0 ]]; do
       else
         library_root_argument=$2
       fi
+      shift 2
+      ;;
+    --port)
+      [[ $# -ge 2 && -n "${2:-}" ]] || {
+        printf 'Missing port for --port.\n' >&2
+        usage >&2
+        exit 2
+      }
+      port_argument=$2
       shift 2
       ;;
     --adopt-marketplace)
@@ -320,18 +337,20 @@ PY
 
 failed_stage="install directory validation"
 directory_config="$($python_command - "$install_config_path" "$state_dir_argument" \
-  "$library_root_argument" "$codex_home" <<'PY'
+  "$library_root_argument" "$codex_home" "$port_argument" <<'PY'
 import json
 import os
 from pathlib import Path
 import stat
 import sys
+import tempfile
 
 MAX_INSTALL_METADATA_BYTES = 64 * 1024
 config_path = Path(os.path.abspath(os.path.normpath(str(Path(sys.argv[1]).expanduser()))))
 state_argument = sys.argv[2]
 library_argument = sys.argv[3]
 current_codex_home = sys.argv[4]
+port_argument = sys.argv[5]
 
 def read_install_metadata(path: Path) -> object | None:
     try:
@@ -565,6 +584,20 @@ else:
     plugin_install_path = ""
     plugin_tree_sha256 = ""
 
+def selected_port(argument: str, saved_value: object) -> int:
+    value: object = argument if argument else saved_value
+    if not argument and saved is None:
+        value = 7331
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise SystemExit("port must be an integer between 1 and 65535")
+    text = str(value)
+    if not text.isascii() or not text.isdigit():
+        raise SystemExit("port must be an integer between 1 and 65535")
+    port = int(text)
+    if not 1 <= port <= 65535:
+        raise SystemExit("port must be an integer between 1 and 65535")
+    return port
+
 def selected(argument: str, key: str, default: str) -> Path:
     if argument:
         value = argument
@@ -593,6 +626,7 @@ state_dir = selected(
     state_argument, "state_dir", str(home / ".local/share/personal-agent-memory")
 )
 library_root = selected(library_argument, "library_root", str(home / "memory-libraries"))
+port = selected_port(port_argument, saved.get("port", 7331) if saved else 7331)
 
 def contains(parent: Path, child: Path) -> bool:
     return child == parent or child.is_relative_to(parent)
@@ -642,6 +676,7 @@ print(line_value("plugin version", plugin_version))
 print(line_value("plugin registration source", plugin_registration_source))
 print(line_value("plugin install path", plugin_install_path))
 print(line_value("plugin tree sha256", plugin_tree_sha256))
+print(line_value("port", port))
 PY
 )" || dependency_error "Invalid install directories. ${directory_config:-Review the selected paths and rerun the installer.}"
 mapfile -t resolved_directories <<<"$directory_config"
@@ -669,6 +704,8 @@ saved_plugin_version=${resolved_directories[20]:-}
 saved_plugin_registration_source=${resolved_directories[21]:-}
 saved_plugin_install_path=${resolved_directories[22]:-}
 saved_plugin_tree_sha256=${resolved_directories[23]:-}
+web_port=${resolved_directories[24]:-7331}
+web_url="http://127.0.0.1:${web_port}"
 export CODEX_HOME="$codex_home"
 install_config_dir=${install_config_path%/*}
 
@@ -1134,7 +1171,7 @@ persist_install_metadata "$saved_installed_version" "$marketplace_ownership" \
   "$state_ownership_token" "$state_dir_ownership" "$uv_command" \
   "$saved_daemon_path" "$saved_unit_path" "$saved_unit_sha256" "$codex_home" \
   "$saved_plugin_id" "$saved_plugin_version" "$saved_plugin_registration_source" \
-  "$saved_plugin_install_path" "$saved_plugin_tree_sha256"
+  "$saved_plugin_install_path" "$saved_plugin_tree_sha256" "$web_port"
 
 failed_stage="user service shutdown"
 if systemctl --user is-active --quiet "$service_name"; then
@@ -1188,13 +1225,14 @@ PY
 )"
 plugin_list="$(codex plugin list --json)"
 managed_plugin_identity="$($python_command - "$target_version" "$installed_plugin_path" \
-  "$source_root/plugins/personal-agent-memory" "$plugin_list" <<'PY'
+  "$source_root/plugins/personal-agent-memory" "$plugin_list" "$web_port" <<'PY'
 import json
 import hashlib
 import os
 from pathlib import Path
 import stat
 import sys
+import tempfile
 
 MAX_ENTRIES = 4096
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -1283,6 +1321,9 @@ target_version = sys.argv[1]
 installed_path = Path(sys.argv[2]).resolve()
 registration_source = Path(sys.argv[3]).resolve()
 installed = json.loads(sys.argv[4]).get("installed", [])
+port = sys.argv[5]
+if not port.isdigit() or not 1 <= int(port) <= 65535:
+    raise SystemExit("invalid listen port")
 matches = [
     item
     for item in installed
@@ -1305,6 +1346,27 @@ manifest = json.loads(
 )
 if manifest.get("name") != "personal-agent-memory" or manifest.get("version") != target_version:
     raise SystemExit("installed Codex plugin manifest does not match this release")
+mcp_path = installed_path / ".mcp.json"
+mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
+server = mcp.get("mcpServers", {}).get("personal-agent-memory")
+if not isinstance(server, dict):
+    raise SystemExit("installed Codex plugin MCP configuration is invalid")
+server["url"] = f"http://127.0.0.1:{int(port)}/mcp"
+mcp_temporary_path: Path | None = None
+try:
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=mcp_path.parent, delete=False
+    ) as stream:
+        json.dump(mcp, stream, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        mcp_temporary_path = Path(stream.name)
+    os.replace(mcp_temporary_path, mcp_path)
+    mcp_temporary_path = None
+finally:
+    if mcp_temporary_path is not None:
+        mcp_temporary_path.unlink(missing_ok=True)
 print(registration_source)
 print(installed_path)
 print(plugin_tree_sha256(installed_path))
@@ -1322,7 +1384,7 @@ persist_install_metadata "$target_version" "$marketplace_ownership" "$source_roo
   "$saved_unit_path" "$saved_unit_sha256" "$codex_home" \
   "personal-agent-memory@personal-agent-memory" "$target_version" \
   "$managed_plugin_registration_source" "$managed_plugin_install_path" \
-  "$managed_plugin_tree_sha256"
+  "$managed_plugin_tree_sha256" "$web_port"
 
 failed_stage="user service installation"
 daemon_unit_command="$(quote_unit_argument "$daemon_command")"
@@ -1331,7 +1393,7 @@ state_unit_argument="$(quote_unit_argument "$state_dir")"
 library_unit_argument="$(quote_unit_argument "$library_root")"
 unit_sha256="$($python_command - "$unit_path" "$daemon_unit_command" \
   "$state_unit_argument" "$library_unit_argument" "$saved_daemon_unit_command" \
-  "$saved_unit_path" "$saved_unit_sha256" <<'PY'
+  "$saved_unit_path" "$saved_unit_sha256" "$web_port" <<'PY'
 import hashlib
 import os
 from pathlib import Path
@@ -1343,6 +1405,7 @@ unit_path = Path(sys.argv[1])
 legacy_daemon_command = sys.argv[5]
 recorded_path = sys.argv[6]
 recorded_sha256 = sys.argv[7]
+port = sys.argv[8]
 recorded = bool(recorded_path or recorded_sha256)
 if recorded and (
     recorded_path != str(unit_path)
@@ -1359,7 +1422,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={daemon_command} serve --state-dir {sys.argv[3]} --library-root {sys.argv[4]} --host "127.0.0.1" --port "7331"
+ExecStart={daemon_command} serve --state-dir {sys.argv[3]} --library-root {sys.argv[4]} --host "127.0.0.1" --port "{port}"
 Restart=on-failure
 RestartSec=2
 
@@ -1457,7 +1520,7 @@ persist_install_metadata "$target_version" "$marketplace_ownership" "$source_roo
   "$unit_path" "$unit_sha256" "$codex_home" \
   "personal-agent-memory@personal-agent-memory" "$target_version" \
   "$managed_plugin_registration_source" "$managed_plugin_install_path" \
-  "$managed_plugin_tree_sha256"
+  "$managed_plugin_tree_sha256" "$web_port"
 
 failed_stage="user service reload"
 systemctl --user daemon-reload
@@ -1508,7 +1571,7 @@ persist_install_metadata "$target_version" "$marketplace_ownership" "$source_roo
   "$unit_path" "$unit_sha256" "$codex_home" \
   "personal-agent-memory@personal-agent-memory" "$target_version" \
   "$managed_plugin_registration_source" "$managed_plugin_install_path" \
-  "$managed_plugin_tree_sha256"
+  "$managed_plugin_tree_sha256" "$web_port"
 
 trap - ERR
 cat <<EOF

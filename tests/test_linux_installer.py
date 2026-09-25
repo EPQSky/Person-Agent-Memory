@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -1832,6 +1833,9 @@ def test_supported_environment_installs_service_plugin_and_healthy_hook(
         home
         / ".codex/plugins/cache/personal-agent-memory/personal-agent-memory/0.1.0"
     )
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
     command_log = tmp_path / "commands.log"
     request_log = tmp_path / "requests.jsonl"
     daemon_script = tmp_path / "daemon.py"
@@ -1900,8 +1904,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-ThreadingHTTPServer(('127.0.0.1', 7331), Handler).serve_forever()
-""".lstrip().replace("{request_log}", str(request_log)),
+ThreadingHTTPServer(('127.0.0.1', {port}), Handler).serve_forever()
+""".lstrip().replace("{request_log}", str(request_log)).replace("{port}", str(port)),
         encoding="utf-8",
     )
     uv_script = f"""#!/bin/sh
@@ -2099,11 +2103,12 @@ esac
         "CODEX_HOME": str(home / ".codex"),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "XDG_BIN_HOME": str(fake_bin),
+        "PERSONAL_AGENT_MEMORY_URL": f"http://127.0.0.1:{port}",
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
     }
     state_dir = home / ".local/share/personal-agent-memory"
     library_root = home / "memory-libraries"
-    installer_arguments: list[str] = []
+    installer_arguments: list[str] = ["--port", str(port)]
     if directory_mode in {
         "state-only",
         "both",
@@ -2126,6 +2131,8 @@ esac
     if directory_mode in {"library-only", "both"}:
         library_root = tmp_path / "custom memory libraries"
         installer_arguments.extend(["--library-root", str(library_root)])
+    environment["PERSONAL_AGENT_MEMORY_API_KEY_FILE"] = str(state_dir / "api-key")
+    environment.pop("PERSONAL_AGENT_MEMORY_API_KEY", None)
     try:
         result = subprocess.run(
             [str(ROOT / "install.sh"), *installer_arguments],
@@ -2169,7 +2176,7 @@ esac
                 "codex plugin marketplace remove personal-agent-memory --json"
             )
             refused = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2214,10 +2221,14 @@ esac
         expected_state_argument = str(state_dir).replace("$", "$$")
         assert f'--state-dir "{expected_state_argument}"' in unit_text
         assert f'--library-root "{library_root}"' in unit_text
-        assert '--host "127.0.0.1" --port "7331"' in unit_text
+        assert f'--host "127.0.0.1" --port "{port}"' in unit_text
+        assert json.loads((plugin_install / ".mcp.json").read_text(encoding="utf-8"))[
+            "mcpServers"
+        ]["personal-agent-memory"]["url"] == f"http://127.0.0.1:{port}/mcp"
         install_metadata = json.loads(install_metadata_path.read_text(encoding="utf-8"))
         expected_metadata = {
             "schema_version": 1,
+            "port": port,
             "state_dir": str(state_dir),
             "library_root": str(library_root),
             "library_root_ownership": "user-content-never-delete",
@@ -2305,7 +2316,7 @@ esac
         assert "Installed version: 0.1.0" in result.stdout
         for expected in (
             "Service status: active",
-            "Web: http://127.0.0.1:7331",
+            f"Web: http://127.0.0.1:{port}",
             f"API key file: {state_dir / 'api-key'}",
             "systemctl --user start personal-agent-memory.service",
             "systemctl --user stop personal-agent-memory.service",
@@ -2403,7 +2414,7 @@ esac
             legacy_unit_contents = unit.read_bytes()
             unit.write_bytes(legacy_unit_contents.replace(b"RestartSec=2", b"RestartSec=9"))
             legacy_replacement = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2419,7 +2430,7 @@ esac
             assert unit.read_bytes() == replacement_unit_contents
             unit.write_bytes(legacy_unit_contents)
             legacy_failure = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env={**environment, "PAM_INSTALL_TEST_FAILURE": "program-update"},
                 text=True,
@@ -2436,7 +2447,7 @@ esac
                     (fake_bin / "personal-agent-memory-uninstall").read_bytes()
                 ).hexdigest()
             same_source_repair = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2475,7 +2486,7 @@ esac
                 "codex plugin marketplace remove personal-agent-memory --json"
             )
             refused_adoption = subprocess.run(
-                [str(adopted_release / "install.sh")],
+                [str(adopted_release / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2493,7 +2504,12 @@ esac
             )
 
             explicit_adoption = subprocess.run(
-                [str(adopted_release / "install.sh"), "--adopt-marketplace"],
+                [
+                    str(adopted_release / "install.sh"),
+                    "--port",
+                    str(port),
+                    "--adopt-marketplace",
+                ],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2508,7 +2524,7 @@ esac
             assert adopted_metadata["marketplace_previous_source"] == str(ROOT)
 
             returned = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2529,7 +2545,12 @@ esac
                 "codex plugin marketplace remove personal-agent-memory --json"
             )
             refused_drifted_adoption = subprocess.run(
-                [str(adopted_release / "install.sh"), "--adopt-marketplace"],
+                [
+                    str(adopted_release / "install.sh"),
+                    "--port",
+                    str(port),
+                    "--adopt-marketplace",
+                ],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2547,7 +2568,7 @@ esac
 
             (tmp_path / "marketplace-records").write_text(f"{ROOT}\n", encoding="utf-8")
             refused_preexisting_adoption = subprocess.run(
-                [str(adopted_release / "install.sh")],
+                [str(adopted_release / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2565,7 +2586,12 @@ esac
             )
 
             adopted_preexisting = subprocess.run(
-                [str(adopted_release / "install.sh"), "--adopt-marketplace"],
+                [
+                    str(adopted_release / "install.sh"),
+                    "--port",
+                    str(port),
+                    "--adopt-marketplace",
+                ],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2582,7 +2608,7 @@ esac
             assert adopted_preexisting_metadata["marketplace_previous_source"] == str(ROOT)
 
             returned = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2622,7 +2648,7 @@ esac
                 path.write_text(content.replace("0.1.0", "0.2.0"), encoding="utf-8")
 
             next_upgrade = subprocess.run(
-                [str(next_release / "install.sh")],
+                [str(next_release / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2640,7 +2666,7 @@ esac
             assert "marketplace_update_from_source" not in next_metadata
 
             returned = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2659,7 +2685,7 @@ esac
             }
             previous_uninstall_sha256 = returned_metadata["uninstall_sha256"]
             remove_failure = subprocess.run(
-                [str(next_release / "install.sh")],
+                [str(next_release / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=remove_failure_environment,
                 text=True,
@@ -2683,7 +2709,7 @@ esac
             assert (tmp_path / "marketplace-records").read_text().strip() == str(ROOT)
 
             remove_retry = subprocess.run(
-                [str(next_release / "install.sh")],
+                [str(next_release / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2699,7 +2725,7 @@ esac
             assert "marketplace_update_from_source" not in retried_replace
 
             returned = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2716,7 +2742,7 @@ esac
             ):
                 failed_environment = {**environment, "PAM_INSTALL_TEST_FAILURE": injected_failure}
                 failed = subprocess.run(
-                    [str(ROOT / "install.sh")],
+                    [str(ROOT / "install.sh"), "--port", str(port)],
                     cwd=tmp_path,
                     env=failed_environment,
                     text=True,
@@ -2738,7 +2764,7 @@ esac
                 )
 
             restored = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2752,7 +2778,7 @@ esac
             install_metadata_path.unlink()
             unit.unlink()
             refused_repair = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2769,7 +2795,7 @@ esac
             (fake_bin / "personal-agent-memory-uninstall").unlink()
             command_log.write_text("", encoding="utf-8")
             repaired = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2798,7 +2824,7 @@ esac
             unit.unlink()
             failed_environment = {**environment, "PAM_INSTALL_TEST_FAILURE": "plugin-update"}
             fresh_failure = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=failed_environment,
                 text=True,
@@ -2817,7 +2843,7 @@ esac
             ).hexdigest()
 
             retry = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2847,7 +2873,7 @@ esac
                 "PAM_INSTALL_TEST_FAILURE": "service-startup",
             }
             service_failure = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=service_failure_environment,
                 text=True,
@@ -2884,7 +2910,7 @@ esac
             install_metadata_path.unlink()
 
             retryable_service_failure = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=service_failure_environment,
                 text=True,
@@ -2894,7 +2920,7 @@ esac
             )
             assert retryable_service_failure.returncode != 0
             service_retry = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2916,7 +2942,7 @@ esac
             assert replacement_cleanup.returncode == 0, replacement_cleanup.stderr
             install_metadata_path.unlink()
             replacement_service_failure = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=service_failure_environment,
                 text=True,
@@ -2927,7 +2953,7 @@ esac
             assert replacement_service_failure.returncode != 0
             unit.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
             refused_replacement_retry = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -2953,7 +2979,7 @@ esac
             unit.unlink()
             install_metadata_path.unlink()
             restored_after_replacement = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -3045,7 +3071,7 @@ esac
             replacement_file.write_text("must survive\n", encoding="utf-8")
 
             reinstall = subprocess.run(
-                [str(ROOT / "install.sh")],
+                [str(ROOT / "install.sh"), "--port", str(port)],
                 cwd=tmp_path,
                 env=environment,
                 text=True,
@@ -3755,6 +3781,39 @@ def test_directory_option_requires_a_path(tmp_path: Path) -> None:
     assert result.returncode == 2
     assert "Missing path for --state-dir" in result.stderr
     assert "unbound variable" not in result.stderr
+
+
+def test_port_option_requires_a_value(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh"), "--port"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "Missing port for --port" in result.stderr
+    assert "unbound variable" not in result.stderr
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "-1", "not-a-port"])
+def test_invalid_port_is_rejected_before_installation(tmp_path: Path, port: str) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+
+    result = subprocess.run(
+        ["/bin/bash", str(ROOT / "install.sh"), "--port", port],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "port must be an integer between 1 and 65535" in result.stderr
+    assert "uv tool install --python" not in command_log.read_text(encoding="utf-8")
+    assert not (home / ".codex").exists()
 
 
 def test_relative_xdg_config_home_is_rejected_before_installation(tmp_path: Path) -> None:

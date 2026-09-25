@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -263,7 +264,13 @@ def test_real_adapter_releases_milvus_server_after_partial_store_initialization(
     document = GraphSourceDocument("one", "one.md", "v1", "Alpha source")
 
     from jiuwen_memory.foundation.store.graph.milvus import MilvusGraphStore
-    from milvus_lite.server_manager import server_manager_instance
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"^pkg_resources is deprecated as an API\.",
+            category=UserWarning,
+        )
+        from milvus_lite.server_manager import server_manager_instance
 
     attempts = 0
 

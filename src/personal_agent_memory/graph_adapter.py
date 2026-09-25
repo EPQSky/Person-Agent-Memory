@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 import threading
 import uuid
+import warnings
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
@@ -25,6 +26,17 @@ class GraphAdapterError(RuntimeError):
 
 class GraphAdapterBusyError(GraphAdapterError):
     """Milvus Lite is busy mutating another local graph projection."""
+
+
+@contextmanager
+def _milvus_lite_import_warnings() -> Iterator[None]:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"^pkg_resources is deprecated as an API\.",
+            category=UserWarning,
+        )
+        yield
 
 
 @dataclass(frozen=True, slots=True)
@@ -812,38 +824,39 @@ class JiuwenMilvusGraphAdapter:
     @staticmethod
     def _open_projection(database: Path) -> Any:
         try:
-            from jiuwen_memory.common.logging.log_config import (
-                configure_log_config,
-            )
+            with _milvus_lite_import_warnings():
+                from jiuwen_memory.common.logging.log_config import (
+                    configure_log_config,
+                )
 
-            configure_log_config(
-                {
-                    "backend": "default",
-                    "output": ["console"],
-                    "interface_output": ["console"],
-                    "performance_output": ["console"],
-                }
-            )
-            from jiuwen_memory.foundation.store.graph import (
-                Entity,
-                Episode,
-                GraphConfig,
-                GraphStoreIndexConfig,
-                GraphStoreStorageConfig,
-                Relation,
-            )
-            from jiuwen_memory.foundation.store.graph.constants import (  # type: ignore[import-untyped]
-                ENTITY_COLLECTION,
-                EPISODE_COLLECTION,
-                RELATION_COLLECTION,
-            )
-            from jiuwen_memory.foundation.store.graph.index_field import (  # type: ignore[import-untyped]
-                MilvusFLAT,
-            )
-            from jiuwen_memory.foundation.store.graph.milvus import (  # type: ignore[import-untyped]
-                MilvusGraphStore,
-            )
-            from pymilvus import MilvusClient  # type: ignore[import-untyped]
+                configure_log_config(
+                    {
+                        "backend": "default",
+                        "output": ["console"],
+                        "interface_output": ["console"],
+                        "performance_output": ["console"],
+                    }
+                )
+                from jiuwen_memory.foundation.store.graph import (
+                    Entity,
+                    Episode,
+                    GraphConfig,
+                    GraphStoreIndexConfig,
+                    GraphStoreStorageConfig,
+                    Relation,
+                )
+                from jiuwen_memory.foundation.store.graph.constants import (  # type: ignore[import-untyped]
+                    ENTITY_COLLECTION,
+                    EPISODE_COLLECTION,
+                    RELATION_COLLECTION,
+                )
+                from jiuwen_memory.foundation.store.graph.index_field import (  # type: ignore[import-untyped]
+                    MilvusFLAT,
+                )
+                from jiuwen_memory.foundation.store.graph.milvus import (  # type: ignore[import-untyped]
+                    MilvusGraphStore,
+                )
+                from pymilvus import MilvusClient  # type: ignore[import-untyped]
         except ImportError as error:
             raise GraphAdapterError("JiuwenMemory or Milvus Lite is unavailable") from error
 
@@ -896,9 +909,10 @@ class JiuwenMilvusGraphAdapter:
                 if client is not None:
                     with suppress(Exception):
                         client.close()
-                from milvus_lite.server_manager import (  # type: ignore[import-untyped]
-                    server_manager_instance,
-                )
+                with _milvus_lite_import_warnings():
+                    from milvus_lite.server_manager import (  # type: ignore[import-untyped]
+                        server_manager_instance,
+                    )
 
                 with suppress(Exception):
                     server_manager_instance.release_server(self._local_uri)
