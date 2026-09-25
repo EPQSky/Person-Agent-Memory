@@ -52,11 +52,18 @@ def _bound_client(tmp_path: Path) -> tuple[TestClient, dict[str, str], str, Path
     return client, headers, str(library["id"]), project
 
 
-def _event(project: Path, kind: str, content: str, event_id: str) -> dict[str, str]:
+def _event(
+    project: Path,
+    kind: str,
+    content: str,
+    event_id: str,
+    *,
+    turn_id: str = "turn-1",
+) -> dict[str, str]:
     return {
         "event_id": event_id,
         "session_id": "session-capture-1",
-        "turn_id": "turn-1",
+        "turn_id": turn_id,
         "event_kind": kind,
         "content": content,
         "occurred_at": "2026-09-05T10:00:00Z",
@@ -100,6 +107,278 @@ def test_capture_inbox_is_idempotent_out_of_order_and_asynchronous(tmp_path: Pat
         with sqlite3.connect(tmp_path / "state" / "platform.sqlite3") as connection:
             assert connection.execute("SELECT COUNT(*) FROM capture_inbox").fetchone() == (2,)
             assert connection.execute("SELECT status FROM capture_rounds").fetchone() == ("done",)
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_ineligible_capture_creates_no_candidate(tmp_path: Path) -> None:
+    client, headers, library_id, project = _bound_client(tmp_path)
+    client.app.state.platform_state.model_client.extract_candidate = lambda _: {
+        "eligible": False
+    }
+    try:
+        for kind, content in (
+            ("user", "Please help me finish this one-off task."),
+            ("assistant", "The task is complete."),
+        ):
+            response = client.post(
+                "/api/v1/capture/events",
+                headers=headers,
+                json=_event(project, kind, content, f"ineligible-{kind}"),
+            )
+            assert response.status_code == 202
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with sqlite3.connect(tmp_path / "state" / "platform.sqlite3") as connection:
+                round_status = connection.execute(
+                    "SELECT status FROM capture_rounds"
+                ).fetchone()
+            if round_status == ("done",):
+                break
+            time.sleep(0.05)
+
+        assert client.get(
+            "/api/v1/candidates",
+            headers=headers,
+            params={"library_id": library_id},
+        ).json() == []
+        with sqlite3.connect(tmp_path / "state" / "platform.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT status, candidate_id FROM capture_rounds"
+            ).fetchone() == ("done", None)
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_clear_user_evidence_is_auto_approved_with_audit_source_and_git_history(
+    tmp_path: Path,
+) -> None:
+    client, headers, library_id, project = _bound_client(tmp_path)
+    state = client.app.state.platform_state
+    state.model_client.extract_candidate = lambda _: {
+        "eligible": True,
+        "suggested_type": "preference",
+        "body": "# Preference\n\nPrefer SQLite for test fixtures.",
+        "confidence": 0.97,
+        "evidence_kind": "user_confirmed",
+        "source_valid": True,
+        "conflict": False,
+        "policy_allowed": True,
+    }
+    try:
+        for kind, content in (
+            ("user", "I prefer SQLite for test fixtures."),
+            ("assistant", "Understood."),
+        ):
+            response = client.post(
+                "/api/v1/capture/events",
+                headers=headers,
+                json=_event(project, kind, content, f"auto-approved-{kind}"),
+            )
+            assert response.status_code == 202
+
+        deadline = time.monotonic() + 3
+        candidates: list[dict[str, object]] = []
+        while time.monotonic() < deadline:
+            candidates = client.get(
+                "/api/v1/candidates",
+                headers=headers,
+                params={"library_id": library_id},
+            ).json()
+            if candidates and candidates[0]["status"] == "approved":
+                break
+            time.sleep(0.05)
+
+        assert len(candidates) == 1
+        promoted = candidates[0]
+        assert promoted["status"] == "approved"
+        assert promoted["operator"] == "platform:auto-promotion"
+        assert len(promoted["source_references"]) == 2
+        assert all(
+            str(reference).startswith("capture:session-capture-1:turn-1:")
+            for reference in promoted["source_references"]
+        )
+        assert promoted["published_path"]
+        assert promoted["commit"]
+
+        with sqlite3.connect(tmp_path / "state" / "platform.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT action, operator FROM candidate_audit "
+                "WHERE candidate_id = ? ORDER BY id",
+                (promoted["id"],),
+            ).fetchall() == [
+                ("created", "session-capture"),
+                ("approved", "platform:auto-promotion"),
+            ]
+            assert connection.execute(
+                "SELECT source, kind FROM memory_operations WHERE source LIKE "
+                "'background-auto-promotion:session-capture-1:turn-1:%'"
+            ).fetchone() == (
+                "background-auto-promotion:session-capture-1:turn-1:platform:auto-promotion",
+                "edit",
+            )
+
+        history = client.get(
+            f"/api/v1/libraries/{library_id}/history", headers=headers
+        ).json()
+        assert history[0]["commit"] == promoted["commit"]
+        assert history[0]["subject"].startswith("Auto-promote candidate")
+        published = (
+            tmp_path / "libraries" / "project-memory" / str(promoted["published_path"])
+        )
+        assert "Prefer SQLite for test fixtures." in published.read_text(encoding="utf-8")
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_capture_exceptions_stay_pending_for_manual_governance(tmp_path: Path) -> None:
+    client, headers, library_id, project = _bound_client(tmp_path)
+    state = client.app.state.platform_state
+    results = iter(
+        (
+            {
+                "eligible": True,
+                "suggested_type": "decision",
+                "body": "# Decision\n\nUse SQLite for this service.",
+                "confidence": 0.89,
+                "evidence_kind": "user_confirmed",
+                "source_valid": True,
+                "conflict": False,
+                "policy_allowed": True,
+            },
+            {
+                "eligible": True,
+                "suggested_type": "decision",
+                "body": "# Decision\n\nThe assistant recommends PostgreSQL.",
+                "confidence": 1.0,
+                "evidence_kind": "assistant_only",
+                "source_valid": True,
+                "conflict": False,
+                "policy_allowed": True,
+            },
+            {
+                "eligible": True,
+                "suggested_type": "decision",
+                "body": "# Decision\n\nUse SQLite for this service.",
+                "confidence": 1.0,
+                "evidence_kind": "user_confirmed",
+                "source_valid": True,
+                "conflict": False,
+                "policy_allowed": True,
+            },
+            {
+                "eligible": True,
+                "suggested_type": "decision",
+                "body": "# Decision\n\nUse Redis for this service.",
+                "confidence": 1.0,
+                "evidence_kind": "user_confirmed",
+                "source_valid": True,
+                "conflict": True,
+                "policy_allowed": True,
+            },
+            {
+                "eligible": True,
+                "suggested_type": "decision",
+                "body": "# Decision\n\nUse MariaDB for this service.",
+                "confidence": 1.0,
+                "evidence_kind": "user_confirmed",
+                "source_valid": True,
+                "conflict": False,
+                "policy_allowed": False,
+            },
+            {
+                "eligible": True,
+                "suggested_type": "decision",
+                "body": "# Decision\n\nUse SQLite for reporting.",
+                "confidence": 1.0,
+                "evidence_kind": "user_confirmed",
+                "source_valid": True,
+                "conflict": False,
+                "policy_allowed": True,
+            },
+            {
+                "eligible": True,
+                "suggested_type": "decision",
+                "body": "# Decision\n\nUse SQLite for analytics.",
+                "confidence": 1.0,
+                "evidence_kind": "user_confirmed",
+                "source_valid": True,
+                "conflict": False,
+                "policy_allowed": True,
+            },
+        )
+    )
+    state.model_client.extract_candidate = lambda _: next(results)
+    seed = client.post(
+        "/mcp/candidates",
+        headers=headers,
+        json={
+            "library_id": library_id,
+            "suggested_type": "decision",
+            "body": "# Decision\n\nUse SQLite for this service.",
+            "source_references": ["seed:session"],
+            "creator": "test",
+            "idempotency_key": "session-capture-duplicate-seed",
+        },
+    ).json()
+    assert client.post(
+        f"/api/v1/candidates/{seed['id']}/approve",
+        headers=headers,
+        json={
+            "operator": "test",
+            "reason": "seed",
+            "operation_id": "session-capture-duplicate-seed-approval",
+        },
+    ).status_code == 200
+    try:
+        turns = (
+            ("low-confidence", "I decided to use SQLite for this service."),
+            ("assistant-only", "I decided to use PostgreSQL for this service."),
+            ("question", "Should we use SQLite for reporting?"),
+            ("conflict", "I decided to use Redis for this service."),
+            ("policy", "I decided to use MariaDB for this service."),
+            ("guess", "I think we should use SQLite for analytics."),
+            ("duplicate", "I decided to use SQLite for this service."),
+        )
+        for turn, user in turns:
+            for kind, content in (("user", user), ("assistant", "Noted.")):
+                response = client.post(
+                    "/api/v1/capture/events",
+                    headers=headers,
+                    json=_event(
+                        project,
+                        kind,
+                        content,
+                        f"{turn}-{kind}",
+                        turn_id=turn,
+                    )
+                )
+                assert response.status_code == 202
+
+        deadline = time.monotonic() + 4
+        candidates: list[dict[str, object]] = []
+        while time.monotonic() < deadline:
+            candidates = client.get(
+                "/api/v1/candidates",
+                headers=headers,
+                params={"library_id": library_id},
+            ).json()
+            if len(candidates) == len(turns) + 1:
+                break
+            time.sleep(0.05)
+
+        assert len(candidates) == len(turns) + 1
+        captured = [
+            item for item in candidates if item["creator"] == "session-capture"
+        ]
+        assert len(captured) == len(turns)
+        assert all(item["status"] == "pending" for item in captured)
+        with sqlite3.connect(tmp_path / "state" / "platform.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM memory_operations "
+                "WHERE source LIKE 'background-auto-promotion:%'"
+            ).fetchone() == (0,)
     finally:
         client.__exit__(None, None, None)
 

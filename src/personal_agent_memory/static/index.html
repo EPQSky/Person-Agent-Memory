@@ -152,10 +152,14 @@
         const retentionForm = document.createElement('form');
         retentionForm.innerHTML = '<div class="field"><label for="retention-library">记忆库</label><select id="retention-library"></select></div><div class="field"><label for="inbox-days">采集收件箱保留天数</label><input id="inbox-days" type="number" min="0" max="3650"></div><div class="field"><label for="candidate-days">候选记忆保留天数</label><input id="candidate-days" type="number" min="0" max="3650"></div><div class="field"><label for="recycle-days">回收站保留天数</label><input id="recycle-days" type="number" min="0" max="3650"></div><div class="field"><label><input id="early-inbox-cleanup" type="checkbox"> 提前清理已归并的收件箱数据</label></div><div class="field"><label><input id="diagnostics-enabled" type="checkbox"> 保留有界诊断数据</label></div><div class="field"><label for="diagnostic-days">诊断数据保留天数</label><input id="diagnostic-days" type="number" min="0" max="365"></div><div class="candidate-actions"><button type="submit">保存策略</button><button type="button" id="retention-preview" class="secondary">预览清理</button><button type="button" id="retention-run" class="danger">立即清理</button><button type="button" id="diagnostics-clear" class="danger">清除诊断</button></div><pre id="retention-impact" class="diff">选择记忆库后可预览清理影响。</pre><div id="candidate-recycle-bin"></div><p id="retention-message" class="notice" aria-live="polite"></p>';
         const candidateHeading = document.createElement('h2');
-        candidateHeading.textContent = '候选审核';
+        candidateHeading.textContent = '候选审核（异常候选）';
+        const candidateNotice = document.createElement('p');
+        candidateNotice.className = 'hint';
+        candidateNotice.textContent = '正常内容会自动晋升；这里只需关注需要人工处理的异常候选。';
         const candidateStatus = document.createElement('select');
         candidateStatus.setAttribute('aria-label', '候选记忆状态');
         candidateStatus.innerHTML = '<option value="">全部状态</option><option value="pending">待处理</option><option value="approved">已批准</option><option value="rejected">已拒绝</option>';
+        candidateStatus.value = 'pending';
         const candidateLayout = document.createElement('div');
         candidateLayout.className = 'candidate-layout';
         const candidateList = document.createElement('nav');
@@ -245,7 +249,7 @@
         serviceSection.append(statusHeading, statusList);
         makeView('overview', '概览', [overviewMetrics, overviewAlert, quickActions, serviceSection]);
         makeView('search', '记忆检索', [searchForm]);
-        makeView('candidates', '候选审核', [candidateStatus, candidateLayout]);
+        makeView('candidates', '候选审核', [candidateHeading, candidateNotice, candidateStatus, candidateLayout]);
         const documentsSection = document.createElement('div');
         documentsSection.className = 'view-section';
         documentsSection.append(editorLibrary, editorLayout);

@@ -4128,6 +4128,13 @@ class PlatformState:
             blockers.append("confidence")
         if inspect_sensitive_text(str(candidate["body"])) is not None:
             blockers.append("sensitive")
+        governance = self.candidate_governance(str(candidate["id"]))
+        if governance["classification"] in {
+            "exact_duplicate",
+            "possible_duplicate",
+            "conflict",
+        }:
+            blockers.append(str(governance["classification"]))
         normalized = self._governance_text(str(candidate["body"]))
         existing = self.connection_or_raise.execute(
             "SELECT content FROM memory_chunks WHERE library_id = ?",
@@ -4397,28 +4404,55 @@ class PlatformState:
         normalized = content.casefold()
         if "?" in normalized or "？" in normalized:
             return False
-        indicators = (
-            "remember",
-            "confirmed",
-            "we decided",
-            "i decided",
-            "must ",
-            "always ",
-            "prefer",
-            "记住",
-            "确认",
-            "决定",
-            "必须",
-            "始终",
-            "偏好",
-            "采用",
-        )
         confirmation_segments = tuple(
-            segment
+            segment.strip()
             for segment in re.split(r"[.!?。！？;；\n]+", normalized)
-            if any(indicator in segment for indicator in indicators)
+            if segment.strip()
         )
         if not confirmation_segments:
+            return False
+        ambiguous_markers = (
+            "maybe",
+            "might",
+            "could",
+            "possibly",
+            "perhaps",
+            "i guess",
+            "i think",
+            "i believe",
+            "not sure",
+            "speculat",
+            "seems",
+            "probably",
+            "建议",
+            "也许",
+            "可能",
+            "猜测",
+            "不确定",
+            "我觉得",
+            "似乎",
+            "大概",
+        )
+        request_markers = (
+            "what do you think",
+            "please suggest",
+            "please recommend",
+            "recommend a ",
+            "suggest a ",
+            "which should",
+            "how should",
+            "can you suggest",
+            "could you suggest",
+            "你觉得",
+            "请建议",
+            "请推荐",
+            "推荐一个",
+        )
+        if any(
+            marker in segment
+            for segment in confirmation_segments
+            for marker in (*ambiguous_markers, *request_markers)
+        ):
             return False
         ignored = {
             "adopt",
@@ -10583,17 +10617,54 @@ class PlatformState:
                             }
                             retry_capture_job = retry_capture_job and complete
                             if complete:
-                                self.connection.execute(
-                                    """UPDATE capture_rounds SET status = ?, last_error = ?,
-                                       updated_at = CURRENT_TIMESTAMP
-                                       WHERE session_id = ? AND turn_id = ?""",
-                                    (
-                                        "pending" if retry_capture_job else "error",
-                                        str(error)[:1000],
-                                        capture_session_id,
-                                        capture_turn_id,
-                                    ),
-                                )
+                                if retry_capture_job:
+                                    self.connection.execute(
+                                        """UPDATE capture_rounds SET status = 'pending',
+                                           last_error = ?, updated_at = CURRENT_TIMESTAMP
+                                           WHERE session_id = ? AND turn_id = ?""",
+                                        (
+                                            str(error)[:1000],
+                                            capture_session_id,
+                                            capture_turn_id,
+                                        ),
+                                    )
+                                else:
+                                    try:
+                                        exception_candidate = (
+                                            self._create_capture_exception_candidate(
+                                                capture_session_id,
+                                                capture_turn_id,
+                                                capture_library_id,
+                                                rows,
+                                            )
+                                        )
+                                    except CandidateGovernanceError as candidate_error:
+                                        self.connection.execute(
+                                            """UPDATE capture_rounds
+                                               SET status = 'error', last_error = ?,
+                                                   updated_at = CURRENT_TIMESTAMP
+                                               WHERE session_id = ? AND turn_id = ?""",
+                                            (
+                                                f"{type(error).__name__}; "
+                                                f"{str(candidate_error)[:800]}",
+                                                capture_session_id,
+                                                capture_turn_id,
+                                            ),
+                                        )
+                                    else:
+                                        self.connection.execute(
+                                            """UPDATE capture_rounds
+                                               SET status = 'done', candidate_id = ?,
+                                                   last_error = ?, updated_at = CURRENT_TIMESTAMP
+                                               WHERE session_id = ? AND turn_id = ?""",
+                                            (
+                                                exception_candidate,
+                                                f"model extraction failed after retries: "
+                                                f"{type(error).__name__}",
+                                                capture_session_id,
+                                                capture_turn_id,
+                                            ),
+                                        )
                             else:
                                 self.connection.execute(
                                     """UPDATE capture_rounds SET status = 'done',
@@ -10626,6 +10697,32 @@ class PlatformState:
                     "UPDATE background_jobs SET status = 'error' WHERE id = ?", (job_id,)
                 )
         self.connection.commit()
+
+    def _create_capture_exception_candidate(
+        self,
+        session_id: str,
+        turn_id: str,
+        library_id: str,
+        rows: list[tuple[object, ...]],
+    ) -> str:
+        user_row = next((row for row in rows if str(row[2]) == "user"), None)
+        if user_row is None:
+            raise CandidateGovernanceError(
+                "model extraction failure has no user evidence to review"
+            )
+        source_references = tuple(
+            f"capture:{session_id}:{turn_id}:{str(row[0])}:{str(row[4])}" for row in rows
+        )
+        candidate = self._create_candidate_locked(
+            library_id,
+            "domain_fact",
+            "# 会话内容待审核\n\n" + str(user_row[3]),
+            source_references,
+            "session-capture",
+            "capture-round:"
+            + hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest(),
+        )
+        return str(candidate["id"])
 
     def _queue_capture_consolidation(
         self,
