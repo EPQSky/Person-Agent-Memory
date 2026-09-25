@@ -98,23 +98,11 @@
     </style>
   </head>
   <body>
-    <main class="login-shell" id="login-shell"><form id="root" class="login-panel"><div class="brand-mark" aria-hidden="true">记</div><h1>个人智能体记忆</h1><p class="subtitle">Personal Agent Memory</p><label for="key">API 密钥</label><input id="key" type="password" autocomplete="off" aria-describedby="message"><button id="connect" type="submit">进入管理工作台</button><p id="message" class="hint" aria-live="polite">请输入平台状态目录中保存的 API 密钥。密钥仅保留在当前页面内存中。</p></form></main>
+    <main class="login-shell" id="login-shell"><form id="root" class="login-panel"><div class="brand-mark" aria-hidden="true">记</div><h1>个人智能体记忆</h1><p class="subtitle">Personal Agent Memory</p><label for="key">API 密钥</label><input id="key" type="password" autocomplete="off" aria-describedby="message"><button id="connect" type="submit">进入管理工作台</button><p id="message" class="hint" aria-live="polite">登录后建立 24 小时本地会话；API 密钥不会保存到浏览器存储。</p></form></main>
     <script src="/editor-history.js"></script>
     <script>
       const root = document.querySelector('#root');
-      document.querySelector('#root').addEventListener('submit', async (event) => {
-        event.preventDefault();
-        const key = document.querySelector('#key').value;
-        const connect = document.querySelector('#connect');
-        const loginMessage = document.querySelector('#message');
-        if (!key) { loginMessage.className = 'error'; loginMessage.textContent = '请输入 API 密钥。'; return; }
-        connect.disabled = true;
-        connect.textContent = '正在连接...';
-        let response;
-        try { response = await fetch('/api/v1/status', {headers: {Authorization: `Bearer ${key}`}}); }
-        catch (_error) { loginMessage.className = 'error'; loginMessage.textContent = '无法连接服务，请检查服务状态后重试。'; connect.disabled = false; connect.textContent = '进入管理工作台'; return; }
-        if (!response.ok) { loginMessage.className = 'error'; loginMessage.textContent = '认证失败，请检查 API 密钥。'; connect.disabled = false; connect.textContent = '进入管理工作台'; return; }
-        const data = await response.json();
+      async function enterWorkspace(data) {
         const loginShell = document.querySelector('#login-shell');
         loginShell.className = 'app-shell';
         root.replaceChildren();
@@ -219,9 +207,18 @@
         sidebar.innerHTML = '<div class="sidebar-brand">个人智能体记忆<small>Personal Agent Memory</small></div><nav aria-label="工作台导航"><button class="nav-button" data-view="overview" aria-current="page">概览</button><button class="nav-button" data-view="search">记忆检索</button><button class="nav-button" data-view="candidates">候选审核</button><button class="nav-button" data-view="documents">文档管理</button><div class="nav-group">管理与治理</div><button class="nav-button" data-view="libraries">记忆库</button><button class="nav-button" data-view="bindings">项目绑定</button><button class="nav-button" data-view="sensitive">敏感隔离</button><button class="nav-button" data-view="history">历史恢复</button><button class="nav-button" data-view="privacy">隐私设置</button></nav>';
         const topbar = document.createElement('header');
         topbar.className = 'topbar';
-        topbar.innerHTML = '<button type="button" id="nav-toggle" class="secondary" aria-label="展开或收起导航" aria-controls="workspace-sidebar" aria-expanded="false" title="展开或收起导航">☰</button><span class="connection ok" id="connection-status" role="status" aria-live="polite">服务已连接</span>';
+        topbar.innerHTML = '<button type="button" id="nav-toggle" class="secondary" aria-label="展开或收起导航" aria-controls="workspace-sidebar" aria-expanded="false" title="展开或收起导航">☰</button><span class="connection ok" id="connection-status" role="status" aria-live="polite">服务已连接</span><span id="session-status" class="hint">会话有效期 24 小时</span><button type="button" id="logout" class="secondary" title="退出当前会话">退出</button>';
         const workspace = document.createElement('div');
         workspace.className = 'workspace';
+        topbar.querySelector('#logout').addEventListener('click', async (event) => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          try {
+            await fetch('/api/v1/auth/logout', {method: 'POST', credentials: 'same-origin'});
+          } finally {
+            window.location.reload();
+          }
+        });
         const makeView = (name, title, nodes) => {
           const view = document.createElement('section');
           view.className = 'view';
@@ -373,6 +370,7 @@
           button.textContent = busy ? label : button.dataset.label;
         };
         const connectionStatus = topbar.querySelector('#connection-status');
+        const sessionStatus = topbar.querySelector('#session-status');
         let requestSequence = 0;
         let connectionObservation = 0;
         const setConnectionStatus = (requestId, state, text) => {
@@ -387,6 +385,10 @@
           if (response.status === 401) {
             connectionStatus.className = 'connection warn';
             connectionStatus.textContent = '认证已失效';
+            if (sessionStatus !== connectionStatus) sessionStatus.textContent = '会话已过期，请重新登录';
+            if (typeof window.setTimeout === 'function' && window.location?.reload) {
+              window.setTimeout(() => window.location.reload(), 0);
+            }
           }
           else if (response.ok) {
             connectionStatus.className = 'connection ok';
@@ -394,10 +396,11 @@
           }
         };
         const nativeFetch = window.fetch.bind(window);
-        const request = async (...args) => {
+        const request = async (input, options = {}) => {
           const requestId = ++requestSequence;
           try {
-            const response = await nativeFetch(...args);
+            const requestOptions = {...options, credentials: 'same-origin'};
+            const response = await nativeFetch(input, requestOptions);
             observeConnectionResponse(requestId, response);
             return response;
           }
@@ -501,7 +504,7 @@
         async function refresh() {
           const generation = ++generations.libraries;
           overviewAlert.textContent = '正在加载概览...';
-          const response = await request('/api/v1/libraries', {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request('/api/v1/libraries', {headers: {}});
           if (!response.ok || generation !== generations.libraries) { overviewAlert.className = 'notice error'; overviewAlert.textContent = '概览加载失败。请刷新页面重试。'; return; }
           const libraries = await response.json();
           if (generation !== generations.libraries) return;
@@ -529,7 +532,7 @@
           if (!libraries.length) { const row = body.insertRow(); const cell = row.insertCell(); cell.colSpan = 8; cell.className = 'empty'; cell.textContent = '还没有记忆库，请使用上方表单注册。'; }
           document.querySelector('#metric-libraries').textContent = String(libraries.length);
           const [candidateResponse, sensitiveCount] = await Promise.all([
-            request('/api/v1/candidates?candidate_status=pending', {headers: {Authorization: `Bearer ${key}`}}),
+            request('/api/v1/candidates?candidate_status=pending', {headers: {}}),
             countSensitiveRecords(),
           ]);
           if (generation !== generations.libraries) return;
@@ -544,7 +547,7 @@
         async function countSensitiveRecords() {
           let offset = 0; let total = 0;
           while (true) {
-            const response = await request(`/api/v1/sensitive-quarantine?offset=${offset}&limit=${sensitivePageSize}`, {headers: {Authorization: `Bearer ${key}`}});
+            const response = await request(`/api/v1/sensitive-quarantine?offset=${offset}&limit=${sensitivePageSize}`, {headers: {}});
             if (!response.ok) return null;
             const page = await response.json(); total += page.length;
             if (page.length < sensitivePageSize) return total;
@@ -558,7 +561,7 @@
           if (!await confirmAction('确认恢复候选记忆', `将从记忆库 ${libraryId} 的回收站恢复候选 ${item.candidate.id}。`)) return;
           const message = retentionForm.querySelector('#retention-message');
           await performOnce(`restore-${item.candidate.id}`, button, '正在恢复...', async () => {
-            const response = await request(`/api/v1/candidates/${item.candidate.id}/restore`, {method: 'POST', headers: {Authorization: `Bearer ${key}`}});
+            const response = await request(`/api/v1/candidates/${item.candidate.id}/restore`, {method: 'POST', headers: {}});
             if (context.selectionGeneration !== retentionSelectionGeneration || context.libraryId !== retentionForm.querySelector('#retention-library').value) return;
             if (!response.ok) { setMessage(message, '候选记忆恢复失败。', 'error'); return; }
             await Promise.all([refreshRetention(), refreshCandidates()]);
@@ -576,8 +579,8 @@
           if (!libraryId) { setMessage(message, '请先注册并选择记忆库。'); return; }
           setMessage(message, '正在加载保留策略...');
           const [policyResponse, recycleResponse] = await Promise.all([
-            request(`/api/v1/libraries/${libraryId}/retention-policy`, {headers: {Authorization: `Bearer ${key}`}}),
-            request(`/api/v1/libraries/${libraryId}/candidate-recycle-bin`, {headers: {Authorization: `Bearer ${key}`}}),
+            request(`/api/v1/libraries/${libraryId}/retention-policy`, {headers: {}}),
+            request(`/api/v1/libraries/${libraryId}/candidate-recycle-bin`, {headers: {}}),
           ]);
           if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
           if (!policyResponse.ok || !recycleResponse.ok) { setMessage(message, '保留策略加载失败，请重试。', 'error'); return; }
@@ -613,7 +616,7 @@
           retentionPreviewContext = null;
           runButton.disabled = true;
           impact.textContent = '正在计算清理影响...';
-          const response = await request(`/api/v1/libraries/${libraryId}/retention-cleanup/preview`, {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request(`/api/v1/libraries/${libraryId}/retention-cleanup/preview`, {headers: {}});
           if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return false;
           if (!response.ok) { impact.textContent = '清理预览不可用，请稍后重试。'; return false; }
           const payload = await response.json();
@@ -645,7 +648,7 @@
           if (!retentionPreviewContext || retentionPreviewContext.libraryId !== libraryId || retentionPreviewContext.generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
           const button = retentionForm.querySelector('#retention-run');
           await performOnce(`retention-run-${libraryId}`, button, '正在清理...', async () => {
-            const response = await request(`/api/v1/libraries/${libraryId}/retention-cleanup`, {method: 'POST', headers: {Authorization: `Bearer ${key}`}});
+            const response = await request(`/api/v1/libraries/${libraryId}/retention-cleanup`, {method: 'POST', headers: {}});
             if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
             if (response.ok) {
               button.dataset.keepDisabled = 'true';
@@ -661,7 +664,7 @@
           clearReconciliation(false);
           if (!libraryId) { reconciliationList.innerHTML = '<p class="empty">请先选择记忆库。</p>'; return; }
           reconciliationList.innerHTML = '<p class="empty">正在加载带外变更...</p>';
-          const response = await request(`/api/v1/libraries/${libraryId}/out-of-band-changes`, {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request(`/api/v1/libraries/${libraryId}/out-of-band-changes`, {headers: {}});
           if (generation !== generations.reconciliation || libraryId !== editorLibrary.value) return;
           if (!response.ok) { reconciliationList.innerHTML = '<p class="empty error">带外变更加载失败，请切换记忆库后重试。</p>'; return; }
           const changes = await response.json();
@@ -759,7 +762,7 @@
             reconciliationDetail.querySelector('#reconciliation-final').value,
             reconciliationDetail.querySelector('#reconciliation-path').value,
           );
-          const response = await request(resolution.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(resolution.body)});
+          const response = await request(resolution.url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(resolution.body)});
           const message = reconciliationDetail.querySelector('#reconciliation-message');
           if (!reconciliationContextIsCurrent(context) || activeReconciliation?.id !== selected.id) return;
           if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '带外变更处理失败'), 'error'); return; }
@@ -774,7 +777,7 @@
           const generation = ++generations.candidates;
           const statusQuery = candidateStatus.value ? `?candidate_status=${encodeURIComponent(candidateStatus.value)}` : '';
           candidateList.innerHTML = '<p class="empty">正在加载候选记忆...</p>';
-          const response = await request(`/api/v1/candidates${statusQuery}`, {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request(`/api/v1/candidates${statusQuery}`, {headers: {}});
           if (generation !== generations.candidates) return;
           if (!response.ok) { candidateList.innerHTML = '<p class="empty error">候选记忆加载失败，请重试。</p>'; return; }
           const candidates = await response.json();
@@ -828,7 +831,7 @@
           for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-pin', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = !pending;
           clearCandidateGovernance();
           candidateDetail.querySelector('#candidate-message').textContent = candidate.published_path ? `已发布为 ${candidate.published_path}，提交 ${candidate.commit}` : '';
-          const response = await request(`/api/v1/candidates/${candidate.id}/governance`, {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request(`/api/v1/candidates/${candidate.id}/governance`, {headers: {}});
           if (governanceGeneration !== generations.candidateGovernance || activeCandidate?.id !== candidateId) return;
           if (!response.ok) {
             const failure = await response.json();
@@ -860,7 +863,7 @@
           const body = candidateDetail.querySelector('#candidate-body').value;
           const url = action === 'edit' ? `/api/v1/candidates/${candidateId}` : `/api/v1/candidates/${candidateId}/${action}`;
           const payload = action === 'edit' ? {body, operator, reason} : {operator, reason, operation_id: crypto.randomUUID()};
-          const response = await request(url, {method: action === 'edit' ? 'PUT' : 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          const response = await request(url, {method: action === 'edit' ? 'PUT' : 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
           const message = candidateDetail.querySelector('#candidate-message');
           if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
           if (!response.ok) { const failure = await response.json(); if (selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId) setMessage(message, describeError(failure, '候选操作失败'), 'error'); return; }
@@ -893,7 +896,7 @@
             effective_at: effective ? new Date(effective).toISOString() : null,
             condition: action === 'scope' ? candidateDetail.querySelector('#candidate-condition').value : null,
           };
-          const response = await request(`/api/v1/candidates/${candidateId}/resolve`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          const response = await request(`/api/v1/candidates/${candidateId}/resolve`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
           const message = candidateDetail.querySelector('#candidate-message');
           if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
           if (!response.ok) { const failure = await response.json(); if (selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId) setMessage(message, describeError(failure, '冲突裁决失败'), 'error'); return; }
@@ -915,7 +918,7 @@
           const button = candidateDetail.querySelector('#candidate-pin');
           await performOnce(`candidate-${candidateId}`, button, '正在置顶...', async () => {
             if (!contextIsCurrent()) return;
-            const response = await request(`/api/v1/candidates/${candidateId}/pin`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({pinned: true})});
+            const response = await request(`/api/v1/candidates/${candidateId}/pin`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pinned: true})});
             const message = candidateDetail.querySelector('#candidate-message');
             if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
             if (!response.ok) { setMessage(message, '候选记忆置顶失败。', 'error'); return; }
@@ -928,7 +931,7 @@
           const generation = ++generations.sensitive;
           sensitiveList.replaceChildren();
           sensitiveList.innerHTML = '<p class="empty">正在加载敏感隔离记录...</p>';
-          const response = await request(`/api/v1/sensitive-quarantine?offset=${sensitiveOffset}&limit=${sensitivePageSize + 1}`, {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request(`/api/v1/sensitive-quarantine?offset=${sensitiveOffset}&limit=${sensitivePageSize + 1}`, {headers: {}});
           if (generation !== generations.sensitive) return;
           if (!response.ok) { sensitiveList.innerHTML = '<p class="empty error">敏感隔离记录加载失败，请重试。</p>'; sensitiveList.append(sensitivePagination); return; }
           const payload = await response.json();
@@ -988,7 +991,7 @@
           if (!contextIsCurrent()) return;
           const button = sensitiveDetail.querySelector(resolution === 'acknowledge' ? '#sensitive-acknowledge' : '#sensitive-discard');
           await performOnce(`sensitive-${recordId}`, button, '正在处理...', async () => {
-          const response = await request(`/api/v1/sensitive-quarantine/${recordId}/resolve`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({resolution})});
+          const response = await request(`/api/v1/sensitive-quarantine/${recordId}/resolve`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({resolution})});
           const message = sensitiveDetail.querySelector('#sensitive-message');
           if (!contextIsCurrent()) return;
           if (!response.ok) { const failure = await response.json(); if (contextIsCurrent()) setMessage(message, describeError(failure, '敏感记录处理失败'), 'error'); return; }
@@ -1027,7 +1030,7 @@
           editor.querySelector('#editor-message').textContent = selectedLibrary ? '正在加载文档...' : '请先选择记忆库。';
           setMessage(historyMessage, selectedLibrary ? '正在加载文档列表...' : '请先选择记忆库。');
           if (!selectedLibrary) return;
-          const response = await request(`/api/v1/libraries/${selectedLibrary}/documents`, {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request(`/api/v1/libraries/${selectedLibrary}/documents`, {headers: {}});
           if (!response.ok) { if (editorContext.isCurrent(requestContext)) setMessage(editor.querySelector('#editor-message'), '文档列表加载失败，请重试。', 'error'); return; }
           if (!editorContext.isCurrent(requestContext)) return;
           const documents = await response.json();
@@ -1060,7 +1063,7 @@
           const selectedLibrary = editorLibrary.value;
           const requestContext = editorContext.requestDocument(selectedLibrary, path);
           setMessage(editor.querySelector('#editor-message'), `正在加载 ${path}...`);
-          const response = await request(`/api/v1/libraries/${selectedLibrary}/document?path=${encodeURIComponent(path)}`, {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request(`/api/v1/libraries/${selectedLibrary}/document?path=${encodeURIComponent(path)}`, {headers: {}});
           if (!response.ok) { if (editorContext.isCurrent(requestContext)) setMessage(editor.querySelector('#editor-message'), `文档加载失败：${path}`, 'error'); return null; }
           const loaded = await response.json();
           const accepted = editorContext.acceptDocument(requestContext, loaded);
@@ -1102,7 +1105,7 @@
           pending.add(`preview-${context.token}`); setBusy(button, true, '正在预览...');
           const previewRequest = PamHistory.previewRequest(context);
           let response;
-          try { response = await request(previewRequest.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(previewRequest.body)}); }
+          try { response = await request(previewRequest.url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(previewRequest.body)}); }
           finally { pending.delete(`preview-${context.token}`); setBusy(button, false, '正在预览...'); }
           const message = editor.querySelector('#editor-message');
           if (!editorContext.isCurrent(context)) return false;
@@ -1126,7 +1129,7 @@
           historySelection.clear();
           setMessage(historyMessage, `正在加载提交 ${entry.commit.slice(0, 12)} 的差异...`);
           let diffResponse;
-          try { diffResponse = await request(`/api/v1/libraries/${selectedLibrary}/history/${entry.commit}/diff`, {headers: {Authorization: `Bearer ${key}`}}); }
+          try { diffResponse = await request(`/api/v1/libraries/${selectedLibrary}/history/${entry.commit}/diff`, {headers: {}}); }
           finally { pending.delete(pendingKey); }
           if (!editorContext.isCurrent(actionContext) || selectionGeneration !== generations.historyDiff) return;
           if (!diffResponse.ok) {
@@ -1163,7 +1166,7 @@
           if (!context || !context.libraryId) return;
           history.innerHTML = '<p class="empty">正在加载本地历史...</p>';
           const selectedLibrary = context.libraryId;
-          const response = await request(`/api/v1/libraries/${selectedLibrary}/history`, {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request(`/api/v1/libraries/${selectedLibrary}/history`, {headers: {}});
           if (!response.ok) { if (editorContext.isCurrent(context)) history.innerHTML = '<p class="empty error">本地历史加载失败，请重试。</p>'; return; }
           if (!editorContext.isCurrent(context) || generation !== generations.history) return;
           const entries = await response.json(); history.replaceChildren();
@@ -1195,7 +1198,7 @@
           const restoreButton = restoreAction.querySelector('button');
           await performOnce(`history-${selection.contextToken}`, restoreButton, '正在恢复...', async () => {
           const restore = PamHistory.request(selection, crypto.randomUUID());
-          const response = await request(restore.url, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(restore.body)});
+          const response = await request(restore.url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(restore.body)});
           if (!selectionIsCurrent()) return;
           if (!response.ok) { const failure = await response.json(); if (!selectionIsCurrent()) return; setMessage(historyMessage, describeError(failure, '历史版本恢复失败'), 'error'); return; }
           restoreAction.replaceChildren();
@@ -1215,7 +1218,7 @@
           const button = editor.querySelector('#preview-delete');
           pending.add(pendingKey); setBusy(button, true, '正在预览...');
           let response;
-          try { response = await request(`/api/v1/libraries/${context.libraryId}/document/delete-preview`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, operation_id: crypto.randomUUID()})}); }
+          try { response = await request(`/api/v1/libraries/${context.libraryId}/document/delete-preview`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, operation_id: crypto.randomUUID()})}); }
           finally { pending.delete(pendingKey); setBusy(button, false, '正在预览...'); }
           if (!documentContextIsCurrent(context) || requestGeneration !== generations.forgettingPreview) return false;
           const message = editor.querySelector('#editor-message');
@@ -1238,7 +1241,7 @@
           if (!editorContext.isCurrent(context)) return;
           const button = editor.querySelector('#confirm-delete');
           await performOnce(`forget-${context.token}`, button, '正在遗忘...', async () => {
-          const response = await request(`/api/v1/libraries/${context.libraryId}/document`, {method: 'DELETE', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, preview_token: deletionPreviewToken, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-delete'})});
+          const response = await request(`/api/v1/libraries/${context.libraryId}/document`, {method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, preview_token: deletionPreviewToken, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-delete'})});
           const message = editor.querySelector('#editor-message');
           if (!editorContext.isCurrent(context)) return;
           if (!response.ok) { const failure = await response.json(); if (editorContext.isCurrent(context)) setMessage(message, describeError(failure, '记忆遗忘失败'), 'error'); return; }
@@ -1255,7 +1258,7 @@
           await performOnce(`save-${context.token}`, button, '正在保存...', async () => {
             if (!(await previewChange(context)) || !documentContextIsCurrent(context)) return;
             const saveRequest = PamHistory.saveRequest(context, crypto.randomUUID());
-            const response = await request(saveRequest.url, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(saveRequest.body)});
+            const response = await request(saveRequest.url, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(saveRequest.body)});
             const message = editor.querySelector('#editor-message');
             if (!documentContextIsCurrent(context)) return;
             if (!response.ok) { const failure = await response.json(); if (!documentContextIsCurrent(context)) return; setMessage(message, describeError(failure, '文档保存失败'), 'error'); return; }
@@ -1292,8 +1295,8 @@
           if (!libraryId) return;
           const contextIsCurrent = () => generation === generations.forgotten && libraryId === editorLibrary.value;
           const [forgottenResponse, historyResponse] = await Promise.all([
-            request(`/api/v1/libraries/${libraryId}/forgotten`, {headers: {Authorization: `Bearer ${key}`}}),
-            request(`/api/v1/libraries/${libraryId}/history`, {headers: {Authorization: `Bearer ${key}`}}),
+            request(`/api/v1/libraries/${libraryId}/forgotten`, {headers: {}}),
+            request(`/api/v1/libraries/${libraryId}/history`, {headers: {}}),
           ]);
           if (!contextIsCurrent()) return;
           if (!forgottenResponse.ok || !historyResponse.ok) { if (contextIsCurrent()) setMessage(forgottenForm.querySelector('#forgotten-message'), '遗忘记忆列表加载失败，请重试。', 'error'); return; }
@@ -1321,7 +1324,7 @@
 
         async function refreshBindings() {
           const generation = ++generations.bindings;
-          const response = await request('/api/v1/project-bindings', {headers: {Authorization: `Bearer ${key}`}});
+          const response = await request('/api/v1/project-bindings', {headers: {}});
           if (generation !== generations.bindings) return;
           if (!response.ok) { bindingTable.querySelector('tbody').innerHTML = '<tr><td colspan="6" class="empty error">项目绑定加载失败，请重试。</td></tr>'; return; }
           const bindings = await response.json();
@@ -1357,7 +1360,7 @@
             remove.addEventListener('click', async () => {
               if (!await confirmAction(binding.kind === 'project' ? '确认解绑项目' : '确认移除 Worktree 关联', `将移除 ${binding.canonical_root} 的当前关系。`)) return;
               await performOnce(`binding-${binding.id}`, remove, '正在移除...', async () => {
-                const response = await request(`/api/v1/project-bindings/${binding.id}`, {method: 'DELETE', headers: {Authorization: `Bearer ${key}`}});
+                const response = await request(`/api/v1/project-bindings/${binding.id}`, {method: 'DELETE', headers: {}});
                 setMessage(bindingForm.querySelector('#binding-message'), response.ok ? '项目关系已移除。' : '项目关系移除失败。', response.ok ? 'success' : 'error');
                 if (response.ok) await refreshBindings();
               });
@@ -1384,7 +1387,7 @@
           try {
             while (true) {
               const libraryId = state.desiredLibraryId;
-              const response = await request(`/api/v1/project-bindings/${bindingId}`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({library_id: libraryId})});
+              const response = await request(`/api/v1/project-bindings/${bindingId}`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({library_id: libraryId})});
               if (libraryId !== state.desiredLibraryId) continue;
               if (!response.ok) {
                 const failure = await response.json();
@@ -1409,7 +1412,7 @@
           await performOnce('register-library', button, '正在注册...', async () => {
           const response = await request('/api/v1/libraries', {
             method: 'POST',
-            headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'},
+            headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({path: form.querySelector('#path').value, kind: form.querySelector('#kind').value, reuse_existing_git: form.querySelector('#reuse-existing-git').checked}),
           });
           const message = form.querySelector('#library-message');
@@ -1427,7 +1430,7 @@
           event.preventDefault();
           const button = bindingForm.querySelector('button[type="submit"]');
           await performOnce('bind-project', button, '正在绑定...', async () => {
-          const response = await request('/api/v1/project-bindings', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({project_root: bindingForm.querySelector('#project-root').value, library_id: bindingForm.querySelector('#project-library').value})});
+          const response = await request('/api/v1/project-bindings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project_root: bindingForm.querySelector('#project-root').value, library_id: bindingForm.querySelector('#project-library').value})});
           const message = bindingForm.querySelector('#binding-message');
           if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '项目绑定失败'), 'error'); return; }
           setMessage(message, '项目已绑定。', 'success');
@@ -1439,7 +1442,7 @@
           event.preventDefault();
           const button = worktreeForm.querySelector('button[type="submit"]');
           await performOnce('associate-worktree', button, '正在关联...', async () => {
-          const response = await request('/api/v1/project-bindings/worktrees', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({worktree_root: worktreeForm.querySelector('#worktree-root').value, main_project_binding_id: worktreeForm.querySelector('#main-binding').value})});
+          const response = await request('/api/v1/project-bindings/worktrees', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({worktree_root: worktreeForm.querySelector('#worktree-root').value, main_project_binding_id: worktreeForm.querySelector('#main-binding').value})});
           const message = worktreeForm.querySelector('#worktree-message');
           if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, 'Worktree 关联失败'), 'error'); return; }
           setMessage(message, 'Worktree 已关联。', 'success');
@@ -1453,7 +1456,7 @@
           const requestId = crypto.randomUUID(); searchForm.dataset.requestId = requestId;
           await performOnce('search', button, '正在检索...', async () => {
           setMessage(searchForm.querySelector('#search-message'), '正在检索记忆...');
-          const response = await request('/api/v1/search', {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({cwd: searchForm.querySelector('#search-cwd').value, query: searchForm.querySelector('#search-query').value})});
+          const response = await request('/api/v1/search', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cwd: searchForm.querySelector('#search-cwd').value, query: searchForm.querySelector('#search-query').value})});
           if (searchForm.dataset.requestId !== requestId) return;
           const message = searchForm.querySelector('#search-message');
           const results = searchForm.querySelector('#search-results');
@@ -1495,7 +1498,7 @@
             diagnostics_enabled: retentionForm.querySelector('#diagnostics-enabled').checked,
             diagnostic_days: Number(retentionForm.querySelector('#diagnostic-days').value),
           };
-          const response = await request(`/api/v1/libraries/${libraryId}/retention-policy`, {method: 'PUT', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          const response = await request(`/api/v1/libraries/${libraryId}/retention-policy`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
           if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
           setMessage(retentionForm.querySelector('#retention-message'), response.ok ? '保留策略已保存。' : '保留策略保存失败。', response.ok ? 'success' : 'error');
           if (response.ok) await previewRetention();
@@ -1510,7 +1513,7 @@
           if (!await confirmAction('确认清除诊断', '将删除当前保留的诊断数据。')) return;
           const button = retentionForm.querySelector('#diagnostics-clear');
           await performOnce('diagnostics-clear', button, '正在清除...', async () => {
-            const response = await request('/api/v1/diagnostics', {method: 'DELETE', headers: {Authorization: `Bearer ${key}`}});
+            const response = await request('/api/v1/diagnostics', {method: 'DELETE', headers: {}});
             setMessage(retentionForm.querySelector('#retention-message'), response.ok ? '诊断数据已清除。' : '诊断数据清除失败。', response.ok ? 'success' : 'error');
           });
         });
@@ -1585,7 +1588,7 @@
           const button = forgottenForm.querySelector('button[type="submit"]');
           await performOnce('forgotten-restore', button, '正在恢复...', async () => {
           if (!restoreContextIsCurrent()) return;
-          const response = await request(`/api/v1/libraries/${libraryId}/forgotten/restore`, {method: 'POST', headers: {Authorization: `Bearer ${key}`, 'Content-Type': 'application/json'}, body: JSON.stringify({tombstone_id: tombstoneId, commit: selectedCommit, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-forgotten-history'})});
+          const response = await request(`/api/v1/libraries/${libraryId}/forgotten/restore`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tombstone_id: tombstoneId, commit: selectedCommit, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-forgotten-history'})});
           const message = forgottenForm.querySelector('#forgotten-message');
           if (!restoreContextIsCurrent()) return;
           if (!response.ok) { const failure = await response.json(); if (restoreContextIsCurrent()) setMessage(message, describeError(failure, '遗忘记忆恢复失败'), 'error'); return; }
@@ -1604,7 +1607,55 @@
         });
         editor.querySelector('#save-change').addEventListener('click', saveDocument);
         await refresh();
+      }
+
+      document.querySelector('#root').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const keyInput = document.querySelector('#key');
+        const connect = document.querySelector('#connect');
+        const loginMessage = document.querySelector('#message');
+        const apiKey = keyInput.value;
+        if (!apiKey) { loginMessage.className = 'error'; loginMessage.textContent = '请输入 API 密钥。'; return; }
+        connect.disabled = true;
+        connect.textContent = '正在连接...';
+        try {
+          const login = await fetch('/api/v1/auth/session', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({api_key: apiKey}),
+          });
+          if (!login.ok) {
+            loginMessage.className = 'error';
+            loginMessage.textContent = login.status === 401 ? '认证失败，请检查 API 密钥。' : '登录服务暂不可用，请稍后重试。';
+            return;
+          }
+          keyInput.value = '';
+          const response = await fetch('/api/v1/status', {credentials: 'same-origin'});
+          if (!response.ok) {
+            loginMessage.className = 'error';
+            loginMessage.textContent = '会话建立失败，请稍后重试。';
+            return;
+          }
+          await enterWorkspace(await response.json());
+        } catch (_error) {
+          loginMessage.className = 'error';
+          loginMessage.textContent = '无法连接服务，请检查服务状态后重试。';
+        } finally {
+          connect.disabled = false;
+          connect.textContent = '进入管理工作台';
+        }
       });
+
+      (async () => {
+        try {
+          const response = await fetch('/api/v1/status', {credentials: 'same-origin'});
+          if (response.ok) await enterWorkspace(await response.json());
+          else if (response.status === 401) document.querySelector('#message').textContent = '会话已过期，请重新输入 API 密钥。';
+        } catch (_error) {
+          document.querySelector('#message').textContent = '无法连接服务，请检查服务状态后重试。';
+        }
+      })();
     </script>
   </body>
 </html>

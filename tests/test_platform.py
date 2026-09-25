@@ -15,6 +15,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,7 @@ from personal_agent_memory.markdown_index import (
     chunk_markdown,
     match_chunk_ids,
 )
+from personal_agent_memory.security import ManagementSessionStore
 from personal_agent_memory.state import MemoryMutationError, PlatformState
 
 
@@ -948,6 +950,112 @@ def test_key_rotation_immediately_invalidates_old_key(tmp_path: Path) -> None:
         assert new_status.json()["api_key_fingerprint"] == response.json()["fingerprint"]
 
 
+def test_management_session_is_cookie_only_persistent_and_expires_at_24_hours(
+    tmp_path: Path,
+) -> None:
+    start = "2026-09-25T12:00:00Z"
+    login_settings = Settings(state_dir=tmp_path, session_now=start)
+    with TestClient(create_app(login_settings)) as client:
+        key = (tmp_path / "api-key").read_text(encoding="utf-8").strip()
+        login = client.post("/api/v1/auth/session", json={"api_key": key})
+        assert login.status_code == 200, login.text
+        assert login.json() == {
+            "expires_at": "2026-09-26T12:00:00+00:00",
+            "expires_in_seconds": 86_400,
+        }
+        cookie = client.cookies.get("pam_management_session")
+        assert cookie
+        set_cookie = login.headers["set-cookie"]
+        assert "HttpOnly" in set_cookie
+        assert "SameSite=strict" in set_cookie
+        assert "Max-Age=86400" in set_cookie
+        assert "Path=/" in set_cookie
+        assert client.get("/api/v1/status").status_code == 200
+        session_file = tmp_path / "management-sessions.json"
+        stored = session_file.read_text(encoding="utf-8")
+        assert cookie not in stored
+        assert key not in stored
+
+    restarted = TestClient(
+        create_app(Settings(state_dir=tmp_path, session_now="2026-09-26T11:59:59Z"))
+    )
+    with restarted:
+        restarted.cookies.set("pam_management_session", cookie)
+        assert restarted.get("/api/v1/status").status_code == 200
+
+    expired = TestClient(
+        create_app(Settings(state_dir=tmp_path, session_now="2026-09-26T12:00:00Z"))
+    )
+    with expired:
+        expired.cookies.set("pam_management_session", cookie)
+        response = expired.get("/api/v1/status")
+        assert response.status_code == 401
+        assert response.json()["detail"] == "invalid API key"
+        assert json.loads((tmp_path / "management-sessions.json").read_text()) == []
+
+
+def test_management_session_logout_and_key_rotation_revoke_cookie_access(
+    tmp_path: Path,
+) -> None:
+    with TestClient(
+        create_app(Settings(state_dir=tmp_path, session_now="2026-09-25T12:00:00Z"))
+    ) as client:
+        old_key = (tmp_path / "api-key").read_text(encoding="utf-8").strip()
+        login = client.post("/api/v1/auth/login", json={"api_key": old_key})
+        assert login.status_code == 200, login.text
+        cookie = client.cookies.get("pam_management_session")
+        assert cookie
+        assert client.post("/api/v1/auth/logout").json() == {"status": "logged_out"}
+        assert client.get("/api/v1/status").status_code == 401
+
+        login = client.post("/api/v1/auth/session", json={"api_key": old_key})
+        assert login.status_code == 200, login.text
+        rotated_cookie = client.cookies.get("pam_management_session")
+        assert rotated_cookie and rotated_cookie != cookie
+        rotated = client.post(
+            "/api/v1/auth/rotate",
+            headers={"Authorization": f"Bearer {old_key}"},
+        )
+        assert rotated.status_code == 200, rotated.text
+        assert client.get("/api/v1/status").status_code == 401
+
+
+def test_management_session_records_are_bounded_and_bearer_remains_supported(
+    tmp_path: Path,
+) -> None:
+    with TestClient(
+        create_app(Settings(state_dir=tmp_path, session_now="2026-09-25T12:00:00Z"))
+    ) as client:
+        key = (tmp_path / "api-key").read_text(encoding="utf-8").strip()
+        for _ in range(80):
+            response = client.post("/api/v1/auth/session", json={"api_key": key})
+            assert response.status_code == 200
+        records = json.loads((tmp_path / "management-sessions.json").read_text())
+        assert len(records) <= 64
+        assert client.get(
+            "/api/v1/status", headers={"Authorization": f"Bearer {key}"}
+        ).status_code == 200
+
+
+def test_management_session_concurrent_creation_is_serialized_and_bounded(
+    tmp_path: Path,
+) -> None:
+    store = ManagementSessionStore(
+        tmp_path / "management-sessions.json",
+        now=lambda: datetime.fromisoformat("2026-09-25T12:00:00+00:00"),
+    )
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        tokens = list(executor.map(lambda _: store.create("concurrent-key")[0], range(200)))
+
+    assert len(tokens) == 200
+    records = json.loads((tmp_path / "management-sessions.json").read_text(encoding="utf-8"))
+    assert len(records) <= store.max_records
+    assert not list(tmp_path.glob("*.tmp"))
+    valid_tokens = sum(store.verify(token, "concurrent-key") for token in tokens)
+    assert valid_tokens == len(records)
+
+
 def test_restart_reports_previous_clean_shutdown(tmp_path: Path) -> None:
     headers: dict[str, str]
     with TestClient(create_app(Settings(state_dir=tmp_path))) as client:
@@ -1008,7 +1116,16 @@ def test_management_interface_is_available(tmp_path: Path) -> None:
         assert fingerprint not in response.text
         assert str(tmp_path) not in response.text
         assert "localStorage" not in response.text
+        assert "sessionStorage" not in response.text
         assert "URLSearchParams" not in response.text
+        assert "Authorization" not in response.text
+        assert "Bearer" not in response.text
+        assert "/api/v1/auth/session" in response.text
+        assert "/api/v1/auth/logout" in response.text
+        assert "credentials: 'same-origin'" in response.text
+        assert "会话有效期 24 小时" in response.text
+        assert "会话已过期，请重新登录" in response.text
+        assert "退出" in response.text
         assert 'lang="zh-CN"' in response.text
         assert "个人智能体记忆" in response.text
         assert "服务状态" in response.text

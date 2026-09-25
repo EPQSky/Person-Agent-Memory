@@ -3378,10 +3378,22 @@ try:
     assert key not in browser.current_url
     assert key not in browser.page_source
     assert browser.execute_script("return [localStorage.length, sessionStorage.length]") == [0, 0]
-    assert browser.get_cookies() == []
+    session_cookies = [
+        cookie for cookie in browser.get_cookies() if cookie["name"] == "pam_management_session"
+    ]
+    assert len(session_cookies) == 1
+    assert session_cookies[0]["httpOnly"] is True
+    assert session_cookies[0]["sameSite"].lower() == "strict"
     assert browser.find_element(By.CSS_SELECTOR, '[data-view-panel="overview"]').is_displayed()
     assert browser.find_element(By.ID, "connection-status").text == "服务已连接"
     assert browser.find_element(By.ID, "metric-service").text == "可用"
+    browser.refresh()
+    wait.until(lambda driver: driver.find_elements(By.ID, "candidate-title"))
+    assert browser.find_element(By.CSS_SELECTOR, '[data-view-panel="overview"]').is_displayed()
+    assert browser.find_element(By.ID, "connection-status").text == "服务已连接"
+    assert key not in browser.current_url
+    assert key not in browser.page_source
+    assert browser.execute_script("return [localStorage.length, sessionStorage.length]") == [0, 0]
 
     def open_browser_view(name: str) -> None:
         navigation_items = browser.find_elements(By.CSS_SELECTOR, f'[data-view="{name}"]')
@@ -4130,6 +4142,16 @@ try:
         "getComputedStyle(sidebar).animationDuration];"
     )
     assert reduced_motion == [True, "0s", "0s"]
+    browser.find_element(By.ID, "logout").click()
+    wait.until(lambda driver: driver.find_element(By.ID, "key").is_displayed())
+    assert browser.get_cookies() == []
+    assert (
+        browser.execute_async_script(
+            "const done = arguments[0]; "
+            "fetch('/api/v1/status').then(response => done(response.status));"
+        )
+        == 401
+    )
     print(
         "Browser screenshots:",
         desktop_overview_screenshot,

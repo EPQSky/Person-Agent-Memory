@@ -10,8 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Response, status
+from fastapi.responses import FileResponse, HTMLResponse
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -19,7 +19,7 @@ from personal_agent_memory.config import Settings
 from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
 from personal_agent_memory.graph_adapter import JiuwenMilvusGraphAdapter
 from personal_agent_memory.model_client import OpenAICompatibleClient
-from personal_agent_memory.security import ApiKeyStore
+from personal_agent_memory.security import ApiKeyStore, ManagementSessionStore
 from personal_agent_memory.state import (
     CandidateGovernanceError,
     CapturePersistenceBusyError,
@@ -221,6 +221,10 @@ class RetentionPolicyUpdate(BaseModel):
     diagnostic_days: int = Field(default=7, ge=0, le=365)
 
 
+class ManagementSessionLogin(BaseModel):
+    api_key: str = Field(min_length=1, max_length=1000)
+
+
 class CandidatePinUpdate(BaseModel):
     pinned: bool
 
@@ -242,6 +246,12 @@ def create_app(settings: Settings) -> FastAPI:
         now=(lambda: fixed_now) if fixed_now is not None else None,
     )
     markdown = MarkdownIt("commonmark", {"html": False})
+    session_fixed_now: datetime | None = None
+    if settings.session_now is not None:
+        session_fixed_now = datetime.fromisoformat(settings.session_now.replace("Z", "+00:00"))
+        if session_fixed_now.tzinfo is None:
+            session_fixed_now = session_fixed_now.replace(tzinfo=UTC)
+        session_fixed_now = session_fixed_now.astimezone(UTC)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -255,21 +265,32 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="Personal Agent Memory", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.platform_state = platform_state
+    app.state.management_session_clock = (
+        (lambda: session_fixed_now) if session_fixed_now is not None else lambda: datetime.now(UTC)
+    )
+    session_store = ManagementSessionStore(
+        settings.state_dir / "management-sessions.json",
+        now=lambda: app.state.management_session_clock(),
+    )
+    app.state.management_session_store = session_store
 
-    def authenticate(authorization: str | None = Header(default=None)) -> None:
+    def authenticate(
+        authorization: str | None = Header(default=None),
+        session_cookie: str | None = Cookie(default=None, alias="pam_management_session"),
+    ) -> None:
         scheme, _, supplied = (authorization or "").partition(" ")
         stored = key_store.read()
-        if (
-            scheme.lower() != "bearer"
-            or not supplied
-            or not stored
-            or not hmac.compare_digest(supplied, stored)
+        if scheme.lower() == "bearer" and supplied and stored and hmac.compare_digest(
+            supplied, stored
         ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="invalid API key",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+            return
+        if session_store.verify(session_cookie or "", stored):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     def status_payload() -> dict[str, str | int | bool]:
         key = key_store.read()
@@ -296,8 +317,43 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.post("/api/v1/auth/rotate", dependencies=[Depends(authenticate)])
     def rotate_key() -> dict[str, str]:
+        old_key = key_store.read()
         new_key = key_store.rotate()
+        session_store.invalidate_key(old_key)
         return {"fingerprint": key_store.fingerprint(new_key)}
+
+    @app.post("/api/v1/auth/login")
+    @app.post("/api/v1/auth/session")
+    def create_management_session(
+        login: ManagementSessionLogin, response: Response
+    ) -> dict[str, object]:
+        stored = key_store.read()
+        if not stored or not hmac.compare_digest(login.api_key, stored):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        token, expires_at = session_store.create(stored)
+        response.set_cookie(
+            "pam_management_session",
+            token,
+            max_age=int(ManagementSessionStore.lifetime.total_seconds()),
+            expires=expires_at,
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+        return {"expires_at": expires_at.isoformat(), "expires_in_seconds": 86_400}
+
+    @app.post("/api/v1/auth/logout")
+    def logout_management_session(
+        response: Response,
+        session_cookie: str | None = Cookie(default=None, alias="pam_management_session"),
+    ) -> dict[str, str]:
+        session_store.revoke(session_cookie or "")
+        response.delete_cookie("pam_management_session", path="/")
+        return {"status": "logged_out"}
 
     def libraries_payload() -> list[dict[str, str]]:
         return [library.payload() for library in platform_state.list_libraries()]

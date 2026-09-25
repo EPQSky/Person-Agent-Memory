@@ -31,6 +31,7 @@ class Settings:
     reranker: ModelEndpoint | None = None
     graph: ModelEndpoint | None = None
     retention_now: str | None = None
+    session_now: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_dir", self.state_dir.expanduser().resolve())
@@ -61,3 +62,10 @@ class Settings:
                 raise ConfigurationError("retention clock must be an ISO-8601 timestamp") from error
             if parsed.tzinfo is None:
                 raise ConfigurationError("retention clock must include a UTC offset")
+        if self.session_now is not None:
+            try:
+                parsed = datetime.fromisoformat(self.session_now.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ConfigurationError("session clock must be an ISO-8601 timestamp") from error
+            if parsed.tzinfo is None:
+                raise ConfigurationError("session clock must include a UTC offset")
