@@ -16,7 +16,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-TEMPLATE_VERSION = "0.3.5"
+TEMPLATE_VERSION = "0.3.7"
 CURRENT_NAMESPACE = "vibeforge-lite"
 LEGACY_NAMESPACE_SHA256 = "53e14fc40e22cdf808c881164f0c78c478b558db6574bf6e834e2011417f6ccd"
 MARKER_NAMESPACE = r"(?P<namespace>vibeforge-lite|[a-z0-9-]+-vibecoding)"

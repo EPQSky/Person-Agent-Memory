@@ -1,4 +1,4 @@
 interface:
   display_name: "顺序实施规格 Ticket"
-  short_description: "按依赖顺序实施、硬门禁复审并逐票提交"
-  default_prompt: "使用 $execute-spec-tickets 按指定 Spec 的依赖顺序实施全部 Ticket，并执行验收证据、独立复审和逐票提交门禁。"
+  short_description: "按依赖顺序实施并持续批量修复"
+  default_prompt: "使用 $execute-spec-tickets 按指定 Spec 的依赖顺序实施全部 Ticket，每轮先集中发现问题、再整批修复；不要使用固定修复轮数上限，以可验证收敛或连续无进展证据决定继续，并执行验收、独立复审和逐票提交门禁。"

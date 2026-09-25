@@ -83,8 +83,9 @@ local_changes = [
   "Treat explicit execute-spec-tickets invocation as authorization for one scoped commit per completed ticket, without repeated confirmation prompts.",
   "Require blocked reviews to return to repair before any done state, staging, or pre-commit gate invocation; the commit gate only validates already-passed review candidates.",
   "Integrated the skill into VibeForge Lite routing, project guidance, release metadata, and provenance records.",
-  "Raised the per-ticket repair limit from five rounds to nine and aligned the hard gate and tests.",
+  "Removed the fixed per-ticket repair limit in favor of evidence-based convergence and three-round stall detection.",
   "Limited blocking review findings to high-confidence incorrect results, resource exhaustion, or acceptance failures so low-impact advice cannot consume repair rounds.",
+  "Required each review to report an exhaustive batch of blocking findings and each repair round to close that entire batch with per-finding evidence.",
 ]
 
 [[sources]]

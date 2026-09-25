@@ -1,6 +1,6 @@
 ---
 name: execute-spec-tickets
-description: 按指定 Spec 的依赖顺序，由主 Agent 串行委派子 Agent 实施全部 Ticket，并为每张票执行独立代码评审、最多九轮修复、失败隔离和范围受控的 Git 提交。适用于用户要求自动推进一组已批准 Ticket；单张 Ticket 的普通实现应直接使用 implement。
+description: 按指定 Spec 的依赖顺序，由主 Agent 串行委派子 Agent 实施全部 Ticket，并为每张票执行批量问题发现、持续整批修复、收敛判断、独立复审、失败隔离和范围受控的 Git 提交。适用于用户要求自动推进一组已批准 Ticket；单张 Ticket 的普通实现应直接使用 implement。
 ---
 
 # 顺序实施 Spec Tickets
@@ -9,7 +9,7 @@ description: 按指定 Spec 的依赖顺序，由主 Agent 串行委派子 Agent
 
 提交前硬门禁只校验已经完成“评审通过、修复闭环、验收通过”的提交候选，不负责替代 Review 分流。任何一轮独立 Review 仍有阻断性 Finding 时，必须先进入修复并重新 Review；不得标记 `done`、勾选验收项、形成提交暂存树、把阶段设为 `ready-to-commit`，也不得调用 `pre-commit` 门禁碰运气。
 
-创建或恢复执行状态、准备提交、处理修复耗尽时，必须读取 [状态与门禁契约](references/state-and-gates.md)。其中的 `ticket_gate` 和校验命令属于强制门禁，不是可选记录。
+创建或恢复执行状态、准备提交、处理修复停滞时，必须读取 [状态与门禁契约](references/state-and-gates.md)。其中的 `ticket_gate` 和校验命令属于强制门禁，不是可选记录。
 
 先把当前已加载的 `execute-spec-tickets` skill 目录解析为 `<skill-dir>`。项目级安装通常位于 `.agents/skills/execute-spec-tickets/`；Plugin 模式必须使用实际安装目录，不得假设项目中存在 `.agents/skills/`。
 
@@ -35,12 +35,12 @@ description: 按指定 Spec 的依赖顺序，由主 Agent 串行委派子 Agent
 规划基线确定后，为本次执行创建可恢复状态：
 
 - 在 Spec 目录下创建未提交的 `.execute-spec-tickets-state.json`，原子更新并始终排除在暂存与提交之外；全部 Ticket 完成后删除。
-- 状态至少记录 Spec、运行 ID、原始 `HEAD`、当前 Ticket、`ticket-review-base`、当前阶段、修复轮数、执行前工作区摘要、快照目录、最近验证结果、当前 `ticket_gate`、不可变的 `ticket_results`、已完成 Commit，以及修复耗尽后跳过的 Ticket、Findings 和封存位置。
+- 状态至少记录 Spec、运行 ID、原始 `HEAD`、当前 Ticket、`ticket-review-base`、当前阶段、修复轮数、执行前工作区摘要、快照目录、最近验证结果、当前 `ticket_gate`、不可变的 `ticket_results`、已完成 Commit，以及修复停滞后跳过的 Ticket、Findings 和封存位置。
 - 在权限为 `0700` 的 OS 临时目录保存执行前已暂存/未暂存补丁、未跟踪文件清单及其内容副本。内容过大、敏感或无法安全复制的未跟踪路径必须标为“受保护”；任何 Ticket 需要修改该路径时立即停止。
 - 每次委派实现、修复或评审子 Agent 时，显式传递状态文件、快照目录、Review Base 和受保护路径，不依赖子 Agent 自己猜测工作区归属。
 - 每次阶段切换、修复轮数变化、验证完成和提交成功前后都先更新状态文件，保证中断后不会重置 Review Base 或修复计数。
 
-若重新调用时发现状态文件：先验证其 Spec、当前 `HEAD`、快照和工作区摘要，再从记录阶段恢复。若发现 `in-progress` Ticket 却没有可信状态文件或 `$handoff`，或者快照缺失/不匹配，必须停止；不得把遗留实现自动归类为用户原有工作，也不得把修复轮数重置为零。
+若重新调用时发现状态文件：先验证其 Spec、当前 `HEAD`、快照和工作区摘要，再从记录阶段恢复。旧状态若缺少 `blocking_findings`、`finding_ids` 或 `resolutions`，只能依据已保存的完整 Review 报告和修复证据原子补齐；无法逐项重建时停止，不得伪造批次证据或跳过已有修复轮次。旧 `repair-exhausted` 状态不得因已经达到九轮而直接迁移为停滞：默认恢复为 `repairing` 并继续，只有现有记录能证明最后连续三轮满足无进展条件时才迁移为 `repair-stalled`。若发现 `in-progress` Ticket 却没有可信状态文件或 `$handoff`，或者快照缺失/不匹配，必须停止；不得把遗留实现自动归类为用户原有工作，也不得把修复轮数重置为零。
 
 恢复时必须先处理提交边界：若状态仍为 `committing`，对照记录的提交前 `HEAD`、当前 `HEAD`、暂存树和 Commit 内容判断提交是否已经成功。确认成功则补记 Commit 并运行提交后门禁；确认失败则将 Ticket 保持或恢复为 `in-progress`；无法唯一判定时停止，不得重复提交或解锁下游 Ticket。
 
@@ -80,7 +80,7 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 - 开始编辑前先审计是否已实现或部分实现，并把证据报告给主 Agent。
 - 保留用户原有修改，只处理当前 Ticket；发现范围冲突时停止报告。
 - 运行 Ticket 所需的聚焦验证和仓库最终验证。
-- 执行 `$implement` 自带的一次实现阶段自审，但不得在内部启动反复的评审修复循环；这次自审属于初始实现，不代替后续独立评审，也不计入外层九轮修复上限。
+- 执行 `$implement` 自带的一次实现阶段自审，但不得在内部启动反复的评审修复循环；这次自审属于初始实现，不代替后续独立评审，也不计入外层修复轮数。
 - 覆盖 `$implement` 的默认完成动作：实现子 Agent 只能把本地 Ticket 保持为 `in-progress`，不得改成 `done`，不得勾选验收清单。只有主 Agent 通过独立评审和提交前门禁后才能完成 Tracker。
 - **不得创建、修改或 amend Git Commit**；主 Agent在独立评审通过后统一提交。
 - 返回修改摘要、验证命令与结果、残余风险和所有改动文件。
@@ -99,17 +99,19 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 - 同时读取 Spec、当前 Ticket、仓库规则和从执行前快照识别出的原有用户修改。
 - 评审从固定 Base 到当前工作区的全部有效变化，包括提交、暂存、未暂存和相关未跟踪文件。
 - 沿 Standards 与 Spec 两个轴审查，但只有能够用代码、测试、运行行为或明确验收条款证明会导致错误结果、资源耗尽或验收失败的问题，才标记为阻断性 Finding。
+- 一次 Review 必须完成当前 Diff 的穷尽式检查，集中返回本轮能够发现的全部阻断性 Findings；不得发现第一个问题后提前结束，也不得把同一代码路径、同一失败模式或同一验收条款下已经可见的问题故意拆到后续轮次。
+- 为每个阻断性 Finding 分配本次执行内稳定的 ID：同一问题跨轮仍存在时复用原 ID，新问题使用新 ID，同一批次内不得重复。在 `blocking_findings` 中记录 ID、严重度、问题、影响分类和证据。`blocked` Review 的列表不能为空；`passed` Review 的列表必须为空。
 - 安全、回归或测试缺口只有在能够映射到上述三类实际影响之一时才阻断；不得仅凭理论可能性、缺少通用防御或“最佳实践”标签触发修复循环。
 - 风格偏好、命名、注释、结构洁癖、理论边角和低影响建议必须标为非阻断建议或残余风险，不得要求修复。
 - 不修改代码、不提交，只返回按严重度排序的可操作 Findings、验证缺口和残余风险。
 
-每轮评审创建新的 Reviewer，Reviewer 不得是实现或修复 Agent，也不得复用上一轮 Reviewer。主 Agent 将 Reviewer ID、结论和报告证据追加到 `review_history`；不得用同一条结论覆盖历史。
+每轮评审创建新的 Reviewer，Reviewer 不得是实现或修复 Agent，也不得复用上一轮 Reviewer。主 Agent 将 Reviewer ID、结论、报告证据和完整 `blocking_findings` 批次追加到 `review_history`；不得用同一条结论覆盖历史。
 
 记录本轮结论后必须立即分流：`blocked` 只能进入第 5 节的修复循环；`passed` 才能结束 Review 循环并进入第 6 节。不得先执行完成、暂存或提交步骤，再依赖 `pre-commit` 门禁发现 Review 尚未通过。
 
 若 Ticket 在本轮开始前已经实现且找不到有意义的 Diff Base，Review 子 Agent 改做独立验收符合性审计：逐条核对验收标准、相关实现与测试。不得为了运行 Diff Review 而伪造空改动。
 
-### 5. 最多九轮修复
+### 5. 持续修复与收敛判断
 
 独立评审没有阻断性 Finding 时结束 Review 循环，进入第 6 节的验收、验证与提交准备；这不等于立即提交。主 Agent 只能接受以下三类阻断问题：
 
@@ -119,26 +121,30 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 
 每个阻断性 Finding 必须标注其中一个影响分类，并给出可复现行为、失败测试、代码路径或验收条款证据。缺少这种映射的 Finding 一律降级为非阻断建议，不得开启修复、不得增加 `repair_round`，也不得仅为重新确认该建议而创建新一轮 Reviewer。风格、理论边角或低影响建议最多记录一次，后续 Reviewer 重复提出时直接引用已有记录。
 
-存在阻断性 Finding 时：
+修复没有固定轮数上限。存在阻断性 Finding 时：
 
-1. 若当前修复轮数小于 9，将 Ticket 状态保持或恢复为 `in-progress`。
-2. 优先向原实现子 Agent发送完整 Findings，要求只修复已确认问题并重跑受影响验证；原 Agent 不可用时创建新的修复子 Agent。
-3. 主 Agent检查修复 Diff 与验证证据。
+1. 将 Ticket 状态保持或恢复为 `in-progress`，连续增加 `repair_round`，不得因达到任意固定次数而停止。
+2. 把上一轮 Review 的完整 `blocking_findings` 批次一次性交给原实现子 Agent，要求在同一修复轮次中逐项处理全部 Finding；不得只修复其中一项便提前返回。原 Agent 不可用时创建新的修复子 Agent。
+3. 修复 Agent 必须按 Finding ID 返回逐项 resolution 和证据，并重跑覆盖整批问题的受影响验证。主 Agent 检查修复 Diff、验证证据和 ID 覆盖关系；上一轮 Finding 未全部关闭时不得创建下一位 Reviewer。
 4. 创建新的独立 Review 子 Agent，仍从原 `ticket-review-base` 审查完整结果。
-5. 每发生一次首次独立评审之后的修复计一轮，并把 Agent、Findings 和验证证据追加到 `repair_history`；初次评审本身以及实现阶段的一次自审不计入修复轮数。修复子 Agent 不得自行开启未计数的额外评审修复循环。
+5. 每发生一次首次独立评审之后的整批修复计一轮，并把 Agent、上一轮全部 Finding ID、逐项 resolution 和整批验证证据追加到 `repair_history`；门禁要求该轮精确覆盖上一轮 Review 的 Finding 集合。初次评审本身以及实现阶段的一次自审不计入修复轮数。修复子 Agent 不得自行开启未计数的额外评审修复循环。
 
-第九轮修复后的复审仍有阻断性 Finding 时，该 Ticket 进入“修复耗尽”而不是自动终止整个 Spec：
+新的 Reviewer 仍需从固定 Base 全量复审，可能发现上一轮在合理穷尽检查中无法提前识别的新问题；但若只是重复或拆分上一轮已经可见的同源问题，主 Agent 应要求 Reviewer 合并到原 Finding 批次，不得借此消耗新的修复轮次。
+
+每轮复审后判断是否仍在收敛。只要 Finding 集合缩小、失败行为发生可验证变化、验收证据增加或必需验证向通过推进，就继续下一轮整批修复。不能因为轮数较高、实现困难或 Reviewer 提出新问题而宣告停滞。
+
+只有连续三轮修复前后的四次独立 Review 都返回完全相同的阻断 Finding ID 集合，且三轮修复都没有新增验收证据、验证进展或可观察行为改善时，该 Ticket 才进入 `repair-stalled`：
 
 1. 保持 Ticket 为 `in-progress`，不得勾选未满足的验收项，也不得提交该票。
-2. 在执行状态中记录九轮修复、剩余 Findings、验证结果、受影响能力和改动文件。
+2. 在执行状态中记录全部修复历史、最后三轮 `stall_assessments`、剩余 Findings、验证结果、受影响能力和改动文件；每条停滞判断必须给出无进展证据。
 3. 将该票全部 Agent 所属改动封存为补丁、未跟踪文件副本和恢复说明。只有能够证明这些改动不含用户并发修改时，才可把工作区中的该票改动恢复到 `ticket-review-base`；不得使用整树重置或覆盖用户文件。
 4. 若失败改动无法安全封存和移出工作区，停止整个执行，避免后续 Ticket 的评审和 Commit 混入失败改动。
-5. 从编号靠后的 Ticket 中寻找下一张候选票。只有其直接和传递阻塞链都不包含任何修复耗尽票，并且剩余 Finding 不影响该票使用的共享接口、基础设施、数据契约、安全边界或必需验证时，才可继续。
+5. 从编号靠后的 Ticket 中寻找下一张候选票。只有其直接和传递阻塞链都不包含任何修复停滞票，并且剩余 Finding 不影响该票使用的共享接口、基础设施、数据契约、安全边界或必需验证时，才可继续。
 6. 判断“互不影响”必须有依赖图和代码影响证据，不能仅因 Ticket 文本未声明 `Blocked by` 就假设独立。无法证明时将候选票记录为被阻塞，继续检查更后的票。
 
-封存和候选判断完成后必须运行 `skip` 硬门禁；门禁会检查九轮记录、剩余 Findings、封存材料、工作区隔离以及对全部后续票的评估。只有门禁通过且返回了 `next_ticket` 才能继续；通过但 `next_ticket=null` 时停止整组并保留恢复材料。
+封存和候选判断完成后必须运行 `skip` 硬门禁；门禁会检查最后三轮无进展证据、稳定未关闭的 Finding 集合、完整历史、封存材料、工作区隔离以及对全部后续票的评估。只有门禁通过且返回了 `next_ticket` 才能继续；通过但 `next_ticket=null` 时停止整组并保留恢复材料。
 
-修复轮数是每张 Ticket 独立计算的；开始下一票时从 0 计数，不能累计前一票的修复次数。
+修复轮数是每张 Ticket 独立计算的非负计数，没有固定上限；开始下一票时从 0 计数，不能累计前一票的修复次数。
 
 本票的必需验证无法执行或持续失败时，同样不得标记 `done` 或提交。把原因记录为本票完成障碍，并复用上述封存、依赖图和代码影响判断寻找下一票；验证障碍只影响当前票时不自动终止整个 Spec。若验证缺失导致无法判断改动是否会破坏后续票，则按“影响无法排除”处理，不得继续。
 
@@ -176,21 +182,21 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 
 若 Ticket 原本已经是 `done` 且无新增变更，不创建空 Commit。若 `ready-for-agent` 的 Ticket 经审计确认早已实现，可以提交其状态变更和必要验证补强，但不得为了满足“一票一提交”制造无意义代码修改。
 
-提交成功后才重新读取 Tracker、计算下一张未完成且依赖已满足的 Ticket，并从新的 `HEAD` 建立下一票 Review Base。修复耗尽票不视为依赖已满足。
+提交成功后才重新读取 Tracker、计算下一张未完成且依赖已满足的 Ticket，并从新的 `HEAD` 建立下一票 Review Base。修复停滞票不视为依赖已满足。
 
 ## 停止条件
 
 以下情况必须停止，不得跳票继续：
 
 - 找不到 Spec、Ticket 或依赖票。
-- 依赖图非法，或遍历全部剩余 Ticket 后仍找不到依赖已满足且不受修复耗尽问题影响的候选票。
+- 依赖图非法，或遍历全部剩余 Ticket 后仍找不到依赖已满足且不受修复停滞问题影响的候选票。
 - 已完成状态与实际验收行为冲突。
 - 用户原有修改与当前 Ticket 无法安全分离。
 - 必需验证、外部凭据、服务、批准或业务决定影响多个后续 Ticket，且无法证明存在不受影响的下一票。
 - 存在 `in-progress` Ticket，但缺少可信执行状态、快照或 handoff，无法证明 Review Base、修复轮数和改动归属。
 - 当前结果包含无法归属的秘密、生成物或破坏性迁移风险。
 
-修复耗尽本身不是整组停止条件；只有失败改动无法安全隔离、后续票受其直接或传递影响，或者命中其他停止条件时才停止。停止时不得为失败票创建“部分成功” Commit，也不得把失败票标为 `done`。说明已经完成的 Ticket 与 Commit、修复耗尽票、被阻塞或跳过的后续票、剩余 Findings、工作区变化和恢复入口；需要跨会话继续时使用 `$handoff`。
+修复停滞本身不是整组停止条件；只有失败改动无法安全隔离、后续票受其直接或传递影响，或者命中其他停止条件时才停止。停止时不得为失败票创建“部分成功” Commit，也不得把失败票标为 `done`。说明已经完成的 Ticket 与 Commit、修复停滞票、被阻塞或跳过的后续票、剩余 Findings、工作区变化和恢复入口；需要跨会话继续时使用 `$handoff`。
 
 ## 最终报告
 
@@ -200,11 +206,11 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 - 每张 Ticket 是新实现、补齐、已实现后确认，还是原本已完成。
 - 每张已提交 Ticket 的 Commit Hash。
 - 每张 Ticket 使用的修复轮数与最终 Review 结论。
-- 修复耗尽、被依赖阻塞或因影响无法排除而跳过的 Ticket，以及各自的恢复入口。
+- 修复停滞、被依赖阻塞或因影响无法排除而跳过的 Ticket，以及各自的恢复入口。
 - 运行过的整体验证及结果。
 - 未提交的原有用户修改和剩余风险。
 
-最终报告前重新枚举全部声称完成的 Ticket，对每张运行 `--phase tracker`，并逐张核对 `completed_commits` 与 `ticket_results`。任何 `done` Ticket 存在 `[ ]`、任何验收缺少证据、任何 Commit 或门禁快照未记录、任何修复耗尽票被错误视为依赖完成时，都不得宣告整个 Spec 完成。
+最终报告前重新枚举全部声称完成的 Ticket，对每张运行 `--phase tracker`，并逐张核对 `completed_commits` 与 `ticket_results`。任何 `done` Ticket 存在 `[ ]`、任何验收缺少证据、任何 Commit 或门禁快照未记录、任何修复停滞票被错误视为依赖完成时，都不得宣告整个 Spec 完成。
 
 最终报告发送前删除本次执行状态文件和临时快照；如果删除会妨碍失败恢复，则保留并在报告中给出位置，只有成功完成全部 Ticket 时才清理。
 

@@ -10,10 +10,10 @@
     "domain-modeling/CONTEXT-FORMAT.md": "b8cc318f2a4285b530e908b6bc43901c3c5cd11100362636bbc4216639bef597",
     "domain-modeling/SKILL.md": "152e2c97239affb12a60c5f4a7e74ab546a49ae169688c81f4e2ccc42dafa579",
     "domain-modeling/agents/openai.yaml": "f6bf2aa996c6e6f53fdd0708e18a0d16a56aed8322cca59fedbe3c0d2c75f06b",
-    "execute-spec-tickets/SKILL.md": "b7fedbd0a4ec6deb42d26fa36251f00e8cbba8544be045c030d8f098dc2efbe2",
-    "execute-spec-tickets/agents/openai.yaml": "05cf75b570e0cca546eba97ad3070cd84066d68c10a0f6958a11ab544bd4d87b",
-    "execute-spec-tickets/references/state-and-gates.md": "c0413987ab75f6b320955d46b85816dc11e2f8d5433384c5819a585b9ab3353a",
-    "execute-spec-tickets/scripts/validate_ticket_gate.py": "82e3eff5b472c63aeb044e2faa6d73091e0eea242efe1c36b31b7afb636d4c28",
+    "execute-spec-tickets/SKILL.md": "3637ec3fc01eedf6381ebfff5cc605de24ab5a8cc3908366f1fe232371e306ff",
+    "execute-spec-tickets/agents/openai.yaml": "90156a6cbd3fd976db0fd60ed56aeb7cbee9c4aba2b4d1d1c65e9a0028279cf6",
+    "execute-spec-tickets/references/state-and-gates.md": "f22db2cff392632b4e7a11ceadf6bf7dd2e2c9257d5288b5122b6c61da667923",
+    "execute-spec-tickets/scripts/validate_ticket_gate.py": "4777331f49e8ded1e4b809f16bd134f9428bb3b873384e19c178ce788479d8db",
     "grill-me/SKILL.md": "d8d518fced44338bb83877c6b7e9b82e4522d8c5194e0454bb49b2ad56ad3c99",
     "grill-me/agents/openai.yaml": "c061e39c3e0f9d865fb1b97556d485704af2a8a58f4b8221a8917a5c2074a32b",
     "grill-with-docs/SKILL.md": "b28fdb650920f36c4c057aca1bf16fb130d8d117cb7274023d39a22fd86befe7",
@@ -41,7 +41,7 @@
     "vibe-guide/agents/openai.yaml": "936cf11151fc9fed3d9e059aa219eacd8de5b1e22c1acecb76744894abf3447e",
     "vibe-init/SKILL.md": "60aca7a71989104b25b68449f759549b60b3cb23acbb8dcf7349483fd4bd1f4f",
     "vibe-init/agents/openai.yaml": "cf0d9bc0f3cc7eb4896d11e5022fa84629b08b0dcc98f19885a16bda32e88b88",
-    "vibe-init/assets/project/AGENTS.md": "6d03f2d73f6a97d2b652f2aa0dc5287a9528c577e4d976abc0989c41f2ba2373",
+    "vibe-init/assets/project/AGENTS.md": "1a081c662447b12e64ef81f54fb1dc06ed6bcbc0b9dce2054023efe65a901618",
     "vibe-init/assets/project/config.toml": "b7c41061a949894054f33d03042c70d34b49f1ade19e823619b2682fb15bf3b6",
     "vibe-init/assets/project/docs/agents/domain.md": "1e4cc98b8f3803b84d1c4334efdbaade57a098d029fe80dd7c7915c7f185bdd8",
     "vibe-init/assets/project/docs/agents/issue-tracker-github.md": "d7badbebc39e80f2790c255297739c90218d26b1748958b285a537c6b35edd68",
@@ -52,9 +52,9 @@
     "vibe-init/issue-tracker-github.md": "1ce613d82c8db361748adbd4461c3a600254976df4260017902174c7491d86a0",
     "vibe-init/issue-tracker-gitlab.md": "f177d263381dd581e9758ab5e32bb269a1079d1d77ff753a343dc45976e55370",
     "vibe-init/issue-tracker-local.md": "38e6a41294fb6062caccdcb9c9c96ea8a887c0408ce49403208aff0a593dff1f",
-    "vibe-init/scripts/vibe_init.py": "fe475f6fe4cd5186780ffc0e553721d3ba8e52241005a849034ed4340ac550a0",
+    "vibe-init/scripts/vibe_init.py": "49f895748dc423aef162c95d7b5fe0860ff6d53ba9a9a75c0b16e8fc84776d82",
     "vibe-init/triage-labels.md": "dae6d934f5e9d2f57433e685f6ddde945d4a7eb7aadfacf18e4c66e2556466ed"
   },
   "schema_version": 1,
-  "template_version": "0.3.5"
+  "template_version": "0.3.7"
 }
