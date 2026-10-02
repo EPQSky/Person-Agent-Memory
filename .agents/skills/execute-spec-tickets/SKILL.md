@@ -1,11 +1,13 @@
 ---
 name: execute-spec-tickets
-description: 按指定 Spec 的依赖顺序，由主 Agent 串行委派子 Agent 实施全部 Ticket，并为每张票执行批量问题发现、持续整批修复、收敛判断、独立复审、失败隔离和范围受控的 Git 提交。适用于用户要求自动推进一组已批准 Ticket；单张 Ticket 的普通实现应直接使用 implement。
+description: 按指定 Spec 的依赖顺序，由主 Agent 最多并行委派 3 张互不影响的 Ticket，在 Spec 目录下隔离 worktree 实施，并为每张票执行批量问题发现、持续整批修复、收敛判断、独立复审、验收、合并和范围受控的 Git 提交。适用于用户要求自动推进一组已批准 Ticket；单张 Ticket 的普通实现应直接使用 implement。
 ---
 
-# 顺序实施 Spec Tickets
+# 并行实施 Spec Tickets
 
-主 Agent 对整个执行序列、工作区归属、评审门禁和提交负责。每次只处理一张 Ticket；即使多张票都已解锁，也不得并行实施。
+主 Agent 对整个执行批次、依赖图、工作区归属、评审门禁、合并和提交负责。每个 Spec 最多同时实施 3 张 Ticket。只有阻塞链已完成、代码影响证据证明互不影响且尚未达到并发上限的 Ticket 才能进入同一批；依赖关系、共享接口、共享迁移、共享配置或影响范围无法排除时必须串行。
+
+每张 Ticket 都必须先记录当前 integration branch，并在 Spec 目录下从该分支创建自己的 Git worktree 和 Ticket 分支，再允许实现、修复或评审 Agent 写入。Ticket 的实现、测试、独立 Review 和验收全部在该 worktree 中完成；主 Agent 只在合并阶段写入记录的 integration branch。Ticket 通过所有门禁后，由主 Agent 获取合并锁，将 Ticket 分支合回创建它时的 base branch，合并成功且合并后验证通过才把 Ticket 视为完成。不得把 Ticket worktree 当作共享工作区，也不得把多个 Ticket 的改动直接写进 integration worktree。
 
 提交前硬门禁只校验已经完成“评审通过、修复闭环、验收通过”的提交候选，不负责替代 Review 分流。任何一轮独立 Review 仍有阻断性 Finding 时，必须先进入修复并重新 Review；不得标记 `done`、勾选验收项、形成提交暂存树、把阶段设为 `ready-to-commit`，也不得调用 `pre-commit` 门禁碰运气。
 
@@ -19,8 +21,9 @@ description: 按指定 Spec 的依赖顺序，由主 Agent 串行委派子 Agent
 2. 按项目配置的 Tracker 查找该 Spec 的 Ticket。对于本地 Markdown Tracker，默认读取 Spec 同级 `issues/` 下按数字编号的文件。
 3. 若 Ticket 不存在，转用 `$to-tickets` 生成拆分并等待用户批准；不得自行边拆票边实施。
 4. 解析每张票的编号、状态、阻塞边和验收标准。缺失依赖、循环依赖或不合法状态必须先报告并停止。
-5. 默认从最小编号开始，严格按依赖顺序处理全部未完成 Ticket。用户指定起止编号或子集时仍必须检查其阻塞票已经完成。
-6. 用户明确调用或要求使用本技能，即视为授权其一票一 Commit 行为。每张 Ticket 通过独立评审、验收和提交前硬门禁后，主 Agent 必须主动创建范围受控的 Commit；不得在执行开始或每票完成时再次询问是否提交。只有用户明确要求不提交或仓库规则禁止提交时才覆盖此默认值；该授权不包含 push、PR、合并或其他外部动作。
+5. 构建依赖图的可执行前沿。每轮按编号优先选取最多 3 张未完成 Ticket；除直接和传递阻塞均已完成外，还必须记录共享代码路径、接口、数据契约和验证资源的影响判断。只要无法证明两张票可以同时写入，就不得并行。
+6. 用户指定起止编号或子集时仍必须检查其阻塞票已经完成，并对同批候选执行相同的代码影响审计。
+7. 用户明确调用或要求使用本技能，即视为授权其一票一 Commit 行为，并授权通过门禁后合回执行开始时记录的 integration branch。每张 Ticket 通过独立评审、验收和提交前硬门禁后，主 Agent 必须主动创建范围受控的 Commit，再串行合并到该分支；不得在执行开始或每票完成时再次询问是否提交或合并。该授权不包含 push、PR 或删除恢复材料等其他外部动作。
 
 ## 执行前基线
 
@@ -35,12 +38,18 @@ description: 按指定 Spec 的依赖顺序，由主 Agent 串行委派子 Agent
 规划基线确定后，为本次执行创建可恢复状态：
 
 - 在 Spec 目录下创建未提交的 `.execute-spec-tickets-state.json`，原子更新并始终排除在暂存与提交之外；全部 Ticket 完成后删除。
-- 状态至少记录 Spec、运行 ID、原始 `HEAD`、当前 Ticket、`ticket-review-base`、当前阶段、修复轮数、执行前工作区摘要、快照目录、最近验证结果、当前 `ticket_gate`、不可变的 `ticket_results`、已完成 Commit，以及修复停滞后跳过的 Ticket、Findings 和封存位置。
-- 在权限为 `0700` 的 OS 临时目录保存执行前已暂存/未暂存补丁、未跟踪文件清单及其内容副本。内容过大、敏感或无法安全复制的未跟踪路径必须标为“受保护”；任何 Ticket 需要修改该路径时立即停止。
-- 每次委派实现、修复或评审子 Agent 时，显式传递状态文件、快照目录、Review Base 和受保护路径，不依赖子 Agent 自己猜测工作区归属。
-- 每次阶段切换、修复轮数变化、验证完成和提交成功前后都先更新状态文件，保证中断后不会重置 Review Base 或修复计数。
+- 在 Spec 目录下创建持久运行根目录 `.execute-spec-tickets/`，并固定以下布局：
+  - `.execute-spec-tickets-state.json`：整组执行状态；
+  - `.execute-spec-tickets/runs/<run-id>/snapshot/`：执行前暂存/未暂存补丁、未跟踪文件清单及内容副本；
+  - `.execute-spec-tickets/worktrees/<ticket-id>-<slug>/`：每张 Ticket 独占的 worktree；
+  - `.execute-spec-tickets/runs/<run-id>/archives/`：修复停滞或无法合并时的封存材料。
+- 禁止把上述快照、状态、封存或 worktree 放入 `/tmp`、系统临时目录、用户缓存目录或仓库外路径。内容过大、敏感或无法安全复制的未跟踪路径必须标为“受保护”；任何 Ticket 需要修改该路径时立即停止。
+- 状态至少记录 Spec、运行 ID、原始 `HEAD`、执行开始时的 `integration_branch`、并发上限 `3`、活动 Ticket、每张 Ticket 的 worktree 路径、`base_branch`、`base_commit`、`ticket-review-base`、当前阶段、修复轮数、执行前工作区摘要、快照目录、最近验证结果、独立 `ticket_gate`、不可变的 `ticket_results`、已完成 Commit 和合并 Commit，以及修复停滞后跳过的 Ticket、Findings 和封存位置。
+- 启动每张 Ticket 前先执行 `git worktree add -b <ticket-branch> <spec-dir>/.execute-spec-tickets/worktrees/<ticket-id>-<slug> <integration-branch>`，确认目录、分支、`base_branch` 和基线已写入状态后才能委派 Agent。worktree 创建失败、路径已存在或基线分支不再可解析时停止，不得退回 integration worktree 开发。
+- 每次委派实现、修复或评审子 Agent 时，显式传递该 Ticket 的状态记录、主仓库的绝对状态文件路径、worktree、分支、快照目录、Review Base 和受保护路径，不依赖子 Agent 自己猜测工作区归属。
+- 每次阶段切换、并发批次变化、修复轮数变化、验证完成、Ticket 分支提交和 integration branch 合并成功前后都先更新状态文件，保证中断后不会重置 Review Base、修复计数、worktree 或合并边界。
 
-若重新调用时发现状态文件：先验证其 Spec、当前 `HEAD`、快照和工作区摘要，再从记录阶段恢复。旧状态若缺少 `blocking_findings`、`finding_ids` 或 `resolutions`，只能依据已保存的完整 Review 报告和修复证据原子补齐；无法逐项重建时停止，不得伪造批次证据或跳过已有修复轮次。旧 `repair-exhausted` 状态不得因已经达到九轮而直接迁移为停滞：默认恢复为 `repairing` 并继续，只有现有记录能证明最后连续三轮满足无进展条件时才迁移为 `repair-stalled`。若发现 `in-progress` Ticket 却没有可信状态文件或 `$handoff`，或者快照缺失/不匹配，必须停止；不得把遗留实现自动归类为用户原有工作，也不得把修复轮数重置为零。
+若重新调用时发现状态文件：先验证其 Spec、integration branch 当前 `HEAD`、快照、活动 Ticket、每个 worktree/分支和工作区摘要，再按每张 Ticket 的阶段恢复。旧状态若缺少 `blocking_findings`、`finding_ids` 或 `resolutions`，只能依据已保存的完整 Review 报告和修复证据原子补齐；无法逐项重建时停止，不得伪造批次证据或跳过已有修复轮次。旧 `repair-exhausted` 状态不得因已经达到九轮而直接迁移为停滞：默认恢复为 `repairing` 并继续，只有现有记录能证明最后连续三轮满足无进展条件时才迁移为 `repair-stalled`。若发现 `in-progress` Ticket 却没有可信状态文件、对应 worktree/分支或 `$handoff`，或者快照缺失/不匹配，必须停止；不得把遗留实现自动归类为用户原有工作，也不得把修复轮数重置为零。
 
 恢复时必须先处理提交边界：若状态仍为 `committing`，对照记录的提交前 `HEAD`、当前 `HEAD`、暂存树和 Commit 内容判断提交是否已经成功。确认成功则补记 Commit 并运行提交后门禁；确认失败则将 Ticket 保持或恢复为 `in-progress`；无法唯一判定时停止，不得重复提交或解锁下游 Ticket。
 
@@ -70,7 +79,7 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 
 ### 2. 固定 Ticket Review Base
 
-在任何 Ticket 修改发生前，将当前 `HEAD` 记录为该票唯一的 `ticket-review-base`，并保存当时工作区所有权快照。后续实现、修复和评审始终使用这个 Base，不得因修复轮次改变。
+在对应 worktree 创建完成、任何 Ticket 修改发生前，将从 integration branch 创建 Ticket 分支时的提交记录为该票唯一的 `ticket-review-base`，并把 `base_branch` 和 `base_commit` 写入执行状态。后续实现、修复和评审始终使用这个 Base，不得因其他 Ticket 合并或修复轮次改变。
 
 ### 3. 委派实现子 Agent
 
@@ -85,7 +94,7 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 - **不得创建、修改或 amend Git Commit**；主 Agent在独立评审通过后统一提交。
 - 返回修改摘要、验证命令与结果、残余风险和所有改动文件。
 
-同一时刻只能有一个实现或修复子 Agent 写工作区。子 Agent 完成后，主 Agent 必须检查实际 Diff、Ticket 状态和验证证据，不能只采信其总结。
+同一 Ticket 的同一时刻只能有一个实现或修复子 Agent 写其 worktree；不同 Ticket 可以在最多 3 个独占 worktree 中并行。子 Agent 完成后，主 Agent 必须检查实际 Diff、Ticket 状态和验证证据，不能只采信其总结。
 
 主 Agent 检查后立即把实现审计、工作区归属检查和实际 Diff 检查写入 `ticket_gate`；缺少明确 evidence 的步骤不得标记为 `passed`。
 
@@ -168,9 +177,9 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
   --phase pre-commit --ticket <ticket-path> --state <state-path>
 ```
 
-- 门禁通过后无需询问用户，立即将状态阶段原子更新为 `committing`，记录提交前 `HEAD` 与暂存树标识，再使用符合仓库惯例且能识别 Ticket 的提交信息创建一个非空 Commit。禁止 amend、合并多个未完成 Ticket 或提交失败状态。
-- Commit 明确失败时，立即把 Ticket 状态恢复为 `in-progress` 并排除候选 `done` 变更；保留实现现场和验证证据后停止。提交结果因进程中断而不明确时，不得盲目重试，交由前述提交边界恢复逻辑对账。
-- 记录 Commit Hash 到 `ticket_gate.commit` 和 `completed_commits`，将当前 `ticket_gate` 完整深拷贝到 `ticket_results`，再将阶段更新为 `committed` 并恢复执行前原有暂存状态。提交后门禁通过前不得覆盖当前门禁处理下一票。
+- 门禁通过后无需询问用户，立即将该 Ticket 状态阶段原子更新为 `committing`，记录票分支提交前 `HEAD` 与暂存树标识，再在该 Ticket worktree 中使用符合仓库惯例且能识别 Ticket 的提交信息创建一个非空 Commit。禁止 amend、合并多个未完成 Ticket 或在 integration worktree 上直接提交 Ticket 改动。
+- Commit 明确失败时，立即把该 Ticket 状态恢复为 `in-progress` 并排除候选 `done` 变更；保留 worktree、分支和验证证据后停止该票。提交结果因进程中断而不明确时，不得盲目重试，交由前述提交边界恢复逻辑对账。
+- 记录 Ticket 分支 Commit Hash 到 `ticket_gate.commit` 和 `completed_commits`，将当前 `ticket_gate` 完整深拷贝到 `ticket_results`，再将阶段更新为 `ready-to-merge`。提交后门禁通过前不得覆盖当前门禁处理下一票。
 - 运行提交后硬门禁，确认 Commit 父节点、路径、Ticket 状态、验收勾选、修复轮数和评审结论与提交前台账一致：
 
 ```bash
@@ -178,7 +187,10 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
   --phase post-commit --ticket <ticket-path> --state <state-path> --commit HEAD
 ```
 
-- 提交后门禁通过，且工作区只剩执行前已有修改或下一票明确需要的状态，才能更新执行摘要并开始下一票。
+- 提交后门禁通过后，主 Agent 必须暂停新的合并、取得 integration branch 合并锁并从 integration worktree 预演合并。无冲突时执行 `git merge --no-ff --no-edit <ticket-branch>`；发生冲突、integration worktree 存在无法归属的修改或合并结果无法由当前 Review 覆盖时，保留票分支和 worktree，Ticket 不得标记 `done`，并停止该票。
+- 合并成功后运行合并门禁，记录实际的 `integration_branch`、`merge_commit`、合并前后 `HEAD` 和合并后整体验证。只有合并门禁通过，才能把该 Ticket 阶段设为 `merged`、写入 `completed_commits` 的合并信息并从活动批次移除。随后才可删除该票 worktree；失败或中断时保留 worktree 和分支供恢复。
+- 合并后的 integration branch 状态只允许由主 Agent 读取和更新；其他活动 Ticket 继续在各自 worktree 中开发，不能因为 integration branch 前进而重写其固定 Review Base。合并下一张票前必须重新检查依赖、代码影响和冲突风险。
+- 一个并行批次中所有票都完成合并后，才能补充下一批候选；整组成功后删除状态文件和成功运行材料。任何失败、停滞或未完成票都必须保留状态、快照、worktree、分支和封存材料。
 
 若 Ticket 原本已经是 `done` 且无新增变更，不创建空 Commit。若 `ready-for-agent` 的 Ticket 经审计确认早已实现，可以提交其状态变更和必要验证补强，但不得为了满足“一票一提交”制造无意义代码修改。
 
@@ -186,12 +198,15 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 
 ## 停止条件
 
-以下情况必须停止，不得跳票继续：
+以下情况必须停止，不得跳票或把改动写回主 worktree：
 
 - 找不到 Spec、Ticket 或依赖票。
 - 依赖图非法，或遍历全部剩余 Ticket 后仍找不到依赖已满足且不受修复停滞问题影响的候选票。
 - 已完成状态与实际验收行为冲突。
 - 用户原有修改与当前 Ticket 无法安全分离。
+- 执行开始时的 integration branch 不存在、integration worktree 无法保持可合并状态、Ticket worktree 无法在 Spec 目录下创建，或活动 Ticket 数量会超过 3。
+- 计划并行的 Ticket 存在未排除的共享代码、接口、数据契约、迁移、配置或验证资源影响。
+- Ticket 分支提交后无法无冲突合并回其记录的 base branch，或合并后验证失败。
 - 必需验证、外部凭据、服务、批准或业务决定影响多个后续 Ticket，且无法证明存在不受影响的下一票。
 - 存在 `in-progress` Ticket，但缺少可信执行状态、快照或 handoff，无法证明 Review Base、修复轮数和改动归属。
 - 当前结果包含无法归属的秘密、生成物或破坏性迁移风险。
@@ -214,4 +229,4 @@ python3 <skill-dir>/scripts/validate_ticket_gate.py \
 
 最终报告发送前删除本次执行状态文件和临时快照；如果删除会妨碍失败恢复，则保留并在报告中给出位置，只有成功完成全部 Ticket 时才清理。
 
-不要自动推送分支、创建 PR、合并或删除工作区；只有用户另行明确要求时才执行这些外部动作。
+不要自动推送分支或创建 PR。合回每张 Ticket 创建时记录的 base branch，是本技能在每张 Ticket 通过独立评审、验收和门禁后的必需内部动作；删除已成功合并的 worktree 仅限于清理本次执行产物，失败或未完成时不得删除恢复现场。

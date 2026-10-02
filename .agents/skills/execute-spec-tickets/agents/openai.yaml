@@ -1,4 +1,4 @@
 interface:
-  display_name: "顺序实施规格 Ticket"
-  short_description: "按依赖顺序实施并持续批量修复"
-  default_prompt: "使用 $execute-spec-tickets 按指定 Spec 的依赖顺序实施全部 Ticket，每轮先集中发现问题、再整批修复；不要使用固定修复轮数上限，以可验证收敛或连续无进展证据决定继续，并执行验收、独立复审和逐票提交门禁。"
+  display_name: "并行实施规格 Ticket"
+  short_description: "最多并行 3 张独立 Ticket 并合回基于分支"
+  default_prompt: "使用 $execute-spec-tickets 按指定 Spec 的依赖图选择最多 3 张代码影响独立的 Ticket，记录执行开始时的 integration branch，在 Spec-local worktree 中并行实施；每轮先集中发现问题、再整批修复，不使用固定修复轮数上限，并执行验收、独立复审、逐票提交和合回该 base branch 的门禁。"

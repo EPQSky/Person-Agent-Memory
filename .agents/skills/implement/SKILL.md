@@ -8,7 +8,7 @@ description: Implement one clear piece of work from a spec or ready ticket, veri
 Implement one approved, user-visible slice from the referenced spec or ticket.
 
 1. Read applicable `AGENTS.md`, domain docs, ADRs, the spec, and the ticket.
-2. Confirm the ticket is unblocked. Before editing, capture `review-base` as the current `HEAD`; store the existing staged and unstaged patches plus untracked-file hashes in the OS temporary directory so unrelated user work remains distinguishable. For a local tracker, then move `ready-for-agent` to `in-progress`.
+2. Confirm the ticket is unblocked. Before editing, capture `review-base` as the current `HEAD`; store the existing staged and unstaged patches plus untracked-file hashes under the Spec directory at `.execute-spec-tickets/runs/<run-id>/snapshot/` so the evidence survives a restart and remains beside the work. Never use `/tmp`, another OS temporary directory, or a repository-wide shared snapshot. For a local tracker, then move `ready-for-agent` to `in-progress`.
 3. Identify the smallest public behavior seam. Use `$tdd` when the seam is testable and the user or repository has agreed to test-first work.
 4. Implement the complete vertical slice. Keep unrelated refactors out of scope.
 5. Run focused tests and type/lint checks during the work, then the repository's required final verification.

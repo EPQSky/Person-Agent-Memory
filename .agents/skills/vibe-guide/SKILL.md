@@ -14,7 +14,7 @@ Route only to skills that ship in this project. Do not suggest an unavailable sk
 3. Use `$to-spec` once the discussion is stable enough to become a product-facing specification.
 4. Use `$to-tickets` when a multi-session implementation needs independently verifiable vertical slices.
 5. Use `$implement` for one approved ticket or one small, already clear change. Use `$tdd` where a public behavior seam is agreed.
-6. Use `$execute-spec-tickets` when the user explicitly wants an approved set of tickets executed serially with independent reviews and one scoped commit per completed ticket.
+6. Use `$execute-spec-tickets` when the user explicitly wants an approved set of tickets executed from a Spec-local worktree pool, with up to 3 independent Tickets in parallel, independent reviews, one scoped commit per Ticket, and gated merges into `main`.
 7. Use `$code-review <fixed-point>` before declaring an ordinary implementation complete; `$execute-spec-tickets` includes this review gate per ticket.
 8. Use `$handoff` when another task or session must continue with the current context.
 
