@@ -14,9 +14,11 @@ classifiers = [
 ]
 dependencies = [
   "fastapi>=0.116,<1",
-  "JiuwenMemory==0.1.2",
+  "JiuwenMemory==0.2.0",
+  "jieba==0.42.1",
   "markdown-it-py>=4,<5",
-  "milvus-lite==2.5.1",
+  "milvus-lite==3.2.2",
+  "pymilvus==3.0.2",
   "setuptools<81",
   "tiktoken>=0.11,<1",
   "typer>=0.16,<1",
@@ -58,3 +60,11 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 python_version = "3.11"
 strict = true
 packages = ["personal_agent_memory"]
+
+[[tool.mypy.overrides]]
+module = ["jiuwen_memory.*", "milvus_lite.*", "pymilvus.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "personal_agent_memory.graph_adapter"
+warn_unused_ignores = false
