@@ -141,6 +141,10 @@ class CapturePersistenceBusyError(RuntimeError):
     """Raised when capture persistence cannot acquire SQLite's write lock immediately."""
 
 
+class PlatformStateUnavailableError(RuntimeError):
+    """Raised when the legacy platform state has not been started for this kernel."""
+
+
 @dataclass(frozen=True, slots=True)
 class BoundDocument:
     root_identity: tuple[int, int]
@@ -998,7 +1002,8 @@ class PlatformState:
                 continue
 
     def enqueue_job(self, kind: str, payload: str) -> int:
-        assert self.connection is not None
+        if self.connection is None:
+            raise PlatformStateUnavailableError("legacy platform state is not started")
         cursor = self.connection.execute(
             "INSERT INTO background_jobs (kind, payload) VALUES (?, ?)", (kind, payload)
         )
@@ -1021,7 +1026,8 @@ class PlatformState:
         return self._queue_graph_rebuild(library_id, False)
 
     def job_status(self, job_id: int) -> str | None:
-        assert self.connection is not None
+        if self.connection is None:
+            raise PlatformStateUnavailableError("legacy platform state is not started")
         row = self.connection.execute(
             "SELECT status FROM background_jobs WHERE id = ?", (job_id,)
         ).fetchone()
@@ -1030,7 +1036,8 @@ class PlatformState:
     def register_library(
         self, requested_path: str, kind: LibraryKind, reuse_existing_git: bool = False
     ) -> MemoryLibrary:
-        assert self.connection is not None
+        if self.connection is None:
+            raise PlatformStateUnavailableError("legacy platform state is not started")
         if not requested_path.strip():
             raise LibraryRegistrationError("memory library path must not be empty")
         requested = Path(requested_path).expanduser()
@@ -1161,7 +1168,8 @@ class PlatformState:
         return library
 
     def list_libraries(self) -> list[MemoryLibrary]:
-        assert self.connection is not None
+        if self.connection is None:
+            raise PlatformStateUnavailableError("legacy platform state is not started")
         rows = self.connection.execute(
             """SELECT library.id, library.kind, library.canonical_path,
                       library.sync_status, COALESCE(graph.status, 'not_configured'),
@@ -10431,7 +10439,8 @@ class PlatformState:
 
     @property
     def connection_or_raise(self) -> sqlite3.Connection:
-        assert self.connection is not None
+        if self.connection is None:
+            raise PlatformStateUnavailableError("legacy platform state is not started")
         return self.connection
 
     def _direct_binding(self, binding_id: str) -> ProjectBinding:
@@ -10539,7 +10548,8 @@ class PlatformState:
         return "available"
 
     async def _execute_pending_jobs(self, *, capture_only: bool | None = None) -> None:
-        assert self.connection is not None
+        if self.connection is None:
+            raise PlatformStateUnavailableError("legacy platform state is not started")
         kind_filter = ""
         if capture_only is True:
             kind_filter = "AND kind = 'capture_consolidation' "
@@ -11104,14 +11114,16 @@ class PlatformState:
             self.connection_or_raise.commit()
 
     def _metadata(self, key: str) -> str | None:
-        assert self.connection is not None
+        if self.connection is None:
+            raise PlatformStateUnavailableError("legacy platform state is not started")
         row = self.connection.execute(
             "SELECT value FROM platform_metadata WHERE key = ?", (key,)
         ).fetchone()
         return None if row is None else str(row[0])
 
     def _set_metadata(self, key: str, value: str) -> None:
-        assert self.connection is not None
+        if self.connection is None:
+            raise PlatformStateUnavailableError("legacy platform state is not started")
         self.connection.execute(
             """
             INSERT INTO platform_metadata (key, value) VALUES (?, ?)
