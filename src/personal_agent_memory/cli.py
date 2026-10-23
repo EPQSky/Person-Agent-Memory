@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import socket
 from pathlib import Path
+from typing import cast
 
 import typer
 import uvicorn
 
 from personal_agent_memory import __version__
 from personal_agent_memory.app import create_app
-from personal_agent_memory.config import ConfigurationError, Settings
+from personal_agent_memory.config import ConfigurationError, MemoryKernelKind, Settings
 from personal_agent_memory.model_client import ModelEndpoint
 
 cli = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -75,6 +76,12 @@ def serve(
         envvar="PERSONAL_AGENT_MEMORY_RETENTION_NOW",
         help="Fixed UTC clock for retention acceptance tests.",
     ),
+    memory_kernel: str = typer.Option(
+        "legacy",
+        "--memory-kernel",
+        envvar="PERSONAL_AGENT_MEMORY_KERNEL",
+        help="Memory kernel implementation: legacy or mem2.",
+    ),
 ) -> None:
     """Run the single local memory daemon."""
     try:
@@ -120,6 +127,7 @@ def serve(
                 else None
             ),
             retention_now=retention_now,
+            memory_kernel=cast(MemoryKernelKind, memory_kernel),
         )
         ensure_port_available(settings.host, settings.port)
     except (ConfigurationError, ValueError) as error:

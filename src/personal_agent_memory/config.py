@@ -4,8 +4,11 @@ import ipaddress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from personal_agent_memory.model_client import ModelEndpoint
+
+MemoryKernelKind = Literal["legacy", "mem2"]
 
 
 class ConfigurationError(ValueError):
@@ -32,6 +35,7 @@ class Settings:
     graph: ModelEndpoint | None = None
     retention_now: str | None = None
     session_now: str | None = None
+    memory_kernel: MemoryKernelKind = "legacy"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_dir", self.state_dir.expanduser().resolve())
@@ -55,6 +59,8 @@ class Settings:
             raise ConfigurationError("host must be an explicit loopback address")
         if not 1 <= self.port <= 65535:
             raise ConfigurationError("port must be between 1 and 65535")
+        if self.memory_kernel not in {"legacy", "mem2"}:
+            raise ConfigurationError("memory kernel must be legacy or mem2")
         if self.retention_now is not None:
             try:
                 parsed = datetime.fromisoformat(self.retention_now.replace("Z", "+00:00"))
