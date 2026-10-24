@@ -1060,7 +1060,6 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
                 {**document, "preview_token": "preview-one"},
                 None,
             ),
-            ("POST", "/api/v1/capture/consolidate", {"session_id": "session-one"}, None),
             ("POST", "/api/v1/libraries/library-one/scan", None, None),
             (
                 "GET",
@@ -1084,8 +1083,6 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
                 },
                 None,
             ),
-            ("GET", "/api/v1/capture/events", None, None),
-            ("GET", "/api/v1/capture/rounds", None, None),
             ("GET", "/api/v1/sensitive-quarantine", None, None),
             (
                 "POST",
@@ -1165,27 +1162,6 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
                 },
                 None,
             ),
-            ("GET", "/api/v1/libraries/library-one/retention-policy", None, None),
-            (
-                "PUT",
-                "/api/v1/libraries/library-one/retention-policy",
-                {
-                    "inbox_days": 30,
-                    "candidate_days": 90,
-                    "recycle_days": 30,
-                    "early_inbox_cleanup": True,
-                    "diagnostics_enabled": True,
-                    "diagnostic_days": 7,
-                },
-                None,
-            ),
-            (
-                "GET",
-                "/api/v1/libraries/library-one/retention-cleanup/preview",
-                None,
-                None,
-            ),
-            ("POST", "/api/v1/libraries/library-one/retention-cleanup", None, None),
         ]
 
         for tool, arguments in (

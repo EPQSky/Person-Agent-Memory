@@ -259,7 +259,12 @@ def test_user_prompt_requests_cwd_scope_and_outputs_sanitized_context() -> None:
     result_item["heading"] = f"Metadata {secret}"
     result_item["source_version"] = f"sha256:{secret}"
     with recall_server(package) as url:
-        result = run_hook(user_event(), url=url, key=secret)
+        result = run_hook(
+            user_event(),
+            url=url,
+            key=secret,
+            extra_environment={"PERSONAL_AGENT_MEMORY_TOPIC_ID": "rust-learning"},
+        )
 
     assert result.returncode == 0
     assert result.stderr == ""
@@ -270,6 +275,8 @@ def test_user_prompt_requests_cwd_scope_and_outputs_sanitized_context() -> None:
             "query": "What is the project architecture?",
             "token_budget": 10_000,
             "target_model": "gpt-4o-mini",
+            "session_id": "session-1",
+            "topic_id": "rust-learning",
         }
     ]
     output = json.loads(result.stdout)

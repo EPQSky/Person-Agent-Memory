@@ -65,6 +65,7 @@ class CaptureMemoryRequest:
     occurred_at: str
     cwd: str
     deadline: float | None = None
+    topic_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,8 @@ class SearchMemoryRequest:
     limit: int = 10
     max_graph_hops: int = 1
     include_history: bool = False
+    session_id: str | None = None
+    topic_id: str | None = None
 
     def __post_init__(self) -> None:
         selectors = (
@@ -533,6 +536,10 @@ class MemoryIdempotencyConflictError(RuntimeError):
 
 class MemoryIdempotencyPendingError(MemoryIdempotencyConflictError):
     """Raised when an earlier write for the idempotency key is incomplete."""
+
+
+class CaptureContractError(ValueError):
+    """Raised when capture input violates a memory-region contract."""
 
 
 class CaptureBindingUnstableError(RuntimeError):
