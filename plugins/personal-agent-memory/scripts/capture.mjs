@@ -551,7 +551,7 @@ async function main() {
   const name = event.hook_event_name;
   if (["PreCompact", "SessionEnd"].includes(name)) {
     await replay(key, hookDeadline);
-    const sessionId = typeof event.session_id === "string" ? event.session_id.slice(0, 1000) : undefined;
+    const sessionId = typeof event.session_id === "string" ? event.session_id.slice(0, 256) : undefined;
     const maintenanceMetadata = [
       event.session_id,
       event.cwd,
@@ -617,13 +617,15 @@ async function main() {
   const eventId = digest(event.session_id, name, turnId, content);
   const capture = {
     event_id: eventId,
-    session_id: event.session_id.slice(0, 1000),
+    session_id: event.session_id.slice(0, 256),
     turn_id: turnId,
     event_kind: kind,
     content,
     occurred_at: occurredAt,
     cwd: event.cwd.slice(0, 4096),
   };
+  const topicId = process.env.PERSONAL_AGENT_MEMORY_TOPIC_ID?.trim();
+  if (topicId && /^[^\s/\\]{1,120}$/.test(topicId)) capture.topic_id = topicId;
   if (kind === "assistant") {
     await rememberCompletedIdentity(event, content, turnId, eventId).catch(() => {});
   }

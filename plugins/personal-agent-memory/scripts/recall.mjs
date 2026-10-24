@@ -203,7 +203,7 @@ function compactCachePath(event) {
   if (
     typeof event.session_id !== "string" ||
     event.session_id.length === 0 ||
-    event.session_id.length > 1000
+    event.session_id.length > 256
   ) {
     return;
   }
@@ -311,6 +311,13 @@ async function main() {
       query: rawQuery.trim().slice(0, MAX_QUERY_CHARACTERS),
       token_budget: tokenBudget,
       target_model: (process.env.PERSONAL_AGENT_MEMORY_TARGET_MODEL ?? "gpt-4o-mini").slice(0, 200),
+      ...(typeof event.session_id === "string" && event.session_id.length > 0
+        ? { session_id: event.session_id.slice(0, 256) }
+        : {}),
+      ...(process.env.PERSONAL_AGENT_MEMORY_TOPIC_ID?.trim() &&
+      /^[^\s/\\]{1,120}$/.test(process.env.PERSONAL_AGENT_MEMORY_TOPIC_ID.trim())
+        ? { topic_id: process.env.PERSONAL_AGENT_MEMORY_TOPIC_ID.trim() }
+        : {}),
     }),
     signal: AbortSignal.timeout(timeout),
   });

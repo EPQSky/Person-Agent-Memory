@@ -13,6 +13,7 @@ Optional global settings are:
 - `PERSONAL_AGENT_MEMORY_TIMEOUT_MS` (default `2000`, clamped to `100`-`2000`)
 - `PERSONAL_AGENT_MEMORY_TOKEN_BUDGET` (default `10000`, clamped to `512`-`10000`)
 - `PERSONAL_AGENT_MEMORY_TARGET_MODEL` (default `gpt-4o-mini`)
+- `PERSONAL_AGENT_MEMORY_TOPIC_ID` 显式把学习会话绑定到专题记忆区域。
 
 The URL must use HTTP and a loopback host. Recall failures produce no context and always leave the
 Codex lifecycle event unblocked.

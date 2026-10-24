@@ -14,7 +14,7 @@ RegionKind = Literal["user", "topic", "project", "session"]
 RegionBindingKind = Literal["project", "worktree"]
 MAX_REGION_ID_LENGTH = 120
 MAX_REGION_NAME_LENGTH = 200
-MAX_SESSION_ID_LENGTH = 200
+MAX_SESSION_ID_LENGTH = 256
 
 
 class RegionError(ValueError):

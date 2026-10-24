@@ -23,7 +23,14 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from markdown_it import MarkdownIt
-from pydantic import BaseModel, BeforeValidator, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from personal_agent_memory.config import Settings
 from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
@@ -42,6 +49,7 @@ from personal_agent_memory.memory_kernel import (
     CandidateRestoreRequest,
     CandidateUpdateRequest,
     CaptureBindingUnstableError,
+    CaptureContractError,
     CaptureEventsRequest,
     CaptureMemoryRequest,
     CaptureRoundsRequest,
@@ -84,6 +92,7 @@ from personal_agent_memory.memory_kernel import (
 from personal_agent_memory.model_client import OpenAICompatibleClient
 from personal_agent_memory.regions import (
     MAX_REGION_ID_LENGTH,
+    MAX_SESSION_ID_LENGTH,
     DuplicateRegionBindingError,
     DuplicateRegionError,
     RegionBindingError,
@@ -110,15 +119,30 @@ LibraryId = Annotated[
     str,
     BeforeValidator(lambda value: value.strip() if isinstance(value, str) else value),
 ]
+
+
+def _stripped_identifier(value: object) -> object:
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            raise ValueError("identifier must not be blank")
+    return value
+
+
+RequiredIdentifier = Annotated[str, BeforeValidator(_stripped_identifier)]
+OptionalIdentifier = Annotated[str | None, BeforeValidator(_stripped_identifier)]
 CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS = 0.06
 CAPTURE_PERSISTENCE_DEADLINE_HEADER = "X-Personal-Agent-Memory-Persistence-Deadline-Ms"
 
 
 def capture_request_budget_seconds(
-    client_deadline_ms: str | None, *, now_epoch_seconds: float | None = None
+    client_deadline_ms: str | None,
+    *,
+    now_epoch_seconds: float | None = None,
+    maximum_seconds: float = CAPTURE_BINDING_DEADLINE_SECONDS,
 ) -> float:
     if client_deadline_ms is None:
-        return CAPTURE_BINDING_DEADLINE_SECONDS
+        return maximum_seconds
     try:
         deadline_ms = int(client_deadline_ms.strip())
     except ValueError:
@@ -127,7 +151,7 @@ def capture_request_budget_seconds(
     remaining = deadline_ms / 1000 - now
     if remaining <= 0:
         return 0.0
-    return min(CAPTURE_BINDING_DEADLINE_SECONDS, remaining)
+    return min(maximum_seconds, remaining)
 
 
 class LibraryRegistration(BaseModel):
@@ -142,7 +166,9 @@ class MemoryRegionCreate(BaseModel):
     region_id: LibraryId | None = Field(
         default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
     )
-    session_id: str | None = Field(default=None, min_length=1, max_length=200)
+    session_id: OptionalIdentifier = Field(
+        default=None, min_length=1, max_length=MAX_SESSION_ID_LENGTH
+    )
 
 
 class ProjectBindingRegistration(BaseModel):
@@ -223,6 +249,12 @@ class SearchRequest(BaseModel):
     token_budget: int = Field(default=10_000, ge=MIN_TOKEN_BUDGET)
     target_model: str = Field(default="gpt-4o-mini", min_length=1, max_length=200)
     include_history: bool = False
+    session_id: OptionalIdentifier = Field(
+        default=None, min_length=1, max_length=MAX_SESSION_ID_LENGTH
+    )
+    topic_id: OptionalIdentifier = Field(
+        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
+    )
 
     @model_validator(mode="after")
     def validate_scope(self) -> SearchRequest:
@@ -353,16 +385,35 @@ class CandidateResolution(CandidateDecision):
 
 class CaptureEvent(BaseModel):
     event_id: str = Field(min_length=1, max_length=200)
-    session_id: str = Field(min_length=1, max_length=1000)
+    session_id: RequiredIdentifier = Field(min_length=1, max_length=MAX_SESSION_ID_LENGTH)
     turn_id: str = Field(min_length=1, max_length=200)
     event_kind: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=65_535)
     occurred_at: str = Field(min_length=1, max_length=100)
     cwd: str = Field(min_length=1, max_length=4096)
+    topic_id: OptionalIdentifier = Field(
+        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
+    )
+
+    @field_validator("occurred_at")
+    @classmethod
+    def validate_occurred_at(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("occurred_at must include a valid timezone offset")
+            parsed.astimezone(UTC)
+        except (ValueError, OverflowError) as error:
+            raise ValueError(
+                "occurred_at must be a valid ISO-8601 timestamp with timezone"
+            ) from error
+        return value
 
 
 class CaptureConsolidation(BaseModel):
-    session_id: str | None = Field(default=None, min_length=1, max_length=1000)
+    session_id: OptionalIdentifier = Field(
+        default=None, min_length=1, max_length=MAX_SESSION_ID_LENGTH
+    )
 
 
 class SensitiveResolution(BaseModel):
@@ -926,6 +977,8 @@ def create_app(
                     limit=request.limit,
                     max_graph_hops=request.graph_hops,
                     include_history=request.include_history,
+                    session_id=request.session_id,
+                    topic_id=request.topic_id,
                 )
             )
             return build_context_package(
@@ -1029,7 +1082,13 @@ def create_app(
         loop = asyncio.get_running_loop()
         monotonic_before_wall_sample = loop.time()
         request_budget = capture_request_budget_seconds(
-            client_deadline_ms, now_epoch_seconds=time.time()
+            client_deadline_ms,
+            now_epoch_seconds=time.time(),
+            maximum_seconds=(
+                2.0
+                if selected_kernel.kind == "mem2"
+                else CAPTURE_BINDING_DEADLINE_SECONDS
+            ),
         )
         request_deadline = monotonic_before_wall_sample + request_budget
         persistence_deadline = (
@@ -1047,6 +1106,7 @@ def create_app(
                         occurred_at=event.occurred_at,
                         cwd=event.cwd,
                         deadline=persistence_deadline,
+                        topic_id=event.topic_id,
                     )
                 )
         except CaptureBindingUnstableError as error:
@@ -1064,7 +1124,11 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="capture persistence is temporarily unavailable",
             ) from error
-        except (CandidateGovernanceError, ProjectBindingError) as error:
+        except CaptureContractError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+        except (CandidateGovernanceError, ProjectBindingError, RegionError) as error:
             raise candidate_error(CandidateGovernanceError(str(error))) from error
 
     @app.get("/api/v1/capture/events", dependencies=[Depends(authenticate)])
@@ -1167,7 +1231,13 @@ def create_app(
         loop = asyncio.get_running_loop()
         monotonic_before_wall_sample = loop.time()
         request_budget = capture_request_budget_seconds(
-            client_deadline_ms, now_epoch_seconds=time.time()
+            client_deadline_ms,
+            now_epoch_seconds=time.time(),
+            maximum_seconds=(
+                2.0
+                if selected_kernel.kind == "mem2"
+                else CAPTURE_BINDING_DEADLINE_SECONDS
+            ),
         )
         request_deadline = monotonic_before_wall_sample + request_budget
         persistence_deadline = (
@@ -1198,7 +1268,7 @@ def create_app(
             return selected_kernel.get_retention_policy(
                 RetentionPolicyRequest(library_id=library_id)
             )
-        except LibraryRegistrationError as error:
+        except (LibraryRegistrationError, RegionError) as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.put(
@@ -1214,7 +1284,7 @@ def create_app(
                     library_id=library_id, **policy.model_dump()
                 )
             )
-        except LibraryRegistrationError as error:
+        except (LibraryRegistrationError, RegionError) as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.get(
@@ -1226,7 +1296,7 @@ def create_app(
             return await selected_kernel.preview_retention_cleanup(
                 RetentionCleanupRequest(library_id=library_id)
             )
-        except LibraryRegistrationError as error:
+        except (LibraryRegistrationError, RegionError) as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.post(
@@ -1238,7 +1308,7 @@ def create_app(
             return await selected_kernel.run_retention_cleanup(
                 RetentionCleanupRequest(library_id=library_id)
             )
-        except LibraryRegistrationError as error:
+        except (LibraryRegistrationError, RegionError) as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.put(
