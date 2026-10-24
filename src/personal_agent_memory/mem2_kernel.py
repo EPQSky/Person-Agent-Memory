@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import sqlite3
@@ -30,7 +31,9 @@ from jiuwen_memory.api import (
 from jiuwen_memory.common.audit.base import AuditLogger, AuditProducer
 from jiuwen_memory.common.embedder.base import Embedder, EmbedderProducer
 from jiuwen_memory.common.embedder.embedder_impl.openai_embedder import OpenAIEmbedder
-from jiuwen_memory.control import DeleteMode, DeleteSelector
+from jiuwen_memory.common.type_def import memory_key
+from jiuwen_memory.common.type_def.memory_codec import dumps
+from jiuwen_memory.control import DeleteMode, DeleteSelector, MemoryPatch, UpdateMode
 from jiuwen_memory.storage import FulltextStore, VectorStore
 from jiuwen_memory.storage.fulltext import FulltextProducer
 from jiuwen_memory.storage.kv import load_units
@@ -50,16 +53,31 @@ from personal_agent_memory.memory_kernel import (
     CaptureRoundsRequest,
     CreateMemoryRegionRequest,
     CreateMemoryRequest,
+    DeleteMemoryRequest,
     DeleteRegionBindingRequest,
+    DocumentInspectRequest,
+    DocumentUpdateRequest,
     EvolveMemoryRequest,
     GetMemoryRegionRequest,
+    HistoryDiffRequest,
     KernelHealth,
+    ListDocumentsRequest,
+    ListForgottenRequest,
+    MemoryGovernanceError,
     MemoryIdempotencyConflictError,
     MemoryIdempotencyPendingError,
     MemoryKernelUnavailableError,
+    MemoryLifecycleConflictError,
+    MemoryRecordNotFoundError,
     MemoryRegionTreeRequest,
+    MemoryRevisionConflictError,
+    MemoryUpdateRequest,
     MemoryWriteRequest,
+    PreviewDocumentDeleteRequest,
+    PreviewDocumentUpdateRequest,
     ResolveRegionRequest,
+    RestoreDocumentRequest,
+    RestoreForgottenRequest,
     RetentionCleanupRequest,
     RetentionPolicyRequest,
     SearchMemoryRequest,
@@ -114,7 +132,28 @@ _CAPTURE_EVOLUTIONS_SCHEMA = """CREATE TABLE IF NOT EXISTS capture_evolutions (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT
 )"""
-_MAINTENANCE_SCHEMA = _SESSION_RETENTION_SCHEMA + ";\n" + _CAPTURE_EVOLUTIONS_SCHEMA + ";"
+_GOVERNANCE_AUDIT_SCHEMA = """CREATE TABLE IF NOT EXISTS governance_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    region_id TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    source TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    before_content TEXT NOT NULL DEFAULT '',
+    after_content TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'committed',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)"""
+_MAINTENANCE_SCHEMA = (
+    _SESSION_RETENTION_SCHEMA
+    + ";\n"
+    + _CAPTURE_EVOLUTIONS_SCHEMA
+    + ";\n"
+    + _GOVERNANCE_AUDIT_SCHEMA
+    + ";"
+)
 _STORE_COLLECTOR: ContextVar[list[object] | None] = ContextVar(
     "personal_agent_memory_mem2_store_collector", default=None
 )
@@ -216,6 +255,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._embedding_api_key_cache: str | None = None
         self._lock = threading.RLock()
         self._maintenance_lock = threading.RLock()
+        self._governance_locks: dict[str, threading.RLock] = {}
+        self._governance_locks_guard = threading.Lock()
         self._idempotency_locks: dict[tuple[str, str], tuple[threading.Lock, int]] = {}
         self._idempotency_locks_guard = threading.Lock()
         self._idempotency_schema_lock = threading.Lock()
@@ -852,28 +893,721 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         except Exception:
             return [], True
 
+    def list_documents(
+        self, request: ListDocumentsRequest
+    ) -> list[dict[str, object]]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        payloads = {
+            unit.id: _unit_payload(unit, region)
+            for _, unit in self._region_unit_pairs(bundle, region)
+        }
+        return [payloads[key] for key in sorted(payloads)]
+
+    def inspect(self, request: object) -> dict[str, object]:
+        if not isinstance(request, DocumentInspectRequest):
+            self._raise()
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        scope, unit = self._find_region_unit(bundle, region, request.path)
+        payload = _unit_payload(unit, region)
+        pairs = self._region_unit_pairs(bundle, region)
+        history = [_unit_payload(item, region) for _, item in _version_chain(unit, pairs)]
+        payload["history"] = history
+        payload["versions"] = history
+        try:
+            trace = bundle.runtime.api.trace(
+                unit.id,
+                scope,
+                security=_security_for(scope),
+            )
+        except Exception:
+            trace = []
+        trace = [item for item in trace if item.id != unit.id]
+        if not trace:
+            references = unit.user_metadata.get("provenance")
+            if not isinstance(references, list):
+                references = unit.user_metadata.get("source_unit_ids")
+            if isinstance(references, list):
+                by_id = {item.id: item for _, item in pairs}
+                trace = [
+                    by_id[reference]
+                    for reference in (str(value) for value in references)
+                    if reference in by_id
+                ]
+        payload["provenance_chain"] = [_unit_payload(item, region) for item in trace]
+        return payload
+
+    async def update(self, request: MemoryUpdateRequest) -> dict[str, object]:
+        return await asyncio.to_thread(self._update_document_serialized, request)
+
+    def _update_document_serialized(
+        self, request: MemoryUpdateRequest
+    ) -> dict[str, object]:
+        if not isinstance(request, DocumentUpdateRequest):
+            return self._update_document(request)
+        with self._governance_region_lock(request.library_id):
+            return self._update_document(request)
+
+    def _update_document(self, request: MemoryUpdateRequest) -> dict[str, object]:
+        if not isinstance(request, DocumentUpdateRequest):
+            self._raise()
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        scope, unit = self._find_region_unit(bundle, region, request.path)
+        _require_revision(unit, request.expected_revision)
+        _require_active(unit, request.mode)
+        mode = UpdateMode.OVERWRITE if request.mode == "overwrite" else UpdateMode.SUPERSEDE
+        event_id = self._begin_governance_event(
+            region.region_id,
+            unit.id,
+            request.mode,
+            request.actor,
+            request.source,
+            request.operation_id,
+            before_content=unit.content,
+            after_content=request.content,
+            detail={"previous_unit_id": unit.id},
+        )
+        try:
+            updated = bundle.runtime.api.update(
+                unit.id,
+                scope,
+                MemoryPatch(
+                    content=request.content,
+                    mode=mode,
+                    user_metadata={
+                        "governance_actor": request.actor,
+                        "governance_source": request.source,
+                        "operation_id": request.operation_id,
+                        "previous_revision": request.expected_revision,
+                    },
+                ),
+                security=_security_for(scope),
+            )
+        except Exception:
+            self._finish_governance_event(
+                event_id,
+                status="failed",
+                unit_id=unit.id,
+                after_content="",
+                detail={"previous_unit_id": unit.id},
+            )
+            raise
+        self._finish_governance_event(
+            event_id,
+            status="committed",
+            unit_id=updated.id,
+            after_content=updated.content,
+            detail={"previous_unit_id": unit.id, "result_unit_id": updated.id},
+        )
+        return _unit_payload(updated, region)
+
+    def preview_document_update(
+        self, request: PreviewDocumentUpdateRequest
+    ) -> dict[str, object]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        _, unit = self._find_region_unit(bundle, region, request.path)
+        _require_revision(unit, request.expected_revision)
+        _require_active(unit, "update preview")
+        return {
+            "path": unit.id,
+            "id": unit.id,
+            "current_content": unit.content,
+            "proposed_content": request.content,
+            "source_version": _unit_revision(unit),
+            "preview_token": _unit_revision(unit),
+            "lifecycle": unit.lifecycle.value,
+            "provenance": list(unit.provenance),
+            "diff": _content_diff(unit.content, request.content),
+        }
+
+    async def preview_document_delete(
+        self, request: PreviewDocumentDeleteRequest
+    ) -> dict[str, object]:
+        return await asyncio.to_thread(self._preview_document_delete, request)
+
+    def _preview_document_delete(
+        self, request: PreviewDocumentDeleteRequest
+    ) -> dict[str, object]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        _, unit = self._find_region_unit(bundle, region, request.path)
+        _require_revision(unit, request.expected_revision)
+        revision = _unit_revision(unit)
+        return {
+            "path": unit.id,
+            "id": unit.id,
+            "content": unit.content,
+            "expected_source_version": revision,
+            "preview_token": revision,
+            "lifecycle": unit.lifecycle.value,
+            "affected_units": 1,
+            "provenance": list(unit.provenance),
+        }
+
+    async def delete(self, request: DeleteMemoryRequest) -> dict[str, str]:
+        return await asyncio.to_thread(self._delete_document_serialized, request)
+
+    def _delete_document_serialized(self, request: DeleteMemoryRequest) -> dict[str, str]:
+        with self._governance_region_lock(request.library_id):
+            return self._delete_document(request)
+
+    def _delete_document(self, request: DeleteMemoryRequest) -> dict[str, str]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        scope, unit = self._find_region_unit(bundle, region, request.path)
+        revision = _unit_revision(unit)
+        _require_revision(unit, request.expected_revision)
+        if request.preview_token != revision:
+            raise MemoryRevisionConflictError("deletion preview is stale or invalid")
+        _require_delete_lifecycle(unit, request.mode)
+        event_id = self._begin_governance_event(
+            region.region_id,
+            unit.id,
+            f"delete:{request.mode}",
+            request.actor,
+            request.source,
+            request.operation_id,
+            before_content=unit.content,
+            after_content="",
+            detail={"mode": request.mode},
+        )
+        try:
+            deleted = bundle.runtime.api.delete(
+                DeleteSelector(
+                    unit_ids=[unit.id],
+                    scope=scope,
+                    mode=DeleteMode(request.mode),
+                ),
+                security=_security_for(scope),
+            )
+        except Exception:
+            self._finish_governance_event(
+                event_id,
+                status="failed",
+                unit_id=unit.id,
+                after_content="",
+                detail={"mode": request.mode},
+            )
+            raise
+        detail: dict[str, object] = {
+            "deleted": bool(deleted),
+            "mode": request.mode,
+        }
+        if request.mode == "forget" and deleted:
+            try:
+                refreshed = load_units(bundle.kv_store, scope, [unit.id])
+                if refreshed:
+                    forgotten = refreshed[0]
+                    forgotten.temporal.t_invalid = datetime.now(UTC)
+                    bundle.kv_store.update(
+                        scope, memory_key(forgotten.id), dumps(forgotten)
+                    )
+            except Exception:
+                # The deletion already succeeded. Keep it successful and leave
+                # a durable audit marker instead of returning a false 500.
+                detail["deleted_at_persist_failed"] = True
+        self._finish_governance_event(
+            event_id,
+            status="committed",
+            unit_id=unit.id,
+            after_content="",
+            detail=detail,
+        )
+        return {
+            "id": unit.id,
+            "path": unit.id,
+            "status": request.mode,
+            "deleted": "true" if deleted else "false",
+        }
+
+    def list_forgotten(
+        self, request: ListForgottenRequest
+    ) -> list[dict[str, object]]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        pairs = self._region_unit_pairs(bundle, region)
+        forgotten: list[dict[str, object]] = []
+        for _, unit in pairs:
+            if unit.lifecycle.value != "forgotten":
+                continue
+            if unit.user_metadata.get("restore_pending") is True:
+                continue
+            chain = _version_chain(unit, pairs)
+            if any(item.lifecycle.value == "active" for _, item in chain):
+                continue
+            latest_forgotten = [
+                item for _, item in chain if item.lifecycle.value == "forgotten"
+            ][-1]
+            if unit.id != latest_forgotten.id:
+                continue
+            payload = _unit_payload(unit, region)
+            payload["history"] = [
+                _unit_payload(item, region) for _, item in chain
+            ]
+            forgotten.append(payload)
+        return forgotten
+
+    async def restore_forgotten(
+        self, request: RestoreForgottenRequest
+    ) -> dict[str, str]:
+        return await asyncio.to_thread(self._restore_forgotten_serialized, request)
+
+    def _restore_forgotten_serialized(
+        self, request: RestoreForgottenRequest
+    ) -> dict[str, str]:
+        with self._governance_region_lock(request.library_id):
+            return self._restore_forgotten(request)
+
+    def _restore_forgotten(self, request: RestoreForgottenRequest) -> dict[str, str]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        pairs = self._region_unit_pairs(bundle, region)
+        _, unit = self._find_region_unit(bundle, region, request.tombstone_id)
+        if unit.lifecycle.value != "forgotten":
+            raise MemoryGovernanceError("memory is not forgotten")
+        chain = _version_chain(unit, pairs)
+        chain_ids = {item.id for _, item in chain}
+        forgotten_versions = [
+            item for _, item in chain if item.lifecycle.value == "forgotten"
+        ]
+        latest_forgotten = forgotten_versions[-1]
+        if unit.id != latest_forgotten.id:
+            raise MemoryLifecycleConflictError(
+                "restore must use the latest forgotten version"
+            )
+        old_scope, old = self._find_region_unit(bundle, region, request.commit)
+        if old.id not in chain_ids:
+            raise MemoryRecordNotFoundError(
+                "memory version not found in document history"
+            )
+        active_versions = [
+            item
+            for _, item in pairs
+            if item.lifecycle.value == "active"
+            and (
+                item.id in chain_ids
+                or item.supersedes in chain_ids
+                or str(item.user_metadata.get("restored_from", "")) in chain_ids
+                or any(str(reference) in chain_ids for reference in item.provenance)
+            )
+        ]
+        if active_versions:
+            raise MemoryLifecycleConflictError(
+                "forgotten memory already has an active version"
+            )
+        event_id = self._begin_governance_event(
+            region.region_id,
+            latest_forgotten.id,
+            "restore:forgotten",
+            request.actor,
+            request.source,
+            request.operation_id,
+            before_content=unit.content,
+            after_content=old.content,
+            detail={"restored_from": old.id, "previous_unit_id": latest_forgotten.id},
+        )
+        try:
+            restored = bundle.runtime.api.add(
+                old.content,
+                old_scope,
+                Modality.TEXT,
+                security=_security_for(old_scope),
+                user_metadata={
+                    **dict(old.user_metadata),
+                    "operation_id": request.operation_id,
+                    "governance_actor": request.actor,
+                    "governance_source": request.source,
+                    "restored_from": old.id,
+                    "provenance": [old.id],
+                    "restore_pending": True,
+                },
+            )
+        except Exception:
+            self._finish_governance_event(
+                event_id,
+                status="failed",
+                unit_id=latest_forgotten.id,
+                after_content="",
+                detail={
+                    "restored_from": old.id,
+                    "previous_unit_id": latest_forgotten.id,
+                },
+            )
+            raise
+        if not restored:
+            self._finish_governance_event(
+                event_id,
+                status="failed",
+                unit_id=latest_forgotten.id,
+                after_content="",
+                detail={
+                    "restored_from": old.id,
+                    "previous_unit_id": latest_forgotten.id,
+                },
+            )
+            raise MemoryKernelUnavailableError("forgotten memory restore created no unit")
+        restored_unit = restored[0]
+        restored_unit.supersedes = latest_forgotten.id
+        restored_unit.provenance = [old.id]
+        restored_unit.user_metadata.pop("restore_pending", None)
+        try:
+            bundle.kv_store.update(
+                old_scope, memory_key(restored_unit.id), dumps(restored_unit)
+            )
+        except Exception:
+            try:
+                bundle.runtime.api.delete(
+                    DeleteSelector(
+                        unit_ids=[restored_unit.id],
+                        scope=old_scope,
+                        mode=DeleteMode.PURGE,
+                    ),
+                    security=_security_for(old_scope),
+                )
+            except Exception as purge_error:
+                try:
+                    bundle.runtime.api.delete(
+                        DeleteSelector(
+                            unit_ids=[restored_unit.id],
+                            scope=old_scope,
+                            mode=DeleteMode.FORGET,
+                        ),
+                        security=_security_for(old_scope),
+                    )
+                except Exception as forget_error:
+                    self._finish_governance_event(
+                        event_id,
+                        status="pending",
+                        unit_id=restored_unit.id,
+                        after_content=restored_unit.content,
+                        detail={
+                            "restored_from": old.id,
+                            "previous_unit_id": latest_forgotten.id,
+                            "version_link_pending": True,
+                            "rollback_error": f"purge={purge_error}; forget={forget_error}",
+                        },
+                    )
+                    raise MemoryKernelUnavailableError(
+                        "forgotten memory restore failed and rollback is pending"
+                    ) from None
+                self._finish_governance_event(
+                    event_id,
+                    status="failed",
+                    unit_id=latest_forgotten.id,
+                    after_content="",
+                    detail={
+                        "restored_from": old.id,
+                        "previous_unit_id": latest_forgotten.id,
+                        "rollback": "forgotten",
+                    },
+                )
+                raise MemoryKernelUnavailableError(
+                    "forgotten memory restore failed; orphan version was forgotten"
+                ) from None
+            self._finish_governance_event(
+                event_id,
+                status="failed",
+                unit_id=latest_forgotten.id,
+                after_content="",
+                detail={
+                    "restored_from": old.id,
+                    "previous_unit_id": latest_forgotten.id,
+                    "rollback": "purged",
+                },
+            )
+            raise MemoryKernelUnavailableError(
+                "forgotten memory restore could not persist its version link"
+            ) from None
+        self._finish_governance_event(
+            event_id,
+            status="committed",
+            unit_id=restored_unit.id,
+            after_content=restored_unit.content,
+            detail={
+                "restored_from": old.id,
+                "previous_unit_id": latest_forgotten.id,
+            },
+        )
+        payload = _unit_payload(restored_unit, region)
+        return {key: str(value) for key, value in payload.items()}
+
+    def history_diff(self, request: HistoryDiffRequest) -> dict[str, object]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        _, unit = self._find_region_unit(bundle, region, request.commit)
+        pairs = self._region_unit_pairs(bundle, region)
+        chain = [item for _, item in _version_chain(unit, pairs)]
+        active = [item for item in chain if item.lifecycle.value == "active"]
+        current = active[-1] if active else chain[-1]
+        return {
+            "library_id": region.region_id,
+            "commit": unit.id,
+            "current": current.id,
+            "before": unit.content,
+            "after": current.content,
+            "diff": _content_diff(unit.content, current.content),
+        }
+
+    async def restore_document(
+        self, request: RestoreDocumentRequest
+    ) -> dict[str, str]:
+        return await asyncio.to_thread(self._restore_document_serialized, request)
+
+    def _restore_document_serialized(
+        self, request: RestoreDocumentRequest
+    ) -> dict[str, str]:
+        with self._governance_region_lock(request.library_id):
+            return self._restore_document(request)
+
+    def _governance_region_lock(self, library_id: str) -> threading.RLock:
+        region_id = validate_library_id(library_id)
+        with self._governance_locks_guard:
+            return self._governance_locks.setdefault(region_id, threading.RLock())
+
+    def _restore_document(self, request: RestoreDocumentRequest) -> dict[str, str]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        scope, current = self._find_region_unit(bundle, region, request.path)
+        _, old = self._find_region_unit(bundle, region, request.commit)
+        pairs = self._region_unit_pairs(bundle, region)
+        chain_ids = {item.id for _, item in _version_chain(current, pairs)}
+        if old.id not in chain_ids:
+            raise MemoryRecordNotFoundError(
+                "memory version not found in document history"
+            )
+        _require_revision(current, request.expected_revision)
+        _require_active(current, "history restore")
+        event_id = self._begin_governance_event(
+            region.region_id,
+            current.id,
+            "restore",
+            request.actor,
+            request.source,
+            request.operation_id,
+            before_content=current.content,
+            after_content=old.content,
+            detail={"restored_from": old.id, "previous_unit_id": current.id},
+        )
+        try:
+            restored = bundle.runtime.api.update(
+                current.id,
+                scope,
+                MemoryPatch(
+                    content=old.content,
+                    mode=UpdateMode.SUPERSEDE,
+                    user_metadata={
+                        "operation_id": request.operation_id,
+                        "governance_actor": request.actor,
+                        "governance_source": request.source,
+                        "restored_from": old.id,
+                    },
+                ),
+                security=_security_for(scope),
+            )
+        except Exception:
+            self._finish_governance_event(
+                event_id,
+                status="failed",
+                unit_id=current.id,
+                after_content="",
+                detail={"restored_from": old.id, "previous_unit_id": current.id},
+            )
+            raise
+        self._finish_governance_event(
+            event_id,
+            status="committed",
+            unit_id=restored.id,
+            after_content=restored.content,
+            detail={"restored_from": old.id, "previous_unit_id": current.id},
+        )
+        payload = _unit_payload(restored, region)
+        return {key: str(value) for key, value in payload.items()}
+
     def audit(self, request: AuditMemoryRequest) -> list[dict[str, str]]:
         bundle = self._require_bundle()
-        library_id = validate_library_id(request.library_id)
-        scope = _scope_for_normalized_library(library_id)
+        region: MemoryRegion | None
+        try:
+            region = self._governance_region(request.library_id)
+        except MemoryRecordNotFoundError:
+            region = None
+        if region is None:
+            library_id = validate_library_id(request.library_id)
+            scope = _scope_for_normalized_library(library_id)
+            target_space = scope.space
+        else:
+            scope = _scope_for_region(region)
+            target_space = region.space
         events = bundle.runtime.api.audit(
-            {"target_space": scope.space},
+            {"target_space": target_space},
             security=_security_for(scope),
             limit=max(1, min(request.limit, 1000)),
         )
-        return [
+        payloads = [
             {
                 "id": event.id,
                 "action": event.action,
                 "decision": event.decision,
                 "actor": event.actor.user,
                 "target": event.target.space,
+                "target_id": event.target_id,
+                "commit": event.target_id or event.id,
+                "subject": event.action,
+                "authored_at": (
+                    event.occurred_at.isoformat() if event.occurred_at is not None else ""
+                ),
+                "actor_type": event.actor.user,
+                "source": "mem2",
                 "occurred_at": (
                     event.occurred_at.isoformat() if event.occurred_at is not None else ""
                 ),
             }
             for event in events
         ]
+        if region is not None:
+            payloads.extend(self._governance_audit_events(region.region_id, request.limit))
+        if region is None and not payloads:
+            raise MemoryRecordNotFoundError("memory region not found")
+        return sorted(payloads, key=_audit_sort_key, reverse=True)[
+            : max(1, min(request.limit, 1000))
+        ]
+
+    def _begin_governance_event(
+        self,
+        region_id: str,
+        unit_id: str,
+        action: str,
+        actor: str,
+        source: str,
+        operation_id: str,
+        *,
+        before_content: str,
+        after_content: str,
+        detail: dict[str, object],
+    ) -> int:
+        with closing(self._maintenance_db()) as connection, connection:
+            cursor = connection.execute(
+                """INSERT INTO governance_events
+                   (region_id, unit_id, action, actor, source, operation_id,
+                    before_content, after_content, detail, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (
+                    region_id,
+                    unit_id,
+                    action,
+                    actor,
+                    source,
+                    operation_id,
+                    before_content,
+                    after_content,
+                    json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise MemoryKernelUnavailableError(
+                    "governance audit event was not persisted"
+                )
+            return cursor.lastrowid
+
+    def _finish_governance_event(
+        self,
+        event_id: int,
+        *,
+        status: str,
+        unit_id: str,
+        after_content: str,
+        detail: dict[str, object],
+    ) -> None:
+        try:
+            with closing(self._maintenance_db()) as connection, connection:
+                connection.execute(
+                    """UPDATE governance_events
+                       SET status = ?, unit_id = ?, after_content = ?, detail = ?
+                       WHERE id = ?""",
+                    (
+                        status,
+                        unit_id,
+                        after_content,
+                        json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                        event_id,
+                    ),
+                )
+        except (sqlite3.Error, OSError):
+            # The pending row already preserves before_content. A completion
+            # failure must not turn a committed mutation into a false 500.
+            return
+
+    def _governance_audit_events(
+        self, region_id: str, limit: int
+    ) -> list[dict[str, str]]:
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                """SELECT id, unit_id, action, actor, source, operation_id,
+                          before_content, after_content, detail, status, created_at
+                   FROM governance_events
+                   WHERE region_id = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (region_id, max(1, min(limit, 1000))),
+            ).fetchall()
+        payloads: list[dict[str, str]] = []
+        for row in rows:
+            occurred = _parse_timestamp(str(row[10]))
+            occurred_at = occurred.isoformat() if occurred is not None else str(row[10])
+            payloads.append(
+                {
+                    "id": f"governance-{row[0]}",
+                    "action": str(row[2]),
+                    "decision": "allow",
+                    "actor": str(row[3]),
+                    "target": region_id,
+                    "target_id": str(row[1]),
+                    "source": str(row[4]),
+                    "operation_id": str(row[5]),
+                    "before_content": str(row[6]),
+                    "after_content": str(row[7]),
+                    "detail": str(row[8]),
+                    "status": str(row[9]),
+                    "commit": str(row[1]),
+                    "subject": str(row[2]),
+                    "authored_at": occurred_at,
+                    "actor_type": str(row[3]),
+                    "occurred_at": occurred_at,
+                }
+            )
+        return payloads
+
+    def _governance_region(self, library_id: str) -> MemoryRegion:
+        identifier = validate_library_id(library_id)
+        try:
+            return self._regions.require_region(identifier)
+        except RegionError as error:
+            raise MemoryRecordNotFoundError(str(error)) from error
+
+    def _region_unit_pairs(
+        self, bundle: _RuntimeBundle, region: MemoryRegion
+    ) -> list[tuple[Scope, MemoryUnit]]:
+        pairs: list[tuple[Scope, MemoryUnit]] = []
+        for scope in bundle.kv_store.scopes():
+            if scope.space != region.space:
+                continue
+            if region.kind == "session" and scope.session != (region.session_id or ""):
+                continue
+            pairs.extend((scope, unit) for unit in self._units_in_scope(bundle, scope))
+        return sorted(pairs, key=_unit_sort_key)
+
+    def _find_region_unit(
+        self, bundle: _RuntimeBundle, region: MemoryRegion, unit_id: str
+    ) -> tuple[Scope, MemoryUnit]:
+        normalized = unit_id.strip()
+        if not normalized:
+            raise MemoryRecordNotFoundError("memory record not found")
+        for scope, unit in self._region_unit_pairs(bundle, region):
+            if unit.id == normalized:
+                return scope, unit
+        raise MemoryRecordNotFoundError("memory record not found")
 
     async def evolve(self, request: EvolveMemoryRequest) -> dict[str, int]:
         return await asyncio.to_thread(self._evolve, request)
@@ -1293,6 +2027,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         }
         if not columns:
             connection.executescript(_MAINTENANCE_SCHEMA)
+            Mem2MemoryKernel._ensure_governance_schema(connection)
             return
         memory_id_column = columns.get("memory_id")
         if (
@@ -1302,6 +2037,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             and not memory_id_column[3]
         ):
             connection.execute(_SESSION_RETENTION_SCHEMA)
+            connection.execute(_GOVERNANCE_AUDIT_SCHEMA)
+            Mem2MemoryKernel._ensure_governance_schema(connection)
             if "source_fingerprint" not in columns:
                 connection.execute(
                     "ALTER TABLE capture_evolutions "
@@ -1314,6 +2051,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
             connection.execute(_SESSION_RETENTION_SCHEMA)
             connection.execute(_CAPTURE_EVOLUTIONS_SCHEMA)
+            connection.execute(_GOVERNANCE_AUDIT_SCHEMA)
+            Mem2MemoryKernel._ensure_governance_schema(connection)
             connection.execute(
                 """INSERT OR REPLACE INTO capture_evolutions
                    (evolve_key, session_id, turn_id, region_id, source_fingerprint, memory_id,
@@ -1323,6 +2062,21 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                    FROM capture_evolutions_v1"""
             )
             connection.execute("DROP TABLE capture_evolutions_v1")
+
+    @staticmethod
+    def _ensure_governance_schema(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1]): row
+            for row in connection.execute(
+                "PRAGMA table_info(governance_events)"
+            ).fetchall()
+        }
+        if "status" not in columns:
+            with connection:
+                connection.execute(
+                    "ALTER TABLE governance_events "
+                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'committed'"
+                )
 
     def _reserve_evolution(
         self,
@@ -2069,6 +2823,11 @@ def _parse_timestamp(value: str) -> datetime | None:
         return None
 
 
+def _audit_sort_key(item: dict[str, str]) -> datetime:
+    parsed = _parse_timestamp(item.get("occurred_at", ""))
+    return parsed if parsed is not None else datetime.min.replace(tzinfo=UTC)
+
+
 def _write_request_hash(request: CreateMemoryRequest) -> str:
     payload = {
         "library_id": request.library_id,
@@ -2181,7 +2940,15 @@ def _search_response(
     vector_status: str,
     region: MemoryRegion | None = None,
 ) -> dict[str, object]:
-    results = [_result_item(item, request) for item in items]
+    visible_items = [
+        item
+        for item in items
+        if not (
+            isinstance(item, MemoryUnit)
+            and item.user_metadata.get("restore_pending") is True
+        )
+    ]
+    results = [_result_item(item, request) for item in visible_items]
     if region is not None:
         for result in results:
             result["region_id"] = region.region_id
@@ -2227,6 +2994,156 @@ def _search_response(
             for error in errors
         ]
     return response
+
+
+def _json_metadata(value: object) -> object:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_metadata(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_metadata(item) for key, item in value.items()}
+    return str(value)
+
+
+def _unit_revision(unit: MemoryUnit) -> str:
+    payload = {
+        "id": unit.id,
+        "content": unit.content,
+        "lifecycle": unit.lifecycle.value,
+        "supersedes": unit.supersedes,
+        "provenance": list(unit.provenance),
+        "system_metadata": _json_metadata(dict(unit.system_metadata)),
+        "user_metadata": _json_metadata(dict(unit.user_metadata)),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _unit_payload(unit: MemoryUnit, region: MemoryRegion) -> dict[str, object]:
+    user_metadata = dict(unit.user_metadata)
+    source_references = user_metadata.get("source_references")
+    provenance = list(unit.provenance)
+    if not provenance:
+        metadata_provenance = user_metadata.get("provenance")
+        if not isinstance(metadata_provenance, list):
+            metadata_provenance = user_metadata.get("source_unit_ids")
+        if isinstance(metadata_provenance, list):
+            provenance = [str(value) for value in metadata_provenance]
+    if not isinstance(source_references, list):
+        source_references = provenance
+    revision = _unit_revision(unit)
+    ingested = unit.temporal.t_ingest or unit.temporal.t_valid or unit.temporal.t_message
+    updated = unit.temporal.t_ingest
+    if unit.lifecycle.value in {"superseded", "forgotten"}:
+        updated = unit.temporal.t_invalid or updated
+    deleted = unit.temporal.t_invalid if unit.lifecycle.value == "forgotten" else None
+    return {
+        "id": unit.id,
+        "path": unit.id,
+        "document_id": unit.id,
+        "content": unit.content,
+        "metadata": {
+            "system": _json_metadata(dict(unit.system_metadata)),
+            "user": _json_metadata(user_metadata),
+        },
+        "system_metadata": _json_metadata(dict(unit.system_metadata)),
+        "user_metadata": _json_metadata(user_metadata),
+        "lifecycle": unit.lifecycle.value,
+        "tier": unit.tier.value,
+        "version": revision,
+        "revision": revision,
+        "source_version": revision,
+        "source": unit.source_ref or "mem2",
+        "source_references": _json_metadata(source_references),
+        "provenance": provenance,
+        "supersedes": unit.supersedes,
+        "region_id": region.region_id,
+        "library_id": region.region_id,
+        "space": region.space,
+        "scope": {
+            "org": unit.scope.org,
+            "space": unit.scope.space,
+            "user": unit.scope.user,
+            "agent": unit.scope.agent,
+            "session": unit.scope.session,
+        },
+        "created_at": ingested.isoformat() if ingested is not None else "",
+        "updated_at": updated.isoformat() if updated else "",
+        "deleted_at": deleted.isoformat() if deleted else "",
+        "valid_from": unit.temporal.t_valid.isoformat() if unit.temporal.t_valid else "",
+        "valid_until": unit.temporal.t_invalid.isoformat() if unit.temporal.t_invalid else "",
+        "active": unit.lifecycle.value == "active",
+    }
+
+
+def _unit_sort_key(pair: tuple[Scope, MemoryUnit]) -> tuple[str, str]:
+    _, unit = pair
+    timestamp = (
+        unit.temporal.t_ingest
+        or unit.temporal.t_valid
+        or unit.temporal.t_message
+        or unit.temporal.t_event
+    )
+    return (timestamp.isoformat() if timestamp is not None else "", unit.id)
+
+
+def _version_chain(
+    unit: MemoryUnit, pairs: list[tuple[Scope, MemoryUnit]]
+) -> list[tuple[Scope, MemoryUnit]]:
+    ids = {unit.id}
+    changed = True
+    while changed:
+        changed = False
+        for _, candidate in pairs:
+            additions = set()
+            if candidate.id in ids and candidate.supersedes:
+                additions.add(candidate.supersedes)
+            if candidate.supersedes in ids:
+                additions.add(candidate.id)
+            new_ids = additions - ids
+            if new_ids:
+                ids.update(new_ids)
+                changed = True
+    return sorted((pair for pair in pairs if pair[1].id in ids), key=_unit_sort_key)
+
+
+def _require_revision(unit: MemoryUnit, expected: str) -> None:
+    if not expected or expected != _unit_revision(unit):
+        raise MemoryRevisionConflictError("memory revision conflict")
+
+
+def _require_active(unit: MemoryUnit, operation: str) -> None:
+    if unit.lifecycle.value != "active":
+        raise MemoryLifecycleConflictError(
+            f"memory lifecycle {unit.lifecycle.value} does not allow {operation}"
+        )
+
+
+def _require_delete_lifecycle(unit: MemoryUnit, mode: str) -> None:
+    allowed = {
+        "forget": {"active", "archived", "superseded"},
+        "archive": {"active", "archived"},
+        "downweight": {"active"},
+        "purge": {"active", "archived", "superseded", "forgotten"},
+    }
+    if unit.lifecycle.value not in allowed[mode]:
+        raise MemoryLifecycleConflictError(
+            f"memory lifecycle {unit.lifecycle.value} does not allow delete mode {mode}"
+        )
+
+
+def _content_diff(before: str, after: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile="before",
+            tofile="after",
+        )
+    )
 
 
 def _result_item(item: Any, request: SearchMemoryRequest) -> dict[str, object]:

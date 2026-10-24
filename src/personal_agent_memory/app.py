@@ -21,7 +21,7 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from markdown_it import MarkdownIt
 from pydantic import (
     BaseModel,
@@ -68,10 +68,14 @@ from personal_agent_memory.memory_kernel import (
     ListForgottenRequest,
     ListOutOfBandChangesRequest,
     ManagedMemoryKernelPort,
+    MemoryGovernanceError,
     MemoryIdempotencyConflictError,
     MemoryKernelPort,
     MemoryKernelUnavailableError,
+    MemoryLifecycleConflictError,
+    MemoryRecordNotFoundError,
     MemoryRegionTreeRequest,
+    MemoryRevisionConflictError,
     OutOfBandChangeRequest,
     PreviewDocumentDeleteRequest,
     PreviewDocumentUpdateRequest,
@@ -285,6 +289,7 @@ class DocumentEdit(DocumentPreview):
     operation_id: str
     actor_type: Literal["user", "platform"] = "user"
     source: str = "web"
+    mode: Literal["supersede", "overwrite"] = "supersede"
 
 
 class DocumentRestore(BaseModel):
@@ -315,6 +320,7 @@ class DocumentDelete(DocumentDeletePreview):
     preview_token: str
     actor_type: Literal["user", "platform"] = "user"
     source: str = "web-delete"
+    mode: Literal["forget", "archive", "downweight", "purge"] = "forget"
 
 
 class ForgottenMemoryRestore(BaseModel):
@@ -622,6 +628,17 @@ def create_app(
         return {"status": "logged_out"}
 
     def libraries_payload() -> list[dict[str, str]]:
+        if selected_kernel.kind == "mem2":
+            return [
+                {
+                    "id": str(region["region_id"]),
+                    "library_id": str(region["region_id"]),
+                    "canonical_path": f"memory://{region['region_id']}",
+                    "kind": str(region["kind"]),
+                    "availability": "available",
+                }
+                for region in selected_kernel.list_regions()
+            ]
         return [library.payload() for library in platform_state.list_libraries()]
 
     def region_error(error: RegionError) -> HTTPException:
@@ -729,7 +746,7 @@ def create_app(
             return selected_kernel.list_out_of_band_changes(
                 ListOutOfBandChangesRequest(library_id=library_id)
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.get(
@@ -741,7 +758,7 @@ def create_app(
             return selected_kernel.out_of_band_change(
                 OutOfBandChangeRequest(library_id=library_id, change_id=change_id)
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -764,7 +781,7 @@ def create_app(
                     external_path=resolution.external_path,
                 )
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1440,7 +1457,7 @@ def create_app(
             )
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1461,9 +1478,15 @@ def create_app(
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
 
-    def mutation_error(error: MemoryMutationError) -> HTTPException:
+    def mutation_error(error: Exception) -> HTTPException:
         detail = str(error)
-        if detail in {
+        if isinstance(error, MemoryRecordNotFoundError):
+            code = status.HTTP_404_NOT_FOUND
+        elif isinstance(
+            error, (MemoryRevisionConflictError, MemoryLifecycleConflictError)
+        ):
+            code = status.HTTP_409_CONFLICT
+        elif detail in {
             "memory library not found",
             "memory document not found",
             "forgotten memory not found",
@@ -1488,17 +1511,46 @@ def create_app(
             return selected_kernel.list_documents(
                 ListDocumentsRequest(library_id=library_id)
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
-    @app.get("/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)])
-    async def read_document(library_id: str, path: str) -> dict[str, str]:
+    @app.get(
+        "/api/v1/libraries/{library_id}/export.md",
+        dependencies=[Depends(authenticate)],
+        response_class=PlainTextResponse,
+    )
+    async def export_library_markdown(library_id: str) -> PlainTextResponse:
         try:
-            document = selected_kernel.inspect(
+            documents = selected_kernel.list_documents(
+                ListDocumentsRequest(library_id=library_id)
+            )
+        except (MemoryMutationError, MemoryGovernanceError) as error:
+            raise mutation_error(error) from error
+        lines = [f"# Memory export: {library_id}", ""]
+        for document in documents:
+            if document.get("lifecycle") not in {"active", "archived"}:
+                continue
+            lines.extend(
+                [
+                    f"## {document.get('id', 'unknown')}",
+                    "",
+                    f"- Lifecycle: {document.get('lifecycle', '')}",
+                    f"- Version: {document.get('version', '')}",
+                    f"- Source: {document.get('source', '')}",
+                    "",
+                    str(document.get("content", "")),
+                    "",
+                ]
+            )
+        return PlainTextResponse("\n".join(lines), media_type="text/markdown; charset=utf-8")
+
+    @app.get("/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)])
+    async def read_document(library_id: str, path: str) -> dict[str, object]:
+        try:
+            return selected_kernel.inspect(
                 DocumentInspectRequest(library_id=library_id, path=path)
             )
-            return {key: str(value) for key, value in document.items()}
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1515,7 +1567,7 @@ def create_app(
                     expected_revision=preview.expected_source_version,
                 )
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
         result["rendered_html"] = markdown.render(preview.content)
         return result
@@ -1532,10 +1584,11 @@ def create_app(
                     operation_id=edit.operation_id,
                     actor=edit.actor_type,
                     source=edit.source,
+                    mode=edit.mode,
                 )
             )
             return {key: str(value) for key, value in updated.items()}
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1553,7 +1606,7 @@ def create_app(
                     expected_revision=deletion.expected_source_version,
                 )
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.delete(
@@ -1571,9 +1624,10 @@ def create_app(
                     actor=deletion.actor_type,
                     source=deletion.source,
                     preview_token=deletion.preview_token,
+                    mode=deletion.mode,
                 )
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.get(
@@ -1585,7 +1639,7 @@ def create_app(
             return selected_kernel.list_forgotten(
                 ListForgottenRequest(library_id=library_id)
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1606,7 +1660,7 @@ def create_app(
                     source=restore.source,
                 )
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.get("/api/v1/libraries/{library_id}/history", dependencies=[Depends(authenticate)])
@@ -1615,7 +1669,7 @@ def create_app(
             return selected_kernel.audit(
                 AuditMemoryRequest(library_id=library_id, limit=limit)
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.get(
@@ -1627,7 +1681,7 @@ def create_app(
             return selected_kernel.history_diff(
                 HistoryDiffRequest(library_id=library_id, commit=commit)
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1647,7 +1701,7 @@ def create_app(
                     source=restore.source,
                 )
             )
-        except MemoryMutationError as error:
+        except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
     mcp_tools: list[dict[str, object]] = [
@@ -1726,10 +1780,9 @@ def create_app(
         if name == "memory_get":
             library_id = str(arguments.get("library_id", ""))
             path = str(arguments.get("path", ""))
-            document = selected_kernel.inspect(
+            return selected_kernel.inspect(
                 DocumentInspectRequest(library_id=library_id, path=path)
             )
-            return {key: str(value) for key, value in document.items()}
         if name == "candidate_create":
             return await create_candidate_payload(CandidateCreate.model_validate(arguments))
         if name == "candidate_list":

@@ -113,16 +113,30 @@
     });
   }
 
-  function saveRequest(context, operationId) {
+  function saveRequest(context, operationId, mode) {
+    const body = {
+      path: context.path,
+      content: context.content,
+      expected_source_version: context.sourceVersion,
+      operation_id: operationId,
+      actor_type: 'user',
+      source: 'web',
+    };
+    if (mode) body.mode = mode;
+    return Object.freeze({url: `/api/v1/libraries/${context.libraryId}/document`, body: Object.freeze(body)});
+  }
+
+  function deleteRequest(context, previewToken, operationId, mode = 'forget') {
     return Object.freeze({
       url: `/api/v1/libraries/${context.libraryId}/document`,
       body: Object.freeze({
         path: context.path,
-        content: context.content,
         expected_source_version: context.sourceVersion,
+        preview_token: previewToken,
         operation_id: operationId,
         actor_type: 'user',
-        source: 'web',
+        source: 'web-delete',
+        mode,
       }),
     });
   }
@@ -148,6 +162,7 @@
     contextStore,
     previewRequest,
     saveRequest,
+    deleteRequest,
     reconciliationRequest,
   });
   scope.PamHistory = api;

@@ -1016,6 +1016,30 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
             assert response.status_code == 503, (method, path, response.text)
             assert "mem2 memory kernel is unavailable" in response.json()["detail"]
 
+        def expect_missing_region(
+            method: str,
+            path: str,
+            *,
+            json: dict[str, object] | None = None,
+            params: dict[str, str] | None = None,
+        ) -> None:
+            response = client.request(
+                method,
+                path,
+                headers=headers,
+                json=json,
+                params=params,
+            )
+            assert response.status_code == 404, (method, path, response.text)
+            assert "memory region not found" in response.json()["detail"]
+
+        def expect_mcp_missing_region(payload: dict[str, object]) -> None:
+            response = client.post("/mcp", headers=headers, json=payload)
+            assert response.status_code == 200, response.text
+            result = response.json()["result"]
+            assert result["isError"] is True
+            assert "memory region not found" in result["content"][0]["text"]
+
         status = client.get("/api/v1/status", headers=headers)
         assert status.status_code == 200
         assert status.json()["status"] == "degraded"
@@ -1151,6 +1175,8 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
                 None,
             ),
             ("GET", "/api/v1/libraries/library-one/history/commit-one/diff", None, None),
+            ("GET", "/api/v1/libraries/library-one/history", None, None),
+            ("GET", "/api/v1/libraries/library-one/export.md", None, None),
             (
                 "POST",
                 "/api/v1/libraries/library-one/history/restore",
@@ -1182,7 +1208,32 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
                 )
             )
 
+        # Ticket 06 implements the mem2 governance routes. They must reach the
+        # mem2 adapter and report a missing region instead of falling back to
+        # legacy state.
+        implemented_governance_routes = {
+            ("GET", "/api/v1/libraries/library-one/document"),
+            ("PUT", "/api/v1/libraries/library-one/document"),
+            ("DELETE", "/api/v1/libraries/library-one/document"),
+            ("GET", "/api/v1/libraries/library-one/documents"),
+            ("POST", "/api/v1/libraries/library-one/document/preview"),
+            ("POST", "/api/v1/libraries/library-one/document/delete-preview"),
+            ("GET", "/api/v1/libraries/library-one/forgotten"),
+            ("POST", "/api/v1/libraries/library-one/forgotten/restore"),
+            ("GET", "/api/v1/libraries/library-one/history/commit-one/diff"),
+            ("GET", "/api/v1/libraries/library-one/history"),
+            ("GET", "/api/v1/libraries/library-one/export.md"),
+            ("POST", "/api/v1/libraries/library-one/history/restore"),
+        }
         for method, path, payload, params in unavailable_requests:
+            if (method, path) in implemented_governance_routes:
+                expect_missing_region(method, path, json=payload, params=params)
+                continue
+            if method == "POST" and path == "/mcp" and isinstance(payload, dict):
+                params_payload = payload.get("params")
+                if isinstance(params_payload, dict) and params_payload.get("name") == "memory_get":
+                    expect_mcp_missing_region(payload)
+                    continue
             expect_unavailable(method, path, json=payload, params=params)
 
         assert not database.exists()
@@ -1273,7 +1324,9 @@ def test_mem2_start_does_not_start_workers_or_mutate_legacy_state(
         assert app.state.platform_state.connection is None
         assert app.state.platform_state.worker_task is None
         assert app.state.platform_state.capture_worker_task is None
-        assert client.get("/api/v1/libraries", headers=headers).status_code == 503
+        libraries_response = client.get("/api/v1/libraries", headers=headers)
+        assert libraries_response.status_code == 200
+        assert libraries_response.json() == []
         for method, path, payload in (
             ("POST", "/api/v1/libraries/library-one/scan", None),
             (
