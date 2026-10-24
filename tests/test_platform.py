@@ -6076,11 +6076,10 @@ async function staleListScenario() {
   };
   requests[0].resolve({
     ok: true,
-    json: async () => [{id: 'old', path: 'old.md', deleted_at: 'today'}],
-  });
-  requests[1].resolve({
-    ok: true,
-    json: async () => [{commit: 'old-commit', subject: 'old'}],
+    json: async () => [{
+      id: 'old', path: 'old.md', deleted_at: 'today',
+      history: [{id: 'old-commit', lifecycle: 'forgotten'}],
+    }],
   });
   await Promise.all([oldLoad, switchAction]);
   return {

@@ -80,12 +80,18 @@
       .source { font: 13px/1.4 ui-monospace, monospace; overflow-wrap: anywhere; }
       .editor-layout { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(0, 3fr); gap: 18px; }
       .document-tree, .history { max-height: 520px; overflow: auto; border-right: 1px solid var(--line); padding-right: 12px; }
+      .document-meta { max-height: 180px; overflow: auto; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); white-space: pre-wrap; overflow-wrap: anywhere; }
       .document-tree button, .history button { display: block; width: 100%; margin: 0 0 6px; text-align: left; overflow-wrap: anywhere; }
       textarea { min-height: 360px; resize: vertical; font: 14px/1.5 ui-monospace, monospace; white-space: pre; overflow: auto; }
       iframe { width: 100%; min-height: 360px; border: 1px solid var(--line); background: white; }
       .editor-tabs { display: flex; gap: 8px; margin: 12px 0; }
       .editor-tabs button { margin: 0; }
       .editor-tabs button[aria-selected="true"] { background: var(--blue); color: white; border-color: var(--blue); }
+      .editor-modes { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-top: 12px; }
+      .editor-modes label { margin: 0; min-width: 150px; }
+      .editor-modes select { margin-top: 4px; }
+      .editor-modes a { display: inline-flex; align-items: center; min-height: 34px; padding: 7px 14px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--ink); text-decoration: none; }
+      .editor-modes a:hover { background: #f2f3f5; }
       .diff { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 ui-monospace, monospace; background: #f5f6f7; padding: 12px; border-radius: 6px; }
       .candidate-layout { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr); gap: 18px; }
       .candidate-list { min-height: 120px; max-height: 420px; overflow: auto; border-right: 1px solid var(--line); padding-right: 12px; }
@@ -184,7 +190,7 @@
         const documentTree = document.createElement('nav');
         documentTree.className = 'document-tree';
         const editor = document.createElement('div');
-        editor.innerHTML = '<strong id="document-path">请从文档列表选择内容</strong><div class="editor-tabs" role="tablist"><button type="button" id="source-tab" class="secondary" role="tab" aria-selected="true">Markdown 源文</button><button type="button" id="preview-tab" class="secondary" role="tab" aria-selected="false">渲染预览</button><button type="button" id="diff-tab" class="secondary" role="tab" aria-selected="false">差异</button></div><textarea id="document-source" aria-label="Markdown 源文" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Markdown 渲染预览"></iframe><pre id="document-diff" class="diff" hidden></pre><button type="button" id="preview-change" class="secondary" disabled>预览变更</button><button type="button" id="save-change" disabled>保存</button><button type="button" id="preview-delete" class="danger" disabled>预览遗忘影响</button><button type="button" id="confirm-delete" class="danger" disabled>确认遗忘</button><p id="editor-message" class="notice" aria-live="polite"></p>';
+        editor.innerHTML = '<strong id="document-path">请从文档列表选择内容</strong><pre id="document-meta" class="document-meta" aria-label="记忆元数据">生命周期、版本和来源将在此显示。</pre><div class="editor-tabs" role="tablist"><button type="button" id="source-tab" class="secondary" role="tab" aria-selected="true">Markdown 源文</button><button type="button" id="preview-tab" class="secondary" role="tab" aria-selected="false">渲染预览</button><button type="button" id="diff-tab" class="secondary" role="tab" aria-selected="false">差异</button></div><textarea id="document-source" aria-label="Markdown 源文" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Markdown 渲染预览"></iframe><pre id="document-diff" class="diff" hidden></pre><div class="editor-modes"><label>更新方式<select id="update-mode" aria-label="更新方式"><option value="supersede">保留旧版本</option><option value="overwrite">原地覆盖</option></select></label><label>删除方式<select id="delete-mode" aria-label="删除方式"><option value="forget">遗忘</option><option value="archive">归档</option><option value="downweight">降权</option><option value="purge">彻底删除</option></select></label><a id="export-markdown" href="#" download>导出 Markdown</a></div><button type="button" id="preview-change" class="secondary" disabled>预览变更</button><button type="button" id="save-change" disabled>保存</button><button type="button" id="preview-delete" class="danger" disabled>预览删除影响</button><button type="button" id="confirm-delete" class="danger" disabled>确认删除</button><p id="editor-message" class="notice" aria-live="polite"></p>';
         editorLayout.append(documentTree, editor);
         const reconciliationHeading = document.createElement('h2');
         reconciliationHeading.textContent = '带外变更';
@@ -1057,12 +1063,18 @@
           deletionPreviewVersion = null;
           deletionPreviewToken = null;
           editor.querySelector('#document-path').textContent = '请从文档列表选择内容';
+          editor.querySelector('#document-meta').textContent = '生命周期、版本和来源将在此显示。';
           editor.querySelector('#document-source').value = '';
           editor.querySelector('#document-source').disabled = true;
           editor.querySelector('#preview-change').disabled = true;
           editor.querySelector('#save-change').disabled = true;
           editor.querySelector('#preview-delete').disabled = true;
           editor.querySelector('#confirm-delete').disabled = true;
+          const exportLink = editor.querySelector('#export-markdown');
+          exportLink.href = selectedLibrary
+            ? `/api/v1/libraries/${encodeURIComponent(selectedLibrary)}/export.md`
+            : '#';
+          exportLink.setAttribute('aria-disabled', String(!selectedLibrary));
           editor.querySelector('#editor-message').textContent = selectedLibrary ? '正在加载文档...' : '请先选择记忆库。';
           setMessage(historyMessage, selectedLibrary ? '正在加载文档列表...' : '请先选择记忆库。');
           if (!selectedLibrary) return;
@@ -1078,7 +1090,7 @@
             if (!editorContext.isCurrent(requestContext)) return;
             const button = documentTree.appendChild(document.createElement('button'));
             button.type = 'button';
-            button.textContent = item.path;
+            button.textContent = `${item.path} · ${item.lifecycle || 'unknown'}`;
             button.addEventListener('click', () => loadDocument(item.path));
             const option = document.createElement('option');
             option.value = item.path;
@@ -1107,12 +1119,22 @@
           activeDocument = loaded;
           historyDocument.value = activeDocument.path;
           editor.querySelector('#document-path').textContent = activeDocument.path;
+          editor.querySelector('#document-meta').textContent = JSON.stringify({
+            lifecycle: activeDocument.lifecycle,
+            version: activeDocument.version,
+            source: activeDocument.source,
+            source_references: activeDocument.source_references,
+            metadata: activeDocument.metadata,
+          }, null, 2);
           editor.querySelector('#document-source').value = activeDocument.content;
           editor.querySelector('#document-source').disabled = false;
-          editor.querySelector('#preview-change').disabled = false;
-          editor.querySelector('#save-change').disabled = false;
+          const canEdit = activeDocument.lifecycle === 'active'
+            && activeDocument.user_metadata?.restore_pending !== true;
+          editor.querySelector('#preview-change').disabled = !canEdit;
+          editor.querySelector('#save-change').disabled = !canEdit;
           editor.querySelector('#preview-delete').disabled = false;
           editor.querySelector('#confirm-delete').disabled = true;
+          editor.querySelector('#export-markdown').href = `/api/v1/libraries/${encodeURIComponent(selectedLibrary)}/export.md`;
           deletionPreviewVersion = null;
           deletionPreviewToken = null;
           showEditorPanel('source');
@@ -1202,24 +1224,62 @@
           if (!context || !context.libraryId) return;
           history.innerHTML = '<p class="empty">正在加载本地历史...</p>';
           const selectedLibrary = context.libraryId;
+          const versions = Array.isArray(activeDocument?.history) ? activeDocument.history : [];
           const response = await request(`/api/v1/libraries/${selectedLibrary}/history`, {headers: {}});
-          if (!response.ok) { if (editorContext.isCurrent(context)) history.innerHTML = '<p class="empty error">本地历史加载失败，请重试。</p>'; return; }
           if (!editorContext.isCurrent(context) || generation !== generations.history) return;
-          const entries = await response.json(); history.replaceChildren();
-          for (const entry of entries) {
-            if (!editorContext.isCurrent(context)) return;
+          let entries = [];
+          if (response.ok) entries = await response.json();
+          else if (!versions.length) { history.innerHTML = '<p class="empty error">本地历史加载失败，请重试。</p>'; return; }
+          history.replaceChildren();
+          for (const version of versions) {
+            const commit = String(version.id || '');
+            if (!commit) continue;
+            const entry = {
+              commit,
+              subject: version.lifecycle || '版本',
+              authored_at: version.updated_at || version.created_at || '',
+              actor_type: version.source || 'mem2',
+              source: version.source || 'mem2',
+            };
             const button = history.appendChild(document.createElement('button'));
             button.type = 'button';
-            button.textContent = `${entry.commit.slice(0, 12)}  ${entry.subject}`;
+            button.textContent = `${commit.slice(0, 12)}  ${entry.subject}`;
             button.className = 'secondary';
-            button.title = `${entry.authored_at} · ${entry.actor_type || '平台'} · ${entry.source || '初始化'}`;
+            button.title = `${entry.authored_at} · ${entry.actor_type} · ${entry.source}`;
             button.addEventListener('click', async () => {
               const actionContext = editorContext.snapshot();
               if (!actionContext || !actionContext.path) { setMessage(historyMessage, '请先选择要恢复的文档。', 'error'); return; }
               await loadHistoryDiff(selectedLibrary, entry, actionContext);
             });
           }
-          if (!entries.length) history.innerHTML = '<p class="empty">还没有本地历史提交。</p>';
+          for (const entry of entries) {
+            if (!editorContext.isCurrent(context)) return;
+            const commit = String(entry.commit || entry.target_id || entry.id || '');
+            if (!commit) continue;
+            const normalized = {
+              ...entry,
+              commit,
+              subject: entry.subject || entry.action || '记忆事件',
+              authored_at: entry.authored_at || entry.occurred_at || '',
+              actor_type: entry.actor_type || entry.actor || '平台',
+              source: entry.source || '',
+            };
+            const statusLabels = {pending: '待完成', committed: '已提交', failed: '失败'};
+            const statusLabel = normalized.status
+              ? ` [${statusLabels[normalized.status] || normalized.status}]`
+              : '';
+            const button = history.appendChild(document.createElement('button'));
+            button.type = 'button';
+            button.textContent = `${normalized.commit.slice(0, 12)}  ${normalized.subject}${statusLabel}`;
+            button.className = 'secondary';
+            button.title = `${normalized.authored_at} · ${normalized.actor_type} · ${normalized.source || '初始化'}${statusLabel}`;
+            button.addEventListener('click', async () => {
+              const actionContext = editorContext.snapshot();
+              if (!actionContext || !actionContext.path) { setMessage(historyMessage, '请先选择要恢复的文档。', 'error'); return; }
+              await loadHistoryDiff(selectedLibrary, normalized, actionContext);
+            });
+          }
+          if (!history.children.length) history.innerHTML = '<p class="empty">还没有本地历史提交。</p>';
         }
 
         async function restoreDocument(selection) {
@@ -1237,11 +1297,13 @@
           const response = await request(restore.url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(restore.body)});
           if (!selectionIsCurrent()) return;
           if (!response.ok) { const failure = await response.json(); if (!selectionIsCurrent()) return; setMessage(historyMessage, describeError(failure, '历史版本恢复失败'), 'error'); return; }
+          const restored = typeof response.json === 'function' ? await response.json() : {};
+          const nextPath = String(restored.id || selection.path);
           restoreAction.replaceChildren();
           historySelection.clear();
           if (!selectionIsCurrent()) return;
-          const loadedContext = await loadDocument(selection.path);
-          if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === selection.libraryId && loadedContext.path === selection.path) setMessage(historyMessage, `已从 ${selection.commit.slice(0, 12)} 恢复 ${selection.path}。`, 'success');
+          const loadedContext = await loadDocument(nextPath);
+          if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === selection.libraryId && loadedContext.path === nextPath) setMessage(historyMessage, `已从 ${selection.commit.slice(0, 12)} 恢复 ${nextPath}。`, 'success');
           }, null, selectionIsCurrent);
         }
 
@@ -1258,7 +1320,7 @@
           finally { pending.delete(pendingKey); setBusy(button, false, '正在预览...'); }
           if (!documentContextIsCurrent(context) || requestGeneration !== generations.forgettingPreview) return false;
           const message = editor.querySelector('#editor-message');
-          if (!response.ok) { const failure = await response.json(); if (documentContextIsCurrent(context) && requestGeneration === generations.forgettingPreview) setMessage(message, describeError(failure, '遗忘影响预览失败'), 'error'); return false; }
+          if (!response.ok) { const failure = await response.json(); if (documentContextIsCurrent(context) && requestGeneration === generations.forgettingPreview) setMessage(message, describeError(failure, '删除影响预览失败'), 'error'); return false; }
           const preview = await response.json();
           if (!documentContextIsCurrent(context) || requestGeneration !== generations.forgettingPreview) return false;
           editor.querySelector('#document-diff').textContent = JSON.stringify(preview, null, 2);
@@ -1266,24 +1328,31 @@
           deletionPreviewVersion = context.sourceVersion;
           deletionPreviewToken = preview.preview_token;
           editor.querySelector('#confirm-delete').disabled = false;
-          setMessage(message, '请检查所有受影响的权威来源和派生数据，再确认遗忘。');
+          setMessage(message, '请检查所有受影响的权威来源和派生数据，再确认删除。');
           return true;
         }
 
         async function forgetDocument() {
           const context = editorContext.snapshot();
           if (!context || deletionPreviewVersion !== context.sourceVersion || !deletionPreviewToken) return;
-          if (!await confirmAction('强化确认：遗忘记忆', `此操作会遗忘 ${context.path} 并清理关联派生数据。`, context.path)) return;
+          const deleteMode = editor.querySelector('#delete-mode')?.value || 'forget';
+          const deleteModeLabels = {forget: '遗忘', archive: '归档', downweight: '降权', purge: '彻底删除'};
+          const deleteLabel = deleteModeLabels[deleteMode] || deleteMode;
+          if (!await confirmAction(`强化确认：${deleteLabel}记忆`, `此操作将对 ${context.path} 执行${deleteLabel}。`, context.path)) return;
           if (!editorContext.isCurrent(context)) return;
           const button = editor.querySelector('#confirm-delete');
-          await performOnce(`forget-${context.token}`, button, '正在遗忘...', async () => {
-          const response = await request(`/api/v1/libraries/${context.libraryId}/document`, {method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, preview_token: deletionPreviewToken, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-delete'})});
+          await performOnce(`delete-${context.token}`, button, '正在删除...', async () => {
+          const operationId = crypto.randomUUID();
+          const deleteRequest = typeof PamHistory !== 'undefined' && typeof PamHistory.deleteRequest === 'function'
+            ? PamHistory.deleteRequest(context, deletionPreviewToken, operationId, deleteMode)
+            : {url: `/api/v1/libraries/${context.libraryId}/document`, body: {path: context.path, expected_source_version: context.sourceVersion, preview_token: deletionPreviewToken, operation_id: operationId, actor_type: 'user', source: 'web-delete', mode: deleteMode}};
+          const response = await request(deleteRequest.url, {method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(deleteRequest.body)});
           const message = editor.querySelector('#editor-message');
           if (!editorContext.isCurrent(context)) return;
-          if (!response.ok) { const failure = await response.json(); if (editorContext.isCurrent(context)) setMessage(message, describeError(failure, '记忆遗忘失败'), 'error'); return; }
+          if (!response.ok) { const failure = await response.json(); if (editorContext.isCurrent(context)) setMessage(message, describeError(failure, `记忆${deleteLabel}失败`), 'error'); return; }
           await refreshDocuments();
           const currentContext = editorContext.snapshot();
-          if (editorLibrary.value === context.libraryId && currentContext?.libraryId === context.libraryId && !currentContext.path) setMessage(message, '记忆已遗忘。', 'success');
+          if (editorLibrary.value === context.libraryId && currentContext?.libraryId === context.libraryId && !currentContext.path) setMessage(message, `记忆已${deleteLabel}。`, 'success');
           }, null, () => documentContextIsCurrent(context));
         }
 
@@ -1293,13 +1362,15 @@
           const button = editor.querySelector('#save-change');
           await performOnce(`save-${context.token}`, button, '正在保存...', async () => {
             if (!(await previewChange(context)) || !documentContextIsCurrent(context)) return;
-            const saveRequest = PamHistory.saveRequest(context, crypto.randomUUID());
+            const saveRequest = PamHistory.saveRequest(context, crypto.randomUUID(), editor.querySelector('#update-mode').value);
             const response = await request(saveRequest.url, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(saveRequest.body)});
             const message = editor.querySelector('#editor-message');
             if (!documentContextIsCurrent(context)) return;
             if (!response.ok) { const failure = await response.json(); if (!documentContextIsCurrent(context)) return; setMessage(message, describeError(failure, '文档保存失败'), 'error'); return; }
-            const loadedContext = await loadDocument(context.path);
-            if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === context.libraryId && loadedContext.path === context.path) setMessage(message, '文档已保存。', 'success');
+            const saved = typeof response.json === 'function' ? await response.json() : {};
+            const nextPath = String(saved.id || context.path);
+            const loadedContext = await loadDocument(nextPath);
+            if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === context.libraryId && loadedContext.path === nextPath) setMessage(message, '文档已保存。', 'success');
           }, null, () => documentContextIsCurrent(context));
           const current = editorContext.snapshot();
           button.disabled = !documentContextIsCurrent(current);
@@ -1330,13 +1401,10 @@
           submitButton.disabled = true;
           if (!libraryId) return;
           const contextIsCurrent = () => generation === generations.forgotten && libraryId === editorLibrary.value;
-          const [forgottenResponse, historyResponse] = await Promise.all([
-            request(`/api/v1/libraries/${libraryId}/forgotten`, {headers: {}}),
-            request(`/api/v1/libraries/${libraryId}/history`, {headers: {}}),
-          ]);
+          const forgottenResponse = await request(`/api/v1/libraries/${libraryId}/forgotten`, {headers: {}});
           if (!contextIsCurrent()) return;
-          if (!forgottenResponse.ok || !historyResponse.ok) { if (contextIsCurrent()) setMessage(forgottenForm.querySelector('#forgotten-message'), '遗忘记忆列表加载失败，请重试。', 'error'); return; }
-          const [forgottenItems, historyEntries] = await Promise.all([forgottenResponse.json(), historyResponse.json()]);
+          if (!forgottenResponse.ok) { if (contextIsCurrent()) setMessage(forgottenForm.querySelector('#forgotten-message'), '遗忘记忆列表加载失败，请重试。', 'error'); return; }
+          const forgottenItems = await forgottenResponse.json();
           if (!contextIsCurrent()) return;
           for (const item of forgottenItems) {
             const option = document.createElement('option');
@@ -1344,12 +1412,20 @@
             option.textContent = `${item.path} · 遗忘于 ${item.deleted_at}`;
             memorySelect.append(option);
           }
-          for (const entry of historyEntries) {
-            const option = document.createElement('option');
-            option.value = entry.commit;
-            option.textContent = `${entry.commit.slice(0, 12)} · ${entry.subject}`;
-            commitSelect.append(option);
-          }
+          const populateCommitOptions = () => {
+            const selected = forgottenItems.find((item) => item.id === memorySelect.value);
+            commitSelect.replaceChildren();
+            for (const version of selected?.history || (selected ? [selected] : [])) {
+              const option = document.createElement('option');
+              option.value = version.id;
+              option.textContent = `${version.id.slice(0, 12)} · ${version.lifecycle || '版本'}`;
+              commitSelect.append(option);
+            }
+            commitSelect.value = selected?.id || '';
+            submitButton.disabled = !memorySelect.value || !commitSelect.value;
+          };
+          memorySelect.onchange = populateCommitOptions;
+          populateCommitOptions();
           if (!contextIsCurrent()) { memorySelect.replaceChildren(); commitSelect.replaceChildren(); return; }
           memorySelect.dataset.libraryId = libraryId;
           memorySelect.dataset.generation = String(generation);

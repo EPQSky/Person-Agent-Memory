@@ -121,6 +121,7 @@ class DocumentUpdateRequest:
     operation_id: str
     actor: str
     source: str
+    mode: Literal["supersede", "overwrite"] = "supersede"
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +141,7 @@ class DeleteMemoryRequest:
     actor: str
     source: str
     preview_token: str
+    mode: Literal["forget", "archive", "downweight", "purge"] = "forget"
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,6 +538,22 @@ class MemoryIdempotencyConflictError(RuntimeError):
 
 class MemoryIdempotencyPendingError(MemoryIdempotencyConflictError):
     """Raised when an earlier write for the idempotency key is incomplete."""
+
+
+class MemoryGovernanceError(ValueError):
+    """Raised when an inspected or governed memory record is invalid."""
+
+
+class MemoryRecordNotFoundError(MemoryGovernanceError):
+    """Raised when a requested memory record does not exist."""
+
+
+class MemoryRevisionConflictError(MemoryGovernanceError):
+    """Raised when a caller acts on a stale memory revision."""
+
+
+class MemoryLifecycleConflictError(MemoryGovernanceError):
+    """Raised when a lifecycle state does not allow the requested governance action."""
 
 
 class CaptureContractError(ValueError):
