@@ -126,7 +126,7 @@ systemctl --user edit --drop-in=model.conf personal-agent-memory.service
 ```ini
 [Service]
 ExecStart=
-ExecStart="/home/epq/.local/bin/personal-agent-memory" serve --state-dir "/home/epq/.local/share/personal-agent-memory" --library-root "/home/epq/memory-libraries" --host "127.0.0.1" --port "7331" --embedding-url "https://api.siliconflow.cn" --embedding-model "Qwen/Qwen3-Embedding-0.6B" --embedding-api-key-file "/home/epq/.config/personal-agent-memory/embedding.key" --reranker-url "https://api.siliconflow.cn" --reranker-model "Qwen/Qwen3-Reranker-0.6B" --reranker-api-key-file "/home/epq/.config/personal-agent-memory/reranker.key" --graph-url "https://api.siliconflow.cn" --graph-model "Qwen/Qwen3.6-35B-A3B" --graph-api-key-file "/home/epq/.config/personal-agent-memory/graph.key"
+ExecStart="/home/epq/.local/bin/personal-agent-memory" serve --state-dir "/home/epq/.local/share/personal-agent-memory" --library-root "/home/epq/memory-libraries" --host "127.0.0.1" --port "7331" --embedding-url "https://api.siliconflow.cn" --embedding-model "Qwen/Qwen3-Embedding-0.6B" --embedding-dimension "1024" --embedding-api-key-file "/home/epq/.config/personal-agent-memory/embedding.key" --reranker-url "https://api.siliconflow.cn" --reranker-model "Qwen/Qwen3-Reranker-0.6B" --reranker-api-key-file "/home/epq/.config/personal-agent-memory/reranker.key" --graph-url "https://api.siliconflow.cn" --graph-model "Qwen/Qwen3.6-35B-A3B" --graph-api-key-file "/home/epq/.config/personal-agent-memory/graph.key"
 ```
 
 当前程序会自动在地址后面请求 `/v1/embeddings`、`/v1/rerank` 和
@@ -345,6 +345,8 @@ Git 提交。Web 界面主要处理低置信度、冲突、重复、敏感或策
 
 ```text
 --embedding-url
+--embedding-model
+--embedding-dimension
 --reranker-url
 ```
 

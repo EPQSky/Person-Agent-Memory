@@ -385,7 +385,7 @@ def test_app_uses_injected_kernel_contract_and_reports_health(tmp_path: Path) ->
         assert status.json()["memory_kernel_detail"] == "contract fake"
 
 
-def test_feature_flag_defaults_to_legacy_and_marks_mem2_unavailable(tmp_path: Path) -> None:
+def test_feature_flag_defaults_to_legacy_and_starts_mem2_runtime(tmp_path: Path) -> None:
     legacy_app = create_app(Settings(state_dir=tmp_path / "legacy-state"))
     assert legacy_app.state.memory_kernel.kind == "legacy"
     with TestClient(legacy_app) as client:
@@ -407,14 +407,15 @@ def test_feature_flag_defaults_to_legacy_and_marks_mem2_unavailable(tmp_path: Pa
         status = client.get("/api/v1/status", headers=headers).json()
         assert status["status"] == "degraded"
         assert status["memory_kernel"] == "mem2"
-        assert status["memory_kernel_status"] == "unavailable"
-        unavailable = client.post(
+        assert status["memory_kernel_status"] == "degraded"
+        assert "embedding endpoint is not configured" in status["memory_kernel_detail"]
+        searched = client.post(
             "/api/v1/search",
             headers=headers,
             json={"library_id": "library-one", "query": "kernel"},
         )
-        assert unavailable.status_code == 503
-        assert "mem2" in unavailable.json()["detail"]
+        assert searched.status_code == 200
+        assert searched.json()["results"] == []
 
 
 def test_feature_flag_rejects_unknown_kernel(tmp_path: Path) -> None:
@@ -763,10 +764,6 @@ def test_all_migrated_rest_and_mcp_routes_call_injected_kernel(tmp_path: Path) -
         for tool, arguments in (
             ("memory_get", {"library_id": "library-one", "path": "memory.md"}),
             ("candidate_list", {"library_id": "library-one"}),
-            (
-                "memory_search",
-                {"library_id": "library-one", "query": "kernel"},
-            ),
         ):
             call(
                 "POST",
@@ -906,20 +903,12 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
         assert status.status_code == 200
         assert status.json()["status"] == "degraded"
         assert status.json()["memory_kernel"] == "mem2"
-        assert status.json()["memory_kernel_status"] == "unavailable"
+        assert status.json()["memory_kernel_status"] == "degraded"
 
         decision = {
             "operator": "epq",
             "reason": "Unavailable kernel matrix",
             "operation_id": "decision-one",
-        }
-        candidate = {
-            "library_id": "library-one",
-            "suggested_type": "decision",
-            "body": "# Decision\n\nMust not write.\n",
-            "source_references": ["codex-session:one#assistant-final"],
-            "creator": "codex",
-            "idempotency_key": "unavailable-write",
         }
         document = {
             "path": "memory.md",
@@ -929,13 +918,6 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
         unavailable_requests: list[
             tuple[str, str, dict[str, object] | None, dict[str, str] | None]
         ] = [
-            ("POST", "/mcp/candidates", candidate, None),
-            (
-                "POST",
-                "/api/v1/search",
-                {"library_id": "library-one", "query": "kernel"},
-                None,
-            ),
             ("GET", "/api/v1/candidates/candidate-one", None, None),
             (
                 "GET",
@@ -961,15 +943,7 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
                 {**document, "preview_token": "preview-one"},
                 None,
             ),
-            ("GET", "/api/v1/libraries/library-one/history", None, None),
             ("POST", "/api/v1/capture/consolidate", {"session_id": "session-one"}, None),
-            (
-                "GET",
-                "/api/v1/project-bindings/resolve",
-                None,
-                {"cwd": "/projects/one"},
-            ),
-            ("POST", "/mcp/project-bindings/resolve", {"cwd": "/projects/one"}, None),
             ("POST", "/api/v1/libraries/library-one/scan", None, None),
             (
                 "GET",
@@ -990,20 +964,6 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
                     "action": "import",
                     "operation_id": "resolve-out-of-band-one",
                     "final_content": "# Resolved\n",
-                },
-                None,
-            ),
-            (
-                "POST",
-                "/api/v1/capture/events",
-                {
-                    "event_id": "event-one",
-                    "session_id": "session-one",
-                    "turn_id": "turn-one",
-                    "event_kind": "user",
-                    "content": "Must not capture.",
-                    "occurred_at": "2026-10-24T00:00:00Z",
-                    "cwd": "/projects/one",
                 },
                 None,
             ),
@@ -1114,10 +1074,6 @@ def test_mem2_unavailable_matrix_does_not_fall_back_to_legacy_state(
         for tool, arguments in (
             ("memory_get", {"library_id": "library-one", "path": "memory.md"}),
             ("candidate_list", {"library_id": "library-one"}),
-            (
-                "memory_search",
-                {"library_id": "library-one", "query": "kernel"},
-            ),
         ):
             unavailable_requests.append(
                 (
@@ -1218,7 +1174,7 @@ def test_mem2_start_does_not_start_workers_or_mutate_legacy_state(
         assert status_response.status_code == 200
         status = status_response.json()
         assert status["memory_kernel"] == "mem2"
-        assert status["memory_kernel_status"] == "unavailable"
+        assert status["memory_kernel_status"] == "degraded"
         assert status["database"] == "not_started"
         assert status["background_worker"] == "not_started"
         assert app.state.platform_state.connection is None

@@ -13,6 +13,24 @@ from personal_agent_memory.state import (
 )
 
 KernelStatus = Literal["ready", "degraded", "unavailable"]
+MAX_SCOPE_SPACE_LENGTH = 256
+LIBRARY_SCOPE_PREFIX = "library:"
+CWD_SCOPE_PREFIX = "cwd:"
+MAX_LIBRARY_ID_LENGTH = MAX_SCOPE_SPACE_LENGTH - len(LIBRARY_SCOPE_PREFIX)
+
+
+def validate_library_id(library_id: str) -> str:
+    """Return the normalized library identifier or reject an invalid scope."""
+    identifier = library_id.strip()
+    if not identifier:
+        raise ValueError("library_id must not be blank")
+    if len(identifier) > MAX_LIBRARY_ID_LENGTH:
+        raise ValueError(
+            f"library_id exceeds the {MAX_LIBRARY_ID_LENGTH}-character scope limit"
+        )
+    return identifier
+
+
 CAPTURE_BINDING_RETRY_LIMIT = 12
 CandidateDecision = Literal["approve", "reject", "resolve"]
 QuarantineResolution = Literal["discard", "acknowledge"]
@@ -418,8 +436,25 @@ class MemoryKernelPort(Protocol):
     ) -> dict[str, object]: ...
 
 
+@runtime_checkable
+class ManagedMemoryKernelPort(Protocol):
+    """Kernel with an owning runtime that the daemon starts and closes."""
+
+    async def start(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+
 class MemoryKernelUnavailableError(RuntimeError):
-    """Raised when the selected memory kernel is not assembled in this build."""
+    """Raised when the selected memory kernel cannot serve an operation."""
+
+
+class MemoryIdempotencyConflictError(RuntimeError):
+    """Raised when an idempotency key is reused for different content."""
+
+
+class MemoryIdempotencyPendingError(MemoryIdempotencyConflictError):
+    """Raised when an earlier write for the idempotency key is incomplete."""
 
 
 class CaptureBindingUnstableError(RuntimeError):
@@ -800,7 +835,7 @@ class LegacyMemoryKernel:
 
 
 class UnavailableMemoryKernel:
-    """Selected kernel placeholder until the mem2 runtime tickets are complete."""
+    """Explicitly unavailable mem2 kernel used when runtime startup fails."""
 
     kind: MemoryKernelKind = "mem2"
 
@@ -808,12 +843,12 @@ class UnavailableMemoryKernel:
         return KernelHealth(
             kind=self.kind,
             status="unavailable",
-            detail="mem2 kernel is not assembled in this build",
+            detail="mem2 kernel runtime is unavailable",
         )
 
     def _raise(self) -> NoReturn:
         raise MemoryKernelUnavailableError(
-            "mem2 memory kernel is unavailable; set --memory-kernel legacy"
+            "mem2 memory kernel is unavailable for this unsupported operation"
         )
 
     async def write(self, request: MemoryWriteRequest) -> dict[str, object]:
@@ -975,4 +1010,10 @@ class UnavailableMemoryKernel:
 def select_memory_kernel(settings: Settings, state: PlatformState) -> MemoryKernelPort:
     if settings.memory_kernel == "legacy":
         return LegacyMemoryKernel(state)
-    return UnavailableMemoryKernel()
+    from personal_agent_memory.mem2_kernel import Mem2MemoryKernel
+
+    return Mem2MemoryKernel(
+        settings.state_dir,
+        embedding=settings.embedding,
+        embedding_dimension=settings.embedding_dimension,
+    )
