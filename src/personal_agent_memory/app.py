@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from fastapi import (
     Cookie,
@@ -23,12 +23,13 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from markdown_it import MarkdownIt
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, ValidationError, model_validator
 
 from personal_agent_memory.config import Settings
 from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
 from personal_agent_memory.graph_adapter import JiuwenMilvusGraphAdapter
 from personal_agent_memory.memory_kernel import (
+    MAX_LIBRARY_ID_LENGTH,
     AuditMemoryRequest,
     CandidateDecisionRequest,
     CandidateGovernanceListRequest,
@@ -53,6 +54,8 @@ from personal_agent_memory.memory_kernel import (
     ListDocumentsRequest,
     ListForgottenRequest,
     ListOutOfBandChangesRequest,
+    ManagedMemoryKernelPort,
+    MemoryIdempotencyConflictError,
     MemoryKernelPort,
     MemoryKernelUnavailableError,
     OutOfBandChangeRequest,
@@ -87,6 +90,10 @@ from personal_agent_memory.state import (
 )
 
 CAPTURE_BINDING_DEADLINE_SECONDS = 0.25
+LibraryId = Annotated[
+    str,
+    BeforeValidator(lambda value: value.strip() if isinstance(value, str) else value),
+]
 CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS = 0.06
 CAPTURE_PERSISTENCE_DEADLINE_HEADER = "X-Personal-Agent-Memory-Persistence-Deadline-Ms"
 
@@ -144,7 +151,9 @@ class IgnoreRulesUpdate(BaseModel):
 
 class SearchRequest(BaseModel):
     cwd: str | None = None
-    library_id: str | None = None
+    library_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
+    )
     query: str
     limit: int = 10
     graph_hops: int = Field(default=1, ge=1, le=2)
@@ -220,11 +229,20 @@ CandidateType = Literal[
 
 
 class CandidateCreate(BaseModel):
-    library_id: str
+    library_id: LibraryId = Field(min_length=1, max_length=MAX_LIBRARY_ID_LENGTH)
     suggested_type: CandidateType
-    body: str = Field(min_length=1, max_length=200_000)
+    body: str = Field(min_length=1, max_length=65_535)
     source_references: list[str] = Field(min_length=1, max_length=100)
     creator: str = Field(min_length=1, max_length=200)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class MemoryCreate(BaseModel):
+    library_id: LibraryId = Field(min_length=1, max_length=MAX_LIBRARY_ID_LENGTH)
+    content: str = Field(min_length=1, max_length=65_535)
+    memory_type: str = Field(default="domain_fact", min_length=1, max_length=100)
+    source_references: list[str] = Field(default_factory=lambda: ["rest"])
+    actor: str = Field(default="local", min_length=1, max_length=200)
     idempotency_key: str = Field(min_length=1, max_length=200)
 
 
@@ -252,7 +270,7 @@ class CaptureEvent(BaseModel):
     session_id: str = Field(min_length=1, max_length=1000)
     turn_id: str = Field(min_length=1, max_length=200)
     event_kind: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=65_536)
+    content: str = Field(min_length=1, max_length=65_535)
     occurred_at: str = Field(min_length=1, max_length=100)
     cwd: str = Field(min_length=1, max_length=4096)
 
@@ -317,12 +335,21 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         key_store.ensure()
         legacy_kernel_selected = selected_kernel.kind == "legacy"
+        managed_kernel = (
+            cast(ManagedMemoryKernelPort, selected_kernel)
+            if isinstance(selected_kernel, ManagedMemoryKernelPort)
+            else None
+        )
         if legacy_kernel_selected:
             await platform_state.start()
+        elif managed_kernel is not None:
+            await managed_kernel.start()
         try:
             yield
         finally:
-            if legacy_kernel_selected and platform_state.connection is not None:
+            if managed_kernel is not None:
+                await managed_kernel.close()
+            elif legacy_kernel_selected and platform_state.connection is not None:
                 await platform_state.close()
 
     app = FastAPI(title="Personal Agent Memory", version="0.1.0", lifespan=lifespan)
@@ -377,6 +404,15 @@ def create_app(
             "previous_shutdown_clean": platform_state.previous_shutdown_clean,
             "api_key_fingerprint": key_store.fingerprint(key),
         }
+
+    @app.exception_handler(MemoryIdempotencyConflictError)
+    async def idempotency_conflict(
+        _: Request, error: MemoryIdempotencyConflictError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(error)},
+        )
 
     @app.exception_handler(MemoryKernelUnavailableError)
     async def kernel_unavailable(
@@ -762,6 +798,28 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
             ) from error
 
+    @app.post(
+        "/api/v1/memories",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_memory(memory: MemoryCreate) -> dict[str, object]:
+        try:
+            return await selected_kernel.write(
+                CreateMemoryRequest(
+                    library_id=memory.library_id,
+                    content=memory.content,
+                    memory_type=memory.memory_type,
+                    source_references=tuple(memory.source_references),
+                    actor=memory.actor,
+                    idempotency_key=memory.idempotency_key,
+                )
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
     @app.post("/api/v1/search", dependencies=[Depends(authenticate)])
     async def search(request: SearchRequest) -> dict[str, object]:
         return await search_payload(request)
@@ -800,6 +858,10 @@ def create_app(
             if isinstance(error, MemoryMutationError):
                 raise mutation_error(error) from error
             raise candidate_error(error) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
 
     @app.post(
         "/api/v1/capture/events",

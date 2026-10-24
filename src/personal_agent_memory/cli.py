@@ -55,6 +55,9 @@ def serve(
     port: int = typer.Option(7331, min=1, max=65535),
     embedding_url: str | None = typer.Option(None, help="OpenAI-compatible embedding base URL."),
     embedding_model: str = typer.Option("text-embedding", help="Embedding model name."),
+    embedding_dimension: int = typer.Option(
+        1536, "--embedding-dimension", min=1, max=65536, help="Embedding vector dimension."
+    ),
     embedding_api_key_file: str | None = typer.Option(
         None, help="File containing the embedding service API key."
     ),
@@ -102,6 +105,7 @@ def serve(
                 if embedding_url is not None
                 else None
             ),
+            embedding_dimension=embedding_dimension,
             reranker=(
                 ModelEndpoint(
                     reranker_url,

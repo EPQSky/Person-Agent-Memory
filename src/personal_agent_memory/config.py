@@ -31,6 +31,7 @@ class Settings:
     port: int = 7331
     library_roots: tuple[Path, ...] = ()
     embedding: ModelEndpoint | None = None
+    embedding_dimension: int = 1536
     reranker: ModelEndpoint | None = None
     graph: ModelEndpoint | None = None
     retention_now: str | None = None
@@ -61,6 +62,8 @@ class Settings:
             raise ConfigurationError("port must be between 1 and 65535")
         if self.memory_kernel not in {"legacy", "mem2"}:
             raise ConfigurationError("memory kernel must be legacy or mem2")
+        if self.embedding_dimension <= 0:
+            raise ConfigurationError("embedding dimension must be positive")
         if self.retention_now is not None:
             try:
                 parsed = datetime.fromisoformat(self.retention_now.replace("Z", "+00:00"))
