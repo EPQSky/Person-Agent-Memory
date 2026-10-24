@@ -51,6 +51,11 @@
       .metric strong { display: block; margin-top: 10px; font-size: 25px; }
       .quick-actions { display: flex; flex-wrap: wrap; gap: 8px; }
       .quick-actions button { margin: 0; }
+      .region-tree { padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+      .region-tree section { margin-top: 14px; }
+      .region-tree h3 { margin: 0 0 8px; }
+      .region-node { margin: 6px 0; padding: 9px 12px; border-left: 3px solid var(--blue); background: var(--blue-soft); border-radius: 4px; overflow-wrap: anywhere; }
+      .region-node small { display: block; color: var(--muted); font-family: ui-monospace, monospace; }
       label { display: block; font-weight: 650; margin-bottom: 6px; }
       input, select, textarea { width: 100%; padding: 8px 10px; border: 1px solid #bbbfc4; border-radius: 6px; background: white; color: var(--ink); }
       input[type="checkbox"] { width: auto; }
@@ -200,11 +205,32 @@
         forgottenHeading.textContent = '遗忘记忆恢复';
         const forgottenForm = document.createElement('form');
         forgottenForm.innerHTML = '<div class="field"><label for="forgotten-memory">遗忘记忆</label><select id="forgotten-memory" required></select></div><div class="field"><label for="forgotten-commit">允许恢复的历史版本</label><select id="forgotten-commit" required></select></div><button type="submit">作为新事务恢复</button><p id="forgotten-message" class="notice" aria-live="polite"></p>';
+        const regionCreateForm = document.createElement('form');
+        regionCreateForm.innerHTML = '<h3>创建记忆区域</h3><div class="field"><label for="region-kind">区域类型</label><select id="region-kind"><option value="user">用户</option><option value="topic">专题</option><option value="project">项目</option><option value="session">会话</option></select></div><div class="field"><label for="region-name">名称</label><input id="region-name" required maxlength="200"></div><div class="field"><label for="region-id">稳定标识（可选）</label><input id="region-id" maxlength="120" placeholder="留空时自动生成"></div><div class="field"><label for="region-session-id">会话标识（仅会话区域）</label><input id="region-session-id" maxlength="200"></div><button type="submit">创建区域</button><p id="region-create-message" class="notice" aria-live="polite"></p>';
+        const regionTree = document.createElement('div');
+        regionTree.id = 'region-tree';
+        regionTree.className = 'region-tree';
+        regionTree.setAttribute('aria-live', 'polite');
+        regionTree.textContent = '正在加载记忆区域树...';
+        const regionBindForm = document.createElement('form');
+        regionBindForm.innerHTML = '<h3>绑定项目根目录</h3><div class="field"><label for="bind-region">项目记忆区域</label><select id="bind-region" required></select></div><div class="field"><label for="bind-project-root">项目根目录</label><input id="bind-project-root" required></div><button type="submit">绑定项目</button><p id="region-bind-message" class="notice" aria-live="polite"></p>';
+        const regionWorktreeForm = document.createElement('form');
+        regionWorktreeForm.innerHTML = '<h3>显式关联 Worktree</h3><div class="field"><label for="worktree-region-root">Worktree 根目录</label><input id="worktree-region-root" required></div><div class="field"><label for="worktree-main-binding">主项目绑定</label><select id="worktree-main-binding" required></select></div><button type="submit">关联主项目绑定</button><p id="region-worktree-message" class="notice" aria-live="polite"></p>';
+        const regionBindingTable = document.createElement('table');
+        regionBindingTable.innerHTML = '<thead><tr><th>项目根目录</th><th>关系</th><th>区域</th><th>可用性</th><th>操作</th></tr></thead><tbody></tbody>';
+        const regionBindingScroll = document.createElement('div');
+        regionBindingScroll.className = 'table-scroll';
+        regionBindingScroll.append(regionBindingTable);
+        const regionMessage = document.createElement('p');
+        regionMessage.id = 'region-message';
+        regionMessage.className = 'notice';
+        regionMessage.setAttribute('aria-live', 'polite');
         historyDiff.className = 'diff';
         const sidebar = document.createElement('aside');
         sidebar.className = 'sidebar';
         sidebar.id = 'workspace-sidebar';
-        sidebar.innerHTML = '<div class="sidebar-brand">个人智能体记忆<small>Personal Agent Memory</small></div><nav aria-label="工作台导航"><button class="nav-button" data-view="overview" aria-current="page">概览</button><button class="nav-button" data-view="search">记忆检索</button><button class="nav-button" data-view="candidates">候选审核</button><button class="nav-button" data-view="documents">文档管理</button><div class="nav-group">管理与治理</div><button class="nav-button" data-view="libraries">记忆库</button><button class="nav-button" data-view="bindings">项目绑定</button><button class="nav-button" data-view="sensitive">敏感隔离</button><button class="nav-button" data-view="history">历史恢复</button><button class="nav-button" data-view="privacy">隐私设置</button></nav>';
+        sidebar.innerHTML = '<div class="sidebar-brand">个人智能体记忆<small>Personal Agent Memory</small></div><nav aria-label="工作台导航"><button class="nav-button" data-view="overview" aria-current="page">概览</button><button class="nav-button" data-view="search">记忆检索</button><button class="nav-button" data-view="candidates">候选审核</button><button class="nav-button" data-view="documents">文档管理</button><div class="nav-group">管理与治理</div><button class="nav-button" data-view="regions">记忆区域</button><button class="nav-button" data-view="libraries">记忆库</button><button class="nav-button" data-view="bindings">项目绑定</button><button class="nav-button" data-view="sensitive">敏感隔离</button><button class="nav-button" data-view="history">历史恢复</button><button class="nav-button" data-view="privacy">隐私设置</button></nav>';
+        sidebar.querySelector('[data-view="regions"]').hidden = data.memory_kernel !== 'mem2';
         const topbar = document.createElement('header');
         topbar.className = 'topbar';
         topbar.innerHTML = '<button type="button" id="nav-toggle" class="secondary" aria-label="展开或收起导航" aria-controls="workspace-sidebar" aria-expanded="false" title="展开或收起导航">☰</button><span class="connection ok" id="connection-status" role="status" aria-live="polite">服务已连接</span><span id="session-status" class="hint">会话有效期 24 小时</span><button type="button" id="logout" class="secondary" title="退出当前会话">退出</button>';
@@ -255,6 +281,7 @@
         reconciliationSection.append(reconciliationHeading, reconciliationLayout);
         makeView('documents', '文档管理', [documentsSection, reconciliationSection]);
         const tableScroll = document.createElement('div'); tableScroll.className = 'table-scroll'; tableScroll.append(table);
+        makeView('regions', '记忆区域', [regionCreateForm, regionTree, regionBindForm, regionWorktreeForm, regionBindingScroll, regionMessage]);
         makeView('libraries', '记忆库', [form, tableScroll]);
         const bindingScroll = document.createElement('div'); bindingScroll.className = 'table-scroll'; bindingScroll.append(bindingTable);
         makeView('bindings', '项目绑定', [bindingForm, worktreeForm, bindingScroll]);
@@ -288,6 +315,9 @@
         let projectLibraries = [];
         let projectBindings = [];
         let allLibraries = [];
+        let allRegions = [];
+        let regionBindings = [];
+        const currentRegionSessionId = crypto.randomUUID();
         let activeDocument = null;
         let deletionPreviewVersion = null;
         let deletionPreviewToken = null;
@@ -296,7 +326,7 @@
         let activeReconciliation = null;
         let sensitiveOffset = 0;
         const sensitivePageSize = 50;
-        const generations = {libraries: 0, candidates: 0, candidateGovernance: 0, sensitive: 0, retention: 0, reconciliation: 0, forgotten: 0, forgettingPreview: 0, history: 0, historyDiff: 0, bindings: 0};
+        const generations = {libraries: 0, candidates: 0, candidateGovernance: 0, sensitive: 0, retention: 0, reconciliation: 0, forgotten: 0, forgettingPreview: 0, history: 0, historyDiff: 0, bindings: 0, regions: 0};
         const pending = new Set();
         const buttonOperations = new WeakMap();
         const bindingIntents = new Map();
@@ -333,6 +363,7 @@
           domain_fact: '领域事实', reusable_experience: '可复用经验', external_reference: '外部参考',
           procedure: '流程', lesson: '经验',
         };
+        const regionKindLabels = {user: '用户记忆区域', topic: '专题记忆区域', project: '项目记忆区域', session: '会话记忆区域'};
         const degradationLabels = {
           graph_not_configured: '图索引未配置', graph_unavailable: '图索引不可用', graph_stale: '图索引待更新',
           graph_error: '图索引异常', text_index_unavailable: '文本索引不可用', vector_index_unavailable: '向量索引不可用',
@@ -505,8 +536,13 @@
           const generation = ++generations.libraries;
           overviewAlert.textContent = '正在加载概览...';
           const response = await request('/api/v1/libraries', {headers: {}});
-          if (!response.ok || generation !== generations.libraries) { overviewAlert.className = 'notice error'; overviewAlert.textContent = '概览加载失败。请刷新页面重试。'; return; }
-          const libraries = await response.json();
+          if (generation !== generations.libraries) return;
+          let libraries = [];
+          if (response.ok) {
+            libraries = await response.json();
+          } else if (response.status !== 503) {
+            overviewAlert.className = 'notice error'; overviewAlert.textContent = '概览加载失败。请刷新页面重试。'; return;
+          }
           if (generation !== generations.libraries) return;
           allLibraries = libraries;
           projectLibraries = libraries.filter((library) => library.kind === 'project');
@@ -541,7 +577,7 @@
           const indexProblems = libraries.filter((library) => ['error', 'unavailable'].includes(library.sync_status) || ['error', 'unavailable'].includes(library.graph_status));
           overviewAlert.className = `notice ${indexProblems.length ? 'error' : 'success'}`;
           overviewAlert.textContent = indexProblems.length ? `${indexProblems.length} 个记忆库存在索引异常，请进入记忆库查看详情。` : '服务、记忆库与索引状态已加载。';
-          await Promise.all([refreshBindings(), refreshCandidates(), refreshRetention(), refreshSensitiveQuarantine(), refreshDocuments()]);
+          await Promise.all([refreshBindings(), refreshRegions(), refreshCandidates(), refreshRetention(), refreshSensitiveQuarantine(), refreshDocuments()]);
         }
 
         async function countSensitiveRecords() {
@@ -1322,6 +1358,97 @@
           submitButton.disabled = !memorySelect.value || !commitSelect.value;
         }
 
+        function renderRegionNode(parent, region, temporary = false) {
+          const node = document.createElement('div');
+          node.className = 'region-node';
+          const title = document.createElement('strong');
+          title.textContent = `${region.name}${temporary ? '（临时）' : ''}`;
+          const detail = document.createElement('small');
+          detail.textContent = `${regionKindLabels[region.kind] || region.kind} · ${region.space}${region.session_id ? ` · session=${region.session_id}` : ''}`;
+          node.append(title, detail);
+          parent.append(node);
+        }
+
+        async function refreshRegions() {
+          const generation = ++generations.regions;
+          const [treeResponse, bindingsResponse] = await Promise.all([
+            request(`/api/v1/regions/tree?session_id=${encodeURIComponent(currentRegionSessionId)}`, {headers: {}}),
+            request('/api/v1/project-bindings', {headers: {}}),
+          ]);
+          if (generation !== generations.regions) return;
+          if (!treeResponse.ok || !bindingsResponse.ok) {
+            regionTree.textContent = '记忆区域加载失败。';
+            setMessage(regionMessage, '请稍后刷新记忆区域。', 'error');
+            return;
+          }
+          const tree = await treeResponse.json();
+          regionBindings = await bindingsResponse.json();
+          allRegions = [tree.root, ...(tree.topics || []), ...(tree.projects || [])].filter(Boolean);
+          regionTree.replaceChildren();
+          if (tree.root) {
+            const rootSection = document.createElement('section');
+            const heading = document.createElement('h3');
+            heading.textContent = '用户记忆区域';
+            rootSection.append(heading);
+            renderRegionNode(rootSection, tree.root);
+            regionTree.append(rootSection);
+          }
+          const appendGroup = (title, nodes) => {
+            const section = document.createElement('section');
+            const heading = document.createElement('h3');
+            heading.textContent = title;
+            section.append(heading);
+            for (const node of nodes || []) renderRegionNode(section, node);
+            if (!(nodes || []).length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = '暂无区域'; section.append(empty); }
+            regionTree.append(section);
+          };
+          appendGroup('专题记忆区域', tree.topics);
+          appendGroup('项目记忆区域', tree.projects);
+          if (tree.current_session) {
+            const sessionSection = document.createElement('section');
+            const heading = document.createElement('h3');
+            heading.textContent = '当前会话';
+            sessionSection.append(heading);
+            renderRegionNode(sessionSection, tree.current_session, true);
+            regionTree.append(sessionSection);
+          }
+          const projectRegions = allRegions.filter((region) => region.kind === 'project');
+          fillSelect(regionBindForm.querySelector('#bind-region'), projectRegions, (region) => region.region_id, (region) => `${region.name} (${region.space})`);
+          fillSelect(regionWorktreeForm.querySelector('#worktree-main-binding'), regionBindings.filter((binding) => binding.kind === 'project'), (binding) => binding.binding_id, (binding) => `${binding.canonical_root} → ${binding.region_id}`);
+          const body = regionBindingTable.querySelector('tbody');
+          body.replaceChildren();
+          for (const binding of regionBindings) {
+            const row = document.createElement('tr');
+            for (const value of [binding.canonical_root, binding.kind, binding.region_id]) {
+              const cell = document.createElement('td');
+              cell.textContent = display(value);
+              if (value === binding.canonical_root) cell.className = 'path';
+              row.append(cell);
+            }
+            const availability = document.createElement('td');
+            availability.append(createStatusBadge(binding.availability));
+            row.append(availability);
+            const actions = document.createElement('td');
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'danger';
+            remove.textContent = '解除绑定';
+            remove.addEventListener('click', async () => {
+              if (!await confirmAction('确认解除区域绑定', `将解除 ${binding.canonical_root} 与 ${binding.region_id} 的显式绑定。`)) return;
+              await performOnce(`region-binding-${binding.binding_id}`, remove, '正在解除...', async () => {
+                const response = await request(`/api/v1/project-bindings/${binding.binding_id}`, {method: 'DELETE', headers: {}});
+                setMessage(regionMessage, response.ok ? '区域绑定已解除。' : '区域绑定解除失败。', response.ok ? 'success' : 'error');
+                if (response.ok) await refreshRegions();
+              });
+            });
+            actions.append(remove);
+            row.append(actions);
+            body.append(row);
+          }
+          if (!regionBindings.length) body.innerHTML = '<tr><td colspan="5" class="empty">还没有项目根目录绑定。</td></tr>';
+          setMessage(regionMessage, '记忆区域树和绑定已加载。', 'success');
+        }
+
         async function refreshBindings() {
           const generation = ++generations.bindings;
           const response = await request('/api/v1/project-bindings', {headers: {}});
@@ -1448,6 +1575,47 @@
           setMessage(message, 'Worktree 已关联。', 'success');
           worktreeForm.querySelector('#worktree-root').value = '';
           await refreshBindings();
+          });
+        });
+        regionCreateForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const button = regionCreateForm.querySelector('button[type="submit"]');
+          await performOnce('create-region', button, '正在创建...', async () => {
+            const kind = regionCreateForm.querySelector('#region-kind').value;
+            const regionId = regionCreateForm.querySelector('#region-id').value.trim();
+            const sessionId = regionCreateForm.querySelector('#region-session-id').value.trim();
+            const response = await request('/api/v1/regions', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind, name: regionCreateForm.querySelector('#region-name').value, region_id: regionId || null, session_id: kind === 'session' ? sessionId || currentRegionSessionId : null})});
+            const message = regionCreateForm.querySelector('#region-create-message');
+            if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '记忆区域创建失败'), 'error'); return; }
+            setMessage(message, '记忆区域已创建。', 'success');
+            regionCreateForm.querySelector('#region-name').value = '';
+            regionCreateForm.querySelector('#region-id').value = '';
+            regionCreateForm.querySelector('#region-session-id').value = '';
+            await refreshRegions();
+          });
+        });
+        regionBindForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const button = regionBindForm.querySelector('button[type="submit"]');
+          await performOnce('bind-region-project', button, '正在绑定...', async () => {
+            const response = await request('/api/v1/project-bindings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project_root: regionBindForm.querySelector('#bind-project-root').value, region_id: regionBindForm.querySelector('#bind-region').value})});
+            const message = regionBindForm.querySelector('#region-bind-message');
+            if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '项目根目录绑定失败'), 'error'); return; }
+            setMessage(message, '项目根目录已绑定。', 'success');
+            regionBindForm.querySelector('#bind-project-root').value = '';
+            await refreshRegions();
+          });
+        });
+        regionWorktreeForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const button = regionWorktreeForm.querySelector('button[type="submit"]');
+          await performOnce('associate-region-worktree', button, '正在关联...', async () => {
+            const response = await request('/api/v1/project-bindings/worktrees', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({worktree_root: regionWorktreeForm.querySelector('#worktree-region-root').value, main_project_binding_id: regionWorktreeForm.querySelector('#worktree-main-binding').value})});
+            const message = regionWorktreeForm.querySelector('#region-worktree-message');
+            if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, 'Worktree 显式关联失败'), 'error'); return; }
+            setMessage(message, 'Worktree 已显式继承主项目绑定。', 'success');
+            regionWorktreeForm.querySelector('#worktree-region-root').value = '';
+            await refreshRegions();
           });
         });
         searchForm.addEventListener('submit', async (event) => {

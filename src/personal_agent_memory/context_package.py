@@ -545,7 +545,7 @@ def build_context_package(
         "graph_index_status": raw.get("graph_index_status", "not_applicable"),
         "results": [],
     }
-    for key in ("project_id", "library_id"):
+    for key in ("project_id", "library_id", "region_id", "region_ids", "space"):
         if key in raw:
             payload[key] = raw[key]
 

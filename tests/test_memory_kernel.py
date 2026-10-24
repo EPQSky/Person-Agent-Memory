@@ -15,7 +15,9 @@ from fastapi.testclient import TestClient
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import ConfigurationError, Settings
 from personal_agent_memory.memory_kernel import (
+    AssociateWorktreeRegionRequest,
     AuditMemoryRequest,
+    BindProjectRegionRequest,
     CandidateDecisionRequest,
     CandidateGovernanceListRequest,
     CandidateGovernanceRequest,
@@ -28,11 +30,14 @@ from personal_agent_memory.memory_kernel import (
     CaptureMemoryRequest,
     CaptureRoundsRequest,
     ClearDiagnosticsRequest,
+    CreateMemoryRegionRequest,
     CreateMemoryRequest,
     DeleteMemoryRequest,
+    DeleteRegionBindingRequest,
     DocumentInspectRequest,
     DocumentUpdateRequest,
     EvolveMemoryRequest,
+    GetMemoryRegionRequest,
     HistoryDiffRequest,
     KernelHealth,
     LegacyMemoryKernel,
@@ -42,6 +47,7 @@ from personal_agent_memory.memory_kernel import (
     ListOutOfBandChangesRequest,
     MemoryInspectRequest,
     MemoryKernelPort,
+    MemoryRegionTreeRequest,
     MemoryUpdateRequest,
     MemoryWriteRequest,
     OutOfBandChangeRequest,
@@ -57,6 +63,7 @@ from personal_agent_memory.memory_kernel import (
     SearchMemoryRequest,
     SensitiveQuarantineListRequest,
     SensitiveQuarantineResolutionRequest,
+    UpdateRegionBindingRequest,
     UpdateRetentionPolicyRequest,
 )
 from personal_agent_memory.model_client import OpenAICompatibleClient
@@ -125,6 +132,45 @@ class ContractFakeKernel:
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]:
         self._called("resolve_region")
         return {"status": "unbound", "cwd": request.cwd}
+
+    def create_region(self, request: CreateMemoryRegionRequest) -> dict[str, object]:
+        self._called("create_region")
+        return {"region_id": request.region_id or "user", "kind": request.kind}
+
+    def list_regions(self) -> list[dict[str, object]]:
+        self._called("list_regions")
+        return []
+
+    def get_region(self, request: GetMemoryRegionRequest) -> dict[str, object]:
+        self._called("get_region")
+        return {"region_id": request.region_id}
+
+    def region_tree(self, request: MemoryRegionTreeRequest) -> dict[str, object]:
+        self._called("region_tree")
+        return {"root": None, "topics": [], "projects": [], "current_session": None}
+
+    def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]:
+        self._called("bind_project_region")
+        return {"binding_id": "binding-one", "region_id": request.region_id}
+
+    def associate_worktree_region(
+        self, request: AssociateWorktreeRegionRequest
+    ) -> dict[str, str]:
+        self._called("associate_worktree_region")
+        return {"binding_id": "worktree-one", "region_id": "region-one"}
+
+    def list_region_bindings(self) -> list[dict[str, str]]:
+        self._called("list_region_bindings")
+        return []
+
+    def update_region_binding(
+        self, request: UpdateRegionBindingRequest
+    ) -> dict[str, str]:
+        self._called("update_region_binding")
+        return {"binding_id": request.binding_id, "region_id": request.region_id}
+
+    def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
+        self._called("delete_region_binding")
 
     async def scan_library(
         self, request: ScanLibraryRequest
@@ -351,6 +397,24 @@ async def _fake_kernel_contract() -> None:
     kernel.audit(AuditMemoryRequest(library_id="library-one"))
     await kernel.evolve(EvolveMemoryRequest(session_id="session-one"))
     kernel.resolve_region(ResolveRegionRequest(cwd="/projects/one"))
+    kernel.create_region(CreateMemoryRegionRequest(kind="user", name="User"))
+    kernel.list_regions()
+    kernel.get_region(GetMemoryRegionRequest(region_id="user"))
+    kernel.region_tree(MemoryRegionTreeRequest(session_id="session-one"))
+    kernel.bind_project_region(
+        BindProjectRegionRequest(project_root="/projects/one", region_id="project-one")
+    )
+    kernel.associate_worktree_region(
+        AssociateWorktreeRegionRequest(
+            worktree_root="/projects/worktree",
+            main_project_binding_id="binding-one",
+        )
+    )
+    kernel.list_region_bindings()
+    kernel.update_region_binding(
+        UpdateRegionBindingRequest(binding_id="binding-one", region_id="project-two")
+    )
+    kernel.delete_region_binding(DeleteRegionBindingRequest(binding_id="binding-one"))
 
     assert kernel.calls == [
         "write:CreateMemoryRequest",
@@ -364,6 +428,15 @@ async def _fake_kernel_contract() -> None:
         "audit",
         "evolve",
         "resolve_region",
+        "create_region",
+        "list_regions",
+        "get_region",
+        "region_tree",
+        "bind_project_region",
+        "associate_worktree_region",
+        "list_region_bindings",
+        "update_region_binding",
+        "delete_region_binding",
     ]
 
 
@@ -565,6 +638,41 @@ def test_all_migrated_rest_and_mcp_routes_call_injected_kernel(tmp_path: Path) -
             "/api/v1/project-bindings/resolve",
             params={"cwd": "/projects/one"},
         )
+        call(
+            "POST",
+            "/api/v1/regions",
+            expected=201,
+            json={"kind": "user", "name": "User", "region_id": "user"},
+        )
+        call("GET", "/api/v1/regions")
+        call("GET", "/api/v1/regions/user")
+        call(
+            "GET",
+            "/api/v1/regions/tree",
+            params={"session_id": "session-one"},
+        )
+        call(
+            "POST",
+            "/api/v1/project-bindings",
+            expected=201,
+            json={"project_root": "/projects/one", "region_id": "project-one"},
+        )
+        call(
+            "POST",
+            "/api/v1/project-bindings/worktrees",
+            expected=201,
+            json={
+                "worktree_root": "/projects/worktree",
+                "main_project_binding_id": "binding-one",
+            },
+        )
+        call("GET", "/api/v1/project-bindings")
+        call(
+            "PUT",
+            "/api/v1/project-bindings/binding-one",
+            json={"region_id": "project-two"},
+        )
+        call("DELETE", "/api/v1/project-bindings/binding-one", expected=204)
         call(
             "POST",
             "/api/v1/search",
@@ -788,6 +896,15 @@ def test_all_migrated_rest_and_mcp_routes_call_injected_kernel(tmp_path: Path) -
         "audit",
         "evolve",
         "resolve_region",
+        "create_region",
+        "list_regions",
+        "get_region",
+        "region_tree",
+        "bind_project_region",
+        "associate_worktree_region",
+        "list_region_bindings",
+        "update_region_binding",
+        "delete_region_binding",
         "scan_library",
         "list_out_of_band_changes",
         "out_of_band_change",

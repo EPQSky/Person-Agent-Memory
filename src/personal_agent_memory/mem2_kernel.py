@@ -38,20 +38,28 @@ from personal_agent_memory.config import MemoryKernelKind
 from personal_agent_memory.memory_kernel import (
     CWD_SCOPE_PREFIX,
     LIBRARY_SCOPE_PREFIX,
+    AssociateWorktreeRegionRequest,
     AuditMemoryRequest,
+    BindProjectRegionRequest,
     CaptureMemoryRequest,
+    CreateMemoryRegionRequest,
     CreateMemoryRequest,
+    DeleteRegionBindingRequest,
+    GetMemoryRegionRequest,
     KernelHealth,
     MemoryIdempotencyConflictError,
     MemoryIdempotencyPendingError,
     MemoryKernelUnavailableError,
+    MemoryRegionTreeRequest,
     MemoryWriteRequest,
     ResolveRegionRequest,
     SearchMemoryRequest,
     UnavailableMemoryKernel,
+    UpdateRegionBindingRequest,
     validate_library_id,
 )
 from personal_agent_memory.model_client import ModelEndpoint
+from personal_agent_memory.regions import MemoryRegion, RegionBindingError, RegionRegistry
 from personal_agent_memory.storage import (
     MilvusLiteFulltextStore,
     MilvusLiteVectorStore,
@@ -152,6 +160,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         embedding: ModelEndpoint | None = None,
         embedding_dimension: int = _DEFAULT_EMBEDDING_DIM,
         config_overrides: Mapping[str, Any] | None = None,
+        regions: RegionRegistry | None = None,
     ) -> None:
         if embedding_dimension <= 0:
             raise ValueError("embedding dimension must be positive")
@@ -159,6 +168,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._embedding = embedding
         self._embedding_dimension = embedding_dimension
         self._config_overrides = config_overrides
+        self._regions = regions or RegionRegistry(self._state_dir / "regions.sqlite3")
         self._bundle: _RuntimeBundle | None = None
         self._startup_error: str | None = None
         self._vector_enabled = False
@@ -255,8 +265,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     def _write(self, request: MemoryWriteRequest) -> dict[str, object]:
         if isinstance(request, CreateMemoryRequest):
-            normalized = replace(request, library_id=validate_library_id(request.library_id))
-            key = (normalized.library_id, normalized.idempotency_key)
+            if request.region_id is not None:
+                region_id = request.region_id.strip()
+                if not region_id:
+                    raise ValueError("region_id must not be blank")
+                self._regions.require_region(region_id)
+                normalized = replace(request, region_id=region_id)
+                key = (_write_identity(normalized), normalized.idempotency_key)
+            else:
+                normalized = replace(request, library_id=validate_library_id(request.library_id))
+                key = (normalized.library_id, normalized.idempotency_key)
             with self._idempotency_lock(key):
                 return self._write_locked(normalized)
         return self._write_locked(request)
@@ -282,10 +300,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     def _write_locked(self, request: MemoryWriteRequest) -> dict[str, object]:
         bundle = self._require_bundle()
         if isinstance(request, CreateMemoryRequest):
-            scope = _scope_for_normalized_library(request.library_id)
+            if request.region_id is not None:
+                region = self._regions.require_region(request.region_id)
+                scope = _scope_for_region(region)
+                identity = _write_identity(request)
+            else:
+                scope = _scope_for_normalized_library(request.library_id)
+                identity = request.library_id
             request_hash = _write_request_hash(request)
             existing_id = self._reserve_idempotency(
-                request.library_id, request.idempotency_key, request_hash
+                identity, request.idempotency_key, request_hash
             )
             if existing_id is not None:
                 return _write_response(request, existing_id, status="existing")
@@ -294,9 +318,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "source_references": list(request.source_references),
                 "request_actor": request.actor,
                 "idempotency_key": request.idempotency_key,
+                "region_id": request.region_id,
             }
         elif isinstance(request, CaptureMemoryRequest):
-            scope = _scope_for_cwd(request.cwd, request.session_id)
+            scope = self._scope_for_cwd(request.cwd, request.session_id)
             user_metadata = {
                 "event_id": request.event_id,
                 "session_id": request.session_id,
@@ -318,17 +343,21 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
         except Exception:
             if isinstance(request, CreateMemoryRequest):
-                self._release_pending_idempotency(request.library_id, request.idempotency_key)
+                self._release_pending_idempotency(
+                    _write_identity(request), request.idempotency_key
+                )
             raise
         if not units:
             if isinstance(request, CreateMemoryRequest):
-                self._release_pending_idempotency(request.library_id, request.idempotency_key)
+                self._release_pending_idempotency(
+                    _write_identity(request), request.idempotency_key
+                )
             raise MemoryKernelUnavailableError("mem2 runtime did not create a memory unit")
         unit = units[0]
         if isinstance(request, CreateMemoryRequest):
             try:
                 self._complete_idempotency(
-                    request.library_id,
+                    _write_identity(request),
                     request.idempotency_key,
                     request_hash,
                     unit.id,
@@ -344,12 +373,97 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     def _search(self, request: SearchMemoryRequest) -> dict[str, object]:
         bundle = self._require_bundle()
+        if request.region_ids is not None:
+            return self._search_regions(bundle, request)
+        if request.region_id is not None:
+            region = self._regions.require_region(request.region_id)
+            return self._search_scope(
+                bundle, request, _scope_for_region(region), region=region
+            )
         if request.library_id is not None:
             library_id = validate_library_id(request.library_id)
-            request = replace(request, library_id=library_id)
-            scope = _scope_for_normalized_library(library_id)
+            normalized = replace(request, library_id=library_id)
+            return self._search_scope(
+                bundle,
+                normalized,
+                _scope_for_normalized_library(library_id),
+            )
+        scope, resolved_region = self._scope_for_cwd_with_region(request.cwd or "", None)
+        return self._search_scope(bundle, request, scope, region=resolved_region)
+
+    def _search_regions(
+        self, bundle: _RuntimeBundle, request: SearchMemoryRequest
+    ) -> dict[str, object]:
+        region_ids = request.region_ids or ()
+        regions = [self._regions.require_region(region_id) for region_id in region_ids]
+        merged: dict[str, dict[str, object]] = {}
+        degradation: list[str] = []
+        vector_statuses: set[str] = set()
+        for region in regions:
+            scoped_request = replace(request, region_id=region.region_id, region_ids=None)
+            response = self._search_scope(
+                bundle,
+                scoped_request,
+                _scope_for_region(region),
+                region=region,
+            )
+            raw_degradation = response.get("degradation", [])
+            if isinstance(raw_degradation, list):
+                for reason in raw_degradation:
+                    reason_text = str(reason)
+                    if reason_text not in degradation:
+                        degradation.append(reason_text)
+            vector_statuses.add(str(response.get("vector_index_status", "degraded")))
+            raw_results = response.get("results", [])
+            if not isinstance(raw_results, list):
+                continue
+            for raw_result in raw_results:
+                if not isinstance(raw_result, dict):
+                    continue
+                item = {str(key): value for key, value in raw_result.items()}
+                item_id = str(item.get("document_id", ""))
+                previous = merged.get(item_id)
+                item_score = float(str(item.get("score", 0.0)))
+                previous_score = (
+                    0.0 if previous is None else float(str(previous.get("score", 0.0)))
+                )
+                if previous is None or item_score > previous_score:
+                    merged[item_id] = item
+        results = sorted(
+            merged.values(),
+            key=lambda item: float(str(item.get("score", 0.0))),
+            reverse=True,
+        )[: max(1, min(request.limit, 100))]
+        if vector_statuses == {"ready"}:
+            vector_status = "ready"
+        elif "degraded" in vector_statuses:
+            vector_status = "degraded"
         else:
-            scope = _scope_for_cwd(request.cwd or "", None)
+            vector_status = "not_configured"
+        return {
+            "status": "bound",
+            "scope": {
+                "kind": "explicit_regions",
+                "region_ids": list(region_ids),
+                "spaces": [_space_for_region(region) for region in regions],
+            },
+            "region_ids": list(region_ids),
+            "query": request.query,
+            "degraded": bool(degradation),
+            "degradation": degradation,
+            "vector_index_status": vector_status,
+            "graph_index_status": "not_configured",
+            "results": results,
+        }
+
+    def _search_scope(
+        self,
+        bundle: _RuntimeBundle,
+        request: SearchMemoryRequest,
+        scope: Scope,
+        *,
+        region: MemoryRegion | None = None,
+    ) -> dict[str, object]:
         security = _security_for(scope)
         degradation: list[str] = []
         embedding_configured = self._vector_enabled
@@ -365,6 +479,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 [],
                 degradation,
                 vector_status="not_configured",
+                region=region,
             )
         try:
             result = bundle.runtime.api.search(
@@ -390,6 +505,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 [],
                 degradation,
                 vector_status="degraded",
+                region=region,
             )
 
         reported_errors = list(result.errors)
@@ -424,7 +540,23 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             reported_errors,
             degradation,
             vector_status=vector_status,
+            region=region,
         )
+
+    def _scope_for_cwd(self, cwd: str, session_id: str | None) -> Scope:
+        scope, _ = self._scope_for_cwd_with_region(cwd, session_id)
+        return scope
+
+    def _scope_for_cwd_with_region(
+        self, cwd: str, session_id: str | None
+    ) -> tuple[Scope, MemoryRegion | None]:
+        try:
+            resolved = self._regions.resolve(cwd)
+        except RegionBindingError:
+            resolved = None
+        if resolved is None:
+            return _scope_for_synthetic_cwd(cwd, session_id), None
+        return _scope_for_region(resolved.region, session_id=session_id), resolved.region
 
     def _keyword_fallback(
         self,
@@ -591,14 +723,58 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
 
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]:
-        scope = _scope_for_cwd(request.cwd, None)
+        resolved = self._regions.resolve(request.cwd)
+        if resolved is None:
+            return {"status": "unbound", "cwd": self._regions.canonical_cwd(request.cwd)}
         return {
             "status": "bound",
-            "cwd": request.cwd,
-            "project_id": scope.space,
-            "library_id": scope.space,
-            "space": scope.space,
+            "cwd": resolved.cwd,
+            "project_id": resolved.region.region_id,
+            "binding_id": resolved.binding.binding_id,
+            "binding_kind": resolved.binding.kind,
+            "project_root": resolved.binding.canonical_root,
+            "region_id": resolved.region.region_id,
+            "library_id": resolved.region.region_id,
+            "space": resolved.region.space,
         }
+
+    def create_region(self, request: CreateMemoryRegionRequest) -> dict[str, object]:
+        return self._regions.create_region(
+            request.kind,
+            request.name,
+            region_id=request.region_id,
+            session_id=request.session_id,
+        ).payload()
+
+    def list_regions(self) -> list[dict[str, object]]:
+        return [region.payload() for region in self._regions.list_regions()]
+
+    def get_region(self, request: GetMemoryRegionRequest) -> dict[str, object]:
+        return self._regions.require_region(request.region_id).payload()
+
+    def region_tree(self, request: MemoryRegionTreeRequest) -> dict[str, object]:
+        return self._regions.region_tree(request.session_id)
+
+    def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]:
+        return self._regions.bind_project(request.project_root, request.region_id).payload()
+
+    def associate_worktree_region(
+        self, request: AssociateWorktreeRegionRequest
+    ) -> dict[str, str]:
+        return self._regions.associate_worktree(
+            request.worktree_root, request.main_project_binding_id
+        ).payload()
+
+    def list_region_bindings(self) -> list[dict[str, str]]:
+        return [binding.payload() for binding in self._regions.list_bindings()]
+
+    def update_region_binding(self, request: UpdateRegionBindingRequest) -> dict[str, str]:
+        return self._regions.update_binding(
+            request.binding_id, request.region_id
+        ).payload()
+
+    def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
+        self._regions.delete_binding(request.binding_id)
 
     def _require_bundle(self) -> _RuntimeBundle:
         with self._lock:
@@ -751,9 +927,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         return self._embedding_api_key_cache
 
 
+def _write_identity(request: CreateMemoryRequest) -> str:
+    if request.region_id is not None:
+        return f"region:{request.region_id}"
+    return request.library_id
+
+
 def _write_request_hash(request: CreateMemoryRequest) -> str:
     payload = {
         "library_id": request.library_id,
+        "region_id": request.region_id,
         "content": request.content,
         "memory_type": request.memory_type,
         "source_references": list(request.source_references),
@@ -771,6 +954,7 @@ def _write_response(
         "memory_id": memory_id,
         "status": status,
         "library_id": getattr(request, "library_id", ""),
+        "region_id": getattr(request, "region_id", None),
         "content": request.content,
         "memory_type": getattr(request, "memory_type", "capture"),
     }
@@ -786,7 +970,21 @@ def _scope_for_normalized_library(library_id: str) -> Scope:
     )
 
 
-def _scope_for_cwd(cwd: str, session_id: str | None) -> Scope:
+def _space_for_region(region: MemoryRegion) -> str:
+    return region.space
+
+
+def _scope_for_region(region: MemoryRegion, *, session_id: str | None = None) -> Scope:
+    return Scope(
+        org=_LOCAL_ORG,
+        space=region.space,
+        user=_LOCAL_USER,
+        agent=_LOCAL_AGENT,
+        session=(region.session_id or "") if session_id is None else session_id,
+    )
+
+
+def _scope_for_synthetic_cwd(cwd: str, session_id: str | None) -> Scope:
     digest = hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:24]
     return Scope(
         org=_LOCAL_ORG,
@@ -840,14 +1038,27 @@ def _search_response(
     degradation: list[str],
     *,
     vector_status: str,
+    region: MemoryRegion | None = None,
 ) -> dict[str, object]:
     results = [_result_item(item, request) for item in items]
+    if region is not None:
+        for result in results:
+            result["region_id"] = region.region_id
+            result["space"] = region.space
+    scope_kind = (
+        "explicit_region"
+        if request.region_id is not None
+        else "explicit_library"
+        if request.library_id is not None
+        else "project_cwd"
+    )
     response: dict[str, object] = {
         "status": "bound",
         "scope": {
-            "kind": "explicit_library" if request.library_id else "project_cwd",
+            "kind": scope_kind,
             "cwd": request.cwd,
             "library_id": request.library_id,
+            "region_id": request.region_id,
             "space": scope.space,
         },
         "query": request.query,
@@ -859,6 +1070,11 @@ def _search_response(
     }
     if request.library_id is not None:
         response["library_id"] = request.library_id
+    if request.region_id is not None:
+        response["region_id"] = request.region_id
+    if region is not None:
+        response["region_id"] = region.region_id
+        response["space"] = region.space
     if errors:
         response["retrieval_errors"] = [
             {
@@ -889,7 +1105,7 @@ def _result_item(item: Any, request: SearchMemoryRequest) -> dict[str, object]:
         "chunk_id": unit_id,
         "document_id": unit_id,
         "content": content,
-        "library_id": request.library_id or "",
+        "library_id": request.region_id or request.library_id or "",
         "path": f"memory://{unit_id}",
         "heading": None,
         "start_line": 1,
