@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal, NoReturn, Protocol, TypeAlias, cast, runtime_checkable
 
 from personal_agent_memory.config import MemoryKernelKind, Settings
+from personal_agent_memory.regions import RegionKind, RegionRegistry
 from personal_agent_memory.state import (
     CandidateGovernanceError,
     PlatformState,
@@ -51,6 +52,7 @@ class CreateMemoryRequest:
     source_references: tuple[str, ...]
     actor: str
     idempotency_key: str
+    region_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,13 +72,28 @@ class SearchMemoryRequest:
     query: str
     cwd: str | None = None
     library_id: str | None = None
+    region_id: str | None = None
+    region_ids: tuple[str, ...] | None = None
     limit: int = 10
     max_graph_hops: int = 1
     include_history: bool = False
 
     def __post_init__(self) -> None:
-        if (self.cwd is None) == (self.library_id is None):
-            raise ValueError("exactly one of cwd or library_id is required")
+        selectors = (
+            self.cwd is not None,
+            self.library_id is not None,
+            self.region_id is not None,
+            self.region_ids is not None,
+        )
+        if sum(selectors) != 1:
+            raise ValueError(
+                "exactly one of cwd, library_id, region_id, or region_ids is required"
+            )
+        if self.region_ids is not None:
+            if not self.region_ids:
+                raise ValueError("at least one memory region is required")
+            if len(set(self.region_ids)) != len(self.region_ids):
+                raise ValueError("memory regions must not contain duplicates")
         if not self.query.strip():
             raise ValueError("search query must not be empty")
 
@@ -137,6 +154,47 @@ class EvolveMemoryRequest:
 @dataclass(frozen=True, slots=True)
 class ResolveRegionRequest:
     cwd: str
+
+
+@dataclass(frozen=True, slots=True)
+class CreateMemoryRegionRequest:
+    kind: RegionKind
+    name: str
+    region_id: str | None = None
+    session_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GetMemoryRegionRequest:
+    region_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRegionTreeRequest:
+    session_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BindProjectRegionRequest:
+    project_root: str
+    region_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class AssociateWorktreeRegionRequest:
+    worktree_root: str
+    main_project_binding_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateRegionBindingRequest:
+    binding_id: str
+    region_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeleteRegionBindingRequest:
+    binding_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +397,26 @@ class MemoryKernelPort(Protocol):
 
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]: ...
 
+    def create_region(self, request: CreateMemoryRegionRequest) -> dict[str, object]: ...
+
+    def list_regions(self) -> list[dict[str, object]]: ...
+
+    def get_region(self, request: GetMemoryRegionRequest) -> dict[str, object]: ...
+
+    def region_tree(self, request: MemoryRegionTreeRequest) -> dict[str, object]: ...
+
+    def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]: ...
+
+    def associate_worktree_region(
+        self, request: AssociateWorktreeRegionRequest
+    ) -> dict[str, str]: ...
+
+    def list_region_bindings(self) -> list[dict[str, str]]: ...
+
+    def update_region_binding(self, request: UpdateRegionBindingRequest) -> dict[str, str]: ...
+
+    def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None: ...
+
     async def scan_library(self, request: ScanLibraryRequest) -> dict[str, int | str]: ...
 
     def list_out_of_band_changes(
@@ -466,8 +544,9 @@ class LegacyMemoryKernel:
 
     kind: MemoryKernelKind = "legacy"
 
-    def __init__(self, state: PlatformState) -> None:
+    def __init__(self, state: PlatformState, regions: RegionRegistry | None = None) -> None:
         self._state = state
+        self._regions = regions or RegionRegistry(state.database_path.parent / "regions.sqlite3")
 
     def health(self) -> KernelHealth:
         if self._state.connection is None:
@@ -480,6 +559,8 @@ class LegacyMemoryKernel:
 
     async def write(self, request: MemoryWriteRequest) -> dict[str, object]:
         if isinstance(request, CreateMemoryRequest):
+            if request.region_id is not None:
+                raise ValueError("memory region writes require the mem2 memory kernel")
             async with self._state.library_write_lock(request.library_id):
                 return self._state.create_candidate(
                     request.library_id,
@@ -509,6 +590,8 @@ class LegacyMemoryKernel:
         raise TypeError("unsupported memory write request")
 
     async def search(self, request: SearchMemoryRequest) -> dict[str, object]:
+        if request.region_id is not None or request.region_ids is not None:
+            raise ValueError("memory region search requires the mem2 memory kernel")
         if request.cwd is not None:
             return await self._state.search_project(
                 request.cwd,
@@ -587,6 +670,44 @@ class LegacyMemoryKernel:
 
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]:
         return self._state.resolve_project_binding(request.cwd)
+
+    def create_region(self, request: CreateMemoryRegionRequest) -> dict[str, object]:
+        return self._regions.create_region(
+            request.kind,
+            request.name,
+            region_id=request.region_id,
+            session_id=request.session_id,
+        ).payload()
+
+    def list_regions(self) -> list[dict[str, object]]:
+        return [region.payload() for region in self._regions.list_regions()]
+
+    def get_region(self, request: GetMemoryRegionRequest) -> dict[str, object]:
+        return self._regions.require_region(request.region_id).payload()
+
+    def region_tree(self, request: MemoryRegionTreeRequest) -> dict[str, object]:
+        return self._regions.region_tree(request.session_id)
+
+    def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]:
+        return self._state.bind_project(request.project_root, request.region_id).payload()
+
+    def associate_worktree_region(
+        self, request: AssociateWorktreeRegionRequest
+    ) -> dict[str, str]:
+        return self._state.associate_worktree(
+            request.worktree_root, request.main_project_binding_id
+        ).payload()
+
+    def list_region_bindings(self) -> list[dict[str, str]]:
+        return [binding.payload() for binding in self._state.list_project_bindings()]
+
+    def update_region_binding(self, request: UpdateRegionBindingRequest) -> dict[str, str]:
+        return self._state.update_project_binding(
+            request.binding_id, request.region_id
+        ).payload()
+
+    def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
+        self._state.delete_project_binding(request.binding_id)
 
     async def scan_library(
         self, request: ScanLibraryRequest
@@ -875,6 +996,35 @@ class UnavailableMemoryKernel:
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]:
         self._raise()
 
+    def create_region(self, request: CreateMemoryRegionRequest) -> dict[str, object]:
+        self._raise()
+
+    def list_regions(self) -> list[dict[str, object]]:
+        self._raise()
+
+    def get_region(self, request: GetMemoryRegionRequest) -> dict[str, object]:
+        self._raise()
+
+    def region_tree(self, request: MemoryRegionTreeRequest) -> dict[str, object]:
+        self._raise()
+
+    def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]:
+        self._raise()
+
+    def associate_worktree_region(
+        self, request: AssociateWorktreeRegionRequest
+    ) -> dict[str, str]:
+        self._raise()
+
+    def list_region_bindings(self) -> list[dict[str, str]]:
+        self._raise()
+
+    def update_region_binding(self, request: UpdateRegionBindingRequest) -> dict[str, str]:
+        self._raise()
+
+    def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
+        self._raise()
+
     async def scan_library(
         self, request: ScanLibraryRequest
     ) -> dict[str, int | str]:
@@ -1008,12 +1158,14 @@ class UnavailableMemoryKernel:
 
 
 def select_memory_kernel(settings: Settings, state: PlatformState) -> MemoryKernelPort:
+    regions = RegionRegistry(settings.state_dir / "regions.sqlite3")
     if settings.memory_kernel == "legacy":
-        return LegacyMemoryKernel(state)
+        return LegacyMemoryKernel(state, regions)
     from personal_agent_memory.mem2_kernel import Mem2MemoryKernel
 
     return Mem2MemoryKernel(
         settings.state_dir,
         embedding=settings.embedding,
         embedding_dimension=settings.embedding_dimension,
+        regions=regions,
     )

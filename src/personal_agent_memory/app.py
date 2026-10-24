@@ -30,7 +30,9 @@ from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_contex
 from personal_agent_memory.graph_adapter import JiuwenMilvusGraphAdapter
 from personal_agent_memory.memory_kernel import (
     MAX_LIBRARY_ID_LENGTH,
+    AssociateWorktreeRegionRequest,
     AuditMemoryRequest,
+    BindProjectRegionRequest,
     CandidateDecisionRequest,
     CandidateGovernanceListRequest,
     CandidateGovernanceRequest,
@@ -44,11 +46,14 @@ from personal_agent_memory.memory_kernel import (
     CaptureMemoryRequest,
     CaptureRoundsRequest,
     ClearDiagnosticsRequest,
+    CreateMemoryRegionRequest,
     CreateMemoryRequest,
     DeleteMemoryRequest,
+    DeleteRegionBindingRequest,
     DocumentInspectRequest,
     DocumentUpdateRequest,
     EvolveMemoryRequest,
+    GetMemoryRegionRequest,
     HistoryDiffRequest,
     ListCandidatesRequest,
     ListDocumentsRequest,
@@ -58,6 +63,7 @@ from personal_agent_memory.memory_kernel import (
     MemoryIdempotencyConflictError,
     MemoryKernelPort,
     MemoryKernelUnavailableError,
+    MemoryRegionTreeRequest,
     OutOfBandChangeRequest,
     PreviewDocumentDeleteRequest,
     PreviewDocumentUpdateRequest,
@@ -71,10 +77,20 @@ from personal_agent_memory.memory_kernel import (
     SearchMemoryRequest,
     SensitiveQuarantineListRequest,
     SensitiveQuarantineResolutionRequest,
+    UpdateRegionBindingRequest,
     UpdateRetentionPolicyRequest,
     select_memory_kernel,
 )
 from personal_agent_memory.model_client import OpenAICompatibleClient
+from personal_agent_memory.regions import (
+    MAX_REGION_ID_LENGTH,
+    DuplicateRegionBindingError,
+    DuplicateRegionError,
+    RegionBindingError,
+    RegionBindingNotFoundError,
+    RegionError,
+    RegionNotFoundError,
+)
 from personal_agent_memory.security import ApiKeyStore, ManagementSessionStore
 from personal_agent_memory.state import (
     CandidateGovernanceError,
@@ -120,13 +136,56 @@ class LibraryRegistration(BaseModel):
     reuse_existing_git: bool = False
 
 
+class MemoryRegionCreate(BaseModel):
+    kind: Literal["user", "topic", "project", "session"]
+    name: str = Field(min_length=1, max_length=200)
+    region_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
+    )
+    session_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 class ProjectBindingRegistration(BaseModel):
     project_root: str
-    library_id: str
+    library_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
+    )
+    region_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
+    )
+
+    @model_validator(mode="after")
+    def validate_region(self) -> ProjectBindingRegistration:
+        if (self.library_id is None) == (self.region_id is None):
+            raise ValueError("exactly one of library_id or region_id is required")
+        return self
+
+    @property
+    def target_region_id(self) -> str:
+        value = self.region_id or self.library_id
+        assert value is not None
+        return value
 
 
 class ProjectBindingUpdate(BaseModel):
-    library_id: str
+    library_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
+    )
+    region_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
+    )
+
+    @model_validator(mode="after")
+    def validate_region(self) -> ProjectBindingUpdate:
+        if (self.library_id is None) == (self.region_id is None):
+            raise ValueError("exactly one of library_id or region_id is required")
+        return self
+
+    @property
+    def target_region_id(self) -> str:
+        value = self.region_id or self.library_id
+        assert value is not None
+        return value
 
 
 class WorktreeAssociation(BaseModel):
@@ -154,6 +213,10 @@ class SearchRequest(BaseModel):
     library_id: LibraryId | None = Field(
         default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
     )
+    region_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
+    )
+    region_ids: list[LibraryId] | None = Field(default=None, min_length=1, max_length=20)
     query: str
     limit: int = 10
     graph_hops: int = Field(default=1, ge=1, le=2)
@@ -163,8 +226,20 @@ class SearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_scope(self) -> SearchRequest:
-        if (self.cwd is None) == (self.library_id is None):
-            raise ValueError("exactly one of cwd or library_id is required")
+        selectors = (
+            self.cwd is not None,
+            self.library_id is not None,
+            self.region_id is not None,
+            self.region_ids is not None,
+        )
+        if sum(selectors) != 1:
+            raise ValueError(
+                "exactly one of cwd, library_id, region_id, or region_ids is required"
+            )
+        if self.region_ids is not None and len(set(self.region_ids)) != len(
+            self.region_ids
+        ):
+            raise ValueError("region_ids must not contain duplicates")
         return self
 
 
@@ -238,12 +313,23 @@ class CandidateCreate(BaseModel):
 
 
 class MemoryCreate(BaseModel):
-    library_id: LibraryId = Field(min_length=1, max_length=MAX_LIBRARY_ID_LENGTH)
+    library_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
+    )
+    region_id: LibraryId | None = Field(
+        default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
+    )
     content: str = Field(min_length=1, max_length=65_535)
     memory_type: str = Field(default="domain_fact", min_length=1, max_length=100)
     source_references: list[str] = Field(default_factory=lambda: ["rest"])
     actor: str = Field(default="local", min_length=1, max_length=200)
     idempotency_key: str = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_region(self) -> MemoryCreate:
+        if (self.library_id is None) == (self.region_id is None):
+            raise ValueError("exactly one of library_id or region_id is required")
+        return self
 
 
 class CandidateEdit(BaseModel):
@@ -487,6 +573,61 @@ def create_app(
     def libraries_payload() -> list[dict[str, str]]:
         return [library.payload() for library in platform_state.list_libraries()]
 
+    def region_error(error: RegionError) -> HTTPException:
+        if isinstance(error, RegionNotFoundError):
+            return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error))
+        if isinstance(error, DuplicateRegionError):
+            return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+        )
+
+    def binding_error(error: RegionError | ProjectBindingError) -> HTTPException:
+        detail = str(error)
+        if detail in {"memory region not found", "project binding not found"}:
+            return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail
+        )
+
+    @app.post(
+        "/api/v1/regions",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_region(region: MemoryRegionCreate) -> dict[str, object]:
+        try:
+            return selected_kernel.create_region(
+                CreateMemoryRegionRequest(
+                    kind=region.kind,
+                    name=region.name,
+                    region_id=region.region_id,
+                    session_id=region.session_id,
+                )
+            )
+        except RegionError as error:
+            raise region_error(error) from error
+
+    @app.get("/api/v1/regions", dependencies=[Depends(authenticate)])
+    async def list_regions() -> list[dict[str, object]]:
+        return selected_kernel.list_regions()
+
+    @app.get("/api/v1/regions/tree", dependencies=[Depends(authenticate)])
+    async def memory_region_tree(session_id: str | None = None) -> dict[str, object]:
+        try:
+            return selected_kernel.region_tree(
+                MemoryRegionTreeRequest(session_id=session_id)
+            )
+        except RegionError as error:
+            raise region_error(error) from error
+
+    @app.get("/api/v1/regions/{region_id}", dependencies=[Depends(authenticate)])
+    async def get_region(region_id: str) -> dict[str, object]:
+        try:
+            return selected_kernel.get_region(GetMemoryRegionRequest(region_id=region_id))
+        except RegionError as error:
+            raise region_error(error) from error
+
     @app.post(
         "/api/v1/libraries",
         dependencies=[Depends(authenticate)],
@@ -664,16 +805,14 @@ def create_app(
         return libraries_payload()
 
     def project_bindings_payload() -> list[dict[str, str]]:
-        return [binding.payload() for binding in platform_state.list_project_bindings()]
+        return selected_kernel.list_region_bindings()
 
     @app.get("/api/v1/project-bindings/resolve", dependencies=[Depends(authenticate)])
     async def resolve_project_binding(cwd: str) -> dict[str, str]:
         try:
             return selected_kernel.resolve_region(ResolveRegionRequest(cwd=cwd))
-        except ProjectBindingError as error:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
-            ) from error
+        except (ProjectBindingError, RegionError) as error:
+            raise binding_error(error) from error
 
     @app.post("/mcp/project-bindings/resolve", dependencies=[Depends(authenticate)])
     async def mcp_resolve_project_binding(resolution: CwdResolution) -> dict[str, str]:
@@ -681,10 +820,8 @@ def create_app(
             return selected_kernel.resolve_region(
                 ResolveRegionRequest(cwd=resolution.cwd)
             )
-        except ProjectBindingError as error:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
-            ) from error
+        except (ProjectBindingError, RegionError) as error:
+            raise binding_error(error) from error
 
     @app.post(
         "/api/v1/project-bindings/worktrees",
@@ -693,18 +830,19 @@ def create_app(
     )
     async def associate_worktree(association: WorktreeAssociation) -> dict[str, str]:
         try:
-            return platform_state.associate_worktree(
-                association.worktree_root, association.main_project_binding_id
-            ).payload()
-        except DuplicateProjectBindingError as error:
+            return selected_kernel.associate_worktree_region(
+                AssociateWorktreeRegionRequest(
+                    worktree_root=association.worktree_root,
+                    main_project_binding_id=association.main_project_binding_id,
+                )
+            )
+        except (DuplicateProjectBindingError, DuplicateRegionBindingError) as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"reason": str(error), "binding_id": error.binding_id},
             ) from error
-        except ProjectBindingError as error:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
-            ) from error
+        except (ProjectBindingError, RegionError) as error:
+            raise binding_error(error) from error
 
     @app.post(
         "/api/v1/project-bindings",
@@ -713,16 +851,19 @@ def create_app(
     )
     async def bind_project(binding: ProjectBindingRegistration) -> dict[str, str]:
         try:
-            return platform_state.bind_project(binding.project_root, binding.library_id).payload()
-        except DuplicateProjectBindingError as error:
+            return selected_kernel.bind_project_region(
+                BindProjectRegionRequest(
+                    project_root=binding.project_root,
+                    region_id=binding.target_region_id,
+                )
+            )
+        except (DuplicateProjectBindingError, DuplicateRegionBindingError) as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"reason": str(error), "binding_id": error.binding_id},
             ) from error
-        except ProjectBindingError as error:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
-            ) from error
+        except (ProjectBindingError, RegionError) as error:
+            raise binding_error(error) from error
 
     @app.get("/api/v1/project-bindings", dependencies=[Depends(authenticate)])
     async def list_project_bindings() -> list[dict[str, str]]:
@@ -733,14 +874,14 @@ def create_app(
         binding_id: str, update: ProjectBindingUpdate
     ) -> dict[str, str]:
         try:
-            return platform_state.update_project_binding(binding_id, update.library_id).payload()
-        except ProjectBindingError as error:
-            status_code = (
-                status.HTTP_404_NOT_FOUND
-                if str(error) == "project binding not found"
-                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            return selected_kernel.update_region_binding(
+                UpdateRegionBindingRequest(
+                    binding_id=binding_id,
+                    region_id=update.target_region_id,
+                )
             )
-            raise HTTPException(status_code=status_code, detail=str(error)) from error
+        except (ProjectBindingError, RegionError) as error:
+            raise binding_error(error) from error
 
     @app.delete(
         "/api/v1/project-bindings/{binding_id}",
@@ -749,9 +890,15 @@ def create_app(
     )
     async def delete_project_binding(binding_id: str) -> Response:
         try:
-            platform_state.delete_project_binding(binding_id)
-        except ProjectBindingError as error:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+            selected_kernel.delete_region_binding(
+                DeleteRegionBindingRequest(binding_id=binding_id)
+            )
+        except (ProjectBindingError, RegionBindingNotFoundError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except RegionBindingError as error:
+            raise binding_error(error) from error
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/mcp/libraries/{library_id}/sync-status", dependencies=[Depends(authenticate)])
@@ -772,6 +919,10 @@ def create_app(
                     query=request.query,
                     cwd=request.cwd,
                     library_id=request.library_id,
+                    region_id=request.region_id,
+                    region_ids=(
+                        None if request.region_ids is None else tuple(request.region_ids)
+                    ),
                     limit=request.limit,
                     max_graph_hops=request.graph_hops,
                     include_history=request.include_history,
@@ -807,12 +958,13 @@ def create_app(
         try:
             return await selected_kernel.write(
                 CreateMemoryRequest(
-                    library_id=memory.library_id,
+                    library_id=memory.library_id or "",
                     content=memory.content,
                     memory_type=memory.memory_type,
                     source_references=tuple(memory.source_references),
                     actor=memory.actor,
                     idempotency_key=memory.idempotency_key,
+                    region_id=memory.region_id,
                 )
             )
         except ValueError as error:
