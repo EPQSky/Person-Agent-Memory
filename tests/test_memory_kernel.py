@@ -54,6 +54,8 @@ from personal_agent_memory.memory_kernel import (
     OutOfBandChangeRequest,
     PreviewDocumentDeleteRequest,
     PreviewDocumentUpdateRequest,
+    PromotionRunRequest,
+    PromotionStatusRequest,
     ResolveOutOfBandChangeRequest,
     ResolveRegionRequest,
     RestoreDocumentRequest,
@@ -138,6 +140,14 @@ class ContractFakeKernel:
         self._called("evolve")
         return {"queued": 1}
 
+    async def start_promotion(self, request: PromotionRunRequest) -> dict[str, object]:
+        self._called("start_promotion")
+        return {"job_id": "fake-promotion", "status": "pending"}
+
+    def promotion_status(self, request: PromotionStatusRequest) -> dict[str, object]:
+        self._called("promotion_status")
+        return {"job_id": request.job_id, "status": "completed"}
+
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]:
         self._called("resolve_region")
         return {"status": "unbound", "cwd": request.cwd}
@@ -162,9 +172,7 @@ class ContractFakeKernel:
         self._called("bind_project_region")
         return {"binding_id": "binding-one", "region_id": request.region_id}
 
-    def associate_worktree_region(
-        self, request: AssociateWorktreeRegionRequest
-    ) -> dict[str, str]:
+    def associate_worktree_region(self, request: AssociateWorktreeRegionRequest) -> dict[str, str]:
         self._called("associate_worktree_region")
         return {"binding_id": "worktree-one", "region_id": "region-one"}
 
@@ -172,18 +180,14 @@ class ContractFakeKernel:
         self._called("list_region_bindings")
         return []
 
-    def update_region_binding(
-        self, request: UpdateRegionBindingRequest
-    ) -> dict[str, str]:
+    def update_region_binding(self, request: UpdateRegionBindingRequest) -> dict[str, str]:
         self._called("update_region_binding")
         return {"binding_id": request.binding_id, "region_id": request.region_id}
 
     def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
         self._called("delete_region_binding")
 
-    async def scan_library(
-        self, request: ScanLibraryRequest
-    ) -> dict[str, int | str]:
+    async def scan_library(self, request: ScanLibraryRequest) -> dict[str, int | str]:
         self._called("scan_library")
         return {"library_id": request.library_id, "documents": 0, "changed": 0}
 
@@ -193,9 +197,7 @@ class ContractFakeKernel:
         self._called("list_out_of_band_changes")
         return []
 
-    def out_of_band_change(
-        self, request: OutOfBandChangeRequest
-    ) -> dict[str, object]:
+    def out_of_band_change(self, request: OutOfBandChangeRequest) -> dict[str, object]:
         self._called("out_of_band_change")
         return {"id": request.change_id}
 
@@ -205,9 +207,7 @@ class ContractFakeKernel:
         self._called("resolve_out_of_band_change")
         return {"status": "resolved", "change_id": request.change_id}
 
-    def list_candidates(
-        self, request: ListCandidatesRequest
-    ) -> list[dict[str, object]]:
+    def list_candidates(self, request: ListCandidatesRequest) -> list[dict[str, object]]:
         self._called("list_candidates")
         return []
 
@@ -217,21 +217,15 @@ class ContractFakeKernel:
         self._called("candidate_governance_queue")
         return []
 
-    def candidate_governance(
-        self, request: CandidateGovernanceRequest
-    ) -> dict[str, object]:
+    def candidate_governance(self, request: CandidateGovernanceRequest) -> dict[str, object]:
         self._called("candidate_governance")
         return {"candidate": {"id": request.memory_id}}
 
-    async def decide_candidate(
-        self, request: CandidateDecisionRequest
-    ) -> dict[str, object]:
+    async def decide_candidate(self, request: CandidateDecisionRequest) -> dict[str, object]:
         self._called("decide_candidate")
         return {"id": request.memory_id, "decision": request.decision}
 
-    async def pin_candidate(
-        self, request: CandidatePinRequest
-    ) -> dict[str, object]:
+    async def pin_candidate(self, request: CandidatePinRequest) -> dict[str, object]:
         self._called("pin_candidate")
         return {"id": request.memory_id, "pinned": request.pinned}
 
@@ -247,15 +241,11 @@ class ContractFakeKernel:
         self._called("restore_recycled_candidate")
         return {"id": request.memory_id}
 
-    def list_documents(
-        self, request: ListDocumentsRequest
-    ) -> list[dict[str, object]]:
+    def list_documents(self, request: ListDocumentsRequest) -> list[dict[str, object]]:
         self._called("list_documents")
         return []
 
-    def preview_document_update(
-        self, request: PreviewDocumentUpdateRequest
-    ) -> dict[str, object]:
+    def preview_document_update(self, request: PreviewDocumentUpdateRequest) -> dict[str, object]:
         self._called("preview_document_update")
         return {"library_id": request.library_id, "path": request.path, "diff": ""}
 
@@ -265,15 +255,11 @@ class ContractFakeKernel:
         self._called("preview_document_delete")
         return {"path": request.path, "preview_token": "fake-preview"}
 
-    def list_forgotten(
-        self, request: ListForgottenRequest
-    ) -> list[dict[str, object]]:
+    def list_forgotten(self, request: ListForgottenRequest) -> list[dict[str, object]]:
         self._called("list_forgotten")
         return []
 
-    async def restore_forgotten(
-        self, request: RestoreForgottenRequest
-    ) -> dict[str, str]:
+    async def restore_forgotten(self, request: RestoreForgottenRequest) -> dict[str, str]:
         self._called("restore_forgotten")
         return {"status": "restored", "tombstone_id": request.tombstone_id}
 
@@ -281,15 +267,11 @@ class ContractFakeKernel:
         self._called("history_diff")
         return {"library_id": request.library_id, "commit": request.commit, "diff": ""}
 
-    async def restore_document(
-        self, request: RestoreDocumentRequest
-    ) -> dict[str, str]:
+    async def restore_document(self, request: RestoreDocumentRequest) -> dict[str, str]:
         self._called("restore_document")
         return {"status": "restored", "path": request.path}
 
-    def get_retention_policy(
-        self, request: RetentionPolicyRequest
-    ) -> dict[str, object]:
+    def get_retention_policy(self, request: RetentionPolicyRequest) -> dict[str, object]:
         self._called("get_retention_policy")
         return {"library_id": request.library_id}
 
@@ -305,9 +287,7 @@ class ContractFakeKernel:
         self._called("preview_retention_cleanup")
         return {"library_id": request.library_id, "counts": {}}
 
-    async def run_retention_cleanup(
-        self, request: RetentionCleanupRequest
-    ) -> dict[str, object]:
+    async def run_retention_cleanup(self, request: RetentionCleanupRequest) -> dict[str, object]:
         self._called("run_retention_cleanup")
         return {"library_id": request.library_id, "counts": {}}
 
@@ -315,15 +295,11 @@ class ContractFakeKernel:
         self._called("clear_diagnostics")
         return 0
 
-    def list_capture_events(
-        self, request: CaptureEventsRequest
-    ) -> list[dict[str, object]]:
+    def list_capture_events(self, request: CaptureEventsRequest) -> list[dict[str, object]]:
         self._called("list_capture_events")
         return []
 
-    def list_capture_rounds(
-        self, request: CaptureRoundsRequest
-    ) -> list[dict[str, object]]:
+    def list_capture_rounds(self, request: CaptureRoundsRequest) -> list[dict[str, object]]:
         self._called("list_capture_rounds")
         return []
 
@@ -405,6 +381,8 @@ async def _fake_kernel_contract() -> None:
     )
     kernel.audit(AuditMemoryRequest(library_id="library-one"))
     await kernel.evolve(EvolveMemoryRequest(session_id="session-one"))
+    await kernel.start_promotion(PromotionRunRequest())
+    kernel.promotion_status(PromotionStatusRequest(job_id="fake-promotion"))
     kernel.resolve_region(ResolveRegionRequest(cwd="/projects/one"))
     kernel.create_region(CreateMemoryRegionRequest(kind="user", name="User"))
     kernel.list_regions()
@@ -436,6 +414,8 @@ async def _fake_kernel_contract() -> None:
         "delete",
         "audit",
         "evolve",
+        "start_promotion",
+        "promotion_status",
         "resolve_region",
         "create_region",
         "list_regions",
@@ -564,16 +544,12 @@ def test_feature_flag_defaults_to_legacy_and_starts_mem2_runtime(tmp_path: Path)
     assert legacy_app.state.memory_kernel.kind == "legacy"
     with TestClient(legacy_app) as client:
         key = (tmp_path / "legacy-state" / "api-key").read_text(encoding="utf-8").strip()
-        status = client.get(
-            "/api/v1/status", headers={"Authorization": f"Bearer {key}"}
-        ).json()
+        status = client.get("/api/v1/status", headers={"Authorization": f"Bearer {key}"}).json()
         assert status["status"] == "ready"
         assert status["memory_kernel"] == "legacy"
         assert status["memory_kernel_status"] == "ready"
 
-    mem2_app = create_app(
-        Settings(state_dir=tmp_path / "mem2-state", memory_kernel="mem2")
-    )
+    mem2_app = create_app(Settings(state_dir=tmp_path / "mem2-state", memory_kernel="mem2"))
     assert mem2_app.state.memory_kernel.kind == "mem2"
     with TestClient(mem2_app) as client:
         key = (tmp_path / "mem2-state" / "api-key").read_text(encoding="utf-8").strip()
@@ -658,9 +634,10 @@ def test_legacy_kernel_contract_covers_port_operations(tmp_path: Path) -> None:
                 )
             )
             candidate_id = str(candidate["id"])
-            assert kernel.inspect(
-                CandidateInspectRequest(memory_id=candidate_id)
-            )["id"] == candidate_id
+            assert (
+                kernel.inspect(CandidateInspectRequest(memory_id=candidate_id))["id"]
+                == candidate_id
+            )
             edited = await kernel.update(
                 CandidateUpdateRequest(
                     memory_id=candidate_id,
@@ -814,6 +791,8 @@ def test_all_migrated_rest_and_mcp_routes_call_injected_kernel(tmp_path: Path) -
             expected=202,
             json={"session_id": "session-one"},
         )
+        call("POST", "/api/v1/promotions", expected=202, json={})
+        call("GET", "/api/v1/promotions/fake-promotion")
         call("GET", "/api/v1/capture/events")
         call("GET", "/api/v1/capture/rounds")
         call("GET", "/api/v1/sensitive-quarantine")
@@ -996,6 +975,8 @@ def test_all_migrated_rest_and_mcp_routes_call_injected_kernel(tmp_path: Path) -
         "delete",
         "audit",
         "evolve",
+        "start_promotion",
+        "promotion_status",
         "resolve_region",
         "create_region",
         "list_regions",
@@ -1392,16 +1373,14 @@ def test_mem2_start_does_not_start_workers_or_mutate_legacy_state(
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
             return {
                 "libraries": connection.execute(
-                    "SELECT id, canonical_path, sync_status FROM memory_libraries "
-                    "ORDER BY id"
+                    "SELECT id, canonical_path, sync_status FROM memory_libraries ORDER BY id"
                 ).fetchall(),
                 "documents": connection.execute(
                     "SELECT library_id, path, source_version FROM memory_documents "
                     "ORDER BY library_id, path"
                 ).fetchall(),
                 "jobs": connection.execute(
-                    "SELECT kind, payload, status, attempts FROM background_jobs "
-                    "ORDER BY id"
+                    "SELECT kind, payload, status, attempts FROM background_jobs ORDER BY id"
                 ).fetchall(),
                 "out_of_band_changes": connection.execute(
                     "SELECT id, library_id, status FROM out_of_band_changes ORDER BY id"
@@ -1475,9 +1454,7 @@ def test_legacy_default_start_still_starts_platform_workers(tmp_path: Path) -> N
         assert state.capture_worker_task is not None
         assert state.startup_count == 1
         key = (tmp_path / "state" / "api-key").read_text(encoding="utf-8").strip()
-        status = client.get(
-            "/api/v1/status", headers={"Authorization": f"Bearer {key}"}
-        ).json()
+        status = client.get("/api/v1/status", headers={"Authorization": f"Bearer {key}"}).json()
         assert status["database"] == "ok"
         assert status["background_worker"] == "running"
         assert status["memory_kernel"] == "legacy"
@@ -1545,9 +1522,7 @@ def test_mem2_lock_routes_fail_before_creating_or_waiting_for_legacy_locks(
                         json=payload,
                     )
                     try:
-                        response = future.result(
-                            timeout=10 if expected_status == 202 else 1
-                        )
+                        response = future.result(timeout=10 if expected_status == 202 else 1)
                     except FutureTimeoutError:
                         fcntl.flock(held_lock, fcntl.LOCK_UN)
                         future.result(timeout=2)
@@ -1561,10 +1536,7 @@ def test_mem2_lock_routes_fail_before_creating_or_waiting_for_legacy_locks(
                     if expected_status != 202:
                         assert elapsed < 0.5
                     if expected_status == 503:
-                        assert (
-                            "legacy platform state is not started"
-                            in response.json()["detail"]
-                        )
+                        assert "legacy platform state is not started" in response.json()["detail"]
                         assert _tree_snapshot(state_dir) == before
             fcntl.flock(held_lock, fcntl.LOCK_UN)
 
@@ -1650,9 +1622,7 @@ def test_legacy_global_graph_status_matches_registered_library(tmp_path: Path) -
                 (library_id,),
             )
 
-        library_status = client.get(
-            f"/api/v1/libraries/{library_id}/graph-status", headers=headers
-        )
+        library_status = client.get(f"/api/v1/libraries/{library_id}/graph-status", headers=headers)
         assert library_status.status_code == 200, library_status.text
         assert library_status.json()["status"] == "ready"
         global_status = client.get("/api/v1/status", headers=headers)

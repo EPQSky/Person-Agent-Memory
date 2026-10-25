@@ -7,16 +7,18 @@ import base64
 import difflib
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator, Mapping
+import uuid
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import closing, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from jiuwen_memory.api import (
     Context,
@@ -84,6 +86,8 @@ from personal_agent_memory.memory_kernel import (
     MemoryWriteRequest,
     PreviewDocumentDeleteRequest,
     PreviewDocumentUpdateRequest,
+    PromotionRunRequest,
+    PromotionStatusRequest,
     ResolveRegionRequest,
     RestoreDocumentRequest,
     RestoreForgottenRequest,
@@ -95,7 +99,7 @@ from personal_agent_memory.memory_kernel import (
     UpdateRetentionPolicyRequest,
     validate_library_id,
 )
-from personal_agent_memory.model_client import ModelEndpoint
+from personal_agent_memory.model_client import ModelEndpoint, OpenAICompatibleClient
 from personal_agent_memory.regions import (
     MAX_SESSION_ID_LENGTH,
     MemoryRegion,
@@ -103,6 +107,7 @@ from personal_agent_memory.regions import (
     RegionError,
     RegionRegistry,
 )
+from personal_agent_memory.sensitive import inspect_sensitive_text
 from personal_agent_memory.storage import (
     MilvusLiteFulltextStore,
     MilvusLiteGraphStore,
@@ -116,6 +121,31 @@ _AUDIT_TARGET = "personal-agent-memory-sqlite"
 _EMBEDDER_TARGET = "personal-agent-memory-openai"
 _GRAPH_PROJECTION_SCHEMA = 2
 _GRAPH_PROJECTION_MANIFEST_SCHEMA = 1
+PromotionClassifier = Callable[[str, Mapping[str, object]], Mapping[str, object]]
+
+
+class _PromotionCandidate(TypedDict):
+    region: MemoryRegion
+    scope: Scope
+    unit: MemoryUnit
+    source_units: tuple[MemoryUnit, ...]
+    explicit: bool
+
+
+class _PromotionDecision(TypedDict):
+    category: str
+    confidence: float
+    explicit: bool
+    topic_id: str | None
+    reason: str
+    status: str
+
+
+class _PromotionOutcome(TypedDict):
+    created: bool
+    decision: dict[str, object]
+
+
 _LOCAL_ORG = "local"
 _LOCAL_USER = "local"
 _LOCAL_AGENT = "personal-agent-memory"
@@ -158,12 +188,39 @@ _GOVERNANCE_AUDIT_SCHEMA = """CREATE TABLE IF NOT EXISTS governance_events (
     status TEXT NOT NULL DEFAULT 'committed',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )"""
+_PROMOTION_SCHEMA = """CREATE TABLE IF NOT EXISTS promotion_jobs (
+    job_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    source_region_ids TEXT NOT NULL DEFAULT '[]',
+    requested_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    summary TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS promotion_records (
+    promotion_key TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    source_unit_id TEXT NOT NULL,
+    source_region_id TEXT NOT NULL,
+    source_region_kind TEXT NOT NULL,
+    target_region_id TEXT NOT NULL,
+    target_region_kind TEXT NOT NULL,
+    target_unit_id TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    audit_event_id INTEGER,
+    created_at TEXT NOT NULL
+)"""
 _MAINTENANCE_SCHEMA = (
     _SESSION_RETENTION_SCHEMA
     + ";\n"
     + _CAPTURE_EVOLUTIONS_SCHEMA
     + ";\n"
     + _GOVERNANCE_AUDIT_SCHEMA
+    + ";\n"
+    + _PROMOTION_SCHEMA
     + ";"
 )
 _STORE_COLLECTOR: ContextVar[list[object] | None] = ContextVar(
@@ -261,6 +318,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         *,
         embedding: ModelEndpoint | None = None,
         embedding_dimension: int = _DEFAULT_EMBEDDING_DIM,
+        graph: ModelEndpoint | None = None,
+        promotion_classifier: PromotionClassifier | None = None,
         config_overrides: Mapping[str, Any] | None = None,
         regions: RegionRegistry | None = None,
     ) -> None:
@@ -269,6 +328,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._state_dir = state_dir.expanduser().resolve()
         self._embedding = embedding
         self._embedding_dimension = embedding_dimension
+        self._promotion_classifier = promotion_classifier
+        self._promotion_model = (
+            OpenAICompatibleClient(None, None, graph) if graph is not None else None
+        )
         self._config_overrides = config_overrides
         self._regions = regions or RegionRegistry(self._state_dir / "regions.sqlite3")
         self._bundle: _RuntimeBundle | None = None
@@ -293,6 +356,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._idempotency_locks: dict[tuple[str, str], tuple[threading.Lock, int]] = {}
         self._idempotency_locks_guard = threading.Lock()
         self._idempotency_schema_lock = threading.Lock()
+        self._promotion_lock = threading.RLock()
+        self._promotion_threads: dict[str, threading.Thread] = {}
+        self._promotion_threads_lock = threading.Lock()
 
     async def start(self) -> None:
         await asyncio.to_thread(self._start)
@@ -333,6 +399,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         await asyncio.to_thread(self._close)
 
     def _close(self) -> None:
+        self._wait_for_promotion_threads()
         with self._lock:
             bundle = self._bundle
             self._bundle = None
@@ -3111,6 +3178,598 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     )
         return {"queued": created}
 
+    async def start_promotion(self, request: PromotionRunRequest) -> dict[str, object]:
+        return await asyncio.to_thread(self._start_promotion, request)
+
+    def _start_promotion(self, request: PromotionRunRequest) -> dict[str, object]:
+        source_regions = self._promotion_source_regions(request.source_region_ids)
+        job_id = f"promotion-{uuid.uuid4().hex}"
+        requested_at = datetime.now(UTC).isoformat()
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """INSERT INTO promotion_jobs
+                   (job_id, status, source_region_ids, requested_at)
+                   VALUES (?, 'pending', ?, ?)""",
+                (
+                    job_id,
+                    json.dumps(
+                        [region.region_id for region in source_regions],
+                        ensure_ascii=False,
+                    ),
+                    requested_at,
+                ),
+            )
+        thread = threading.Thread(
+            target=self._run_promotion_job,
+            args=(job_id, tuple(source_regions)),
+            name=f"memory-promotion-{job_id}",
+            daemon=True,
+        )
+        with self._promotion_threads_lock:
+            self._promotion_threads[job_id] = thread
+        thread.start()
+        return self._promotion_status_payload(job_id)
+
+    def promotion_status(self, request: PromotionStatusRequest) -> dict[str, object]:
+        return self._promotion_status_payload(request.job_id)
+
+    def _promotion_source_regions(
+        self,
+        source_region_ids: tuple[str, ...] | None,
+    ) -> list[MemoryRegion]:
+        regions = self._regions.list_regions()
+        by_id = {region.region_id: region for region in regions}
+        if source_region_ids is None:
+            selected = [region for region in regions if region.kind != "user"]
+        else:
+            selected = []
+            for region_id in source_region_ids:
+                region = by_id.get(region_id)
+                if region is None:
+                    raise MemoryRecordNotFoundError(f"source memory region not found: {region_id}")
+                if region.kind == "user":
+                    raise ValueError("user memory cannot be a promotion source")
+                selected.append(region)
+        return selected
+
+    def _wait_for_promotion_threads(self) -> None:
+        with self._promotion_threads_lock:
+            threads = tuple(self._promotion_threads.values())
+        for thread in threads:
+            thread.join(timeout=30.0)
+
+    def _run_promotion_job(
+        self,
+        job_id: str,
+        source_regions: tuple[MemoryRegion, ...],
+    ) -> None:
+        try:
+            self._update_promotion_job(
+                job_id,
+                status="running",
+                started_at=datetime.now(UTC).isoformat(),
+            )
+            bundle = self._require_bundle()
+            candidates = self._promotion_candidates(bundle, source_regions)
+            topics = [region for region in self._regions.list_regions() if region.kind == "topic"]
+            decisions: list[dict[str, object]] = []
+            promoted = 0
+            skipped = 0
+            failed = 0
+            for candidate in candidates:
+                try:
+                    decision = self._classify_promotion_candidate(candidate, topics)
+                    target = self._promotion_target(candidate, decision, topics)
+                    if target is None or decision["status"] != "promote":
+                        skipped += 1
+                        decisions.append(
+                            {
+                                "source_unit_id": candidate["unit"].id,
+                                "source_region_id": candidate["region"].region_id,
+                                "classification": decision["category"],
+                                "confidence": decision["confidence"],
+                                "status": "skipped",
+                                "reason": decision["reason"],
+                            }
+                        )
+                        continue
+                    outcome = self._apply_promotion(
+                        bundle,
+                        job_id,
+                        candidate,
+                        target,
+                        decision,
+                    )
+                    if outcome["created"]:
+                        promoted += 1
+                    else:
+                        skipped += 1
+                    decisions.append(outcome["decision"])
+                except Exception as error:
+                    failed += 1
+                    decisions.append(
+                        {
+                            "source_unit_id": candidate["unit"].id,
+                            "source_region_id": candidate["region"].region_id,
+                            "status": "failed",
+                            "reason": str(error),
+                        }
+                    )
+            self._update_promotion_job(
+                job_id,
+                status="completed",
+                completed_at=datetime.now(UTC).isoformat(),
+                summary={
+                    "candidates": len(candidates),
+                    "promoted": promoted,
+                    "skipped": skipped,
+                    "failed": failed,
+                    "decisions": decisions,
+                },
+            )
+        except Exception as error:
+            self._update_promotion_job(
+                job_id,
+                status="failed",
+                completed_at=datetime.now(UTC).isoformat(),
+                error=str(error),
+            )
+        finally:
+            with self._promotion_threads_lock:
+                self._promotion_threads.pop(job_id, None)
+
+    def _update_promotion_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        summary: Mapping[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        assignments = ["status = ?"]
+        values: list[object] = [status]
+        if started_at is not None:
+            assignments.append("started_at = ?")
+            values.append(started_at)
+        if completed_at is not None:
+            assignments.append("completed_at = ?")
+            values.append(completed_at)
+        if summary is not None:
+            assignments.append("summary = ?")
+            values.append(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        if error is not None:
+            assignments.append("error = ?")
+            values.append(error)
+        values.append(job_id)
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                f"UPDATE promotion_jobs SET {', '.join(assignments)} WHERE job_id = ?",
+                tuple(values),
+            )
+
+    def _promotion_status_payload(self, job_id: str) -> dict[str, object]:
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                """SELECT job_id, status, source_region_ids, requested_at,
+                          started_at, completed_at, summary, error
+                   FROM promotion_jobs WHERE job_id = ?""",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            raise MemoryRecordNotFoundError("promotion job not found")
+        try:
+            source_region_ids = json.loads(str(row[2]))
+        except json.JSONDecodeError:
+            source_region_ids = []
+        try:
+            summary = json.loads(str(row[6]))
+        except json.JSONDecodeError:
+            summary = {}
+        return {
+            "job_id": str(row[0]),
+            "status": str(row[1]),
+            "source_region_ids": source_region_ids,
+            "requested_at": str(row[3]),
+            "started_at": row[4],
+            "completed_at": row[5],
+            "summary": summary,
+            "error": str(row[7]),
+        }
+
+    def _promotion_candidates(
+        self,
+        bundle: _RuntimeBundle,
+        source_regions: tuple[MemoryRegion, ...],
+    ) -> list[_PromotionCandidate]:
+        allowed_types = {
+            "evolved",
+            "preference",
+            "constraint",
+            "decision",
+            "domain_fact",
+            "reusable_experience",
+            "external_reference",
+        }
+        candidates: list[_PromotionCandidate] = []
+        for region in source_regions:
+            for scope in bundle.kv_store.scopes():
+                if scope.space != region.space:
+                    continue
+                if region.kind == "session" and scope.session != (region.session_id or ""):
+                    continue
+                for unit in self._units_in_scope(bundle, scope):
+                    if unit.lifecycle.value != "active":
+                        continue
+                    memory_type = _metadata_text(unit, "memory_type")
+                    if memory_type not in allowed_types:
+                        continue
+                    source_units = self._promotion_source_units(bundle, scope, unit)
+                    explicit = self._promotion_has_explicit_source(unit, source_units)
+                    candidate: _PromotionCandidate = {
+                        "region": region,
+                        "scope": scope,
+                        "unit": unit,
+                        "source_units": source_units,
+                        "explicit": explicit,
+                    }
+                    candidates.append(candidate)
+        return sorted(
+            candidates,
+            key=lambda item: (
+                item["region"].region_id,
+                item["unit"].id,
+            ),
+        )
+
+    def _promotion_source_units(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        unit: MemoryUnit,
+    ) -> tuple[MemoryUnit, ...]:
+        source_ids = _metadata_strings(unit, "source_unit_ids")
+        if not source_ids:
+            source_ids = _metadata_strings(unit, "provenance")
+        if not source_ids:
+            return ()
+        return tuple(load_units(bundle.kv_store, scope, list(dict.fromkeys(source_ids))))
+
+    @staticmethod
+    def _promotion_has_explicit_source(
+        unit: MemoryUnit,
+        source_units: tuple[MemoryUnit, ...],
+    ) -> bool:
+        if any(_metadata_text(source, "event_kind") == "user" for source in source_units):
+            return True
+        if _metadata_text(unit, "event_kind") == "user":
+            return True
+        if source_units:
+            return False
+        return bool(
+            _metadata_text(unit, "request_actor")
+            or unit.user_metadata.get("source_references")
+            or unit.provenance
+        )
+
+    def _classify_promotion_candidate(
+        self,
+        candidate: _PromotionCandidate,
+        topics: list[MemoryRegion],
+    ) -> _PromotionDecision:
+        unit = candidate["unit"]
+        region = candidate["region"]
+        context: dict[str, object] = {
+            "source_region_id": region.region_id,
+            "source_region_kind": region.kind,
+            "memory_type": _metadata_text(unit, "memory_type"),
+            "explicit_source": candidate["explicit"],
+            "topic_regions": [
+                {"topic_id": topic.region_id, "name": topic.name} for topic in topics
+            ],
+        }
+        if self._promotion_classifier is not None:
+            raw = self._promotion_classifier(unit.content, context)
+        elif self._promotion_model is not None:
+            raw = self._promotion_model.classify_promotion(unit.content, context)
+        else:
+            raw = _heuristic_promotion_decision(unit.content, context)
+        return _validated_promotion_decision(
+            raw,
+            content=unit.content,
+            explicit_source=bool(candidate["explicit"]),
+            topic_ids={topic.region_id for topic in topics},
+        )
+
+    def _promotion_target(
+        self,
+        candidate: _PromotionCandidate,
+        decision: _PromotionDecision,
+        topics: list[MemoryRegion],
+    ) -> MemoryRegion | None:
+        if decision.get("status") != "promote":
+            return None
+        source_region = candidate["region"]
+        category = decision["category"]
+        target: MemoryRegion | None
+        if category == "user":
+            target = self._regions.ensure_user_region()
+        elif category == "topic":
+            topic_id = str(decision.get("topic_id") or "")
+            target = next(
+                (topic for topic in topics if topic.region_id == topic_id),
+                None,
+            )
+            if target is None:
+                return None
+        else:
+            return None
+        if target.region_id == source_region.region_id:
+            return None
+        return target
+
+    def _apply_promotion(
+        self,
+        bundle: _RuntimeBundle,
+        job_id: str,
+        candidate: _PromotionCandidate,
+        target: MemoryRegion,
+        decision: _PromotionDecision,
+    ) -> _PromotionOutcome:
+        unit = candidate["unit"]
+        source_region = candidate["region"]
+        source_units = candidate["source_units"]
+        promotion_key = _promotion_key(unit.content, target.region_id)
+        target_scope = _scope_for_region(target)
+        with (
+            self._maintenance_lock,
+            self._promotion_lock,
+            self._governance_region_lock(target.region_id),
+            self._graph_write_lock,
+        ):
+            if self._promotion_record_exists(promotion_key):
+                return {
+                    "created": False,
+                    "decision": {
+                        "source_unit_id": unit.id,
+                        "source_region_id": source_region.region_id,
+                        "classification": str(decision["category"]),
+                        "confidence": decision["confidence"],
+                        "status": "skipped",
+                        "target_region_id": target.region_id,
+                        "reason": "duplicate promotion key",
+                    },
+                }
+            existing = self._promoted_target(bundle, target_scope, promotion_key)
+            if existing is not None:
+                self._persist_promotion(
+                    existing,
+                    target,
+                    unit,
+                    source_region,
+                    job_id,
+                    promotion_key,
+                    decision,
+                )
+                if bundle.graph_store is not None:
+                    self._associate_graph_scope(
+                        bundle,
+                        target_scope,
+                        region_id=target.region_id,
+                    )
+                return {
+                    "created": False,
+                    "decision": {
+                        "source_unit_id": unit.id,
+                        "source_region_id": source_region.region_id,
+                        "classification": str(decision["category"]),
+                        "confidence": decision["confidence"],
+                        "status": "skipped",
+                        "target_region_id": target.region_id,
+                        "target_unit_id": existing.id,
+                        "reason": "promotion already persisted",
+                    },
+                }
+
+            source_ids = [str(source.id) for source in source_units] or [unit.id]
+            source_event_ids = [
+                _metadata_text(source, "event_id")
+                for source in source_units
+                if _metadata_text(source, "event_id")
+            ]
+            source_references = _promotion_source_references(
+                unit,
+                source_units,
+                source_region,
+            )
+            added: MemoryUnit | None = None
+            try:
+                units = bundle.runtime.api.add(
+                    unit.content,
+                    target_scope,
+                    Modality.TEXT,
+                    security=_security_for(target_scope),
+                    user_metadata={
+                        "memory_type": "promoted",
+                        "promotion_key": promotion_key,
+                        "promotion_job_id": job_id,
+                        "promotion_classification": str(decision["category"]),
+                        "promotion_confidence": float(decision["confidence"]),
+                        "source_unit_ids": source_ids,
+                        "source_event_ids": source_event_ids,
+                        "source_region_id": source_region.region_id,
+                        "source_region_kind": source_region.kind,
+                        "source_references": source_references,
+                        "provenance": source_ids,
+                        "region_id": target.region_id,
+                        "region_kind": target.kind,
+                        "promoted_at": datetime.now(UTC).isoformat(),
+                    },
+                )
+                if not units:
+                    raise MemoryKernelUnavailableError("promotion did not create a memory unit")
+                added = units[0]
+                added.provenance = source_ids
+                bundle.kv_store.update(
+                    target_scope,
+                    memory_key(added.id),
+                    dumps(added),
+                )
+                self._persist_promotion(
+                    added,
+                    target,
+                    unit,
+                    source_region,
+                    job_id,
+                    promotion_key,
+                    decision,
+                )
+                if bundle.graph_store is not None:
+                    self._associate_graph_scope(
+                        bundle,
+                        target_scope,
+                        region_id=target.region_id,
+                    )
+            except Exception:
+                if added is not None:
+                    with suppress(Exception):
+                        bundle.runtime.api.delete(
+                            DeleteSelector(
+                                unit_ids=[added.id],
+                                scope=target_scope,
+                                mode=DeleteMode.PURGE,
+                            ),
+                            security=_security_for(target_scope),
+                        )
+                raise
+            return {
+                "created": True,
+                "decision": {
+                    "source_unit_id": unit.id,
+                    "source_region_id": source_region.region_id,
+                    "classification": str(decision["category"]),
+                    "confidence": decision["confidence"],
+                    "status": "promoted",
+                    "target_region_id": target.region_id,
+                    "target_unit_id": added.id,
+                    "reason": str(decision["reason"]),
+                },
+            }
+
+    def _promotion_record_exists(self, promotion_key: str) -> bool:
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM promotion_records WHERE promotion_key = ?",
+                (promotion_key,),
+            ).fetchone()
+        return row is not None
+
+    def _promoted_target(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        promotion_key: str,
+    ) -> MemoryUnit | None:
+        return next(
+            (
+                unit
+                for unit in self._units_in_scope(bundle, scope)
+                if unit.lifecycle.value == "active"
+                and _metadata_text(unit, "promotion_key") == promotion_key
+            ),
+            None,
+        )
+
+    def _persist_promotion(
+        self,
+        target_unit: MemoryUnit,
+        target: MemoryRegion,
+        source_unit: MemoryUnit,
+        source_region: MemoryRegion,
+        job_id: str,
+        promotion_key: str,
+        decision: _PromotionDecision,
+    ) -> int:
+        detail = {
+            "source_unit_id": source_unit.id,
+            "source_region_id": source_region.region_id,
+            "source_region_kind": source_region.kind,
+            "classification": decision["category"],
+            "confidence": decision["confidence"],
+            "job_id": job_id,
+        }
+        with closing(self._maintenance_db()) as connection, connection:
+            row = connection.execute(
+                """SELECT id FROM governance_events
+                   WHERE operation_id = ? AND action = 'promote'
+                   ORDER BY id LIMIT 1""",
+                (promotion_key,),
+            ).fetchone()
+            serialized_detail = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+            if row is None:
+                cursor = connection.execute(
+                    """INSERT INTO governance_events
+                       (region_id, unit_id, action, actor, source, operation_id,
+                        before_content, after_content, detail, status, created_at)
+                       VALUES (?, ?, 'promote', 'platform:auto-promotion', ?, ?,
+                               '', ?, ?, 'committed', ?)""",
+                    (
+                        target.region_id,
+                        target_unit.id,
+                        f"promotion:{job_id}",
+                        promotion_key,
+                        target_unit.content,
+                        serialized_detail,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+                if cursor.lastrowid is None:
+                    raise MemoryKernelUnavailableError(
+                        "promotion audit event was not persisted"
+                    )
+                audit_id = int(cursor.lastrowid)
+            else:
+                audit_id = int(row[0])
+                connection.execute(
+                    """UPDATE governance_events
+                       SET region_id = ?, unit_id = ?, actor = 'platform:auto-promotion',
+                           source = ?, before_content = '', after_content = ?,
+                           detail = ?, status = 'committed'
+                       WHERE id = ?""",
+                    (
+                        target.region_id,
+                        target_unit.id,
+                        f"promotion:{job_id}",
+                        target_unit.content,
+                        serialized_detail,
+                        audit_id,
+                    ),
+                )
+            connection.execute(
+                """INSERT INTO promotion_records
+                   (promotion_key, job_id, source_unit_id, source_region_id,
+                    source_region_kind, target_region_id, target_region_kind,
+                    target_unit_id, classification, confidence, audit_event_id,
+                    created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    promotion_key,
+                    job_id,
+                    source_unit.id,
+                    source_region.region_id,
+                    source_region.kind,
+                    target.region_id,
+                    target.kind,
+                    target_unit.id,
+                    str(decision["category"]),
+                    float(decision["confidence"]),
+                    audit_id,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+        return audit_id
+
     def get_retention_policy(self, request: RetentionPolicyRequest) -> dict[str, object]:
         region = self._session_region(request.library_id)
         days = self._retention_days(region.region_id)
@@ -3329,6 +3988,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     @staticmethod
     def _ensure_maintenance_schema(connection: sqlite3.Connection) -> None:
+        connection.executescript(_PROMOTION_SCHEMA)
         columns = {
             str(row[1]): row
             for row in connection.execute("PRAGMA table_info(capture_evolutions)").fetchall()
@@ -4497,6 +5157,184 @@ def _result_item(item: Any, request: SearchMemoryRequest) -> dict[str, object]:
         "retrieval_sources": ["hybrid"],
         "system_metadata": system_metadata,
         "user_metadata": user_metadata,
+    }
+
+
+def _metadata_strings(unit: MemoryUnit, key: str) -> list[str]:
+    value = unit.user_metadata.get(key)
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _normalize_promotion_text(content: str) -> str:
+    return " ".join(content.casefold().split())
+
+
+def _promotion_key(content: str, target_region_id: str) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [_normalize_promotion_text(content), target_region_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _promotion_source_references(
+    unit: MemoryUnit,
+    source_units: tuple[MemoryUnit, ...],
+    source_region: MemoryRegion,
+) -> list[str]:
+    references = [*_metadata_strings(unit, "source_references"), f"unit:{unit.id}"]
+    for source in source_units:
+        references.append(f"unit:{source.id}")
+        event_id = _metadata_text(source, "event_id")
+        if event_id:
+            references.append(f"capture:{source_region.region_id}:{event_id}")
+    return list(dict.fromkeys(references))
+
+
+def _heuristic_promotion_decision(
+    content: str,
+    context: Mapping[str, object],
+) -> dict[str, object]:
+    if inspect_sensitive_text(content) is not None:
+        return {
+            "category": "sensitive",
+            "confidence": 1.0,
+            "explicit": False,
+            "topic_id": None,
+            "reason": "sensitive content requires manual review",
+        }
+    text = _normalize_promotion_text(content)
+    personal = bool(
+        re.search(
+            r"\b(?:i|my|me)\b|\b(?:prefer|always|usually|never)\b|"
+            r"我(?:偏好|喜欢|习惯|通常|希望|一直)|我的[^。\n]{0,40}(?:是|为)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    project_specific = bool(
+        re.search(
+            r"\b(?:this|the)\s+(?:project|repo|repository|branch|worktree)\b|"
+            r"(?:^|\s)(?:\./|/)[\w./-]+|"
+            r"本(?:项目|仓库)|当前(?:项目|分支|工作树)|该(?:项目|仓库)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if personal and not project_specific:
+        return {
+            "category": "user",
+            "confidence": 0.95,
+            "explicit": True,
+            "topic_id": None,
+            "reason": "explicit stable personal fact",
+        }
+    if project_specific:
+        return {
+            "category": "project",
+            "confidence": 0.95,
+            "explicit": True,
+            "topic_id": None,
+            "reason": "project-specific content remains in its source region",
+        }
+    topic_matches: list[tuple[int, str]] = []
+    raw_topics = context.get("topic_regions")
+    if isinstance(raw_topics, list):
+        for raw_topic in raw_topics:
+            if not isinstance(raw_topic, Mapping):
+                continue
+            topic_id = str(raw_topic.get("topic_id") or "").strip()
+            topic_name = str(raw_topic.get("name") or "").strip()
+            candidates = {
+                value.casefold() for value in (topic_id, topic_name) if len(value.strip()) >= 2
+            }
+            matched = [
+                value
+                for value in candidates
+                if re.search(
+                    rf"(?<![\w]){re.escape(value)}(?![\w])",
+                    text,
+                )
+            ]
+            if matched:
+                topic_matches.append((max(len(value) for value in matched), topic_id))
+    knowledge_marker = bool(
+        re.search(
+            r"\b(?:is|are|means|allows|provides|enables|ownership|principle|"
+            r"concept|syntax)\b|(?:是指|表示|原理|概念|语法|用于|可以)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if topic_matches and knowledge_marker:
+        longest = max(length for length, _ in topic_matches)
+        best = [topic_id for length, topic_id in topic_matches if length == longest]
+        if len(set(best)) == 1:
+            return {
+                "category": "topic",
+                "confidence": 0.95,
+                "explicit": True,
+                "topic_id": best[0],
+                "reason": "explicit generalizable topic knowledge",
+            }
+    return {
+        "category": "retain",
+        "confidence": 0.0,
+        "explicit": False,
+        "topic_id": None,
+        "reason": "no explicit high-confidence promotion target",
+    }
+
+
+def _validated_promotion_decision(
+    raw: Mapping[str, object],
+    *,
+    content: str,
+    explicit_source: bool,
+    topic_ids: set[str],
+) -> _PromotionDecision:
+    category = str(raw.get("category", "retain")).strip()
+    if category not in {"user", "topic", "project", "conflict", "sensitive", "retain"}:
+        raise ValueError("promotion classifier returned an invalid category")
+    confidence = raw.get("confidence")
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not 0 <= float(confidence) <= 1
+    ):
+        raise ValueError("promotion classifier returned an invalid confidence")
+    explicit = raw.get("explicit") is True
+    topic_id = str(raw.get("topic_id") or "").strip() or None
+    reason = str(raw.get("reason") or "").strip() or "classified by promotion policy"
+    if inspect_sensitive_text(content) is not None:
+        category = "sensitive"
+        confidence = 1.0
+        explicit = False
+        reason = "sensitive content requires manual review"
+    if category in {"user", "topic"}:
+        if not explicit_source or not explicit:
+            category = "retain"
+            reason = "promotion requires an explicit source statement"
+        elif float(confidence) < 0.9:
+            category = "retain"
+            reason = "promotion confidence is below 0.90"
+        elif category == "topic" and topic_id not in topic_ids:
+            category = "retain"
+            reason = "promotion topic does not match an existing topic region"
+    status = "promote" if category in {"user", "topic"} else "skip"
+    return {
+        "category": category,
+        "confidence": float(confidence),
+        "explicit": explicit,
+        "topic_id": topic_id,
+        "reason": reason,
+        "status": status,
     }
 
 

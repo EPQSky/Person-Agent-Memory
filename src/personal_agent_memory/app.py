@@ -79,6 +79,8 @@ from personal_agent_memory.memory_kernel import (
     OutOfBandChangeRequest,
     PreviewDocumentDeleteRequest,
     PreviewDocumentUpdateRequest,
+    PromotionRunRequest,
+    PromotionStatusRequest,
     ResolveOutOfBandChangeRequest,
     ResolveRegionRequest,
     RestoreDocumentRequest,
@@ -167,9 +169,7 @@ class LibraryRegistration(BaseModel):
 class MemoryRegionCreate(BaseModel):
     kind: Literal["user", "topic", "project", "session"]
     name: str = Field(min_length=1, max_length=200)
-    region_id: LibraryId | None = Field(
-        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
-    )
+    region_id: LibraryId | None = Field(default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH)
     session_id: OptionalIdentifier = Field(
         default=None, min_length=1, max_length=MAX_SESSION_ID_LENGTH
     )
@@ -180,9 +180,7 @@ class ProjectBindingRegistration(BaseModel):
     library_id: LibraryId | None = Field(
         default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
     )
-    region_id: LibraryId | None = Field(
-        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
-    )
+    region_id: LibraryId | None = Field(default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH)
 
     @model_validator(mode="after")
     def validate_region(self) -> ProjectBindingRegistration:
@@ -201,9 +199,7 @@ class ProjectBindingUpdate(BaseModel):
     library_id: LibraryId | None = Field(
         default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
     )
-    region_id: LibraryId | None = Field(
-        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
-    )
+    region_id: LibraryId | None = Field(default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH)
 
     @model_validator(mode="after")
     def validate_region(self) -> ProjectBindingUpdate:
@@ -243,9 +239,7 @@ class SearchRequest(BaseModel):
     library_id: LibraryId | None = Field(
         default=None, min_length=1, max_length=MAX_LIBRARY_ID_LENGTH
     )
-    region_id: LibraryId | None = Field(
-        default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
-    )
+    region_id: LibraryId | None = Field(default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH)
     region_ids: list[LibraryId] | None = Field(default=None, min_length=1, max_length=20)
     query: str
     limit: int = 10
@@ -269,12 +263,8 @@ class SearchRequest(BaseModel):
             self.region_ids is not None,
         )
         if sum(selectors) != 1:
-            raise ValueError(
-                "exactly one of cwd, library_id, region_id, or region_ids is required"
-            )
-        if self.region_ids is not None and len(set(self.region_ids)) != len(
-            self.region_ids
-        ):
+            raise ValueError("exactly one of cwd, library_id, region_id, or region_ids is required")
+        if self.region_ids is not None and len(set(self.region_ids)) != len(self.region_ids):
             raise ValueError("region_ids must not contain duplicates")
         return self
 
@@ -422,6 +412,13 @@ class CaptureConsolidation(BaseModel):
     )
 
 
+class PromotionRun(BaseModel):
+    source_region_ids: list[RequiredIdentifier] | None = Field(
+        default=None,
+        max_length=100,
+    )
+
+
 class SensitiveResolution(BaseModel):
     resolution: Literal["discard", "acknowledge"]
 
@@ -443,9 +440,7 @@ class CandidatePinUpdate(BaseModel):
     pinned: bool
 
 
-def create_app(
-    settings: Settings, *, memory_kernel: MemoryKernelPort | None = None
-) -> FastAPI:
+def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = None) -> FastAPI:
     key_store = ApiKeyStore(settings.state_dir / "api-key")
     model_client = OpenAICompatibleClient(settings.embedding, settings.reranker, settings.graph)
     fixed_now: datetime | None = None
@@ -514,8 +509,11 @@ def create_app(
     ) -> None:
         scheme, _, supplied = (authorization or "").partition(" ")
         stored = key_store.read()
-        if scheme.lower() == "bearer" and supplied and stored and hmac.compare_digest(
-            supplied, stored
+        if (
+            scheme.lower() == "bearer"
+            and supplied
+            and stored
+            and hmac.compare_digest(supplied, stored)
         ):
             return
         if session_store.verify(session_cookie or "", stored):
@@ -534,9 +532,7 @@ def create_app(
         key = key_store.read()
         kernel_health = await asyncio.to_thread(selected_kernel.health)
         graph_status = await asyncio.to_thread(selected_kernel.graph_status)
-        legacy_running = (
-            selected_kernel.kind == "legacy" and platform_state.connection is not None
-        )
+        legacy_running = selected_kernel.kind == "legacy" and platform_state.connection is not None
         return {
             "status": "ready" if kernel_health.status == "ready" else "degraded",
             "database": "ok" if legacy_running else "not_started",
@@ -560,9 +556,7 @@ def create_app(
         )
 
     @app.exception_handler(MemoryKernelUnavailableError)
-    async def kernel_unavailable(
-        _: Request, error: MemoryKernelUnavailableError
-    ) -> JSONResponse:
+    async def kernel_unavailable(_: Request, error: MemoryKernelUnavailableError) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"detail": str(error)},
@@ -648,17 +642,13 @@ def create_app(
             return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error))
         if isinstance(error, DuplicateRegionError):
             return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
-        return HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
-        )
+        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error))
 
     def binding_error(error: RegionError | ProjectBindingError) -> HTTPException:
         detail = str(error)
         if detail in {"memory region not found", "project binding not found"}:
             return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
-        return HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail
-        )
+        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
     @app.post(
         "/api/v1/regions",
@@ -685,9 +675,7 @@ def create_app(
     @app.get("/api/v1/regions/tree", dependencies=[Depends(authenticate)])
     async def memory_region_tree(session_id: str | None = None) -> dict[str, object]:
         try:
-            return selected_kernel.region_tree(
-                MemoryRegionTreeRequest(session_id=session_id)
-            )
+            return selected_kernel.region_tree(MemoryRegionTreeRequest(session_id=session_id))
         except RegionError as error:
             raise region_error(error) from error
 
@@ -728,9 +716,7 @@ def create_app(
                     "bulk external acceptance is disabled; resolve each out-of-band "
                     "change explicitly"
                 )
-            return await selected_kernel.scan_library(
-                ScanLibraryRequest(library_id=library_id)
-            )
+            return await selected_kernel.scan_library(ScanLibraryRequest(library_id=library_id))
         except (LibraryRegistrationError, MemoryMutationError) as error:
             status_code = (
                 status.HTTP_404_NOT_FOUND
@@ -914,9 +900,7 @@ def create_app(
     @app.post("/mcp/project-bindings/resolve", dependencies=[Depends(authenticate)])
     async def mcp_resolve_project_binding(resolution: CwdResolution) -> dict[str, str]:
         try:
-            return selected_kernel.resolve_region(
-                ResolveRegionRequest(cwd=resolution.cwd)
-            )
+            return selected_kernel.resolve_region(ResolveRegionRequest(cwd=resolution.cwd))
         except (ProjectBindingError, RegionError) as error:
             raise binding_error(error) from error
 
@@ -987,13 +971,9 @@ def create_app(
     )
     async def delete_project_binding(binding_id: str) -> Response:
         try:
-            selected_kernel.delete_region_binding(
-                DeleteRegionBindingRequest(binding_id=binding_id)
-            )
+            selected_kernel.delete_region_binding(DeleteRegionBindingRequest(binding_id=binding_id))
         except (ProjectBindingError, RegionBindingNotFoundError) as error:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
-            ) from error
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
         except RegionBindingError as error:
             raise binding_error(error) from error
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1017,9 +997,7 @@ def create_app(
                     cwd=request.cwd,
                     library_id=request.library_id,
                     region_id=request.region_id,
-                    region_ids=(
-                        None if request.region_ids is None else tuple(request.region_ids)
-                    ),
+                    region_ids=(None if request.region_ids is None else tuple(request.region_ids)),
                     limit=request.limit,
                     max_graph_hops=request.graph_hops,
                     include_history=request.include_history,
@@ -1083,11 +1061,7 @@ def create_app(
         detail = str(error)
         if detail in {"candidate memory not found", "memory library not found"}:
             code = status.HTTP_404_NOT_FOUND
-        elif (
-            "already" in detail
-            or "no longer pending" in detail
-            or "in the recycle bin" in detail
-        ):
+        elif "already" in detail or "no longer pending" in detail or "in the recycle bin" in detail:
             code = status.HTTP_409_CONFLICT
         else:
             code = status.HTTP_422_UNPROCESSABLE_CONTENT
@@ -1131,15 +1105,11 @@ def create_app(
             client_deadline_ms,
             now_epoch_seconds=time.time(),
             maximum_seconds=(
-                2.0
-                if selected_kernel.kind == "mem2"
-                else CAPTURE_BINDING_DEADLINE_SECONDS
+                2.0 if selected_kernel.kind == "mem2" else CAPTURE_BINDING_DEADLINE_SECONDS
             ),
         )
         request_deadline = monotonic_before_wall_sample + request_budget
-        persistence_deadline = (
-            request_deadline - CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS
-        )
+        persistence_deadline = request_deadline - CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS
         try:
             async with asyncio.timeout_at(request_deadline):
                 return await selected_kernel.write(
@@ -1179,9 +1149,7 @@ def create_app(
 
     @app.get("/api/v1/capture/events", dependencies=[Depends(authenticate)])
     async def capture_events(session_id: str | None = None) -> list[dict[str, object]]:
-        return selected_kernel.list_capture_events(
-            CaptureEventsRequest(session_id=session_id)
-        )
+        return selected_kernel.list_capture_events(CaptureEventsRequest(session_id=session_id))
 
     @app.get("/api/v1/sensitive-quarantine", dependencies=[Depends(authenticate)])
     async def sensitive_quarantine(
@@ -1210,9 +1178,7 @@ def create_app(
 
     @app.get("/api/v1/capture/rounds", dependencies=[Depends(authenticate)])
     async def capture_rounds(session_id: str | None = None) -> list[dict[str, object]]:
-        return selected_kernel.list_capture_rounds(
-            CaptureRoundsRequest(session_id=session_id)
-        )
+        return selected_kernel.list_capture_rounds(CaptureRoundsRequest(session_id=session_id))
 
     @app.get("/api/v1/candidate-governance", dependencies=[Depends(authenticate)])
     async def candidate_governance_queue(
@@ -1280,15 +1246,11 @@ def create_app(
             client_deadline_ms,
             now_epoch_seconds=time.time(),
             maximum_seconds=(
-                2.0
-                if selected_kernel.kind == "mem2"
-                else CAPTURE_BINDING_DEADLINE_SECONDS
+                2.0 if selected_kernel.kind == "mem2" else CAPTURE_BINDING_DEADLINE_SECONDS
             ),
         )
         request_deadline = monotonic_before_wall_sample + request_budget
-        persistence_deadline = (
-            request_deadline - CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS
-        )
+        persistence_deadline = request_deadline - CAPTURE_PERSISTENCE_COMMIT_MARGIN_SECONDS
         try:
             # The deadline is a pre-commit admission boundary. Once SQLite commit starts,
             # await its definitive result rather than returning 503 while it can still land.
@@ -1303,6 +1265,61 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="capture consolidation is temporarily unavailable",
+            ) from error
+
+    @app.post(
+        "/api/v1/promotions",
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(authenticate)],
+    )
+    async def run_promotion(request: PromotionRun) -> dict[str, object]:
+        try:
+            return await selected_kernel.start_promotion(
+                PromotionRunRequest(
+                    source_region_ids=(
+                        None
+                        if request.source_region_ids is None
+                        else tuple(request.source_region_ids)
+                    )
+                )
+            )
+        except MemoryKernelUnavailableError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(error),
+            ) from error
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(error),
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
+            ) from error
+
+    @app.get(
+        "/api/v1/promotions/{job_id}",
+        dependencies=[Depends(authenticate)],
+    )
+    async def promotion_status(job_id: str) -> dict[str, object]:
+        try:
+            return selected_kernel.promotion_status(PromotionStatusRequest(job_id=job_id))
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(error),
+            ) from error
+        except MemoryKernelUnavailableError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(error),
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
             ) from error
 
     @app.get(
@@ -1326,9 +1343,7 @@ def create_app(
     ) -> dict[str, object]:
         try:
             return await selected_kernel.update_retention_policy(
-                UpdateRetentionPolicyRequest(
-                    library_id=library_id, **policy.model_dump()
-                )
+                UpdateRetentionPolicyRequest(library_id=library_id, **policy.model_dump())
             )
         except (LibraryRegistrationError, RegionError) as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
@@ -1411,9 +1426,7 @@ def create_app(
     ) -> list[dict[str, object]]:
         try:
             return selected_kernel.list_candidates(
-                ListCandidatesRequest(
-                    library_id=library_id, status=candidate_status
-                )
+                ListCandidatesRequest(library_id=library_id, status=candidate_status)
             )
         except (CandidateGovernanceError, MemoryMutationError) as error:
             if isinstance(error, MemoryMutationError):
@@ -1423,9 +1436,7 @@ def create_app(
     @app.get("/mcp/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
     async def mcp_get_candidate(candidate_id: str) -> dict[str, object]:
         try:
-            return selected_kernel.inspect(
-                CandidateInspectRequest(memory_id=candidate_id)
-            )
+            return selected_kernel.inspect(CandidateInspectRequest(memory_id=candidate_id))
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
 
@@ -1435,9 +1446,7 @@ def create_app(
     ) -> list[dict[str, object]]:
         try:
             return selected_kernel.list_candidates(
-                ListCandidatesRequest(
-                    library_id=library_id, status=candidate_status
-                )
+                ListCandidatesRequest(library_id=library_id, status=candidate_status)
             )
         except (CandidateGovernanceError, MemoryMutationError) as error:
             if isinstance(error, MemoryMutationError):
@@ -1447,9 +1456,7 @@ def create_app(
     @app.get("/api/v1/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
     async def get_candidate(candidate_id: str) -> dict[str, object]:
         try:
-            return selected_kernel.inspect(
-                CandidateInspectRequest(memory_id=candidate_id)
-            )
+            return selected_kernel.inspect(CandidateInspectRequest(memory_id=candidate_id))
         except CandidateGovernanceError as error:
             raise candidate_error(error) from error
 
@@ -1511,9 +1518,7 @@ def create_app(
         detail = str(error)
         if isinstance(error, MemoryRecordNotFoundError):
             code = status.HTTP_404_NOT_FOUND
-        elif isinstance(
-            error, (MemoryRevisionConflictError, MemoryLifecycleConflictError)
-        ):
+        elif isinstance(error, (MemoryRevisionConflictError, MemoryLifecycleConflictError)):
             code = status.HTTP_409_CONFLICT
         elif detail in {
             "memory library not found",
@@ -1537,9 +1542,7 @@ def create_app(
     @app.get("/api/v1/libraries/{library_id}/documents", dependencies=[Depends(authenticate)])
     async def list_documents(library_id: str) -> list[dict[str, object]]:
         try:
-            return selected_kernel.list_documents(
-                ListDocumentsRequest(library_id=library_id)
-            )
+            return selected_kernel.list_documents(ListDocumentsRequest(library_id=library_id))
         except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
@@ -1550,9 +1553,7 @@ def create_app(
     )
     async def export_library_markdown(library_id: str) -> PlainTextResponse:
         try:
-            documents = selected_kernel.list_documents(
-                ListDocumentsRequest(library_id=library_id)
-            )
+            documents = selected_kernel.list_documents(ListDocumentsRequest(library_id=library_id))
         except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
         lines = [f"# Memory export: {library_id}", ""]
@@ -1576,9 +1577,7 @@ def create_app(
     @app.get("/api/v1/libraries/{library_id}/document", dependencies=[Depends(authenticate)])
     async def read_document(library_id: str, path: str) -> dict[str, object]:
         try:
-            return selected_kernel.inspect(
-                DocumentInspectRequest(library_id=library_id, path=path)
-            )
+            return selected_kernel.inspect(DocumentInspectRequest(library_id=library_id, path=path))
         except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
@@ -1665,9 +1664,7 @@ def create_app(
     )
     async def list_forgotten_memories(library_id: str) -> list[dict[str, object]]:
         try:
-            return selected_kernel.list_forgotten(
-                ListForgottenRequest(library_id=library_id)
-            )
+            return selected_kernel.list_forgotten(ListForgottenRequest(library_id=library_id))
         except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
@@ -1695,9 +1692,7 @@ def create_app(
     @app.get("/api/v1/libraries/{library_id}/history", dependencies=[Depends(authenticate)])
     async def library_history(library_id: str, limit: int = 50) -> list[dict[str, str]]:
         try:
-            return selected_kernel.audit(
-                AuditMemoryRequest(library_id=library_id, limit=limit)
-            )
+            return selected_kernel.audit(AuditMemoryRequest(library_id=library_id, limit=limit))
         except (MemoryMutationError, MemoryGovernanceError) as error:
             raise mutation_error(error) from error
 
@@ -1809,9 +1804,7 @@ def create_app(
         if name == "memory_get":
             library_id = str(arguments.get("library_id", ""))
             path = str(arguments.get("path", ""))
-            return selected_kernel.inspect(
-                DocumentInspectRequest(library_id=library_id, path=path)
-            )
+            return selected_kernel.inspect(DocumentInspectRequest(library_id=library_id, path=path))
         if name == "candidate_create":
             return await create_candidate_payload(CandidateCreate.model_validate(arguments))
         if name == "candidate_list":
@@ -1819,16 +1812,8 @@ def create_app(
             candidate_status = arguments.get("candidate_status")
             return selected_kernel.list_candidates(
                 ListCandidatesRequest(
-                    library_id=(
-                        None
-                        if filter_library_id is None
-                        else str(filter_library_id)
-                    ),
-                    status=(
-                        None
-                        if candidate_status is None
-                        else str(candidate_status)
-                    ),
+                    library_id=(None if filter_library_id is None else str(filter_library_id)),
+                    status=(None if candidate_status is None else str(candidate_status)),
                 )
             )
         if name == "library_list":
