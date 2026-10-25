@@ -271,7 +271,6 @@ def _app(
 ):
     settings = Settings(
         state_dir=state_dir,
-        memory_kernel="mem2",
         embedding=embedding,
         embedding_dimension=embedding_dimension,
     )
@@ -606,19 +605,6 @@ def test_mem2_enforces_fulltext_content_limit_at_rest_boundary(
         )
         assert rejected.status_code == 422
 
-        rejected_candidate = client.post(
-            "/mcp/candidates",
-            headers=headers,
-            json={
-                "library_id": LIBRARY_ID,
-                "suggested_type": "domain_fact",
-                "body": "x" * 70_000,
-                "source_references": ["test:mem2"],
-                "creator": "test",
-                "idempotency_key": "candidate-too-long",
-            },
-        )
-        assert rejected_candidate.status_code == 422
 
 
 def test_mem2_idempotency_persists_and_conflicts_on_changed_content(

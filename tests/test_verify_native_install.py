@@ -23,7 +23,7 @@ def test_native_verifier_uses_an_isolated_home_and_cleans_up(tmp_path: Path) -> 
     assert '--python "$python_command"' in script
     assert '--constraints "$work_root/constraints.txt"' in script
     assert '--no-python-downloads' in script
-    assert '--memory-kernel mem2' in script
+    assert "grep -q -- '--memory-kernel' \"$work_root/serve-help.txt\"" in script
     request_start = script.index("def request(")
     request_end = script.index("\ndeadline = time.monotonic()", request_start)
     key_read = script.index("key = key_path.read_text", request_start)

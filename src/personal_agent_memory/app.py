@@ -16,12 +16,11 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
-    Query,
     Request,
     Response,
     status,
 )
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from markdown_it import MarkdownIt
 from pydantic import (
     BaseModel,
@@ -34,26 +33,16 @@ from pydantic import (
 
 from personal_agent_memory.config import Settings
 from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
-from personal_agent_memory.graph_adapter import JiuwenMilvusGraphAdapter
 from personal_agent_memory.memory_kernel import (
     MAX_LIBRARY_ID_LENGTH,
     AssociateWorktreeRegionRequest,
     AuditMemoryRequest,
     BindProjectRegionRequest,
-    CandidateDecisionRequest,
-    CandidateGovernanceListRequest,
-    CandidateGovernanceRequest,
-    CandidateInspectRequest,
-    CandidatePinRequest,
-    CandidateRecycleListRequest,
-    CandidateRestoreRequest,
-    CandidateUpdateRequest,
     CaptureBindingUnstableError,
     CaptureContractError,
     CaptureEventsRequest,
     CaptureMemoryRequest,
     CaptureRoundsRequest,
-    ClearDiagnosticsRequest,
     CreateMemoryRegionRequest,
     CreateMemoryRequest,
     DeleteMemoryRequest,
@@ -63,10 +52,8 @@ from personal_agent_memory.memory_kernel import (
     EvolveMemoryRequest,
     GetMemoryRegionRequest,
     HistoryDiffRequest,
-    ListCandidatesRequest,
     ListDocumentsRequest,
     ListForgottenRequest,
-    ListOutOfBandChangesRequest,
     ManagedMemoryKernelPort,
     MemoryGovernanceError,
     MemoryIdempotencyConflictError,
@@ -76,26 +63,20 @@ from personal_agent_memory.memory_kernel import (
     MemoryRecordNotFoundError,
     MemoryRegionTreeRequest,
     MemoryRevisionConflictError,
-    OutOfBandChangeRequest,
     PreviewDocumentDeleteRequest,
     PreviewDocumentUpdateRequest,
     PromotionRunRequest,
     PromotionStatusRequest,
-    ResolveOutOfBandChangeRequest,
     ResolveRegionRequest,
     RestoreDocumentRequest,
     RestoreForgottenRequest,
     RetentionCleanupRequest,
     RetentionPolicyRequest,
-    ScanLibraryRequest,
     SearchMemoryRequest,
-    SensitiveQuarantineListRequest,
-    SensitiveQuarantineResolutionRequest,
     UpdateRegionBindingRequest,
     UpdateRetentionPolicyRequest,
     select_memory_kernel,
 )
-from personal_agent_memory.model_client import OpenAICompatibleClient
 from personal_agent_memory.regions import (
     MAX_REGION_ID_LENGTH,
     MAX_SESSION_ID_LENGTH,
@@ -107,18 +88,6 @@ from personal_agent_memory.regions import (
     RegionNotFoundError,
 )
 from personal_agent_memory.security import ApiKeyStore, ManagementSessionStore
-from personal_agent_memory.state import (
-    CandidateGovernanceError,
-    CapturePersistenceBusyError,
-    DuplicateLibraryError,
-    DuplicateProjectBindingError,
-    LibraryKind,
-    LibraryRegistrationError,
-    MemoryMutationError,
-    PlatformState,
-    PlatformStateUnavailableError,
-    ProjectBindingError,
-)
 
 CAPTURE_BINDING_DEADLINE_SECONDS = 0.25
 LibraryId = Annotated[
@@ -160,10 +129,6 @@ def capture_request_budget_seconds(
     return min(maximum_seconds, remaining)
 
 
-class LibraryRegistration(BaseModel):
-    path: str
-    kind: LibraryKind
-    reuse_existing_git: bool = False
 
 
 class MemoryRegionCreate(BaseModel):
@@ -243,8 +208,6 @@ class McpRpcRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
-class IgnoreRulesUpdate(BaseModel):
-    patterns: list[str]
 
 
 class SearchRequest(BaseModel):
@@ -307,13 +270,6 @@ class DocumentRestore(BaseModel):
     source: str = "web"
 
 
-class OutOfBandResolution(BaseModel):
-    action: Literal["import", "restore"]
-    operation_id: str = Field(min_length=1, max_length=200)
-    actor_type: Literal["user", "platform"] = "user"
-    source: str = Field(default="web-reconciliation", min_length=1, max_length=200)
-    final_content: str | None = Field(default=None, max_length=2_000_000)
-    external_path: str | None = Field(default=None, min_length=1, max_length=2_000)
 
 
 class DocumentDeletePreview(BaseModel):
@@ -337,23 +293,8 @@ class ForgottenMemoryRestore(BaseModel):
     source: str = "web-forgotten-history"
 
 
-CandidateType = Literal[
-    "preference",
-    "decision",
-    "constraint",
-    "domain_fact",
-    "reusable_experience",
-    "external_reference",
-]
 
 
-class CandidateCreate(BaseModel):
-    library_id: LibraryId = Field(min_length=1, max_length=MAX_LIBRARY_ID_LENGTH)
-    suggested_type: CandidateType
-    body: str = Field(min_length=1, max_length=65_535)
-    source_references: list[str] = Field(min_length=1, max_length=100)
-    creator: str = Field(min_length=1, max_length=200)
-    idempotency_key: str = Field(min_length=1, max_length=200)
 
 
 class MemoryCreate(BaseModel):
@@ -376,23 +317,10 @@ class MemoryCreate(BaseModel):
         return self
 
 
-class CandidateEdit(BaseModel):
-    body: str = Field(min_length=1, max_length=200_000)
-    operator: str = Field(min_length=1, max_length=200)
-    reason: str = Field(min_length=1, max_length=2_000)
 
 
-class CandidateDecision(BaseModel):
-    operator: str = Field(min_length=1, max_length=200)
-    reason: str = Field(min_length=1, max_length=2_000)
-    operation_id: str = Field(min_length=1, max_length=200)
 
 
-class CandidateResolution(CandidateDecision):
-    action: Literal["keep", "adopt", "merge", "scope"]
-    merged_body: str | None = Field(default=None, max_length=200_000)
-    effective_at: str | None = Field(default=None, max_length=100)
-    condition: str | None = Field(default=None, max_length=2_000)
 
 
 class CaptureEvent(BaseModel):
@@ -435,47 +363,22 @@ class PromotionRun(BaseModel):
     )
 
 
-class SensitiveResolution(BaseModel):
-    resolution: Literal["discard", "acknowledge"]
 
 
 class RetentionPolicyUpdate(BaseModel):
     inbox_days: int = Field(default=30, ge=0, le=3650)
-    candidate_days: int = Field(default=90, ge=0, le=3650)
-    recycle_days: int = Field(default=30, ge=0, le=3650)
-    early_inbox_cleanup: bool = True
-    diagnostics_enabled: bool = True
-    diagnostic_days: int = Field(default=7, ge=0, le=365)
 
 
 class ManagementSessionLogin(BaseModel):
     api_key: str = Field(min_length=1, max_length=1000)
 
 
-class CandidatePinUpdate(BaseModel):
-    pinned: bool
 
 
 def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = None) -> FastAPI:
     key_store = ApiKeyStore(settings.state_dir / "api-key")
-    model_client = OpenAICompatibleClient(settings.embedding, settings.reranker, settings.graph)
-    fixed_now: datetime | None = None
-    if settings.retention_now is not None:
-        fixed_now = datetime.fromisoformat(settings.retention_now.replace("Z", "+00:00"))
-        if fixed_now.tzinfo is None:
-            fixed_now = fixed_now.replace(tzinfo=UTC)
-        fixed_now = fixed_now.astimezone(UTC)
-    platform_state = PlatformState(
-        settings.state_dir / "platform.sqlite3",
-        library_roots=settings.library_roots,
-        model_client=model_client,
-        graph_adapter=JiuwenMilvusGraphAdapter(settings.state_dir / "graphs", model_client),
-        now=(lambda: fixed_now) if fixed_now is not None else None,
-    )
     selected_kernel = (
-        memory_kernel
-        if memory_kernel is not None
-        else select_memory_kernel(settings, platform_state)
+        memory_kernel if memory_kernel is not None else select_memory_kernel(settings)
     )
     markdown = MarkdownIt("commonmark", {"html": False})
     session_fixed_now: datetime | None = None
@@ -488,27 +391,21 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         key_store.ensure()
-        legacy_kernel_selected = selected_kernel.kind == "legacy"
         managed_kernel = (
             cast(ManagedMemoryKernelPort, selected_kernel)
             if isinstance(selected_kernel, ManagedMemoryKernelPort)
             else None
         )
-        if legacy_kernel_selected:
-            await platform_state.start()
-        elif managed_kernel is not None:
+        if managed_kernel is not None:
             await managed_kernel.start()
         try:
             yield
         finally:
             if managed_kernel is not None:
                 await managed_kernel.close()
-            elif legacy_kernel_selected and platform_state.connection is not None:
-                await platform_state.close()
 
     app = FastAPI(title="Personal Agent Memory", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
-    app.state.platform_state = platform_state
     app.state.memory_kernel = selected_kernel
     app.state.management_session_clock = (
         (lambda: session_fixed_now) if session_fixed_now is not None else lambda: datetime.now(UTC)
@@ -540,25 +437,17 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    def require_legacy_state() -> None:
-        if selected_kernel.kind != "legacy" or platform_state.connection is None:
-            raise PlatformStateUnavailableError("legacy platform state is not started")
 
-    async def status_payload() -> dict[str, str | int | bool]:
+    async def status_payload() -> dict[str, str]:
         key = key_store.read()
         kernel_health = await asyncio.to_thread(selected_kernel.health)
         graph_status = await asyncio.to_thread(selected_kernel.graph_status)
-        legacy_running = selected_kernel.kind == "legacy" and platform_state.connection is not None
         return {
             "status": "ready" if kernel_health.status == "ready" else "degraded",
-            "database": "ok" if legacy_running else "not_started",
-            "background_worker": "running" if legacy_running else "not_started",
             "memory_kernel": kernel_health.kind,
             "memory_kernel_status": kernel_health.status,
             "memory_kernel_detail": kernel_health.detail,
             "graph_index_status": str(graph_status.get("status", "not_configured")),
-            "startup_count": platform_state.startup_count,
-            "previous_shutdown_clean": platform_state.previous_shutdown_clean,
             "api_key_fingerprint": key_store.fingerprint(key),
         }
 
@@ -578,25 +467,17 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             content={"detail": str(error)},
         )
 
-    @app.exception_handler(PlatformStateUnavailableError)
-    async def platform_state_unavailable(
-        _: Request, error: PlatformStateUnavailableError
-    ) -> JSONResponse:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"detail": str(error)},
-        )
 
     @app.get("/health/live", dependencies=[Depends(authenticate)])
     def live() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/api/v1/status", dependencies=[Depends(authenticate)])
-    async def api_status() -> dict[str, str | int | bool]:
+    async def api_status() -> dict[str, str]:
         return await status_payload()
 
     @app.get("/mcp/health", dependencies=[Depends(authenticate)])
-    async def mcp_status() -> dict[str, str | int | bool]:
+    async def mcp_status() -> dict[str, str]:
         return await status_payload()
 
     @app.post("/api/v1/auth/rotate", dependencies=[Depends(authenticate)])
@@ -639,19 +520,6 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
         response.delete_cookie("pam_management_session", path="/")
         return {"status": "logged_out"}
 
-    def libraries_payload() -> list[dict[str, str]]:
-        if selected_kernel.kind == "mem2":
-            return [
-                {
-                    "id": str(region["region_id"]),
-                    "library_id": str(region["region_id"]),
-                    "canonical_path": f"memory://{region['region_id']}",
-                    "kind": str(region["kind"]),
-                    "availability": "available",
-                }
-                for region in selected_kernel.list_regions()
-            ]
-        return [library.payload() for library in platform_state.list_libraries()]
 
     def region_error(error: RegionError) -> HTTPException:
         if isinstance(error, RegionNotFoundError):
@@ -660,7 +528,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
         return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error))
 
-    def binding_error(error: RegionError | ProjectBindingError) -> HTTPException:
+    def binding_error(error: RegionError) -> HTTPException:
         detail = str(error)
         if detail in {"memory region not found", "project binding not found"}:
             return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
@@ -702,110 +570,11 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
         except RegionError as error:
             raise region_error(error) from error
 
-    @app.post(
-        "/api/v1/libraries",
-        dependencies=[Depends(authenticate)],
-        status_code=status.HTTP_201_CREATED,
-    )
-    async def register_library(registration: LibraryRegistration) -> dict[str, str]:
-        try:
-            return platform_state.register_library(
-                registration.path,
-                registration.kind,
-                registration.reuse_existing_git,
-            ).payload()
-        except DuplicateLibraryError as error:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"reason": str(error), "library_id": error.library_id},
-            ) from error
-        except LibraryRegistrationError as error:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
-            ) from error
 
-    @app.post("/api/v1/libraries/{library_id}/scan", dependencies=[Depends(authenticate)])
-    async def scan_library(library_id: str, accept_external: bool = False) -> dict[str, int | str]:
-        try:
-            if accept_external:
-                raise MemoryMutationError(
-                    "bulk external acceptance is disabled; resolve each out-of-band "
-                    "change explicitly"
-                )
-            return await selected_kernel.scan_library(ScanLibraryRequest(library_id=library_id))
-        except (LibraryRegistrationError, MemoryMutationError) as error:
-            status_code = (
-                status.HTTP_404_NOT_FOUND
-                if str(error) == "memory library not found"
-                else status.HTTP_422_UNPROCESSABLE_CONTENT
-            )
-            raise HTTPException(status_code=status_code, detail=str(error)) from error
 
-    @app.get(
-        "/api/v1/libraries/{library_id}/out-of-band-changes",
-        dependencies=[Depends(authenticate)],
-    )
-    async def out_of_band_changes(library_id: str) -> list[dict[str, object]]:
-        try:
-            return selected_kernel.list_out_of_band_changes(
-                ListOutOfBandChangesRequest(library_id=library_id)
-            )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
-            raise mutation_error(error) from error
 
-    @app.get(
-        "/api/v1/libraries/{library_id}/out-of-band-changes/{change_id}",
-        dependencies=[Depends(authenticate)],
-    )
-    async def out_of_band_change(library_id: str, change_id: str) -> dict[str, object]:
-        try:
-            return selected_kernel.out_of_band_change(
-                OutOfBandChangeRequest(library_id=library_id, change_id=change_id)
-            )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
-            raise mutation_error(error) from error
 
-    @app.post(
-        "/api/v1/libraries/{library_id}/out-of-band-changes/{change_id}/resolve",
-        dependencies=[Depends(authenticate)],
-    )
-    async def resolve_out_of_band_change(
-        library_id: str, change_id: str, resolution: OutOfBandResolution
-    ) -> dict[str, str]:
-        try:
-            return await selected_kernel.resolve_out_of_band_change(
-                ResolveOutOfBandChangeRequest(
-                    library_id=library_id,
-                    change_id=change_id,
-                    action=resolution.action,
-                    operation_id=resolution.operation_id,
-                    actor=resolution.actor_type,
-                    source=resolution.source,
-                    final_content=resolution.final_content,
-                    external_path=resolution.external_path,
-                )
-            )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
-            raise mutation_error(error) from error
 
-    @app.post(
-        "/api/v1/libraries/{library_id}/vector-index/rebuild",
-        dependencies=[Depends(authenticate)],
-        status_code=status.HTTP_202_ACCEPTED,
-    )
-    async def rebuild_vector_index(library_id: str) -> dict[str, object]:
-        try:
-            require_legacy_state()
-            async with platform_state.library_write_lock(library_id):
-                job_id = platform_state.enqueue_vector_rebuild(library_id)
-        except LibraryRegistrationError as error:
-            code = (
-                status.HTTP_404_NOT_FOUND
-                if str(error) == "memory library not found"
-                else status.HTTP_422_UNPROCESSABLE_CONTENT
-            )
-            raise HTTPException(status_code=code, detail=str(error)) from error
-        return {"library_id": library_id, "job_id": job_id, "status": "pending"}
 
     @app.post(
         "/api/v1/libraries/{library_id}/graph-index/rebuild",
@@ -813,95 +582,42 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def rebuild_graph_index(library_id: str) -> dict[str, object]:
-        if selected_kernel.kind != "legacy":
-            try:
-                return await selected_kernel.rebuild_graph(library_id)
-            except MemoryRecordNotFoundError as error:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
-                ) from error
-            except ValueError as error:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail=str(error),
-                ) from error
         try:
-            require_legacy_state()
-            async with platform_state.library_write_lock(library_id):
-                job_id = platform_state.enqueue_graph_rebuild(library_id)
-        except LibraryRegistrationError as error:
-            code = (
-                status.HTTP_404_NOT_FOUND
-                if str(error) == "memory library not found"
-                else status.HTTP_422_UNPROCESSABLE_CONTENT
-            )
-            raise HTTPException(status_code=code, detail=str(error)) from error
-        return {"library_id": library_id, "job_id": job_id, "status": "pending"}
+            return await selected_kernel.rebuild_graph(library_id)
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
+            ) from error
 
     @app.get(
         "/api/v1/libraries/{library_id}/graph-status",
         dependencies=[Depends(authenticate)],
     )
     async def graph_status(library_id: str) -> dict[str, object]:
-        if selected_kernel.kind != "legacy":
-            try:
-                return await asyncio.to_thread(
-                    selected_kernel.graph_status,
-                    library_id,
-                )
-            except MemoryRecordNotFoundError as error:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
-                ) from error
-            except ValueError as error:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail=str(error),
-                ) from error
         try:
-            return platform_state.graph_status(library_id)
-        except LibraryRegistrationError as error:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
-
-    @app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(authenticate)])
-    async def background_job(job_id: int) -> dict[str, object]:
-        job_state = platform_state.job_status(job_id)
-        if job_state is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
-        return {"job_id": job_id, "status": job_state}
-
-    @app.get("/api/v1/libraries/{library_id}/ignore-rules", dependencies=[Depends(authenticate)])
-    async def get_ignore_rules(library_id: str) -> dict[str, object]:
-        try:
-            patterns = platform_state.library_ignore_patterns(library_id)
-        except LibraryRegistrationError as error:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
-        return {"library_id": library_id, "patterns": patterns}
-
-    @app.put("/api/v1/libraries/{library_id}/ignore-rules", dependencies=[Depends(authenticate)])
-    async def update_ignore_rules(library_id: str, update: IgnoreRulesUpdate) -> dict[str, object]:
-        try:
-            require_legacy_state()
-            async with platform_state.library_write_lock(library_id):
-                patterns = platform_state.update_library_ignore_patterns(
-                    library_id, tuple(update.patterns)
-                )
-        except LibraryRegistrationError as error:
-            status_code = (
-                status.HTTP_404_NOT_FOUND
-                if str(error) == "memory library not found"
-                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            return await asyncio.to_thread(
+                selected_kernel.graph_status,
+                library_id,
             )
-            raise HTTPException(status_code=status_code, detail=str(error)) from error
-        return {"library_id": library_id, "patterns": patterns}
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
+            ) from error
 
-    @app.get("/api/v1/libraries", dependencies=[Depends(authenticate)])
-    async def list_libraries() -> list[dict[str, str]]:
-        return libraries_payload()
 
-    @app.get("/mcp/libraries", dependencies=[Depends(authenticate)])
-    async def mcp_list_libraries() -> list[dict[str, str]]:
-        return libraries_payload()
+
+
+
 
     def project_bindings_payload() -> list[dict[str, str]]:
         return selected_kernel.list_region_bindings()
@@ -910,14 +626,14 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     async def resolve_project_binding(cwd: str) -> dict[str, str]:
         try:
             return selected_kernel.resolve_region(ResolveRegionRequest(cwd=cwd))
-        except (ProjectBindingError, RegionError) as error:
+        except RegionError as error:
             raise binding_error(error) from error
 
     @app.post("/mcp/project-bindings/resolve", dependencies=[Depends(authenticate)])
     async def mcp_resolve_project_binding(resolution: CwdResolution) -> dict[str, str]:
         try:
             return selected_kernel.resolve_region(ResolveRegionRequest(cwd=resolution.cwd))
-        except (ProjectBindingError, RegionError) as error:
+        except RegionError as error:
             raise binding_error(error) from error
 
     @app.post(
@@ -933,12 +649,12 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     main_project_binding_id=association.main_project_binding_id,
                 )
             )
-        except (DuplicateProjectBindingError, DuplicateRegionBindingError) as error:
+        except DuplicateRegionBindingError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"reason": str(error), "binding_id": error.binding_id},
             ) from error
-        except (ProjectBindingError, RegionError) as error:
+        except RegionError as error:
             raise binding_error(error) from error
 
     @app.post(
@@ -954,12 +670,12 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     region_id=binding.target_region_id,
                 )
             )
-        except (DuplicateProjectBindingError, DuplicateRegionBindingError) as error:
+        except DuplicateRegionBindingError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"reason": str(error), "binding_id": error.binding_id},
             ) from error
-        except (ProjectBindingError, RegionError) as error:
+        except RegionError as error:
             raise binding_error(error) from error
 
     @app.get("/api/v1/project-bindings", dependencies=[Depends(authenticate)])
@@ -977,7 +693,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     region_id=update.target_region_id,
                 )
             )
-        except (ProjectBindingError, RegionError) as error:
+        except RegionError as error:
             raise binding_error(error) from error
 
     @app.delete(
@@ -988,22 +704,12 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     async def delete_project_binding(binding_id: str) -> Response:
         try:
             selected_kernel.delete_region_binding(DeleteRegionBindingRequest(binding_id=binding_id))
-        except (ProjectBindingError, RegionBindingNotFoundError) as error:
+        except RegionBindingNotFoundError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
         except RegionBindingError as error:
             raise binding_error(error) from error
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    @app.get("/mcp/libraries/{library_id}/sync-status", dependencies=[Depends(authenticate)])
-    async def mcp_sync_status(library_id: str) -> dict[str, str]:
-        library = platform_state.library(library_id)
-        if library is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="library not found")
-        return {
-            "library_id": library.id,
-            "availability": library.availability,
-            "sync_status": library.sync_status,
-        }
 
     async def search_payload(request: SearchRequest) -> dict[str, object]:
         try:
@@ -1032,17 +738,10 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 requested_budget=request.token_budget,
                 target_model=request.target_model,
             )
-        except ProjectBindingError as error:
+        except RegionError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
             ) from error
-        except LibraryRegistrationError as error:
-            status_code = (
-                status.HTTP_404_NOT_FOUND
-                if str(error) == "memory library not found"
-                else status.HTTP_422_UNPROCESSABLE_CONTENT
-            )
-            raise HTTPException(status_code=status_code, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
@@ -1079,36 +778,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     async def mcp_search(request: SearchRequest) -> dict[str, object]:
         return await search_payload(request)
 
-    def candidate_error(error: CandidateGovernanceError) -> HTTPException:
-        detail = str(error)
-        if detail in {"candidate memory not found", "memory library not found"}:
-            code = status.HTTP_404_NOT_FOUND
-        elif "already" in detail or "no longer pending" in detail or "in the recycle bin" in detail:
-            code = status.HTTP_409_CONFLICT
-        else:
-            code = status.HTTP_422_UNPROCESSABLE_CONTENT
-        return HTTPException(status_code=code, detail=detail)
 
-    async def create_candidate_payload(candidate: CandidateCreate) -> dict[str, object]:
-        try:
-            return await selected_kernel.write(
-                CreateMemoryRequest(
-                    library_id=candidate.library_id,
-                    content=candidate.body,
-                    memory_type=candidate.suggested_type,
-                    source_references=tuple(candidate.source_references),
-                    actor=candidate.creator,
-                    idempotency_key=candidate.idempotency_key,
-                )
-            )
-        except (CandidateGovernanceError, MemoryMutationError) as error:
-            if isinstance(error, MemoryMutationError):
-                raise mutation_error(error) from error
-            raise candidate_error(error) from error
-        except ValueError as error:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
-            ) from error
 
     @app.post(
         "/api/v1/capture/events",
@@ -1127,7 +797,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             client_deadline_ms,
             now_epoch_seconds=time.time(),
             maximum_seconds=(
-                2.0 if selected_kernel.kind == "mem2" else CAPTURE_BINDING_DEADLINE_SECONDS
+                2.0
             ),
         )
         request_deadline = monotonic_before_wall_sample + request_budget
@@ -1157,99 +827,27 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="capture timed out while waiting for a stable project binding",
             ) from error
-        except CapturePersistenceBusyError as error:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="capture persistence is temporarily unavailable",
-            ) from error
         except CaptureContractError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
             ) from error
-        except (CandidateGovernanceError, ProjectBindingError, RegionError) as error:
-            raise candidate_error(CandidateGovernanceError(str(error))) from error
+        except RegionError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
 
     @app.get("/api/v1/capture/events", dependencies=[Depends(authenticate)])
     async def capture_events(session_id: str | None = None) -> list[dict[str, object]]:
         return selected_kernel.list_capture_events(CaptureEventsRequest(session_id=session_id))
 
-    @app.get("/api/v1/sensitive-quarantine", dependencies=[Depends(authenticate)])
-    async def sensitive_quarantine(
-        offset: int = Query(default=0, ge=0),
-        limit: int = Query(default=100, ge=1, le=100),
-    ) -> list[dict[str, object]]:
-        return selected_kernel.list_sensitive_quarantine(
-            SensitiveQuarantineListRequest(offset=offset, limit=limit)
-        )
 
-    @app.post(
-        "/api/v1/sensitive-quarantine/{record_id}/resolve",
-        dependencies=[Depends(authenticate)],
-    )
-    async def resolve_sensitive_quarantine(
-        record_id: str, decision: SensitiveResolution
-    ) -> dict[str, object]:
-        try:
-            return selected_kernel.resolve_sensitive_quarantine(
-                SensitiveQuarantineResolutionRequest(
-                    record_id=record_id, resolution=decision.resolution
-                )
-            )
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
     @app.get("/api/v1/capture/rounds", dependencies=[Depends(authenticate)])
     async def capture_rounds(session_id: str | None = None) -> list[dict[str, object]]:
         return selected_kernel.list_capture_rounds(CaptureRoundsRequest(session_id=session_id))
 
-    @app.get("/api/v1/candidate-governance", dependencies=[Depends(authenticate)])
-    async def candidate_governance_queue(
-        classification: str | None = None,
-    ) -> list[dict[str, object]]:
-        try:
-            return selected_kernel.candidate_governance_queue(
-                CandidateGovernanceListRequest(classification=classification)
-            )
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
-    @app.get(
-        "/api/v1/candidates/{candidate_id}/governance",
-        dependencies=[Depends(authenticate)],
-    )
-    async def candidate_governance(candidate_id: str) -> dict[str, object]:
-        try:
-            return selected_kernel.candidate_governance(
-                CandidateGovernanceRequest(memory_id=candidate_id)
-            )
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
-    @app.post(
-        "/api/v1/candidates/{candidate_id}/resolve",
-        dependencies=[Depends(authenticate)],
-    )
-    async def resolve_candidate(
-        candidate_id: str, resolution: CandidateResolution
-    ) -> dict[str, object]:
-        try:
-            return await selected_kernel.decide_candidate(
-                CandidateDecisionRequest(
-                    memory_id=candidate_id,
-                    decision="resolve",
-                    actor=resolution.operator,
-                    reason=resolution.reason,
-                    operation_id=resolution.operation_id,
-                    resolution_action=resolution.action,
-                    merged_body=resolution.merged_body,
-                    effective_at=resolution.effective_at,
-                    condition=resolution.condition,
-                )
-            )
-        except (CandidateGovernanceError, MemoryMutationError) as error:
-            if isinstance(error, MemoryMutationError):
-                raise mutation_error(error) from error
-            raise candidate_error(error) from error
 
     @app.post(
         "/api/v1/capture/consolidate",
@@ -1268,7 +866,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             client_deadline_ms,
             now_epoch_seconds=time.time(),
             maximum_seconds=(
-                2.0 if selected_kernel.kind == "mem2" else CAPTURE_BINDING_DEADLINE_SECONDS
+                2.0
             ),
         )
         request_deadline = monotonic_before_wall_sample + request_budget
@@ -1283,10 +881,10 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 )
             )
             return {"queued": evolved["queued"]}
-        except CapturePersistenceBusyError as error:
+        except TimeoutError as error:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="capture consolidation is temporarily unavailable",
+                detail="capture consolidation timed out",
             ) from error
 
     @app.post(
@@ -1353,7 +951,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             return selected_kernel.get_retention_policy(
                 RetentionPolicyRequest(library_id=library_id)
             )
-        except (LibraryRegistrationError, RegionError) as error:
+        except RegionError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.put(
@@ -1367,7 +965,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             return await selected_kernel.update_retention_policy(
                 UpdateRetentionPolicyRequest(library_id=library_id, **policy.model_dump())
             )
-        except (LibraryRegistrationError, RegionError) as error:
+        except RegionError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.get(
@@ -1379,7 +977,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             return await selected_kernel.preview_retention_cleanup(
                 RetentionCleanupRequest(library_id=library_id)
             )
-        except (LibraryRegistrationError, RegionError) as error:
+        except RegionError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
     @app.post(
@@ -1391,150 +989,20 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             return await selected_kernel.run_retention_cleanup(
                 RetentionCleanupRequest(library_id=library_id)
             )
-        except (LibraryRegistrationError, RegionError) as error:
+        except RegionError as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
-    @app.put(
-        "/api/v1/candidates/{candidate_id}/pin",
-        dependencies=[Depends(authenticate)],
-    )
-    async def pin_candidate(candidate_id: str, update: CandidatePinUpdate) -> dict[str, object]:
-        try:
-            return await selected_kernel.pin_candidate(
-                CandidatePinRequest(memory_id=candidate_id, pinned=update.pinned)
-            )
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
-    @app.get(
-        "/api/v1/libraries/{library_id}/candidate-recycle-bin",
-        dependencies=[Depends(authenticate)],
-    )
-    async def candidate_recycle_bin(library_id: str) -> list[dict[str, object]]:
-        try:
-            return selected_kernel.list_recycled_candidates(
-                CandidateRecycleListRequest(library_id=library_id)
-            )
-        except LibraryRegistrationError as error:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
 
-    @app.post(
-        "/api/v1/candidates/{candidate_id}/restore",
-        dependencies=[Depends(authenticate)],
-    )
-    async def restore_recycled_candidate(candidate_id: str) -> dict[str, object]:
-        try:
-            return await selected_kernel.restore_recycled_candidate(
-                CandidateRestoreRequest(memory_id=candidate_id)
-            )
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
-    @app.delete("/api/v1/diagnostics", dependencies=[Depends(authenticate)])
-    async def clear_diagnostics() -> dict[str, int]:
-        return {"deleted": selected_kernel.clear_diagnostics(ClearDiagnosticsRequest())}
 
-    @app.post(
-        "/mcp/candidates",
-        dependencies=[Depends(authenticate)],
-        status_code=status.HTTP_201_CREATED,
-    )
-    async def mcp_create_candidate(candidate: CandidateCreate) -> dict[str, object]:
-        return await create_candidate_payload(candidate)
 
-    @app.get("/mcp/candidates", dependencies=[Depends(authenticate)])
-    async def mcp_list_candidates(
-        library_id: str | None = None, candidate_status: str | None = None
-    ) -> list[dict[str, object]]:
-        try:
-            return selected_kernel.list_candidates(
-                ListCandidatesRequest(library_id=library_id, status=candidate_status)
-            )
-        except (CandidateGovernanceError, MemoryMutationError) as error:
-            if isinstance(error, MemoryMutationError):
-                raise mutation_error(error) from error
-            raise candidate_error(error) from error
 
-    @app.get("/mcp/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
-    async def mcp_get_candidate(candidate_id: str) -> dict[str, object]:
-        try:
-            return selected_kernel.inspect(CandidateInspectRequest(memory_id=candidate_id))
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
-    @app.get("/api/v1/candidates", dependencies=[Depends(authenticate)])
-    async def list_candidates(
-        library_id: str | None = None, candidate_status: str | None = None
-    ) -> list[dict[str, object]]:
-        try:
-            return selected_kernel.list_candidates(
-                ListCandidatesRequest(library_id=library_id, status=candidate_status)
-            )
-        except (CandidateGovernanceError, MemoryMutationError) as error:
-            if isinstance(error, MemoryMutationError):
-                raise mutation_error(error) from error
-            raise candidate_error(error) from error
 
-    @app.get("/api/v1/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
-    async def get_candidate(candidate_id: str) -> dict[str, object]:
-        try:
-            return selected_kernel.inspect(CandidateInspectRequest(memory_id=candidate_id))
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
-    @app.put("/api/v1/candidates/{candidate_id}", dependencies=[Depends(authenticate)])
-    async def edit_candidate(candidate_id: str, edit: CandidateEdit) -> dict[str, object]:
-        try:
-            return await selected_kernel.update(
-                CandidateUpdateRequest(
-                    memory_id=candidate_id,
-                    content=edit.body,
-                    actor=edit.operator,
-                    reason=edit.reason,
-                )
-            )
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
-    @app.post(
-        "/api/v1/candidates/{candidate_id}/approve",
-        dependencies=[Depends(authenticate)],
-    )
-    async def approve_candidate(
-        candidate_id: str, decision: CandidateDecision
-    ) -> dict[str, object]:
-        try:
-            return await selected_kernel.decide_candidate(
-                CandidateDecisionRequest(
-                    memory_id=candidate_id,
-                    decision="approve",
-                    actor=decision.operator,
-                    reason=decision.reason,
-                    operation_id=decision.operation_id,
-                )
-            )
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
-        except (MemoryMutationError, MemoryGovernanceError) as error:
-            raise mutation_error(error) from error
 
-    @app.post(
-        "/api/v1/candidates/{candidate_id}/reject",
-        dependencies=[Depends(authenticate)],
-    )
-    async def reject_candidate(candidate_id: str, decision: CandidateDecision) -> dict[str, object]:
-        try:
-            return await selected_kernel.decide_candidate(
-                CandidateDecisionRequest(
-                    memory_id=candidate_id,
-                    decision="reject",
-                    actor=decision.operator,
-                    reason=decision.reason,
-                    operation_id=decision.operation_id,
-                )
-            )
-        except CandidateGovernanceError as error:
-            raise candidate_error(error) from error
 
     def mutation_error(error: Exception) -> HTTPException:
         detail = str(error)
@@ -1565,7 +1033,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     async def list_documents(library_id: str) -> list[dict[str, object]]:
         try:
             return selected_kernel.list_documents(ListDocumentsRequest(library_id=library_id))
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.get(
@@ -1576,7 +1044,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     async def export_library_markdown(library_id: str) -> PlainTextResponse:
         try:
             documents = selected_kernel.list_documents(ListDocumentsRequest(library_id=library_id))
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
         lines = [f"# Memory export: {library_id}", ""]
         for document in documents:
@@ -1600,7 +1068,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     async def read_document(library_id: str, path: str) -> dict[str, object]:
         try:
             return selected_kernel.inspect(DocumentInspectRequest(library_id=library_id, path=path))
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1617,7 +1085,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     expected_revision=preview.expected_source_version,
                 )
             )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
         result["rendered_html"] = markdown.render(preview.content)
         return result
@@ -1638,7 +1106,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 )
             )
             return {key: str(value) for key, value in updated.items()}
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1656,7 +1124,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     expected_revision=deletion.expected_source_version,
                 )
             )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.delete(
@@ -1677,7 +1145,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     mode=deletion.mode,
                 )
             )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.get(
@@ -1687,7 +1155,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     async def list_forgotten_memories(library_id: str) -> list[dict[str, object]]:
         try:
             return selected_kernel.list_forgotten(ListForgottenRequest(library_id=library_id))
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1708,14 +1176,14 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     source=restore.source,
                 )
             )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.get("/api/v1/libraries/{library_id}/history", dependencies=[Depends(authenticate)])
     async def library_history(library_id: str, limit: int = 50) -> list[dict[str, str]]:
         try:
             return selected_kernel.audit(AuditMemoryRequest(library_id=library_id, limit=limit))
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.get(
@@ -1727,7 +1195,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             return selected_kernel.history_diff(
                 HistoryDiffRequest(library_id=library_id, commit=commit)
             )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     @app.post(
@@ -1747,21 +1215,21 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     source=restore.source,
                 )
             )
-        except (MemoryMutationError, MemoryGovernanceError) as error:
+        except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 
     mcp_tools: list[dict[str, object]] = [
         {
             "name": "memory_search",
             "description": (
-                "Search one project-bound memory library, one explicit region, or multiple "
-                "explicit regions through cross-region recall."
+                "Search one project-bound region, one explicit region, or multiple explicit "
+                "regions through cross-region recall."
             ),
             "inputSchema": SearchRequest.model_json_schema(),
         },
         {
             "name": "memory_get",
-            "description": "Read one authoritative Markdown document by library and relative path.",
+            "description": "Read one memory unit by region and memory:// path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1769,38 +1237,6 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     "path": {"type": "string"},
                 },
                 "required": ["library_id", "path"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "candidate_create",
-            "description": "Create an unapproved candidate memory.",
-            "inputSchema": CandidateCreate.model_json_schema(),
-        },
-        {
-            "name": "candidate_list",
-            "description": "List candidate memories, optionally filtered by library and status.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "library_id": {"type": "string"},
-                    "candidate_status": {"type": "string"},
-                },
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "library_list",
-            "description": "List registered memory libraries.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-        {
-            "name": "sync_status",
-            "description": "Read availability and synchronization status for one memory library.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"library_id": {"type": "string"}},
-                "required": ["library_id"],
                 "additionalProperties": False,
             },
         },
@@ -1830,28 +1266,6 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             library_id = str(arguments.get("library_id", ""))
             path = str(arguments.get("path", ""))
             return selected_kernel.inspect(DocumentInspectRequest(library_id=library_id, path=path))
-        if name == "candidate_create":
-            return await create_candidate_payload(CandidateCreate.model_validate(arguments))
-        if name == "candidate_list":
-            filter_library_id = arguments.get("library_id")
-            candidate_status = arguments.get("candidate_status")
-            return selected_kernel.list_candidates(
-                ListCandidatesRequest(
-                    library_id=(None if filter_library_id is None else str(filter_library_id)),
-                    status=(None if candidate_status is None else str(candidate_status)),
-                )
-            )
-        if name == "library_list":
-            return libraries_payload()
-        if name == "sync_status":
-            library = platform_state.library(str(arguments.get("library_id", "")))
-            if library is None:
-                raise LibraryRegistrationError("memory library not found")
-            return {
-                "library_id": library.id,
-                "availability": library.availability,
-                "sync_status": library.sync_status,
-            }
         raise ValueError("unknown MCP tool")
 
     @app.post("/mcp", dependencies=[Depends(authenticate)], response_model=None)
@@ -1895,14 +1309,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     "isError": True,
                 },
             }
-        except (
-            CandidateGovernanceError,
-            LibraryRegistrationError,
-            MemoryMutationError,
-            ProjectBindingError,
-            ValidationError,
-            ValueError,
-        ) as error:
+        except (MemoryGovernanceError, ValidationError, ValueError) as error:
             return {
                 "jsonrpc": "2.0",
                 "id": rpc.id,
@@ -1914,13 +1321,9 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
         return {"jsonrpc": "2.0", "id": rpc.id, "result": mcp_tool_result(result)}
 
     frontend = Path(__file__).parent / "static" / "index.html"
-    editor_history = Path(__file__).parent / "static" / "editor_history.js"
 
-    @app.get("/editor-history.js")
-    def editor_history_script() -> FileResponse:
-        return FileResponse(editor_history, media_type="text/javascript")
 
-    @app.get("/", response_class=HTMLResponse)
+    @app.get("/")
     def management_interface() -> FileResponse:
         return FileResponse(frontend)
 

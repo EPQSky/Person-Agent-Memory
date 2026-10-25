@@ -18,7 +18,7 @@ CAPTURE_HOOK = ROOT / "plugins" / "personal-agent-memory" / "scripts" / "capture
 
 
 def _app(state_dir: Path):
-    return create_app(Settings(state_dir=state_dir, memory_kernel="mem2"))
+    return create_app(Settings(state_dir=state_dir))
 
 
 def _headers(state_dir: Path) -> dict[str, str]:
@@ -937,14 +937,7 @@ def test_session_retention_policy_archives_captures_but_keeps_evolved_units(
         policy = client.put(
             f"/api/v1/libraries/{region_id}/retention-policy",
             headers=headers,
-            json={
-                "inbox_days": 0,
-                "candidate_days": 90,
-                "recycle_days": 30,
-                "early_inbox_cleanup": True,
-                "diagnostics_enabled": False,
-                "diagnostic_days": 7,
-            },
+            json={"inbox_days": 0},
         )
         assert policy.status_code == 200, policy.text
         assert policy.json()["inbox_days"] == 0

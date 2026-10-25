@@ -27,9 +27,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-acceptance = [
-  "selenium>=4.35,<5",
-]
 dev = [
   "httpx>=0.28,<1",
   "mypy>=1.17,<2",
@@ -65,7 +62,3 @@ packages = ["personal_agent_memory"]
 [[tool.mypy.overrides]]
 module = ["jiuwen_memory.*", "milvus_lite.*", "pymilvus.*"]
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "personal_agent_memory.graph_adapter"
-warn_unused_ignores = false

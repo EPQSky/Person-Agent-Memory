@@ -18,7 +18,7 @@ from personal_agent_memory.regions import MemoryRegion
 
 
 def _app(state_dir: Path):
-    return create_app(Settings(state_dir=state_dir, memory_kernel="mem2"))
+    return create_app(Settings(state_dir=state_dir))
 
 
 def _long_region_id(index: int, *, namespace: str = "healthy") -> str:

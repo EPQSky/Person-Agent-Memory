@@ -4967,11 +4967,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "region_id": region.region_id,
             "inbox_days": days,
             "retention_days": days,
-            "candidate_days": 0,
-            "recycle_days": 0,
-            "early_inbox_cleanup": True,
-            "diagnostics_enabled": False,
-            "diagnostic_days": 0,
         }
 
     def _retention_plan(self, region: MemoryRegion) -> list[tuple[Scope, MemoryUnit]]:

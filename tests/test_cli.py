@@ -63,9 +63,10 @@ def test_port_preflight_allows_immediate_restart_after_connection_closes() -> No
     ensure_port_available("127.0.0.1", port)
 
 
-def test_serve_exposes_memory_kernel_feature_flag() -> None:
+def test_serve_has_no_memory_kernel_feature_flag() -> None:
     result = CliRunner().invoke(cli, ["serve", "--help"])
 
     assert result.exit_code == 0
-    assert "--memory-kernel" in result.output
-    assert "legacy" in result.output
+    assert "--state-dir" in result.output
+    assert "--memory-kernel" not in result.output
+    assert "legacy" not in result.output

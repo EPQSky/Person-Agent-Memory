@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import ast
-import asyncio
 import hashlib
 import json
 import os
 import re
 import shutil
 import socket
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -16,8 +13,6 @@ import tomllib
 from pathlib import Path
 
 import pytest
-
-from personal_agent_memory.state import PlatformState
 
 ROOT = Path(__file__).parents[1]
 
@@ -1881,8 +1876,8 @@ import sys
 
 state = Path(sys.argv[sys.argv.index('--state-dir') + 1])
 state.mkdir(parents=True, exist_ok=True)
-if '--memory-kernel' not in sys.argv or sys.argv[sys.argv.index('--memory-kernel') + 1] != 'mem2':
-    raise SystemExit('installer did not select the mem2 memory kernel')
+if '--memory-kernel' in sys.argv:
+    raise SystemExit('installer still emits the removed memory kernel flag')
 (state / 'mem2').mkdir(parents=True, exist_ok=True)
 (state / 'mem2' / 'VERSION').write_text('jiuwen-memory-0.2.0\\n', encoding='utf-8')
 key_path = state / 'api-key'
@@ -2300,9 +2295,8 @@ esac
         expected_state_argument = str(state_dir).replace("$", "$$")
         assert f'--state-dir "{expected_state_argument}"' in unit_text
         assert f'--library-root "{library_root}"' in unit_text
-        assert (
-            f'--host "127.0.0.1" --port "{port}" --memory-kernel "mem2"' in unit_text
-        )
+        assert f'--host "127.0.0.1" --port "{port}"' in unit_text
+        assert '--memory-kernel' not in unit_text
         assert (
             state_dir / "mem2" / "VERSION"
         ).read_text(encoding="utf-8") == "jiuwen-memory-0.2.0\n"
@@ -4198,12 +4192,14 @@ def test_release_contract_pins_mem2_dependencies_and_python_matrix() -> None:
         "export --frozen --no-dev --no-hashes --no-emit-project",
         '--constraints "$constraints_file"',
         "--no-python-downloads personal-agent-memory",
-        '--memory-kernel "mem2"',
         "/api/v1/regions/tree",
         "/mcp/project-bindings/resolve",
         'state_dir / "mem2" / "VERSION"',
     ):
         assert contract in installer
+    cli = (ROOT / "src/personal_agent_memory/cli.py").read_text(encoding="utf-8")
+    assert "--memory-kernel" not in cli
+    assert "PERSONAL_AGENT_MEMORY_KERNEL" not in cli
 
 
 def test_real_lifecycle_verifier_reports_reproducible_skip_gate() -> None:
@@ -4223,63 +4219,67 @@ def test_real_lifecycle_verifier_reports_reproducible_skip_gate() -> None:
     assert "PAM_INSTALL_ACCEPTANCE_DEDICATED_USER=1" in result.stderr
 
     script = (ROOT / "scripts/verify-linux-installer.sh").read_text(encoding="utf-8")
-    assert '"${VERSION_ID:-}" =~ ^(22\\.04|24\\.04)$' in script
+    assert r'"${VERSION_ID:-}" =~ ^(22\.04|24\.04)$' in script
     assert 'python_command="$(command -v "$candidate")"' in script
     assert "Python 3.11, 3.12, or 3.13 is required" in script
     assert "python3 - " not in script
     assert 'managed_bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"' in script
     assert 'PATH="$managed_bin_dir:$PATH"; export PATH' in script
-    assert '"$unit_path" "$codex_home" "$acceptance_scenario" <<\x27PY\x27' in script
-    assert '"$unit_path" "$CODEX_HOME" "$acceptance_scenario"' not in script
-    assert script.index(
-        'skip "Personal Agent Memory command already exists for this user"'
-    ) < script.index('managed_bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"')
-    assert script.count('"$python_command" - ') == 16
+    assert script.count('"$python_command" - ') == 11
     assert '"$repo_root/install.sh"' in script
+    assert script.count('"$repo_root/install.sh" "${install_arguments[@]}"') == 2
+    assert 'codex plugin marketplace add "$repo_root" --json' in script
+    assert 'install_arguments=(--adopt-marketplace)' in script
     assert "PAM_INSTALL_ACCEPTANCE_CUSTOM_DIRS" in script
     assert "systemctl --user is-enabled" in script
     assert "systemctl --user is-active" in script
     assert 'systemctl --user restart "$service_name"' in script
+    assert 'serve --help' in script
+    assert "grep -q -- '--memory-kernel'" in script
     assert '"library_root_ownership": "user-content-never-delete"' in script
-    assert 'legacy_commit="9383eba03a8ec8901ec51c29a467265cec86c433"' in script
-    assert 'git -C "$repo_root" archive "$legacy_commit"' in script
+    assert "legacy_commit" not in script
+    assert "old_release" not in script
+    assert 'git -C "$repo_root" archive' not in script
+    assert "JiuwenMemory 0.1.2" not in script
+    assert "/mcp/candidates" not in script
+    assert "candidate_memories" not in script
+    assert '"/api/v1/libraries"' not in script
+    assert script.count('[[ ! -e "$state_dir/platform.sqlite3" ]]') == 3
     assert '"preexisting" if scenario == "normal" else "installer-managed"' in script
     assert '"marketplace_update_pending": False' in script
+    assert '"state_dir_ownership": "installer-created-exclusive"' in script
     assert 'cat "$state_dir/mem2/VERSION"' in script
     assert '"memory_kernel"] == "mem2"' in script
     assert '"/api/v1/regions/tree"' in script
     assert '"/mcp/project-bindings/resolve"' in script
     assert 'capture.mjs' in script
-    assert '"$old_release/install.sh"' in script
-    assert script.count('"$repo_root/install.sh"') >= 2
     assert '[[ "$(personal-agent-memory --version)" == "$target_version" ]]' in script
-    assert 'cmp "$work_root/state.before.json" "$work_root/state.after.json"' in script
+    assert 'cmp "$work_root/api-key.before" "$key_file"' in script
+    assert 'cmp "$work_root/regions-inode.before"' in script
+    assert 'cmp "$work_root/memory-inode.before"' in script
     assert "codex plugin list --json" in script
-    after_install = script.split(
-        '"$repo_root/install.sh" >"$work_root/install-reinstall.out"', maxsplit=1
-    )[1]
+    reinstall_marker = (
+        '"$repo_root/install.sh" "${install_arguments[@]}" "${installer_arguments[@]}" \\\n'
+        '  >"$work_root/install-reinstall.out"'
+    )
+    after_install = script.split(reinstall_marker, maxsplit=1)[1]
     assert "codex plugin add" not in after_install
     assert 'installed_path = source.get("path")' in after_install
     assert 'node "$managed_plugin_install_path/scripts/recall.mjs"' in script
     assert "grep -q 'Installer acceptance fact'" in script
-    assert script.index("grep -q 'Installer acceptance fact'") < script.index(
-        '"$work_root/state.after.json"'
+    assert script.index('project_search = request(') < script.index(
+        "grep -q 'Installer acceptance fact'"
     )
     assert 'PAM_INSTALL_ACCEPTANCE_SCENARIO=normal "$0"' in script
     assert 'PAM_INSTALL_ACCEPTANCE_SCENARIO=purge "$0"' in script
     assert '"$uninstall_command" >"$work_root/uninstall.out"' in script
     assert '"$uninstall_command" --purge >"$work_root/purge.out"' in script
     assert '"$repo_root/uninstall.sh" --purge' not in script
-    assert script.count('[[ ! -e "$state_dir" ]]') >= 2
+    assert script.count('[[ ! -e "$state_dir" ]]') >= 1
     assert script.count('[[ ! -e "$install_config_path" ]]') >= 2
     assert 'codex plugin marketplace list --json' in script
     assert '"$managed_uv_path" tool list >"$work_root/tools-after-uninstall.txt"' in script
-    assert 'cmp "$work_root/state.before.json" "$work_root/state.after-uninstall.json"' in script
-    upgrade_branch = script[script.index('if [[ "$acceptance_scenario" == "normal" ]]'):]
-    assert upgrade_branch.index('codex plugin marketplace remove') < upgrade_branch.index(
-        '"$repo_root/install.sh" >"$work_root/install-upgrade.out"'
-    )
-    assert '"installer-managed"' in upgrade_branch
+    assert 'cmp "$work_root/state-owner.before"' in script
     assert "sudo" not in script
 
 
@@ -4341,31 +4341,6 @@ def test_real_lifecycle_post_uninstall_contract_is_behavioral(
         sys.argv = original_argv
 
 
-def test_real_lifecycle_snapshot_tables_match_product_database_schema(
-    tmp_path: Path,
-) -> None:
-    async def create_database() -> None:
-        state = PlatformState(tmp_path / "platform.sqlite3")
-        await state.start()
-        await state.close()
-
-    asyncio.run(create_database())
-    script = (ROOT / "scripts/verify-linux-installer.sh").read_text(encoding="utf-8")
-    table_blocks = re.findall(
-        r"tables = \(\n((?:    \"[a-z_]+\",\n)+)\)",
-        script,
-    )
-    snapshot_tables = [ast.literal_eval(f"({block})") for block in table_blocks]
-
-    assert len(snapshot_tables) == 3
-    assert snapshot_tables[0] == snapshot_tables[1] == snapshot_tables[2]
-    assert "capture_inbox" in snapshot_tables[0]
-    assert script.count('    "capture_inbox",') == 4
-    assert '    "capture_events",' not in script
-    with sqlite3.connect(tmp_path / "platform.sqlite3") as connection:
-        for tables in snapshot_tables:
-            for table in tables:
-                connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
 
 
 def test_real_lifecycle_verifier_selects_supported_versioned_python(
@@ -4415,38 +4390,63 @@ def test_real_lifecycle_verifier_selects_supported_versioned_python(
 
 def test_linux_release_contract_documents_assets_and_lifecycle() -> None:
     release = (ROOT / "docs/release.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     required_sections = (
-        "## Support Matrix",
-        "## Release Assets",
-        "## Automatic Installation",
-        "## Manual `uv` Installation",
-        "## Service Management",
-        "## Upgrade and Reinstall",
-        "## Uninstall",
-        "## Release Verification",
-        "## Backup Responsibility",
-        "## Known Limitations",
-        "## Explicit Exclusions",
+        "## 产品范围",
+        "## 支持矩阵",
+        "## 发行资产",
+        "## 自动安装",
+        "## 手动安装",
+        "## 服务管理",
+        "## 升级和重装",
+        "## 卸载",
+        "## 发行验证",
+        "## 模型配置",
+        "## 备份责任",
+        "## 已知限制",
+        "## 明确排除项",
     )
     for section in required_sections:
         assert section in release
-    for asset in ("install.sh", "uninstall.sh", "source archive"):
+    for asset in ("install.sh", "uninstall.sh", "源码归档"):
         assert asset in release
     for phrase in (
         "Ubuntu 22.04",
         "Ubuntu 24.04",
         "systemd linger",
-        "never opens a browser",
-        "never require `sudo`",
-        "**never** removes the",
+        "安装器不会自动",
+        "不需要 `sudo`",
+        "普通卸载",
+        "保留平台状态",
         "RPM",
         "AppImage",
-        "automatic background updates",
+        "自动后台升级",
+    ):
+        assert phrase in release
+    for phrase in (
+        "记忆区域",
+        "会话记忆",
+        "多目标晋升",
+        "跨区域召回",
+        "持久化审计",
     ):
         assert phrase in release
     assert "PAM_INSTALL_ACCEPTANCE_DEDICATED_USER=1" in release
     assert "PAM_INSTALL_ACCEPTANCE_MISSING_UV=1" in release
     assert "personal-agent-memory-uninstall --purge" in release
+    assert "假模型" not in release
+    assert "发行验收只验证不依赖外部模型的 BM25 路径" in release
+    for phrase in (
+        "记忆区域",
+        "会话记忆",
+        "跨区域召回",
+        "自动晋升支持多个目标",
+        "服务重启后",
+        "审计记录仍可查询",
+    ):
+        assert phrase in readme
+    assert "JiuwenMemory 0.2.0" in readme
+    assert "JiuwenMemory 0.2.0" in release
 
 
 def test_linux_lifecycle_verifier_checks_reviewable_release_assets() -> None:
@@ -4458,8 +4458,22 @@ def test_linux_lifecycle_verifier_checks_reviewable_release_assets() -> None:
         "release asset is missing from the checkout",
         "PAM_INSTALL_ACCEPTANCE_MISSING_UV",
         "missing uv bootstrap acceptance passed",
+        "/api/v1/regions/tree",
+        "/mcp/project-bindings/resolve",
+        'state_dir/mem2/VERSION',
     ):
         assert asset in script
+    assert "legacy_commit" not in script
+    assert "old-release" not in script
+    assert 'git -C "$repo_root" archive' not in script
+    assert "/mcp/candidates" not in script
+    assert "/api/v1/libraries" not in script
+    assert "platform.sqlite3" in script
+    assert all(
+        line.strip() == '[[ ! -e "$state_dir/platform.sqlite3" ]]'
+        for line in script.splitlines()
+        if "platform.sqlite3" in line
+    )
 
 
 def test_legacy_service_unit_without_mem2_argument_is_owned_and_upgraded(
@@ -4514,11 +4528,11 @@ WantedBy=default.target
     )
     assert upgraded.returncode == 0, upgraded.stderr
     installed = unit_path.read_text(encoding="utf-8")
-    assert '--memory-kernel "mem2"' in installed
+    assert '--memory-kernel' not in installed
     assert hashlib.sha256(installed.encode()).hexdigest() == upgraded.stdout.strip()
 
     unit_path.write_text(
-        installed.replace(' --memory-kernel "mem2"', '').replace("RestartSec=2", "RestartSec=9"),
+        installed.replace("RestartSec=2", "RestartSec=9"),
         encoding="utf-8",
     )
     refused = subprocess.run(
@@ -4541,3 +4555,29 @@ WantedBy=default.target
     )
     assert refused.returncode != 0
     assert "already exists and is not installer-owned" in refused.stderr
+
+    previous_unit = installed.replace(
+        ' --port "7331"',
+        ' --port "7331" --memory-kernel "mem2"',
+    )
+    unit_path.write_text(previous_unit, encoding="utf-8")
+    previous_upgrade = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(unit_path),
+            daemon_command,
+            state_argument,
+            library_argument,
+            daemon_command,
+            "",
+            "",
+            "7331",
+        ],
+        input=unit_checker,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert previous_upgrade.returncode == 0, previous_upgrade.stderr
+    assert '--memory-kernel' not in unit_path.read_text(encoding="utf-8")

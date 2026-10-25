@@ -73,7 +73,7 @@ def recall_server(
 
 
 def context_package(
-    *, content: str = "Project fact", path: str = "memory.md", token_budget: int = 10_000
+    *, content: str = "Project fact", path: str = "memory://unit-1", token_budget: int = 10_000
 ) -> dict[str, object]:
     return {
         "schema_version": "memory-context-package/v1",
@@ -94,7 +94,7 @@ def context_package(
                 "heading": "Memory",
                 "start_line": 3,
                 "end_line": 3,
-                "source_type": "markdown",
+                "source_type": "mem2",
                 "classification": "direct",
                 "score": 0.8,
                 "source_version": "sha256:abc",
@@ -177,7 +177,7 @@ def test_plugin_recall_and_capture_reach_real_mem2_daemon(tmp_path: Path) -> Non
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    app = create_app(Settings(state_dir=state_dir, memory_kernel="mem2", port=port))
+    app = create_app(Settings(state_dir=state_dir, port=port))
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
     )
@@ -321,36 +321,32 @@ def test_configured_mcp_endpoint_initializes_and_exposes_bounded_tools(tmp_path:
             headers=headers,
             json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         )
-        libraries = client.post(
-            "/mcp",
-            headers=headers,
-            json={
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {"name": "library_list", "arguments": {}},
-            },
-        )
-        candidates = client.post(
-            "/mcp",
-            headers=headers,
-            json={
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": {"name": "candidate_list", "arguments": {}},
-            },
-        )
+        removed = [
+            client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": {}},
+                },
+            )
+            for index, name in enumerate(
+                ("candidate_create", "candidate_list", "library_list", "sync_status"),
+                start=3,
+            )
+        ]
         missing = client.post(
             "/mcp",
             headers=headers,
             json={
                 "jsonrpc": "2.0",
-                "id": 5,
+                "id": 7,
                 "method": "tools/call",
                 "params": {
                     "name": "memory_search",
-                    "arguments": {"library_id": "missing", "query": "anything"},
+                    "arguments": {"region_id": "missing", "query": "anything"},
                 },
             },
         )
@@ -358,23 +354,14 @@ def test_configured_mcp_endpoint_initializes_and_exposes_bounded_tools(tmp_path:
     assert initialized.status_code == 200
     assert initialized.json()["result"]["protocolVersion"] == "2025-06-18"
     names = {tool["name"] for tool in tools.json()["result"]["tools"]}
-    assert names == {
-        "memory_search",
-        "memory_get",
-        "candidate_create",
-        "candidate_list",
-        "library_list",
-        "sync_status",
-    }
-    assert not {"memory_edit", "memory_delete", "candidate_approve"} & names
-    for response in (libraries, candidates):
+    assert names == {"memory_search", "memory_get"}
+    for response in removed:
         result = response.json()["result"]
-        assert result["isError"] is False
-        assert json.loads(result["content"][0]["text"]) == []
-        assert "structuredContent" not in result
+        assert result["isError"] is True
+        assert "unknown MCP tool" in result["content"][0]["text"]
     assert missing.status_code == 200
     assert missing.json()["result"]["isError"] is True
-    assert "memory library not found" in missing.json()["result"]["content"][0]["text"]
+    assert "memory region not found" in missing.json()["result"]["content"][0]["text"]
 
 
 def test_user_prompt_requests_cwd_scope_and_outputs_sanitized_context() -> None:

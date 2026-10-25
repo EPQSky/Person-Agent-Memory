@@ -88,11 +88,15 @@ with socket.socket() as probe:
     print(probe.getsockname()[1])
 PY
 )"
+"$XDG_BIN_HOME/personal-agent-memory" serve --help >"$work_root/serve-help.txt"
+if grep -q -- '--memory-kernel' "$work_root/serve-help.txt"; then
+  printf 'installed CLI still exposes the removed memory kernel flag\n' >&2
+  exit 1
+fi
 "$XDG_BIN_HOME/personal-agent-memory" serve \
   --state-dir "$state_dir" \
   --library-root "$library_root" \
-  --port "$port" \
-  --memory-kernel mem2 >"$work_root/daemon.log" 2>&1 &
+  --port "$port" >"$work_root/daemon.log" 2>&1 &
 daemon_pid=$!
 
 project_root="$work_root/project"
