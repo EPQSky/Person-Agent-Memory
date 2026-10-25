@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Literal, NoReturn, Protocol, TypeAlias, cast, runtime_checkable
 
@@ -9,6 +11,7 @@ from personal_agent_memory.config import MemoryKernelKind, Settings
 from personal_agent_memory.regions import RegionKind, RegionRegistry
 from personal_agent_memory.state import (
     CandidateGovernanceError,
+    LibraryRegistrationError,
     PlatformState,
     ProjectBindingError,
 )
@@ -386,6 +389,10 @@ class MemoryKernelPort(Protocol):
 
     def health(self) -> KernelHealth: ...
 
+    def graph_status(self, library_id: str | None = None) -> dict[str, object]: ...
+
+    async def rebuild_graph(self, library_id: str) -> dict[str, object]: ...
+
     async def write(self, request: MemoryWriteRequest) -> dict[str, object]: ...
 
     async def search(self, request: SearchMemoryRequest) -> dict[str, object]: ...
@@ -581,6 +588,63 @@ class LegacyMemoryKernel:
                 detail="legacy platform state is not started",
             )
         return KernelHealth(kind=self.kind, status="ready", detail="legacy memory path")
+
+    def graph_status(self, library_id: str | None = None) -> dict[str, object]:
+        if self._state.connection is None:
+            return {"status": "not_configured", "backend": "legacy"}
+        with closing(sqlite3.connect(self._state.database_path)) as connection:
+            if library_id is not None:
+                if connection.execute(
+                    "SELECT 1 FROM memory_libraries WHERE id = ?",
+                    (library_id,),
+                ).fetchone() is None:
+                    raise LibraryRegistrationError("memory library not found")
+                row = connection.execute(
+                    """SELECT status, total_documents, projected_documents,
+                              last_error, updated_at
+                       FROM memory_graph_indexes WHERE library_id = ?""",
+                    (library_id,),
+                ).fetchone()
+                if row is None:
+                    return {
+                        "library_id": library_id,
+                        "status": "not_configured",
+                        "total_documents": 0,
+                        "projected_documents": 0,
+                        "last_error": "",
+                        "updated_at": None,
+                        "backend": "legacy",
+                    }
+                return {
+                    "library_id": library_id,
+                    "status": str(row[0]),
+                    "total_documents": int(row[1]),
+                    "projected_documents": int(row[2]),
+                    "last_error": str(row[3]),
+                    "updated_at": str(row[4]),
+                    "backend": "legacy",
+                }
+            rows = connection.execute(
+                """SELECT COALESCE(graph.status, 'not_configured')
+                   FROM memory_libraries AS library
+                   LEFT JOIN memory_graph_indexes AS graph
+                     ON graph.library_id = library.id"""
+            ).fetchall()
+        statuses = {str(row[0]) for row in rows}
+        if "error" in statuses:
+            status = "error"
+        elif statuses & {"building", "pending"}:
+            status = "building"
+        elif "ready" in statuses:
+            status = "ready"
+        else:
+            status = "not_configured"
+        return {"status": status, "backend": "legacy"}
+
+    async def rebuild_graph(self, library_id: str) -> dict[str, object]:
+        async with self._state.library_write_lock(library_id):
+            job_id = self._state.enqueue_graph_rebuild(library_id)
+        return {"library_id": library_id, "job_id": job_id, "status": "pending"}
 
     async def write(self, request: MemoryWriteRequest) -> dict[str, object]:
         if isinstance(request, CreateMemoryRequest):
@@ -991,6 +1055,12 @@ class UnavailableMemoryKernel:
             status="unavailable",
             detail="mem2 kernel runtime is unavailable",
         )
+
+    def graph_status(self, library_id: str | None = None) -> dict[str, object]:
+        return {"status": "unavailable", "backend": "mem2"}
+
+    async def rebuild_graph(self, library_id: str) -> dict[str, object]:
+        self._raise()
 
     def _raise(self) -> NoReturn:
         raise MemoryKernelUnavailableError(

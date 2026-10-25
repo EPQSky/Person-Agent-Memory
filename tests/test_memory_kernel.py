@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -81,6 +82,14 @@ class ContractFakeKernel:
 
     def health(self) -> KernelHealth:
         return KernelHealth(kind=self.kind, status="ready", detail="contract fake")
+
+    def graph_status(self, library_id: str | None = None) -> dict[str, object]:
+        self._called("graph_status")
+        return {"status": "ready", "backend": "fake"}
+
+    async def rebuild_graph(self, library_id: str) -> dict[str, object]:
+        self._called("rebuild_graph")
+        return {"library_id": library_id, "status": "ready"}
 
     async def write(self, request: MemoryWriteRequest) -> dict[str, object]:
         self._called(f"write:{type(request).__name__}")
@@ -456,6 +465,98 @@ def test_app_uses_injected_kernel_contract_and_reports_health(tmp_path: Path) ->
         assert status.json()["memory_kernel"] == "mem2"
         assert status.json()["memory_kernel_status"] == "ready"
         assert status.json()["memory_kernel_detail"] == "contract fake"
+
+
+def test_library_graph_status_does_not_block_event_loop(tmp_path: Path) -> None:
+    class SlowGraphStatusKernel(ContractFakeKernel):
+        def graph_status(self, library_id: str | None = None) -> dict[str, object]:
+            time.sleep(0.25)
+            return super().graph_status(library_id)
+
+    app = create_app(
+        Settings(state_dir=tmp_path / "state", memory_kernel="mem2"),
+        memory_kernel=SlowGraphStatusKernel(),
+    )
+
+    async def scenario() -> None:
+        async with app.router.lifespan_context(app):
+            key = (tmp_path / "state" / "api-key").read_text(encoding="utf-8").strip()
+            loop = asyncio.get_running_loop()
+            gaps: list[float] = []
+            stop = asyncio.Event()
+
+            async def ticker() -> None:
+                previous = loop.time()
+                while not stop.is_set():
+                    await asyncio.sleep(0.01)
+                    current = loop.time()
+                    gaps.append(current - previous)
+                    previous = current
+
+            ticker_task = asyncio.create_task(ticker())
+            await asyncio.sleep(0.03)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+                headers={"Authorization": f"Bearer {key}"},
+            ) as client:
+                response = await client.get("/api/v1/libraries/library-one/graph-status")
+            stop.set()
+            await ticker_task
+            assert response.status_code == 200, response.text
+            assert response.json()["status"] == "ready"
+            assert max(gaps) < 0.15
+
+    asyncio.run(scenario())
+
+
+def test_global_status_does_not_block_event_loop(tmp_path: Path) -> None:
+    class SlowHealthKernel(ContractFakeKernel):
+        def health(self) -> KernelHealth:
+            time.sleep(0.25)
+            return super().health()
+
+    app = create_app(
+        Settings(state_dir=tmp_path / "state", memory_kernel="mem2"),
+        memory_kernel=SlowHealthKernel(),
+    )
+
+    async def scenario() -> None:
+        async with app.router.lifespan_context(app):
+            key = (tmp_path / "state" / "api-key").read_text(encoding="utf-8").strip()
+            loop = asyncio.get_running_loop()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://test",
+                headers={"Authorization": f"Bearer {key}"},
+            ) as client:
+
+                async def measure(path: str) -> None:
+                    gaps: list[float] = []
+                    stop = asyncio.Event()
+
+                    async def ticker() -> None:
+                        previous = loop.time()
+                        while not stop.is_set():
+                            await asyncio.sleep(0.01)
+                            current = loop.time()
+                            gaps.append(current - previous)
+                            previous = current
+
+                    ticker_task = asyncio.create_task(ticker())
+                    await asyncio.sleep(0.03)
+                    response = await client.get(path)
+                    stop.set()
+                    await ticker_task
+                    assert response.status_code == 200, response.text
+                    assert max(gaps) < 0.15
+
+                for path in ("/api/v1/status", "/mcp/health"):
+                    await measure(path)
+
+    asyncio.run(scenario())
 
 
 def test_feature_flag_defaults_to_legacy_and_starts_mem2_runtime(tmp_path: Path) -> None:
@@ -1412,26 +1513,29 @@ def test_mem2_lock_routes_fail_before_creating_or_waiting_for_legacy_locks(
 
         with lock_path.open("a+b") as held_lock:
             fcntl.flock(held_lock, fcntl.LOCK_EX)
-            before = _tree_snapshot(state_dir)
             requests = (
                 (
                     "POST",
                     "/api/v1/libraries/library-one/vector-index/rebuild",
                     None,
+                    503,
                 ),
                 (
                     "POST",
                     "/api/v1/libraries/library-one/graph-index/rebuild",
                     None,
+                    202,
                 ),
                 (
                     "PUT",
                     "/api/v1/libraries/library-one/ignore-rules",
                     {"patterns": []},
+                    503,
                 ),
             )
             with ThreadPoolExecutor(max_workers=1) as executor:
-                for method, path, payload in requests:
+                for method, path, payload, expected_status in requests:
+                    before = _tree_snapshot(state_dir)
                     started = time.monotonic()
                     future = executor.submit(
                         client.request,
@@ -1441,16 +1545,27 @@ def test_mem2_lock_routes_fail_before_creating_or_waiting_for_legacy_locks(
                         json=payload,
                     )
                     try:
-                        response = future.result(timeout=1)
+                        response = future.result(
+                            timeout=10 if expected_status == 202 else 1
+                        )
                     except FutureTimeoutError:
                         fcntl.flock(held_lock, fcntl.LOCK_UN)
                         future.result(timeout=2)
                         pytest.fail("mem2 request waited for the external legacy lock")
                     elapsed = time.monotonic() - started
-                    assert response.status_code == 503, (method, path, response.text)
-                    assert elapsed < 0.5
-                    assert "legacy platform state is not started" in response.json()["detail"]
-                    assert _tree_snapshot(state_dir) == before
+                    assert response.status_code == expected_status, (
+                        method,
+                        path,
+                        response.text,
+                    )
+                    if expected_status != 202:
+                        assert elapsed < 0.5
+                    if expected_status == 503:
+                        assert (
+                            "legacy platform state is not started"
+                            in response.json()["detail"]
+                        )
+                        assert _tree_snapshot(state_dir) == before
             fcntl.flock(held_lock, fcntl.LOCK_UN)
 
 
@@ -1504,3 +1619,42 @@ def test_bound_capture_with_injected_kernel_does_not_touch_legacy_state(
         assert _tree_snapshot(state_dir) == before
         assert not (state_dir / "platform.sqlite3").exists()
         assert not (state_dir / "locks").exists()
+
+
+def test_legacy_global_graph_status_matches_registered_library(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    library_root = tmp_path / "memory-libraries" / "library"
+    library_root.mkdir(parents=True)
+    app = create_app(Settings(state_dir=state_dir))
+    with TestClient(app) as client:
+        key = (state_dir / "api-key").read_text(encoding="utf-8").strip()
+        headers = {"Authorization": f"Bearer {key}"}
+        state = app.state.platform_state
+        registered = client.post(
+            "/api/v1/libraries",
+            headers=headers,
+            json={"path": str(library_root), "kind": "project"},
+        )
+        assert registered.status_code == 201, registered.text
+        library_id = str(registered.json()["id"])
+        with sqlite3.connect(state.database_path) as connection:
+            connection.execute(
+                """INSERT INTO memory_graph_indexes
+                   (library_id, status, total_documents, projected_documents, last_error)
+                   VALUES (?, 'ready', 2, 2, '')
+                   ON CONFLICT(library_id) DO UPDATE SET
+                     status = 'ready',
+                     total_documents = 2,
+                     projected_documents = 2,
+                     last_error = ''""",
+                (library_id,),
+            )
+
+        library_status = client.get(
+            f"/api/v1/libraries/{library_id}/graph-status", headers=headers
+        )
+        assert library_status.status_code == 200, library_status.text
+        assert library_status.json()["status"] == "ready"
+        global_status = client.get("/api/v1/status", headers=headers)
+        assert global_status.status_code == 200, global_status.text
+        assert global_status.json()["graph_index_status"] == "ready"

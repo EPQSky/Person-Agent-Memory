@@ -342,7 +342,10 @@ def test_mem2_without_embedding_is_explicitly_degraded_without_vector(
         assert result["results"][0]["document_id"] == memory_id
         assert result["vector_index_status"] == "not_configured"
         assert result["degraded"] is True
-        assert result["degradation"] == ["embedding_not_configured"]
+        assert result["degradation"] == [
+            "embedding_not_configured",
+            "graph_unavailable",
+        ]
 
 
 def test_mem2_restart_preserves_memory_and_search(tmp_path: Path) -> None:
@@ -479,7 +482,10 @@ def test_mem2_dimension_mismatch_is_degraded_and_never_reports_vector_ready(
             result = _search(client, headers, "DIMENSION-MISMATCH")
             assert result["results"][0]["document_id"] == memory_id
             assert result["degraded"] is True
-            assert result["degradation"] == ["embedding_dimension_mismatch"]
+            assert result["degradation"] == [
+                "embedding_dimension_mismatch",
+                "graph_unavailable",
+            ]
             assert result["vector_index_status"] == "not_configured"
 
 
