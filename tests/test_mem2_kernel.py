@@ -362,6 +362,99 @@ def test_mem2_restart_preserves_memory_and_search(tmp_path: Path) -> None:
             assert result["results"][0]["document_id"] == memory_id
 
 
+def test_mem2_fresh_state_writes_version_marker_without_touching_legacy_state(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    legacy_database = state_dir / "platform.sqlite3"
+    legacy_database.write_bytes(b"legacy-state-must-not-be-read")
+
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        assert client.get("/mcp/health", headers=headers).json()["memory_kernel"] == "mem2"
+        regions = client.get("/api/v1/regions/tree", headers=headers)
+        assert regions.status_code == 200
+        assert regions.json()["root"]["region_id"] == "user"
+
+    assert (state_dir / "mem2" / "VERSION").read_text(encoding="utf-8") == (
+        "jiuwen-memory-0.2.0\n"
+    )
+    assert (state_dir / "mem2" / "regions.sqlite3").is_file()
+    assert not (state_dir / "regions.sqlite3").exists()
+    assert legacy_database.read_bytes() == b"legacy-state-must-not-be-read"
+
+
+@pytest.mark.parametrize("state_kind", ["unversioned", "unsupported"])
+def test_mem2_rejects_old_state_without_reading_or_rewriting_it(
+    tmp_path: Path, state_kind: str
+) -> None:
+    state_dir = tmp_path / "state"
+    mem2_dir = state_dir / "mem2"
+    mem2_dir.mkdir(parents=True)
+    sentinel = mem2_dir / "memory.sqlite3"
+    sentinel.write_bytes(b"old-mem2-state-must-survive")
+    version_path = mem2_dir / "VERSION"
+    if state_kind == "unsupported":
+        version_path.write_text("jiuwen-memory-0.1.0\n", encoding="utf-8")
+
+    def files() -> dict[str, bytes]:
+        return {
+            path.relative_to(mem2_dir).as_posix(): path.read_bytes()
+            for path in mem2_dir.rglob("*")
+            if path.is_file()
+        }
+
+    before = files()
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        health = client.get("/mcp/health", headers=headers).json()
+        assert health["memory_kernel"] == "mem2"
+        assert health["memory_kernel_status"] == "unavailable"
+        assert "reset the state directory explicitly" in health["memory_kernel_detail"]
+        blocked_responses = [
+            client.get("/api/v1/regions", headers=headers),
+            client.post(
+                MEMORY_PATH,
+                headers=headers,
+                json={
+                    "region_id": "user",
+                    "content": "must not touch rejected state",
+                    "memory_type": "domain_fact",
+                    "source_references": ["test:rejected-state"],
+                    "actor": "test",
+                    "idempotency_key": "rejected-state-write",
+                },
+            ),
+            client.post(
+                MEMORY_PATH,
+                headers=headers,
+                json={
+                    "library_id": LIBRARY_ID,
+                    "content": "must not create rejected idempotency state",
+                    "memory_type": "domain_fact",
+                    "source_references": ["test:rejected-state"],
+                    "actor": "test",
+                    "idempotency_key": "rejected-state-library-write",
+                },
+            ),
+            client.get("/api/v1/promotions/does-not-exist", headers=headers),
+            client.get("/api/v1/libraries/user/retention-policy", headers=headers),
+            client.get(
+                "/api/v1/libraries/user/retention-cleanup/preview", headers=headers
+            ),
+            client.post("/api/v1/libraries/user/retention-cleanup", headers=headers),
+        ]
+        for response in blocked_responses:
+            assert response.status_code == 503, response.text
+            assert "reset the state directory explicitly" in response.json()["detail"]
+
+    assert files() == before
+    for forbidden in ("regions.sqlite3", "maintenance.sqlite3", "idempotency.sqlite3"):
+        assert not (mem2_dir / forbidden).exists()
+    assert sentinel.read_bytes() == b"old-mem2-state-must-survive"
+
+
 def test_mem2_search_respects_hard_token_budget(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     with (

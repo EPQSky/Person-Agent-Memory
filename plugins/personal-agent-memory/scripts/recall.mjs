@@ -85,6 +85,13 @@ function safeRelativePath(value, key) {
     : value;
 }
 
+function safeResultPath(value, key) {
+  const redacted = redact(value, key, 1024);
+  if (!redacted) return undefined;
+  if (/^memory:\/\/[A-Za-z0-9_-]{1,256}$/.test(redacted)) return redacted;
+  return safeRelativePath(redacted, key);
+}
+
 function finiteNumber(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
@@ -95,7 +102,7 @@ function boundedString(value, key, maximum = 200_000) {
 
 function sanitizeResult(raw, key) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const path = safeRelativePath(raw.path, key);
+  const path = safeResultPath(raw.path, key);
   const libraryId = safeIdentifier(raw.library_id, key);
   const content = boundedString(raw.content, key);
   const sourceVersion = boundedString(raw.source_version, key, 256);

@@ -17,6 +17,23 @@ def test_native_verifier_uses_an_isolated_home_and_cleans_up(tmp_path: Path) -> 
     assert 'export XDG_BIN_HOME="$work_root/bin"' in script
     assert 'rm -rf "$work_root"' in script
     assert 'uv tool install' in script
+    assert 'uv export --frozen --no-dev --no-hashes --no-emit-project' in script
+    assert 'PAM_VERIFY_PYTHON' in script
+    assert 'python_command="$(command -v "$requested_python"' in script
+    assert '--python "$python_command"' in script
+    assert '--constraints "$work_root/constraints.txt"' in script
+    assert '--no-python-downloads' in script
+    assert '--memory-kernel mem2' in script
+    request_start = script.index("def request(")
+    request_end = script.index("\ndeadline = time.monotonic()", request_start)
+    key_read = script.index("key = key_path.read_text", request_start)
+    assert request_start < key_read < request_end
+    assert '/mcp/health' in script
+    assert '/api/v1/regions/tree' in script
+    assert '/mcp/project-bindings/resolve' in script
+    assert 'capture.mjs' in script
+    assert '"prompt": "NATIVE-INSTALL-MEMORY"' in script
+    assert 'mem2" / "VERSION"' in script
     assert 'codex plugin marketplace add "$repo_root"' in script
     assert 'codex plugin add personal-agent-memory@personal-agent-memory' in script
 

@@ -7,8 +7,10 @@ import base64
 import difflib
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import stat
 import threading
 import time
 import uuid
@@ -341,9 +343,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             OpenAICompatibleClient(None, None, graph) if graph is not None else None
         )
         self._config_overrides = config_overrides
-        self._regions = regions or RegionRegistry(self._state_dir / "regions.sqlite3")
+        self._regions_registry = regions
+        self._regions_registry_lock = threading.Lock()
         self._bundle: _RuntimeBundle | None = None
         self._startup_error: str | None = None
+        self._state_ready = False
         self._vector_enabled = False
         self._vector_degradation = "embedding_not_configured"
         self._embedding_detail = "embedding endpoint is not configured; vector recall is disabled"
@@ -354,8 +358,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             self._state_dir / "mem2" / "graph_projection_manifests.json"
         )
         self._graph_projection_lock = threading.RLock()
-        self._graph_projection_errors = self._load_graph_projection_errors()
-        self._graph_projection_manifests = self._load_graph_projection_manifests()
+        self._graph_projection_errors: dict[str, str] = {}
+        self._graph_projection_manifests: dict[str, dict[str, str]] = {}
         self._lock = threading.RLock()
         self._maintenance_lock = threading.RLock()
         self._graph_write_lock = threading.RLock()
@@ -376,10 +380,14 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             if self._bundle is not None:
                 return
             self._startup_error = None
+            self._state_ready = False
+            state_dir = self._prepare_state_dir()
+            if state_dir is None:
+                return
+            self._state_ready = True
             self._prepare_embedding()
-            state_dir = self._state_dir / "mem2"
-            state_dir.mkdir(parents=True, exist_ok=True)
-            (state_dir / "VERSION").write_text(_STATE_VERSION + "\n", encoding="utf-8")
+            self._graph_projection_errors = self._load_graph_projection_errors()
+            self._graph_projection_manifests = self._load_graph_projection_manifests()
             stores: list[object] = []
             kv_store: SQLiteKVStore | None = None
             token = _STORE_COLLECTOR.set(stores)
@@ -402,6 +410,78 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 None,
             )
             self._bundle = _RuntimeBundle(runtime, kv_store, tuple(stores), graph_store)
+
+    def _prepare_state_dir(self) -> Path | None:
+        state_dir = self._state_dir / "mem2"
+        version_path = state_dir / "VERSION"
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self._startup_error = f"mem2 state directory is not usable: {error}"
+            return None
+        try:
+            descriptor = os.open(version_path, flags)
+        except FileNotFoundError:
+            try:
+                has_entries = any(state_dir.iterdir())
+            except OSError as error:
+                self._startup_error = f"mem2 state directory cannot be inspected: {error}"
+                return None
+            if has_entries:
+                self._startup_error = (
+                    "mem2 state directory has no VERSION marker; "
+                    "reset the state directory explicitly before starting"
+                )
+                return None
+            try:
+                descriptor = os.open(
+                    version_path,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            except OSError as error:
+                self._startup_error = f"mem2 state version marker cannot be created: {error}"
+                return None
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    stream.write(_STATE_VERSION + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except OSError as error:
+                self._startup_error = f"mem2 state version marker cannot be written: {error}"
+                return None
+            return state_dir
+        except OSError as error:
+            self._startup_error = f"mem2 state version marker cannot be read safely: {error}"
+            return None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 256:
+                self._startup_error = "mem2 state version marker is not a small regular file"
+                return None
+            contents = os.read(descriptor, 257)
+        except OSError as error:
+            self._startup_error = f"mem2 state version marker cannot be read: {error}"
+            return None
+        finally:
+            os.close(descriptor)
+        try:
+            version = contents.decode("utf-8")
+        except UnicodeError as error:
+            self._startup_error = f"mem2 state version marker is not UTF-8: {error}"
+            return None
+        if version != _STATE_VERSION + "\n":
+            self._startup_error = (
+                f"unsupported mem2 state version {version.strip()!r}; "
+                f"expected {_STATE_VERSION!r}; reset the state directory explicitly before starting"
+            )
+            return None
+        return state_dir
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close)
@@ -4922,6 +5002,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         return count
 
     def _maintenance_db(self) -> sqlite3.Connection:
+        self._require_state_ready()
         path = self._state_dir / "mem2" / "maintenance.sqlite3"
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path, timeout=5.0)
@@ -5219,6 +5300,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         return [(str(row[0]), str(row[1])) for row in rows]
 
     def _idempotency_db(self) -> sqlite3.Connection:
+        self._require_state_ready()
         path = self._state_dir / "mem2" / "idempotency.sqlite3"
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path, timeout=5.0)
@@ -5388,6 +5470,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
 
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]:
+        self._require_state_ready()
         resolved = self._regions.resolve(request.cwd)
         if resolved is None:
             return {"status": "unbound", "cwd": self._regions.canonical_cwd(request.cwd)}
@@ -5404,6 +5487,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         }
 
     def create_region(self, request: CreateMemoryRegionRequest) -> dict[str, object]:
+        self._require_state_ready()
         return self._regions.create_region(
             request.kind,
             request.name,
@@ -5412,30 +5496,57 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         ).payload()
 
     def list_regions(self) -> list[dict[str, object]]:
+        self._require_state_ready()
         return [region.payload() for region in self._regions.list_regions()]
 
     def get_region(self, request: GetMemoryRegionRequest) -> dict[str, object]:
+        self._require_state_ready()
         return self._regions.require_region(request.region_id).payload()
 
     def region_tree(self, request: MemoryRegionTreeRequest) -> dict[str, object]:
+        self._require_state_ready()
         return self._regions.region_tree(request.session_id)
 
     def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]:
+        self._require_state_ready()
         return self._regions.bind_project(request.project_root, request.region_id).payload()
 
     def associate_worktree_region(self, request: AssociateWorktreeRegionRequest) -> dict[str, str]:
+        self._require_state_ready()
         return self._regions.associate_worktree(
             request.worktree_root, request.main_project_binding_id
         ).payload()
 
     def list_region_bindings(self) -> list[dict[str, str]]:
+        self._require_state_ready()
         return [binding.payload() for binding in self._regions.list_bindings()]
 
     def update_region_binding(self, request: UpdateRegionBindingRequest) -> dict[str, str]:
+        self._require_state_ready()
         return self._regions.update_binding(request.binding_id, request.region_id).payload()
 
     def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
+        self._require_state_ready()
         self._regions.delete_binding(request.binding_id)
+
+    def _require_state_ready(self) -> None:
+        if not self._state_ready:
+            raise MemoryKernelUnavailableError(
+                self._startup_error or "mem2 state version has not been validated"
+            )
+
+    @property
+    def _regions(self) -> RegionRegistry:
+        self._require_state_ready()
+        registry = self._regions_registry
+        if registry is None:
+            with self._regions_registry_lock:
+                if self._regions_registry is None:
+                    self._regions_registry = RegionRegistry(
+                        self._state_dir / "mem2" / "regions.sqlite3"
+                    )
+                registry = self._regions_registry
+        return registry
 
     def _require_bundle(self) -> _RuntimeBundle:
         with self._lock:
