@@ -219,6 +219,19 @@ class WorktreeAssociation(BaseModel):
     main_project_binding_id: str
 
 
+class CrossRegionBudgetRequest(BaseModel):
+    user_fraction: float = Field(default=0.30, gt=0, le=1)
+    selected_region_fraction: float = Field(default=0.20, gt=0, le=1)
+    graph_fraction: float = Field(default=0.20, gt=0, le=1)
+    source_structure_fraction: float = Field(default=0.10, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_fractions(self) -> CrossRegionBudgetRequest:
+        if self.graph_fraction + self.source_structure_fraction > 1:
+            raise ValueError("graph and source/structure fractions must not exceed 1")
+        return self
+
+
 class CwdResolution(BaseModel):
     cwd: str
 
@@ -253,6 +266,7 @@ class SearchRequest(BaseModel):
     topic_id: OptionalIdentifier = Field(
         default=None, min_length=1, max_length=MAX_REGION_ID_LENGTH
     )
+    cross_region_budget: CrossRegionBudgetRequest | None = None
 
     @model_validator(mode="after")
     def validate_scope(self) -> SearchRequest:
@@ -266,6 +280,8 @@ class SearchRequest(BaseModel):
             raise ValueError("exactly one of cwd, library_id, region_id, or region_ids is required")
         if self.region_ids is not None and len(set(self.region_ids)) != len(self.region_ids):
             raise ValueError("region_ids must not contain duplicates")
+        if self.cross_region_budget is not None and self.region_ids is None:
+            raise ValueError("cross_region_budget requires explicit region_ids")
         return self
 
 
@@ -1005,6 +1021,12 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     topic_id=request.topic_id,
                 )
             )
+            if request.region_ids is not None:
+                raw["cross_region_budget"] = (
+                    {}
+                    if request.cross_region_budget is None
+                    else request.cross_region_budget.model_dump()
+                )
             return build_context_package(
                 raw,
                 requested_budget=request.token_budget,
@@ -1731,7 +1753,10 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     mcp_tools: list[dict[str, object]] = [
         {
             "name": "memory_search",
-            "description": "Search one project-bound or explicitly selected memory library.",
+            "description": (
+                "Search one project-bound memory library, one explicit region, or multiple "
+                "explicit regions through cross-region recall."
+            ),
             "inputSchema": SearchRequest.model_json_schema(),
         },
         {

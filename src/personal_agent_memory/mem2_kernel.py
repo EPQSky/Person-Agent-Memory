@@ -1834,6 +1834,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     ) -> dict[str, object]:
         region_ids = request.region_ids or ()
         regions = [self._regions.require_region(region_id) for region_id in region_ids]
+        if any(region.kind == "session" for region in regions):
+            raise ValueError(
+                "cross-region recall only supports user, topic, and project memory regions"
+            )
         targets: list[tuple[Scope, MemoryRegion]] = []
         for region in regions:
             base_session = region.session_id if region.kind == "session" else ""
@@ -1880,7 +1884,36 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         degradation: list[str] = []
         vector_statuses: set[str] = set()
         graph_statuses: set[str] = set()
+        regions_by_id = {region.region_id: region for _, region in targets}
+        groups: dict[str, dict[str, object]] = {}
+        group_vector_statuses: dict[str, set[str]] = {}
+        group_graph_statuses: dict[str, set[str]] = {}
+        scope_attempts: dict[str, int] = {}
+        scope_failures: dict[str, int] = {}
+        source_references: dict[str, list[str]] = {}
+        for region_id in region_ids:
+            region = regions_by_id[region_id]
+            groups[region_id] = {
+                "region_id": region_id,
+                "kind": region.kind,
+                "name": region.name,
+                "space": region.space,
+                "status": "ok",
+                "degraded": False,
+                "degradation": [],
+                "vector_index_status": "not_configured",
+                "graph_index_status": "not_configured",
+                "result_ids": [],
+                "source_references": [],
+            }
+            group_vector_statuses[region_id] = set()
+            group_graph_statuses[region_id] = set()
+            scope_attempts[region_id] = 0
+            scope_failures[region_id] = 0
+            source_references[region_id] = []
         for scope, region in targets:
+            group = groups[region.region_id]
+            scope_attempts[region.region_id] += 1
             scoped_request = replace(
                 request,
                 cwd=None,
@@ -1889,15 +1922,47 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 region_ids=None,
                 topic_id=None,
             )
-            response = self._search_scope(bundle, scoped_request, scope, region=region)
+            try:
+                response = self._search_scope(bundle, scoped_request, scope, region=region)
+            except Exception as error:
+                scope_failures[region.region_id] += 1
+                group_degradation = cast(list[object], group["degradation"])
+                if "retrieval_unavailable" not in group_degradation:
+                    group_degradation.append("retrieval_unavailable")
+                if "retrieval_unavailable" not in degradation:
+                    degradation.append("retrieval_unavailable")
+                group["degraded"] = True
+                group["status"] = "degraded"
+                classification = _classify_failure(
+                    error, embedding_configured=self._vector_enabled
+                )
+                if classification not in degradation:
+                    degradation.append(classification)
+                continue
             raw_degradation = response.get("degradation", [])
             if isinstance(raw_degradation, list):
+                group_degradation = cast(list[object], group["degradation"])
                 for reason in raw_degradation:
                     reason_text = str(reason)
                     if reason_text not in degradation:
                         degradation.append(reason_text)
-            vector_statuses.add(str(response.get("vector_index_status", "degraded")))
-            graph_statuses.add(str(response.get("graph_index_status", "degraded")))
+                    if reason_text not in {
+                        "fulltext_unavailable",
+                        "graph_unavailable",
+                        "model_unavailable",
+                        "retrieval_unavailable",
+                        "vector_unavailable",
+                    }:
+                        continue
+                    if reason_text not in group_degradation:
+                        group_degradation.append(reason_text)
+                    group["degraded"] = True
+            vector_status = str(response.get("vector_index_status", "degraded"))
+            graph_status = str(response.get("graph_index_status", "degraded"))
+            vector_statuses.add(vector_status)
+            graph_statuses.add(graph_status)
+            group_vector_statuses[region.region_id].add(vector_status)
+            group_graph_statuses[region.region_id].add(graph_status)
             raw_results = response.get("results", [])
             if not isinstance(raw_results, list):
                 continue
@@ -1908,12 +1973,50 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 item["region_id"] = region.region_id
                 item["space"] = region.space
                 item["library_id"] = region.region_id
-                item_id = str(item.get("document_id", ""))
-                previous = merged.get(item_id)
+                references = _result_source_references(item)
+                item["source_references"] = references
+                for reference in references:
+                    if reference not in source_references[region.region_id]:
+                        source_references[region.region_id].append(reference)
+                item_id = str(
+                    item.get("document_id")
+                    or item.get("chunk_id")
+                    or f"anonymous-{len(merged)}"
+                )
+                merged_key = f"{region.region_id}\0{item_id}"
+                previous = merged.get(merged_key)
                 item_score = float(str(item.get("score", 0.0)))
                 previous_score = 0.0 if previous is None else float(str(previous.get("score", 0.0)))
                 if previous is None or item_score > previous_score:
-                    merged[item_id] = item
+                    merged[merged_key] = item
+        for region_id, group in groups.items():
+            failures = scope_failures[region_id]
+            attempts = scope_attempts[region_id]
+            group_degradation = cast(list[object], group["degradation"])
+            if attempts and failures == attempts:
+                group["status"] = "unavailable"
+                group["degraded"] = True
+                if "region_unavailable" not in degradation:
+                    degradation.append("region_unavailable")
+                marker = f"region_unavailable:{region_id}"
+                if marker not in degradation:
+                    degradation.append(marker)
+            elif failures:
+                group["status"] = "degraded"
+                group["degraded"] = True
+                marker = f"region_degraded:{region_id}"
+                if marker not in degradation:
+                    degradation.append(marker)
+            elif group_degradation:
+                group["status"] = "degraded"
+                group["degraded"] = True
+            group["vector_index_status"] = _combined_index_status(
+                group_vector_statuses[region_id]
+            )
+            group["graph_index_status"] = _combined_index_status(
+                group_graph_statuses[region_id]
+            )
+            group["source_references"] = source_references[region_id]
         ranked = sorted(
             merged.values(),
             key=lambda item: float(str(item.get("score", 0.0))),
@@ -1935,7 +2038,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             graph_status = "degraded"
         else:
             graph_status = "not_configured"
-        return {
+        result: dict[str, object] = {
             "status": "bound",
             "scope": {
                 "kind": scope_kind,
@@ -1953,6 +2056,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "graph_index_status": graph_status,
             "results": results,
         }
+        if scope_kind == "explicit_regions":
+            result["region_groups"] = [groups[region_id] for region_id in region_ids]
+        return result
 
     def _search_scope(
         self,
@@ -5776,6 +5882,14 @@ def _channel_failure(channel: str, error: Any) -> str:
     return f"{channel}_unavailable"
 
 
+def _combined_index_status(statuses: set[str]) -> str:
+    if "degraded" in statuses:
+        return "degraded"
+    if "ready" in statuses:
+        return "ready"
+    return "not_configured"
+
+
 def _search_response(
     request: SearchMemoryRequest,
     scope: Scope,
@@ -6019,6 +6133,26 @@ def _result_payload(item: Any, request: SearchMemoryRequest) -> dict[str, object
     return _result_item(item, request)
 
 
+def _result_source_references(item: Any) -> list[str]:
+    if isinstance(item, dict):
+        metadata = item.get("user_metadata")
+        references = item.get("source_references")
+        provenance = item.get("provenance")
+    else:
+        metadata = getattr(item, "user_metadata", None)
+        references = None
+        provenance = getattr(item, "provenance", None)
+    if not isinstance(references, list):
+        references = metadata.get("source_references") if isinstance(metadata, dict) else None
+    if not isinstance(references, list):
+        references = metadata.get("provenance") if isinstance(metadata, dict) else None
+    if not isinstance(references, list):
+        references = provenance
+    if not isinstance(references, (list, tuple)):
+        return []
+    return list(dict.fromkeys(str(value) for value in references if str(value).strip()))
+
+
 def _result_item(item: Any, request: SearchMemoryRequest) -> dict[str, object]:
     if isinstance(item, MemoryUnit):
         unit_id = item.id
@@ -6046,6 +6180,8 @@ def _result_item(item: Any, request: SearchMemoryRequest) -> dict[str, object]:
         "classification": "direct",
         "score": score,
         "retrieval_sources": ["hybrid"],
+        "source_references": _result_source_references(item),
+        "provenance": list(item.provenance) if isinstance(item, MemoryUnit) else [],
         "system_metadata": system_metadata,
         "user_metadata": user_metadata,
     }
