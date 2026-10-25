@@ -910,6 +910,7 @@ def test_old_capture_schema_migration_creates_governance_audit(tmp_path: Path) -
     state_dir = tmp_path / "state"
     mem2_dir = state_dir / "mem2"
     mem2_dir.mkdir(parents=True)
+    (mem2_dir / "VERSION").write_text("jiuwen-memory-0.2.0\n", encoding="utf-8")
     with sqlite3.connect(mem2_dir / "maintenance.sqlite3") as connection:
         connection.executescript(
             """CREATE TABLE capture_evolutions (

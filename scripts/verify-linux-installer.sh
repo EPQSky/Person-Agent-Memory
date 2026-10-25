@@ -336,6 +336,7 @@ systemctl --user is-active "$service_name" | grep -qx active
 [[ "$(personal-agent-memory --version)" == "$target_version" ]]
 cmp "$work_root/api-key.before" "$state_dir/api-key"
 cmp "$work_root/memory.before" "$memory_path/memory.md"
+[[ "$(cat "$state_dir/mem2/VERSION")" == "jiuwen-memory-0.2.0" ]]
 mapfile -t managed_paths < <("$python_command" - "$install_config_path" \
   "$state_dir" "$library_root" "$target_version" \
   "$repo_root" "$old_release" "$(command -v uv)" "$(command -v personal-agent-memory)" \
@@ -418,6 +419,81 @@ PY
 [[ "$(readlink -f "$plugin_root")" == \
   "$(readlink -f "$managed_plugin_registration_source")" ]]
 
+"$python_command" - "$key_file" "$project_root" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.request
+
+key = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+def request(path, *, method="GET", payload=None):
+    data = None if payload is None else json.dumps(payload).encode()
+    request_headers = dict(headers)
+    if data is None:
+        request_headers.pop("Content-Type")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:7331{path}",
+        data=data,
+        headers=request_headers,
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+health = request("/mcp/health")
+assert health["memory_kernel"] == "mem2"
+assert health["memory_kernel_status"] in {"ready", "degraded"}
+assert request("/api/v1/regions/tree")["root"]["region_id"] == "user"
+region = request(
+    "/api/v1/regions",
+    method="POST",
+    payload={"kind": "project", "name": "Installer acceptance", "region_id": "installer-acceptance"},
+)
+request(
+    "/api/v1/project-bindings",
+    method="POST",
+    payload={"project_root": sys.argv[2], "region_id": region["region_id"]},
+)
+assert request(
+    "/mcp/project-bindings/resolve",
+    method="POST",
+    payload={"cwd": sys.argv[2]},
+)["status"] == "bound"
+request(
+    "/api/v1/memories",
+    method="POST",
+    payload={
+        "region_id": region["region_id"],
+        "content": "Installer acceptance fact.",
+        "memory_type": "domain_fact",
+        "source_references": ["linux-installer:acceptance"],
+        "actor": "linux-installer",
+        "idempotency_key": "linux-installer-acceptance-memory",
+    },
+)
+search = request(
+    "/mcp",
+    method="POST",
+    payload={
+        "jsonrpc": "2.0",
+        "id": "linux-installer",
+        "method": "tools/call",
+        "params": {
+            "name": "memory_search",
+            "arguments": {
+                "region_ids": [region["region_id"]],
+                "query": "Installer acceptance fact",
+            },
+        },
+    },
+)
+assert search["result"]["isError"] is False
+assert search["result"]["structuredContent"]["results"]
+PY
+
+export PLUGIN_DATA="$work_root/plugin-data"
 "$python_command" - "$project_root" <<'PY' | \
   node "$managed_plugin_install_path/scripts/recall.mjs" >"$work_root/hook.out"
 import json
@@ -431,6 +507,19 @@ print(json.dumps({
 }))
 PY
 grep -q 'Installer acceptance fact' "$work_root/hook.out"
+"$python_command" - "$project_root" <<'PY' | \
+  node "$managed_plugin_install_path/scripts/capture.mjs"
+import json
+import sys
+
+print(json.dumps({
+    "session_id": "real-installer-capture",
+    "cwd": sys.argv[1],
+    "hook_event_name": "UserPromptSubmit",
+    "prompt": "remember the installer acceptance",
+}))
+PY
+[[ -z "$(find "$PLUGIN_DATA/spool" -maxdepth 1 -name 'event-*.json' -print -quit 2>/dev/null)" ]]
 
 "$python_command" - "$state_dir/platform.sqlite3" "$work_root/state.after.json" <<'PY'
 import json
@@ -481,6 +570,7 @@ fi
 [[ ! -e "$uninstall_command" ]]
 if [[ "$acceptance_scenario" == "normal" ]]; then
   [[ -e "$state_dir/api-key" ]]
+  [[ -e "$state_dir/mem2/VERSION" ]]
   [[ -e "$install_config_path" ]]
   cmp "$work_root/api-key.before" "$state_dir/api-key"
   "$python_command" - "$state_dir/platform.sqlite3" \

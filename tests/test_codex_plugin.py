@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from personal_agent_memory.app import create_app
@@ -164,6 +168,137 @@ def test_plugin_is_globally_installable_with_discovered_hooks_and_mcp() -> None:
         "bearer_token_env_var": "PERSONAL_AGENT_MEMORY_API_KEY",
     }
     assert not list(ROOT.glob(".codex-plugin/**"))
+
+
+def test_plugin_recall_and_capture_reach_real_mem2_daemon(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    app = create_app(Settings(state_dir=state_dir, memory_kernel="mem2", port=port))
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{port}"
+    key_path = state_dir / "api-key"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            key = key_path.read_text(encoding="utf-8").strip()
+            request = urllib.request.Request(
+                f"{url}/mcp/health",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            with urllib.request.urlopen(request, timeout=1) as response:
+                if response.status == 200:
+                    break
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.1)
+    else:
+        server.should_exit = True
+        thread.join(timeout=5)
+        raise AssertionError("mem2 daemon did not start")
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    def post(path: str, payload: dict[str, object]) -> dict[str, object]:
+        request = urllib.request.Request(
+            f"{url}{path}",
+            data=json.dumps(payload).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.load(response)
+
+    post("/api/v1/regions", {"kind": "project", "name": "Plugin", "region_id": "plugin"})
+    post(
+        "/api/v1/project-bindings",
+        {"project_root": str(project_root), "region_id": "plugin"},
+    )
+    post(
+        "/api/v1/memories",
+        {
+            "region_id": "plugin",
+            "content": "PLUGIN-MEM2-FACT is available.",
+            "memory_type": "domain_fact",
+            "source_references": ["plugin-test:acceptance"],
+            "actor": "plugin-test",
+            "idempotency_key": "plugin-test-memory",
+        },
+    )
+    deadline = time.monotonic() + 10
+    package: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        package = post(
+            "/api/v1/search",
+            {
+                "cwd": str(project_root),
+                "query": "PLUGIN-MEM2-FACT",
+                "token_budget": 10_000,
+            },
+        )
+        if package.get("results"):
+            break
+        time.sleep(0.1)
+    assert package.get("results")
+    environment = {
+        **os.environ,
+        "PERSONAL_AGENT_MEMORY_URL": url,
+        "PERSONAL_AGENT_MEMORY_API_KEY": key,
+        "PLUGIN_DATA": str(tmp_path / "plugin-data"),
+    }
+    recall = subprocess.run(
+        ["node", str(PLUGIN / "scripts/recall.mjs")],
+        input=json.dumps(
+            {
+                "session_id": "plugin-acceptance",
+                "cwd": str(project_root),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "PLUGIN-MEM2-FACT",
+            }
+        ),
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    capture = subprocess.run(
+        ["node", str(PLUGIN / "scripts/capture.mjs")],
+        input=json.dumps(
+            {
+                "session_id": "plugin-acceptance",
+                "cwd": str(project_root),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "remember the plugin acceptance",
+            }
+        ),
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    server.should_exit = True
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert recall.returncode == 0
+    assert recall.stderr == ""
+    assert "PLUGIN-MEM2-FACT" in recall.stdout
+    assert capture.returncode == 0
+    assert capture.stdout == ""
+    assert capture.stderr == ""
+    spool = tmp_path / "plugin-data" / "spool"
+    assert not list(spool.glob("event-*.json"))
 
 
 def test_configured_mcp_endpoint_initializes_and_exposes_bounded_tools(tmp_path: Path) -> None:

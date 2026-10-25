@@ -309,6 +309,7 @@ fi
 failed_stage="release validation"
 target_version="$($python_command - "$source_root" <<'PY'
 import json
+import re
 from pathlib import Path
 import sys
 import tomllib
@@ -318,18 +319,70 @@ uninstaller = source_root / "uninstall.sh"
 if not uninstaller.is_file() or uninstaller.is_symlink():
     raise SystemExit(f"release uninstaller is missing or unsafe: {uninstaller}")
 with (source_root / "pyproject.toml").open("rb") as stream:
-    package_version = tomllib.load(stream)["project"]["version"]
+    project = tomllib.load(stream)["project"]
+with (source_root / "uv.lock").open("rb") as stream:
+    lock = tomllib.load(stream)
 plugin = json.loads(
     (source_root / "plugins/personal-agent-memory/.codex-plugin/plugin.json").read_text(
         encoding="utf-8"
     )
 )
+package_version = project["version"]
 plugin_version = plugin.get("version")
 if not isinstance(package_version, str) or not package_version:
     raise SystemExit("Python package release version is missing")
 if plugin_version != package_version:
     raise SystemExit(
         f"release version mismatch: Python package {package_version}, Codex plugin {plugin_version}"
+    )
+if project.get("requires-python") != ">=3.11,<3.14":
+    raise SystemExit("Python package must support exactly Python 3.11, 3.12, and 3.13")
+if lock.get("requires-python") != ">=3.11, <3.14":
+    raise SystemExit("uv.lock must cover Python 3.11, 3.12, and 3.13")
+
+required_versions = {
+    "jiuwenmemory": "0.2.0",
+    "milvus-lite": "3.2.2",
+    "pymilvus": "3.0.2",
+}
+locked = {
+    str(package.get("name", "")).lower(): package.get("version")
+    for package in lock.get("package", [])
+    if isinstance(package, dict)
+}
+for name, expected_version in required_versions.items():
+    if locked.get(name) != expected_version:
+        raise SystemExit(
+            f"uv.lock must pin {name}=={expected_version}; found {locked.get(name)!r}"
+        )
+
+def requirement_name(requirement: str) -> str:
+    match = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", requirement)
+    if match is None:
+        raise SystemExit(f"invalid project dependency: {requirement}")
+    return match.group(0).lower().replace("_", "-")
+
+dependencies = project.get("dependencies")
+if not isinstance(dependencies, list) or not all(
+    isinstance(item, str) for item in dependencies
+):
+    raise SystemExit("Python package dependencies are invalid")
+direct_names = {requirement_name(item) for item in dependencies}
+if not set(required_versions).issubset(direct_names):
+    raise SystemExit("required mem2 dependencies are missing from pyproject.toml")
+for name in required_versions:
+    requirement = next(
+        item for item in dependencies if requirement_name(item) == name
+    )
+    if requirement.replace(" ", "").lower() != f"{name}=={required_versions[name]}":
+        raise SystemExit(f"{name} must use an exact, non-floating version constraint")
+missing_locked_dependencies = sorted(
+    name for name in direct_names if name not in locked
+)
+if missing_locked_dependencies:
+    raise SystemExit(
+        "uv.lock is missing project dependencies: "
+        + ", ".join(missing_locked_dependencies)
     )
 print(package_version)
 PY
@@ -714,6 +767,7 @@ uv_is_compatible() {
   local candidate=$1
   command -v "$candidate" >/dev/null 2>&1 || return 1
   "$candidate" --version >/dev/null 2>&1 || return 1
+  "$candidate" export --help >/dev/null 2>&1 || return 1
   "$candidate" tool install --python "$python_command" --force --from "$source_root" \
     personal-agent-memory --help >/dev/null 2>&1 || return 1
   uv_bin_dir="$("$candidate" tool dir --bin 2>/dev/null)" || return 1
@@ -942,6 +996,19 @@ if $uv_needs_install; then
   fi
   cleanup_uv_installer
   trap - EXIT
+fi
+
+failed_stage="dependency lock export"
+constraints_file="$(mktemp "${TMPDIR:-/tmp}/personal-agent-memory-constraints.XXXXXX")" || \
+  dependency_error "Could not create a temporary dependency constraints file."
+cleanup_constraints() {
+  rm -f "$constraints_file"
+}
+trap cleanup_constraints EXIT
+if ! "$uv_command" export --frozen --no-dev --no-hashes --no-emit-project \
+  --project "$source_root" --output-file "$constraints_file"; then
+  dependency_error \
+    "Could not export the locked dependency set from uv.lock. Refresh the lock file and rerun this installer."
 fi
 
 failed_stage="directory preparation"
@@ -1180,7 +1247,7 @@ fi
 
 failed_stage="Python tool installation"
 "$uv_command" tool install --python "$python_command" --force --from "$source_root" \
-  personal-agent-memory
+  --constraints "$constraints_file" --no-python-downloads personal-agent-memory
 daemon_command="${uv_bin_dir}/personal-agent-memory"
 [[ -x "$daemon_command" ]]
 installed_command_version="$($daemon_command --version)"
@@ -1415,14 +1482,15 @@ if recorded and (
     raise SystemExit(
         f"existing install metadata does not prove ownership of user service definition: {unit_path}"
     )
-def unit_content(daemon_command: str) -> bytes:
+def unit_content(daemon_command: str, *, cross_kernel_upgrade: bool) -> bytes:
+    kernel_argument = ' --memory-kernel "mem2"' if cross_kernel_upgrade else ""
     return f'''[Unit]
 Description=Personal Agent Memory daemon
 After=network.target
 
 [Service]
 Type=simple
-ExecStart={daemon_command} serve --state-dir {sys.argv[3]} --library-root {sys.argv[4]} --host "127.0.0.1" --port "{port}"
+ExecStart={daemon_command} serve --state-dir {sys.argv[3]} --library-root {sys.argv[4]} --host "127.0.0.1" --port "{port}"{kernel_argument}
 Restart=on-failure
 RestartSec=2
 
@@ -1430,8 +1498,8 @@ RestartSec=2
 WantedBy=default.target
 '''.encode("utf-8")
 
-payload = unit_content(sys.argv[2])
-legacy_payload = unit_content(legacy_daemon_command)
+payload = unit_content(sys.argv[2], cross_kernel_upgrade=True)
+legacy_payload = unit_content(legacy_daemon_command, cross_kernel_upgrade=False)
 if unit_path.parent.resolve() != unit_path.parent:
     raise SystemExit(f"user service directory is not a lexical directory: {unit_path.parent}")
 directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -1471,7 +1539,10 @@ def current_state() -> tuple[str, tuple[int, int] | None]:
                 raise SystemExit(
                     f"user service definition does not match install metadata: {unit_path}"
                 )
-        elif digest != hashlib.sha256(legacy_payload).hexdigest():
+        elif digest not in {
+            hashlib.sha256(legacy_payload).hexdigest(),
+            hashlib.sha256(payload).hexdigest(),
+        }:
             raise SystemExit(
                 f"user service definition already exists and is not installer-owned: {unit_path}"
             )
@@ -1529,35 +1600,96 @@ failed_stage="user service startup"
 systemctl --user enable --now "$service_name"
 
 failed_stage="authenticated health check"
-"$python_command" - "$state_dir/api-key" "$web_url/health/live" <<'PY'
-import pathlib
+"$python_command" - "$state_dir/api-key" "$web_url" "$state_dir" <<'PY'
+import json
+from pathlib import Path
 import sys
 import time
 import urllib.error
 import urllib.request
 
-key_path = pathlib.Path(sys.argv[1])
-health_url = sys.argv[2]
+key_path = Path(sys.argv[1])
+base_url = sys.argv[2].rstrip("/")
+state_dir = Path(sys.argv[3])
 deadline = time.monotonic() + 30
 last_error = "API key was not created"
+
+def request(path: str, *, method: str = "GET", payload: object | None = None) -> object:
+    key = key_path.read_text(encoding="utf-8").strip()
+    if not key:
+        raise OSError("API key is empty")
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Authorization": f"Bearer {key}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    http_request = urllib.request.Request(
+        base_url + path,
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    with urllib.request.urlopen(http_request, timeout=5) as response:
+        return json.load(response)
+
 while time.monotonic() < deadline:
     try:
-        key = key_path.read_text(encoding="utf-8").strip()
-        if not key:
-            raise OSError("API key is empty")
-        request = urllib.request.Request(
-            health_url,
-            headers={"Authorization": f"Bearer {key}"},
-        )
-        with urllib.request.urlopen(request, timeout=1) as response:
-            if response.status == 200:
-                break
-            last_error = f"health endpoint returned {response.status}"
-    except (OSError, urllib.error.URLError) as error:
+        live = request("/health/live")
+        if live == {"status": "ok"}:
+            break
+        last_error = f"unexpected live health response: {live!r}"
+    except (OSError, ValueError, urllib.error.URLError) as error:
         last_error = str(error)
     time.sleep(0.1)
 else:
     raise SystemExit(f"daemon did not become healthy: {last_error}")
+
+health = request("/mcp/health")
+if not isinstance(health, dict):
+    raise SystemExit("MCP health response is not an object")
+if health.get("memory_kernel") != "mem2":
+    raise SystemExit(f"MCP health selected the wrong memory kernel: {health.get('memory_kernel')!r}")
+if health.get("memory_kernel_status") not in {"ready", "degraded"}:
+    raise SystemExit(f"MCP memory kernel is not usable: {health.get('memory_kernel_status')!r}")
+
+region_tree = request("/api/v1/regions/tree")
+if not isinstance(region_tree, dict) or region_tree.get("root", {}).get("region_id") != "user":
+    raise SystemExit("memory region tree did not expose the user region")
+bindings = request("/api/v1/project-bindings")
+if not isinstance(bindings, list):
+    raise SystemExit("project binding endpoint did not return a list")
+resolved = request(
+    "/mcp/project-bindings/resolve",
+    method="POST",
+    payload={"cwd": str(state_dir)},
+)
+if not isinstance(resolved, dict) or resolved.get("status") not in {"bound", "unbound"}:
+    raise SystemExit("MCP project binding resolution returned an invalid response")
+search = request(
+    "/mcp",
+    method="POST",
+    payload={
+        "jsonrpc": "2.0",
+        "id": "installer-health",
+        "method": "tools/call",
+        "params": {
+            "name": "memory_search",
+            "arguments": {"region_ids": ["user"], "query": "installer health check"},
+        },
+    },
+)
+if not isinstance(search, dict):
+    raise SystemExit("MCP search response is not an object")
+result = search.get("result")
+if not isinstance(result, dict) or result.get("isError") is not False:
+    raise SystemExit("MCP search failed during installation acceptance")
+
+version_path = state_dir / "mem2" / "VERSION"
+try:
+    version = version_path.read_text(encoding="utf-8")
+except OSError as error:
+    raise SystemExit(f"mem2 state version marker is missing: {error}") from error
+if version != "jiuwen-memory-0.2.0\n":
+    raise SystemExit(f"unexpected mem2 state version marker: {version!r}")
 PY
 
 failed_stage="service status check"
@@ -1577,6 +1709,7 @@ trap - ERR
 cat <<EOF
 Personal Agent Memory installation complete.
 Installed version: ${target_version}
+Memory kernel:    mem2 (JiuwenMemory 0.2.0)
 Service status: ${service_status}
 Web: ${web_url}
 API key file: ${state_dir}/api-key

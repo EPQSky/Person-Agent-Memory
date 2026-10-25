@@ -1584,6 +1584,9 @@ def test_promotion_schema_migrates_existing_ticket08_database(tmp_path: Path) ->
     state_dir = tmp_path / "state"
     maintenance = state_dir / "mem2" / "maintenance.sqlite3"
     maintenance.parent.mkdir(parents=True)
+    (maintenance.parent / "VERSION").write_text(
+        "jiuwen-memory-0.2.0\n", encoding="utf-8"
+    )
     with sqlite3.connect(maintenance) as connection:
         connection.execute(
             """CREATE TABLE promotion_records (

@@ -1209,9 +1209,11 @@ class UnavailableMemoryKernel:
 
 
 def select_memory_kernel(settings: Settings, state: PlatformState) -> MemoryKernelPort:
-    regions = RegionRegistry(settings.state_dir / "regions.sqlite3")
     if settings.memory_kernel == "legacy":
-        return LegacyMemoryKernel(state, regions)
+        return LegacyMemoryKernel(
+            state,
+            RegionRegistry(settings.state_dir / "regions.sqlite3"),
+        )
     from personal_agent_memory.mem2_kernel import Mem2MemoryKernel
 
     return Mem2MemoryKernel(
@@ -1219,5 +1221,4 @@ def select_memory_kernel(settings: Settings, state: PlatformState) -> MemoryKern
         embedding=settings.embedding,
         embedding_dimension=settings.embedding_dimension,
         graph=settings.graph,
-        regions=regions,
     )

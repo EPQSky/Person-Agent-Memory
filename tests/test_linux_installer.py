@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -1784,24 +1785,28 @@ exec "{sys.executable}" "$@"
 
 
 @pytest.mark.parametrize(
-    ("uv_mode", "python_fallback", "directory_mode"),
+    ("uv_mode", "python_version", "directory_mode"),
     [
-        ("existing", False, "default"),
-        ("missing", False, "default"),
-        ("trimmed", False, "default"),
-        ("existing", True, "default"),
-        ("existing", False, "state-only"),
-        ("existing", False, "library-only"),
-        ("existing", False, "both"),
-        ("existing", False, "literal-dollar"),
-        ("existing", False, "empty-xdg-custom-state"),
-        ("existing", False, "preexisting-state"),
+        ("existing", None, "default"),
+        ("missing", None, "default"),
+        ("trimmed", None, "default"),
+        ("existing", "3.11", "default"),
+        ("existing", "3.12", "default"),
+        ("existing", "3.13", "default"),
+        ("existing", None, "state-only"),
+        ("existing", None, "library-only"),
+        ("existing", None, "both"),
+        ("existing", None, "literal-dollar"),
+        ("existing", None, "empty-xdg-custom-state"),
+        ("existing", None, "preexisting-state"),
     ],
     ids=[
         "existing-uv",
         "bootstrapped-uv",
         "trimmed-uv",
-        "versioned-python",
+        "python-3.11",
+        "python-3.12",
+        "python-3.13",
         "custom-state",
         "custom-library",
         "custom-both",
@@ -1811,7 +1816,7 @@ exec "{sys.executable}" "$@"
     ],
 )
 def test_supported_environment_installs_service_plugin_and_healthy_hook(
-    tmp_path: Path, uv_mode: str, python_fallback: bool, directory_mode: str
+    tmp_path: Path, uv_mode: str, python_version: str | None, directory_mode: str
 ) -> None:
     repo_status = subprocess.run(
         ["git", "status", "--porcelain=v1", "--untracked-files=all"],
@@ -1846,14 +1851,23 @@ def test_supported_environment_installs_service_plugin_and_healthy_hook(
             fake_bin / name,
             f'#!/bin/sh\nprintf \'{name} %s\\n\' "$*" >>"{command_log}"\nexit 99\n',
         )
-    if python_fallback:
-        executable(fake_bin / "python3", "#!/bin/sh\nexit 1\n")
-        executable(fake_bin / "python3.13", "#!/bin/sh\nexit 1\n")
-        executable(fake_bin / "python3.12", "#!/bin/sh\nexit 1\n")
+    if python_version is None:
         executable(
-            fake_bin / "python3.11",
+            fake_bin / "python3",
+                f"""#!/bin/sh
+printf 'python3 %s\n' "$*" >>"{command_log}"
+exec "{sys.executable}" "$@"
+""",
+        )
+    else:
+        executable(fake_bin / "python3", "#!/bin/sh\nexit 1\n")
+        for candidate in ("3.11", "3.12", "3.13"):
+            if candidate != python_version:
+                executable(fake_bin / f"python{candidate}", "#!/bin/sh\nexit 1\n")
+        executable(
+            fake_bin / f"python{python_version}",
             f"""#!/bin/sh
-printf 'python3.11 %s\n' "$*" >>"{command_log}"
+printf 'python{python_version} %s\n' "$*" >>"{command_log}"
 exec "{sys.executable}" "$@"
 """,
         )
@@ -1867,6 +1881,10 @@ import sys
 
 state = Path(sys.argv[sys.argv.index('--state-dir') + 1])
 state.mkdir(parents=True, exist_ok=True)
+if '--memory-kernel' not in sys.argv or sys.argv[sys.argv.index('--memory-kernel') + 1] != 'mem2':
+    raise SystemExit('installer did not select the mem2 memory kernel')
+(state / 'mem2').mkdir(parents=True, exist_ok=True)
+(state / 'mem2' / 'VERSION').write_text('jiuwen-memory-0.2.0\\n', encoding='utf-8')
 key_path = state / 'api-key'
 if not key_path.exists():
     key_path.write_text('installer-test-secret\\n', encoding='utf-8')
@@ -1886,7 +1904,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        self.reply({'status': 'ok'})
+        if self.path == '/health/live':
+            self.reply({'status': 'ok'})
+        elif self.path == '/mcp/health':
+            self.reply({
+                'status': 'degraded',
+                'memory_kernel': 'mem2',
+                'memory_kernel_status': 'degraded',
+            })
+        elif self.path == '/api/v1/regions/tree':
+            self.reply({'root': {'region_id': 'user', 'kind': 'user'}, 'topics': [],
+                        'projects': [], 'current_session': None})
+        elif self.path == '/api/v1/project-bindings':
+            self.reply([])
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def do_POST(self):
         self.rfile.read(int(self.headers.get('content-length', '0')))
@@ -1895,11 +1928,28 @@ class Handler(BaseHTTPRequestHandler):
                 'path': self.path,
                 'authorization': self.headers.get('Authorization'),
             }) + '\\n')
-        self.reply({
-            'schema_version': 'memory-context-package/v1',
-            'status': 'unbound',
-            'results': [],
-        })
+        if self.path == '/mcp/project-bindings/resolve':
+            self.reply({'status': 'unbound'})
+        elif self.path == '/mcp':
+            self.reply({
+                'jsonrpc': '2.0',
+                'id': 'installer-health',
+                'result': {
+                    'content': [{'type': 'text', 'text': '{}'}],
+                    'isError': False,
+                    'structuredContent': {
+                        'schema_version': 'memory-context-package/v1',
+                        'status': 'bound',
+                        'results': [],
+                    },
+                },
+            })
+        else:
+            self.reply({
+                'schema_version': 'memory-context-package/v1',
+                'status': 'unbound',
+                'results': [],
+            })
 
     def log_message(self, format, *args):
         pass
@@ -1913,6 +1963,22 @@ set -eu
 printf 'uv %s\\n' "$*" >>"{command_log}"
 if [ "$*" = '--version' ]; then
   printf 'uv 0.8.0\\n'
+  exit 0
+fi
+if [ "$*" = 'export --help' ]; then
+  exit 0
+fi
+if [ "${{1:-}}" = 'export' ]; then
+  output=''
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = '--output-file' ]; then
+      output=$2
+      break
+    fi
+    shift
+  done
+  [ -n "$output" ]
+  printf '%s\\n' 'jiuwenmemory==0.2.0' 'milvus-lite==3.2.2' 'pymilvus==3.0.2' >"$output"
   exit 0
 fi
 if [ "${{1:-}} ${{2:-}} ${{3:-}} ${{5:-}} ${{6:-}} ${{8:-}} ${{9:-}}" = \
@@ -1953,8 +2019,21 @@ chmod +x "{fake_bin}/personal-agent-memory"
                 f"""#!/bin/sh
 printf 'trimmed-uv %s\n' "$*" >>"{command_log}"
 case "$*" in
-  '--version'|'tool install --help') exit 0 ;;
+  '--version'|'export --help'|'tool install --help') exit 0 ;;
 esac
+if [ "${{1:-}}" = 'export' ]; then
+  output=''
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = '--output-file' ]; then
+      output=$2
+      break
+    fi
+    shift
+  done
+  [ -n "$output" ]
+  printf '%s\\n' 'jiuwenmemory==0.2.0' 'milvus-lite==3.2.2' 'pymilvus==3.0.2' >"$output"
+  exit 0
+fi
 if [ "${{1:-}} ${{2:-}} ${{3:-}} ${{5:-}} ${{7:-}}" = \
   'tool install --python --from --help' ]; then
   exit 0
@@ -2151,7 +2230,7 @@ esac
         install_metadata_path = home / ".config/personal-agent-memory/install.json"
         install_metadata = json.loads(install_metadata_path.read_text(encoding="utf-8"))
         old_marketplace_source = tmp_path / "old-release"
-        legacy_upgrade = directory_mode == "default" and not python_fallback
+        legacy_upgrade = directory_mode == "default" and python_version is None
         if legacy_upgrade:
             install_metadata.pop("installed_version")
             install_metadata.pop("marketplace_ownership")
@@ -2221,7 +2300,12 @@ esac
         expected_state_argument = str(state_dir).replace("$", "$$")
         assert f'--state-dir "{expected_state_argument}"' in unit_text
         assert f'--library-root "{library_root}"' in unit_text
-        assert f'--host "127.0.0.1" --port "{port}"' in unit_text
+        assert (
+            f'--host "127.0.0.1" --port "{port}" --memory-kernel "mem2"' in unit_text
+        )
+        assert (
+            state_dir / "mem2" / "VERSION"
+        ).read_text(encoding="utf-8") == "jiuwen-memory-0.2.0\n"
         assert json.loads((plugin_install / ".mcp.json").read_text(encoding="utf-8"))[
             "mcpServers"
         ]["personal-agent-memory"]["url"] == f"http://127.0.0.1:{port}/mcp"
@@ -2290,10 +2374,14 @@ esac
         assert ("curl " in log) is (uv_mode != "existing")
         if uv_mode == "trimmed":
             assert "trimmed-uv tool install --python" in log
-        if python_fallback:
-            assert f"uv tool install --python {fake_bin / 'python3.11'}" in log
-            assert "python3.11 -c" in log
-            assert f"python3.11 - {home / '.local/share/personal-agent-memory/api-key'}" in log
+        if python_version is not None:
+            selected_python = fake_bin / f"python{python_version}"
+            assert f"uv tool install --python {selected_python}" in log
+            assert f"python{python_version} -c" in log
+            assert (
+                f"python{python_version} - "
+                f"{home / '.local/share/personal-agent-memory/api-key'}"
+            ) in log
         assert log.count(f"codex plugin marketplace add {ROOT}") == 2
         assert log.count("codex plugin marketplace remove personal-agent-memory --json") == 1
         assert log.count("codex plugin add personal-agent-memory@personal-agent-memory") == 2
@@ -2315,6 +2403,7 @@ esac
         assert "installer-test-secret" not in result.stdout
         assert "Installed version: 0.1.0" in result.stdout
         for expected in (
+            "Memory kernel:    mem2 (JiuwenMemory 0.2.0)",
             "Service status: active",
             f"Web: http://127.0.0.1:{port}",
             f"API key file: {state_dir / 'api-key'}",
@@ -2364,7 +2453,8 @@ esac
         assert capture.returncode == 0
         assert capture.stdout == ""
         assert capture.stderr == ""
-        assert [json.loads(line) for line in request_log.read_text().splitlines()] == [
+        requests = [json.loads(line) for line in request_log.read_text().splitlines()]
+        assert requests[-2:] == [
             {
                 "path": "/api/v1/search",
                 "authorization": "Bearer installer-test-secret",
@@ -2374,6 +2464,10 @@ esac
                 "authorization": "Bearer installer-test-secret",
             },
         ]
+        assert sum(
+            item["path"] == "/mcp/project-bindings/resolve" for item in requests
+        ) == 2
+        assert sum(item["path"] == "/mcp" for item in requests) == 2
         assert (
             subprocess.run(
                 ["git", "status", "--porcelain=v1", "--untracked-files=all"],
@@ -2394,7 +2488,7 @@ esac
             ).stdout
             == repo_remotes
         )
-        if uv_mode == "existing" and not python_fallback and directory_mode == "default":
+        if uv_mode == "existing" and python_version is None and directory_mode == "default":
             legacy_same_source_metadata = dict(install_metadata)
             for field in (
                 "installed_version",
@@ -2467,6 +2561,7 @@ esac
             shutil.copy2(ROOT / "install.sh", adopted_release / "install.sh")
             shutil.copy2(ROOT / "uninstall.sh", adopted_release / "uninstall.sh")
             shutil.copy2(ROOT / "pyproject.toml", adopted_release / "pyproject.toml")
+            shutil.copy2(ROOT / "uv.lock", adopted_release / "uv.lock")
             shutil.copytree(
                 ROOT / "plugins" / "personal-agent-memory",
                 adopted_release / "plugins" / "personal-agent-memory",
@@ -2632,6 +2727,7 @@ esac
                 encoding="utf-8",
             )
             shutil.copy2(ROOT / "pyproject.toml", next_release / "pyproject.toml")
+            shutil.copy2(ROOT / "uv.lock", next_release / "uv.lock")
             shutil.copytree(
                 ROOT / "plugins" / "personal-agent-memory",
                 next_release / "plugins" / "personal-agent-memory",
@@ -3064,7 +3160,7 @@ esac
             line.startswith(("sudo ", "apt ", "apt-get ", "dnf ", "yum ", "pacman ", "zypper "))
             for line in uninstall_log
         )
-        if uv_mode == "existing" and not python_fallback and directory_mode == "default":
+        if uv_mode == "existing" and python_version is None and directory_mode == "default":
             shutil.rmtree(state_dir)
             state_dir.mkdir(parents=True)
             replacement_file = state_dir / "replacement-user-file.txt"
@@ -3965,7 +4061,7 @@ def test_uv_bootstrap_failure_leaves_no_partial_installation(tmp_path: Path) -> 
         f"""#!/bin/sh
 echo "trimmed-uv $*" >>"{command_log}"
 case "$*" in
-  '--version'|'tool install --help') exit 0 ;;
+      '--version'|'export --help'|'tool install --help') exit 0 ;;
 esac
 if [ "${{1:-}} ${{2:-}} ${{3:-}} ${{5:-}} ${{7:-}}" = \
   'tool install --python --from --help' ]; then
@@ -4026,6 +4122,90 @@ def test_uv_bootstrap_temp_file_failure_is_actionable(tmp_path: Path) -> None:
     assert "curl " not in command_log.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("python_version", ["3.11", "3.12", "3.13"])
+def test_installer_selects_each_supported_python_without_network(
+    tmp_path: Path, python_version: str
+) -> None:
+    environment, home, command_log = preflight_test_environment(tmp_path)
+    fake_bin = Path(environment["PATH"].split(":", 1)[0])
+    executable(fake_bin / "python3", "#!/bin/sh\nexit 1\n")
+    for candidate in ("3.11", "3.12", "3.13"):
+        path = fake_bin / f"python{candidate}"
+        if candidate == python_version:
+            executable(
+                path,
+                f"""#!/bin/sh
+printf 'python{candidate} %s\n' "$*" >>"{command_log}"
+exec "{sys.executable}" "$@"
+""",
+            )
+        else:
+            executable(path, "#!/bin/sh\nexit 1\n")
+    executable(fake_bin / "git", "#!/bin/sh\nexit 1\n")
+
+    result = subprocess.run(
+        [str(ROOT / "install.sh")],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "A working Git installation is required" in result.stderr
+    version_check = (
+        "-c import sys; raise SystemExit(0 if (3, 11) <= "
+        "sys.version_info[:2] < (3, 14) else 1)"
+    )
+    log = command_log.read_text(encoding="utf-8").splitlines()
+    assert f"python{python_version} {version_check}" in log
+    assert any(line.startswith(f"python{python_version} - ") for line in log)
+    assert not (home / ".local/share/personal-agent-memory").exists()
+    assert not any("uv tool install --python" in line for line in log)
+
+
+def test_release_contract_pins_mem2_dependencies_and_python_matrix() -> None:
+    with (ROOT / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)["project"]
+    with (ROOT / "uv.lock").open("rb") as stream:
+        lock = tomllib.load(stream)
+
+    assert project["requires-python"] == ">=3.11,<3.14"
+    assert lock["requires-python"] == ">=3.11, <3.14"
+    dependencies = set(project["dependencies"])
+    assert {
+        "JiuwenMemory==0.2.0",
+        "milvus-lite==3.2.2",
+        "pymilvus==3.0.2",
+    } <= dependencies
+    assert not any("docker" in dependency.lower() for dependency in dependencies)
+    assert {
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+    } <= set(project["classifiers"])
+    locked = {
+        package["name"].lower(): package["version"] for package in lock["package"]
+    }
+    assert locked["jiuwenmemory"] == "0.2.0"
+    assert locked["milvus-lite"] == "3.2.2"
+    assert locked["pymilvus"] == "3.0.2"
+
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    for contract in (
+        "export --frozen --no-dev --no-hashes --no-emit-project",
+        '--constraints "$constraints_file"',
+        "--no-python-downloads personal-agent-memory",
+        '--memory-kernel "mem2"',
+        "/api/v1/regions/tree",
+        "/mcp/project-bindings/resolve",
+        'state_dir / "mem2" / "VERSION"',
+    ):
+        assert contract in installer
+
+
 def test_real_lifecycle_verifier_reports_reproducible_skip_gate() -> None:
     environment = {**os.environ}
     environment.pop("PAM_INSTALL_ACCEPTANCE_DEDICATED_USER", None)
@@ -4054,7 +4234,7 @@ def test_real_lifecycle_verifier_reports_reproducible_skip_gate() -> None:
     assert script.index(
         'skip "Personal Agent Memory command already exists for this user"'
     ) < script.index('managed_bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"')
-    assert script.count('"$python_command" - ') == 14
+    assert script.count('"$python_command" - ') == 16
     assert '"$repo_root/install.sh"' in script
     assert "PAM_INSTALL_ACCEPTANCE_CUSTOM_DIRS" in script
     assert "systemctl --user is-enabled" in script
@@ -4065,6 +4245,11 @@ def test_real_lifecycle_verifier_reports_reproducible_skip_gate() -> None:
     assert 'git -C "$repo_root" archive "$legacy_commit"' in script
     assert '"preexisting" if scenario == "normal" else "installer-managed"' in script
     assert '"marketplace_update_pending": False' in script
+    assert 'cat "$state_dir/mem2/VERSION"' in script
+    assert '"memory_kernel"] == "mem2"' in script
+    assert '"/api/v1/regions/tree"' in script
+    assert '"/mcp/project-bindings/resolve"' in script
+    assert 'capture.mjs' in script
     assert '"$old_release/install.sh"' in script
     assert script.count('"$repo_root/install.sh"') >= 2
     assert '[[ "$(personal-agent-memory --version)" == "$target_version" ]]' in script
@@ -4275,3 +4460,84 @@ def test_linux_lifecycle_verifier_checks_reviewable_release_assets() -> None:
         "missing uv bootstrap acceptance passed",
     ):
         assert asset in script
+
+
+def test_legacy_service_unit_without_mem2_argument_is_owned_and_upgraded(
+    tmp_path: Path,
+) -> None:
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    marker = '"$saved_unit_path" "$saved_unit_sha256" "$web_port" <<\'PY\'\n'
+    start = installer.index(marker) + len(marker)
+    end = installer.index('\nPY\n)"', start)
+    unit_checker = installer[start:end]
+
+    unit_path = tmp_path / "personal-agent-memory.service"
+    daemon_command = '"/opt/personal-agent-memory"'
+    state_argument = '"/tmp/platform state"'
+    library_argument = '"/tmp/memory libraries"'
+    legacy_exec_start = (
+        f"{daemon_command} serve --state-dir {state_argument} "
+        f"--library-root {library_argument} --host \"127.0.0.1\" --port \"7331\""
+    )
+    legacy_unit = f"""[Unit]
+Description=Personal Agent Memory daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={legacy_exec_start}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+"""
+    unit_path.write_text(legacy_unit, encoding="utf-8")
+
+    upgraded = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(unit_path),
+            daemon_command,
+            state_argument,
+            library_argument,
+            daemon_command,
+            "",
+            "",
+            "7331",
+        ],
+        input=unit_checker,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert upgraded.returncode == 0, upgraded.stderr
+    installed = unit_path.read_text(encoding="utf-8")
+    assert '--memory-kernel "mem2"' in installed
+    assert hashlib.sha256(installed.encode()).hexdigest() == upgraded.stdout.strip()
+
+    unit_path.write_text(
+        installed.replace(' --memory-kernel "mem2"', '').replace("RestartSec=2", "RestartSec=9"),
+        encoding="utf-8",
+    )
+    refused = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(unit_path),
+            daemon_command,
+            state_argument,
+            library_argument,
+            daemon_command,
+            "",
+            "",
+            "7331",
+        ],
+        input=unit_checker,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert refused.returncode != 0
+    assert "already exists and is not installer-owned" in refused.stderr
