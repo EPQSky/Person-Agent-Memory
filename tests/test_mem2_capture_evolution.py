@@ -339,6 +339,7 @@ def test_non_project_default_recall_is_user_plus_current_chat_only(tmp_path: Pat
             client, headers, "DEFAULT-RECALL", cwd=other_root, session_id="chat-session"
         )
         assert result["scope"]["kind"] == "user_and_session"
+        assert "cross_region" not in result["budget"]
         assert {item["region_id"] for item in result["results"]} == {
             "user",
             _capture_region_id(client, headers, "chat-session"),
@@ -361,8 +362,16 @@ def test_explicit_session_region_search_uses_region_session_scope(tmp_path: Path
         memory_id = _write_region(
             client, headers, "session-region", "R2F1-SESSION-REGION"
         )
+        cross_region_attempt = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "region_ids": ["session-region"],
+                "query": "R2F1-SESSION-REGION",
+            },
+        )
+        assert cross_region_attempt.status_code == 422
         for selector in (
-            {"region_ids": ["session-region"]},
             {"region_id": "session-region"},
             {
                 "region_id": "session-region",

@@ -546,3 +546,165 @@ def test_search_contract_requires_explicit_scope_and_user_library(tmp_path: Path
                 "degradation",
             )
         ).issubset(hit)
+
+
+def test_cross_region_package_enforces_region_graph_and_source_structure_caps() -> None:
+    def cross_result(
+        content: str,
+        region_id: str,
+        *,
+        classification: str = "direct",
+        path: str,
+    ) -> dict[str, object]:
+        payload = result(content, classification=classification, path=path)
+        payload.update(
+            {
+                "region_id": region_id,
+                "space": f"topic:{region_id}",
+                "source_references": [f"source:{region_id}"],
+            }
+        )
+        return payload
+
+    region_ids = ["user", "topic", "project"]
+    groups = [
+        {
+            "region_id": region_id,
+            "kind": "user" if region_id == "user" else "topic",
+            "name": region_id,
+            "space": "user" if region_id == "user" else f"topic:{region_id}",
+            "status": "ok",
+            "degraded": False,
+            "degradation": [],
+            "vector_index_status": "not_configured",
+            "graph_index_status": "ready",
+        }
+        for region_id in region_ids
+    ]
+    package = build_context_package(
+        {
+            "status": "bound",
+            "scope": {"kind": "explicit_regions", "region_ids": region_ids},
+            "region_ids": region_ids,
+            "region_groups": groups,
+            "query": "cross-region",
+            "degradation": [],
+            "vector_index_status": "not_configured",
+            "graph_index_status": "ready",
+            "cross_region_budget": {
+                "user_fraction": 0.30,
+                "selected_region_fraction": 0.50,
+                "graph_fraction": 0.20,
+                "source_structure_fraction": 0.25,
+            },
+            "results": [
+                cross_result("user evidence " * 8_000, "user", path="user.md"),
+                cross_result("topic direct evidence", "topic", path="topic.md"),
+                cross_result(
+                    "graph evidence " * 8_000,
+                    "topic",
+                    classification="graph_expansion",
+                    path="graph.md",
+                ),
+                cross_result("project direct evidence", "project", path="project.md"),
+            ],
+        },
+        requested_budget=4_000,
+        target_model="gpt-4o-mini",
+    )
+
+    cross = package["budget"]["cross_region"]
+    groups_by_id = {
+        region_ids[group["region_index"]]: group for group in package["region_groups"]
+    }
+    assert cross["graph_used_tokens"] > 0
+    assert cross["graph_used_tokens"] <= cross["graph_limit_tokens"] == 800
+    assert cross["source_structure_used_tokens"] <= cross[
+        "source_structure_limit_tokens"
+    ] == 1_000
+    assert groups_by_id["user"]["content_tokens"] <= groups_by_id["user"]["limit_tokens"]
+    assert groups_by_id["topic"]["content_tokens"] <= groups_by_id["topic"]["limit_tokens"]
+    assert any(
+        item["classification"] == "graph_expansion"
+        and item["region_id"] == "topic"
+        and item["source_references"] == ["source:topic"]
+        for item in package["results"]
+    )
+    assert encoded_tokens(package) <= 4_000
+    assert package["budget"]["telemetry_accounting"] == "exact_serialized_v1"
+    assert package["budget"]["used_tokens"] == encoded_tokens(package)
+
+
+def test_non_cross_region_scope_ignores_region_groups_and_default_budget() -> None:
+    content = "project evidence " * 1_000
+    project_result = result(content, path="project.md")
+    project_result.update({"region_id": "project", "space": "project:project"})
+    package = build_context_package(
+        {
+            "status": "bound",
+            "scope": {"kind": "project_cwd", "region_ids": ["project"]},
+            "region_ids": ["project"],
+            "region_groups": [
+                {
+                    "region_id": "project",
+                    "kind": "project",
+                    "name": "project",
+                    "space": "project:project",
+                    "status": "ok",
+                }
+            ],
+            "query": "project evidence",
+            "degradation": [],
+            "vector_index_status": "not_configured",
+            "graph_index_status": "not_configured",
+            "results": [project_result],
+        },
+        requested_budget=10_000,
+        target_model="gpt-4o-mini",
+    )
+
+    assert "cross_region" not in package["budget"]
+    assert "region_groups" not in package
+    counter = TokenCounter.for_model("gpt-4o-mini")
+    assert counter.count(str(package["results"][0]["content"])) > 2_000
+    assert package["budget"]["used_tokens"] <= 10_000
+
+
+def test_cross_region_default_budget_supports_twenty_degraded_regions() -> None:
+    region_ids = [f"topic-{index:02d}" for index in range(20)]
+    groups = [
+        {
+            "region_id": region_id,
+            "kind": "topic",
+            "name": region_id,
+            "space": f"topic:{region_id}",
+            "status": "degraded",
+            "degraded": True,
+            "degradation": ["graph_unavailable"],
+            "graph_index_status": "degraded",
+        }
+        for region_id in region_ids
+    ]
+    package = build_context_package(
+        {
+            "status": "bound",
+            "scope": {"kind": "explicit_regions", "region_ids": region_ids},
+            "region_ids": region_ids,
+            "region_groups": groups,
+            "query": "coverage",
+            "degradation": ["graph_unavailable"],
+            "vector_index_status": "not_configured",
+            "graph_index_status": "degraded",
+            "results": [],
+        },
+        requested_budget=10_000,
+        target_model="gpt-4o-mini",
+    )
+
+    assert [
+        package["region_ids"][group["region_index"]] for group in package["region_groups"]
+    ] == region_ids
+    cross = package["budget"]["cross_region"]
+    assert cross["source_structure_used_tokens"] <= 1_000
+    assert cross["graph_used_tokens"] == 0
+    assert package["budget"]["used_tokens"] <= 10_000
