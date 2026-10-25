@@ -155,3 +155,5 @@ def test_promotion_classifier_uses_bounded_candidate_profile() -> None:
         prompt = json.dumps(request["messages"], ensure_ascii=False)
         assert "promotion-classifier-v1" in prompt
         assert "topic_regions" in prompt
+        assert "claim_subject" in prompt
+        assert "claim_value" in prompt

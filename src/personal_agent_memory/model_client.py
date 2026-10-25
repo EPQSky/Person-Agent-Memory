@@ -276,7 +276,8 @@ class OpenAICompatibleClient:
                         "role": "system",
                         "content": (
                             "promotion-classifier-v1: return one JSON object with category, "
-                            "confidence, explicit, topic_id, and reason. category must be one "
+                            "confidence, explicit, topic_id, claim_subject, claim_value, and "
+                            "reason. category must be one "
                             "of user, topic, project, conflict, sensitive, or retain. Use user "
                             "only for a stable personal preference, relationship, goal, "
                             "constraint, or long-term fact that applies across projects. Use "
@@ -286,7 +287,10 @@ class OpenAICompatibleClient:
                             "facts. explicit is true only when the user explicitly stated the "
                             "fact; assistant inference alone is not explicit. Never promote "
                             "secrets, credentials, conflict, transient progress, or unsupported "
-                            "speculation. Return confidence from 0 to 1."
+                            "speculation. Return confidence from 0 to 1. Set claim_subject and "
+                            "claim_value when the content states a checkable claim; otherwise "
+                            "return empty strings. Use the same claim_subject for opposing "
+                            "values so conflicts are detectable."
                         ),
                     },
                     {
