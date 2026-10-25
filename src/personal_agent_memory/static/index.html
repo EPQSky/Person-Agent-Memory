@@ -1,1905 +1,367 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>个人智能体记忆 | Personal Agent Memory</title>
-    <style>
-      :root { --blue: #1664ff; --blue-soft: #e8f0ff; --teal: #00a870; --orange: #ff8800; --red: #d54941; --ink: #1d2129; --muted: #646a73; --line: #dee0e3; --surface: #fff; --canvas: #f5f6f7; color: var(--ink); background: var(--canvas); font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      * { box-sizing: border-box; }
-      body { margin: 0; min-width: 320px; }
-      button, input, select, textarea { font: inherit; }
-      button { min-height: 34px; margin-top: 12px; padding: 7px 14px; border: 1px solid transparent; border-radius: 6px; background: var(--blue); color: white; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; }
-      button:hover:not(:disabled) { background: #0f55d9; }
-      button:disabled { cursor: not-allowed; opacity: .5; }
-      button.secondary { border-color: var(--line); background: white; color: var(--ink); }
-      button.secondary:hover:not(:disabled) { background: #f2f3f5; }
-      button.danger { background: var(--red); }
-      button.danger:hover:not(:disabled) { background: #b83b34; }
-      button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid rgba(22,100,255,.24); outline-offset: 2px; }
-      .login-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #f5f6f7; }
-      .login-panel { width: min(420px, 100%); padding: 32px; border: 1px solid var(--line); border-radius: 8px; background: white; box-shadow: 0 10px 32px rgba(31,35,41,.08); }
-      .brand-mark { width: 40px; height: 40px; display: grid; place-items: center; margin-bottom: 20px; border-radius: 8px; background: var(--blue); color: white; font-size: 22px; font-weight: 700; }
-      h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
-      h2 { margin: 0 0 18px; font-size: 20px; letter-spacing: 0; }
-      h3 { margin: 22px 0 8px; font-size: 15px; letter-spacing: 0; }
-      .subtitle, .hint, .source { color: var(--muted); }
-      .subtitle { margin: 4px 0 24px; }
-      .app-shell { min-height: 100vh; display: grid; grid-template-columns: 232px minmax(0, 1fr); }
-      .sidebar { position: sticky; top: 0; height: 100vh; overflow-y: auto; padding: 18px 12px; border-right: 1px solid var(--line); background: white; }
-      .sidebar-brand { padding: 0 10px 18px; font-weight: 700; font-size: 16px; }
-      .sidebar-brand small { display: block; color: var(--muted); font-weight: 400; font-size: 11px; }
-      .nav-group { margin: 14px 10px 6px; color: var(--muted); font-size: 12px; }
-      .nav-button { width: 100%; margin: 2px 0; text-align: left; background: transparent; color: var(--ink); }
-      .nav-button:hover:not(:disabled) { background: #f2f3f5; }
-      .nav-button[aria-current="page"] { background: var(--blue-soft); color: #0f55d9; font-weight: 650; }
-      .app-main { min-width: 0; }
-      .topbar { position: sticky; top: 0; z-index: 5; height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 24px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.96); }
-      .topbar button { margin: 0; }
-      .connection { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
-      .connection::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #8b9097; }
-      .connection.ok::before { background: var(--teal); }
-      .connection.warn::before { background: #ad5f00; }
-      .connection.bad::before { background: var(--red); }
-      .workspace { width: min(1240px, 100%); margin: 0 auto; padding: 24px; }
-      .view[hidden] { display: none; }
-      .view-section { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--line); }
-      .view-section:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
-      .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }
-      .metric { min-height: 106px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: white; }
-      .metric span { color: var(--muted); }
-      .metric strong { display: block; margin-top: 10px; font-size: 25px; }
-      .quick-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-      .quick-actions button { margin: 0; }
-      .region-tree { padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: white; }
-      .region-tree section { margin-top: 14px; }
-      .region-tree h3 { margin: 0 0 8px; }
-      .region-node { margin: 6px 0; padding: 9px 12px; border-left: 3px solid var(--blue); background: var(--blue-soft); border-radius: 4px; overflow-wrap: anywhere; }
-      .region-node small { display: block; color: var(--muted); font-family: ui-monospace, monospace; }
-      label { display: block; font-weight: 650; margin-bottom: 6px; }
-      input, select, textarea { width: 100%; padding: 8px 10px; border: 1px solid #bbbfc4; border-radius: 6px; background: white; color: var(--ink); }
-      input[type="checkbox"] { width: auto; }
-      dl { display: grid; grid-template-columns: 180px 1fr; gap: 8px; }
-      dt { color: var(--muted); } dd { margin: 0; font-family: ui-monospace, monospace; }
-      .error { color: var(--red); }
-      .success { color: var(--teal); }
-      .notice { min-height: 22px; margin: 8px 0 0; }
-      .field { margin-top: 14px; }
-      .table-scroll { overflow-x: auto; }
-      table { width: 100%; min-width: 760px; border-collapse: collapse; margin-top: 14px; }
-      th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
-      th { color: var(--muted); font-size: 12px; }
-      td.path { overflow-wrap: anywhere; }
-      .badge { display: inline-flex; align-items: center; min-height: 24px; padding: 2px 8px; border-radius: 5px; background: #f2f3f5; color: var(--muted); white-space: nowrap; }
-      .badge.ok { background: #e8f8f2; color: #087f5b; }
-      .badge.warn { background: #fff3e0; color: #ad5f00; }
-      .badge.bad { background: #fdecea; color: #b83b34; }
-      .empty { padding: 28px 16px; text-align: center; color: var(--muted); border: 1px dashed #bbbfc4; border-radius: 6px; }
-      .search-result { border-top: 1px solid var(--line); padding: 14px 0; }
-      .search-result pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-      .source { font: 13px/1.4 ui-monospace, monospace; overflow-wrap: anywhere; }
-      .editor-layout { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(0, 3fr); gap: 18px; }
-      .document-tree, .history { max-height: 520px; overflow: auto; border-right: 1px solid var(--line); padding-right: 12px; }
-      .document-meta { max-height: 180px; overflow: auto; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); white-space: pre-wrap; overflow-wrap: anywhere; }
-      .document-tree button, .history button { display: block; width: 100%; margin: 0 0 6px; text-align: left; overflow-wrap: anywhere; }
-      textarea { min-height: 360px; resize: vertical; font: 14px/1.5 ui-monospace, monospace; white-space: pre; overflow: auto; }
-      iframe { width: 100%; min-height: 360px; border: 1px solid var(--line); background: white; }
-      .editor-tabs { display: flex; gap: 8px; margin: 12px 0; }
-      .editor-tabs button { margin: 0; }
-      .editor-tabs button[aria-selected="true"] { background: var(--blue); color: white; border-color: var(--blue); }
-      .editor-modes { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-top: 12px; }
-      .editor-modes label { margin: 0; min-width: 150px; }
-      .editor-modes select { margin-top: 4px; }
-      .editor-modes a { display: inline-flex; align-items: center; min-height: 34px; padding: 7px 14px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--ink); text-decoration: none; }
-      .editor-modes a:hover { background: #f2f3f5; }
-      .diff { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 ui-monospace, monospace; background: #f5f6f7; padding: 12px; border-radius: 6px; }
-      .candidate-layout { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr); gap: 18px; }
-      .candidate-list { min-height: 120px; max-height: 420px; overflow: auto; border-right: 1px solid var(--line); padding-right: 12px; }
-      .candidate-list button { display: block; width: 100%; margin: 0 0 6px; text-align: left; overflow-wrap: anywhere; }
-      .candidate-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-      .candidate-actions button { flex: 0 0 auto; }
-      dialog { width: min(480px, calc(100% - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 18px 50px rgba(31,35,41,.22); }
-      dialog::backdrop { background: rgba(31,35,41,.45); }
-      .dialog-body { padding: 22px; }
-      .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 22px; border-top: 1px solid var(--line); }
-      .dialog-actions button { margin: 0; }
-      @media (max-width: 860px) { .app-shell { grid-template-columns: 1fr; } .sidebar { position: fixed; z-index: 10; width: 232px; transform: translateX(-100%); transition: transform 160ms ease; } .app-shell.nav-open .sidebar { transform: translateX(0); box-shadow: 8px 0 24px rgba(31,35,41,.14); } .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
-      @media (max-width: 720px) { .workspace { padding: 16px; } .topbar { padding: 0 16px; } .editor-layout, .candidate-layout { grid-template-columns: 1fr; } .document-tree, .history, .candidate-list { border-right: 0; max-height: 220px; } .metric-grid { grid-template-columns: 1fr; } dl { grid-template-columns: 1fr; } }
-      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; } }
-    </style>
-  </head>
-  <body>
-    <main class="login-shell" id="login-shell"><form id="root" class="login-panel"><div class="brand-mark" aria-hidden="true">记</div><h1>个人智能体记忆</h1><p class="subtitle">Personal Agent Memory</p><label for="key">API 密钥</label><input id="key" type="password" autocomplete="off" aria-describedby="message"><button id="connect" type="submit">进入管理工作台</button><p id="message" class="hint" aria-live="polite">登录后建立 24 小时本地会话；API 密钥不会保存到浏览器存储。</p></form></main>
-    <script src="/editor-history.js"></script>
-    <script>
-      const root = document.querySelector('#root');
-      async function enterWorkspace(data) {
-        const loginShell = document.querySelector('#login-shell');
-        loginShell.className = 'app-shell';
-        root.replaceChildren();
-        root.className = 'app-main';
-        const statusHeading = document.createElement('h2');
-        statusHeading.textContent = '服务状态';
-        const statusList = document.createElement('dl');
-        for (const [label, value] of [['数据库', data.database], ['后台任务', data.background_worker], ['API 密钥指纹', data.api_key_fingerprint], ['启动次数', data.startup_count]]) {
-          const term = document.createElement('dt');
-          const detail = document.createElement('dd');
-          term.textContent = label;
-          detail.textContent = ({ok: '正常', running: '运行中', error: '错误', not_configured: '未配置'}[value] || value);
-          statusList.append(term, detail);
-        }
-        const heading = document.createElement('h2');
-        heading.textContent = '记忆库';
-        const form = document.createElement('form');
-        form.innerHTML = '<div class="field"><label for="path">目录路径</label><input id="path" required></div><div class="field"><label for="kind">记忆库类型</label><select id="kind"><option value="project">项目记忆库</option><option value="user">用户记忆库</option></select></div><div class="field"><label><input id="reuse-existing-git" type="checkbox"> 授权使用此专用记忆仓库</label></div><button type="submit">注册记忆库</button><p id="library-message" class="notice" aria-live="polite"></p>';
-        const table = document.createElement('table');
-        table.innerHTML = '<thead><tr><th>标识符</th><th>类型</th><th>路径</th><th>可用性</th><th>文本索引</th><th>图索引</th><th>图索引进度</th><th>图索引错误</th></tr></thead><tbody></tbody>';
-        const bindingHeading = document.createElement('h2');
-        bindingHeading.textContent = '项目绑定';
-        const bindingForm = document.createElement('form');
-        bindingForm.innerHTML = '<div class="field"><label for="project-root">项目根目录</label><input id="project-root" required></div><div class="field"><label for="project-library">项目记忆库</label><select id="project-library" required></select></div><button type="submit">绑定项目</button><p id="binding-message" class="notice" aria-live="polite"></p>';
-        const worktreeForm = document.createElement('form');
-        worktreeForm.innerHTML = '<div class="field"><label for="worktree-root">Worktree 根目录</label><input id="worktree-root" required></div><div class="field"><label for="main-binding">主项目</label><select id="main-binding" required></select></div><button type="submit">关联 Worktree</button><p id="worktree-message" class="notice" aria-live="polite"></p>';
-        const bindingTable = document.createElement('table');
-        bindingTable.innerHTML = '<thead><tr><th>项目</th><th>关系</th><th>根目录</th><th>记忆库</th><th>可用性</th><th>操作</th></tr></thead><tbody></tbody>';
-        const searchHeading = document.createElement('h2');
-        searchHeading.textContent = '记忆检索';
-        const searchForm = document.createElement('form');
-        searchForm.innerHTML = '<div class="field"><label for="search-cwd">项目工作目录</label><input id="search-cwd" required></div><div class="field"><label for="search-query">关键词</label><input id="search-query" required></div><button type="submit">检索</button><p id="search-message" class="notice" aria-live="polite"></p><div id="search-results"></div>';
-        const retentionHeading = document.createElement('h2');
-        retentionHeading.textContent = '隐私设置';
-        const retentionForm = document.createElement('form');
-        retentionForm.innerHTML = '<div class="field"><label for="retention-library">记忆库</label><select id="retention-library"></select></div><div class="field"><label for="inbox-days">采集收件箱保留天数</label><input id="inbox-days" type="number" min="0" max="3650"></div><div class="field"><label for="candidate-days">候选记忆保留天数</label><input id="candidate-days" type="number" min="0" max="3650"></div><div class="field"><label for="recycle-days">回收站保留天数</label><input id="recycle-days" type="number" min="0" max="3650"></div><div class="field"><label><input id="early-inbox-cleanup" type="checkbox"> 提前清理已归并的收件箱数据</label></div><div class="field"><label><input id="diagnostics-enabled" type="checkbox"> 保留有界诊断数据</label></div><div class="field"><label for="diagnostic-days">诊断数据保留天数</label><input id="diagnostic-days" type="number" min="0" max="365"></div><div class="candidate-actions"><button type="submit">保存策略</button><button type="button" id="retention-preview" class="secondary">预览清理</button><button type="button" id="retention-run" class="danger">立即清理</button><button type="button" id="diagnostics-clear" class="danger">清除诊断</button></div><pre id="retention-impact" class="diff">选择记忆库后可预览清理影响。</pre><div id="candidate-recycle-bin"></div><p id="retention-message" class="notice" aria-live="polite"></p>';
-        const candidateHeading = document.createElement('h2');
-        candidateHeading.textContent = '候选审核（异常候选）';
-        const candidateNotice = document.createElement('p');
-        candidateNotice.className = 'hint';
-        candidateNotice.textContent = '正常内容会自动晋升；这里只需关注需要人工处理的异常候选。';
-        const candidateStatus = document.createElement('select');
-        candidateStatus.setAttribute('aria-label', '候选记忆状态');
-        candidateStatus.innerHTML = '<option value="">全部状态</option><option value="pending">待处理</option><option value="approved">已批准</option><option value="rejected">已拒绝</option>';
-        candidateStatus.value = 'pending';
-        const candidateLayout = document.createElement('div');
-        candidateLayout.className = 'candidate-layout';
-        const candidateList = document.createElement('nav');
-        candidateList.className = 'candidate-list';
-        const candidateDetail = document.createElement('div');
-        candidateDetail.innerHTML = '<strong id="candidate-title">请选择候选记忆</strong><p id="candidate-sources" class="source"></p><p id="candidate-governance" class="source"></p><pre id="candidate-current" class="diff" hidden></pre><pre id="candidate-conflict-diff" class="diff" hidden></pre><textarea id="candidate-body" aria-label="候选记忆内容" spellcheck="false" disabled></textarea><div class="field"><label for="candidate-operator">操作人</label><input id="candidate-operator" disabled></div><div class="field"><label for="candidate-reason">裁决理由</label><input id="candidate-reason" disabled></div><div class="field"><label for="candidate-resolution">冲突裁决</label><select id="candidate-resolution" disabled><option value="keep">保留当前正式记忆</option><option value="adopt">采用候选记忆</option><option value="merge">合并为新版本</option><option value="scope">按不同条件并存</option></select></div><div class="field"><label for="candidate-effective">生效时间</label><input id="candidate-effective" type="datetime-local" disabled></div><div class="field"><label for="candidate-condition">适用条件</label><input id="candidate-condition" disabled></div><div class="candidate-actions"><button type="button" id="candidate-pin" class="secondary" disabled>置顶</button><button type="button" id="candidate-save" disabled>保存编辑</button><button type="button" id="candidate-approve" disabled>批准</button><button type="button" id="candidate-resolve" disabled>提交裁决</button><button type="button" id="candidate-reject" class="danger" disabled>拒绝</button></div><p id="candidate-message" class="notice" aria-live="polite"></p>';
-        candidateLayout.append(candidateList, candidateDetail);
-        const sensitiveHeading = document.createElement('h2');
-        sensitiveHeading.textContent = '敏感隔离';
-        const sensitiveLayout = document.createElement('div');
-        sensitiveLayout.className = 'candidate-layout';
-        const sensitiveList = document.createElement('nav');
-        sensitiveList.id = 'sensitive-quarantine-list';
-        sensitiveList.className = 'candidate-list';
-        const sensitivePagination = document.createElement('div');
-        sensitivePagination.className = 'candidate-actions';
-        sensitivePagination.innerHTML = '<button type="button" id="sensitive-previous" class="secondary">上一页</button><span id="sensitive-page"></span><button type="button" id="sensitive-next" class="secondary">下一页</button><button type="button" id="sensitive-refresh" class="secondary">刷新</button>';
-        sensitiveList.append(sensitivePagination);
-        const sensitiveDetail = document.createElement('div');
-        sensitiveDetail.id = 'sensitive-quarantine-detail';
-        sensitiveDetail.innerHTML = '<strong id="sensitive-title">请选择隔离记录</strong><p id="sensitive-summary"></p><p id="sensitive-metadata" class="source"></p><div class="candidate-actions"><button type="button" id="sensitive-acknowledge" disabled>已知悉</button><button type="button" id="sensitive-discard" class="danger" disabled>丢弃</button></div><p id="sensitive-message" class="notice" aria-live="polite"></p>';
-        sensitiveLayout.append(sensitiveList, sensitiveDetail);
-        const editorHeading = document.createElement('h2');
-        editorHeading.textContent = '文档管理';
-        const editorLibrary = document.createElement('select');
-        editorLibrary.setAttribute('aria-label', '要编辑的记忆库');
-        const editorLayout = document.createElement('div');
-        editorLayout.className = 'editor-layout';
-        const documentTree = document.createElement('nav');
-        documentTree.className = 'document-tree';
-        const editor = document.createElement('div');
-        editor.innerHTML = '<strong id="document-path">请从文档列表选择内容</strong><pre id="document-meta" class="document-meta" aria-label="记忆元数据">生命周期、版本和来源将在此显示。</pre><div class="editor-tabs" role="tablist"><button type="button" id="source-tab" class="secondary" role="tab" aria-selected="true">Markdown 源文</button><button type="button" id="preview-tab" class="secondary" role="tab" aria-selected="false">渲染预览</button><button type="button" id="diff-tab" class="secondary" role="tab" aria-selected="false">差异</button></div><textarea id="document-source" aria-label="Markdown 源文" spellcheck="false" disabled></textarea><iframe id="document-preview" sandbox hidden title="Markdown 渲染预览"></iframe><pre id="document-diff" class="diff" hidden></pre><div class="editor-modes"><label>更新方式<select id="update-mode" aria-label="更新方式"><option value="supersede">保留旧版本</option><option value="overwrite">原地覆盖</option></select></label><label>删除方式<select id="delete-mode" aria-label="删除方式"><option value="forget">遗忘</option><option value="archive">归档</option><option value="downweight">降权</option><option value="purge">彻底删除</option></select></label><a id="export-markdown" href="#" download>导出 Markdown</a></div><button type="button" id="preview-change" class="secondary" disabled>预览变更</button><button type="button" id="save-change" disabled>保存</button><button type="button" id="preview-delete" class="danger" disabled>预览删除影响</button><button type="button" id="confirm-delete" class="danger" disabled>确认删除</button><p id="editor-message" class="notice" aria-live="polite"></p>';
-        editorLayout.append(documentTree, editor);
-        const reconciliationHeading = document.createElement('h2');
-        reconciliationHeading.textContent = '带外变更';
-        const reconciliationLayout = document.createElement('div');
-        reconciliationLayout.className = 'candidate-layout';
-        const reconciliationList = document.createElement('nav');
-        reconciliationList.className = 'candidate-list';
-        const reconciliationDetail = document.createElement('div');
-        reconciliationDetail.innerHTML = '<strong id="reconciliation-title">请选择带外变更</strong><p id="reconciliation-status" class="source"></p><h3>基准内容</h3><pre id="reconciliation-base" class="diff"></pre><h3>平台内容</h3><pre id="reconciliation-platform" class="diff"></pre><h3>外部内容</h3><pre id="reconciliation-external" class="diff"></pre><div class="field" id="reconciliation-path-field" hidden><label for="reconciliation-path">外部路径</label><select id="reconciliation-path"></select></div><div class="field"><label for="reconciliation-final">冲突的最终内容</label><textarea id="reconciliation-final" spellcheck="false" disabled></textarea></div><div class="candidate-actions"><button type="button" id="reconciliation-import" disabled>导入外部版本</button><button type="button" id="reconciliation-restore" disabled>恢复平台版本</button></div><p id="reconciliation-message" class="notice" aria-live="polite"></p>';
-        reconciliationLayout.append(reconciliationList, reconciliationDetail);
-        const historyHeading = document.createElement('h2');
-        historyHeading.textContent = '本地历史';
-        const history = document.createElement('div');
-        history.className = 'history';
-        const restoreAction = document.createElement('div');
-        const historyDiff = document.createElement('pre');
-        const forgottenHeading = document.createElement('h2');
-        forgottenHeading.textContent = '遗忘记忆恢复';
-        const forgottenForm = document.createElement('form');
-        forgottenForm.innerHTML = '<div class="field"><label for="forgotten-memory">遗忘记忆</label><select id="forgotten-memory" required></select></div><div class="field"><label for="forgotten-commit">允许恢复的历史版本</label><select id="forgotten-commit" required></select></div><button type="submit">作为新事务恢复</button><p id="forgotten-message" class="notice" aria-live="polite"></p>';
-        const regionCreateForm = document.createElement('form');
-        regionCreateForm.innerHTML = '<h3>创建记忆区域</h3><div class="field"><label for="region-kind">区域类型</label><select id="region-kind"><option value="user">用户</option><option value="topic">专题</option><option value="project">项目</option><option value="session">会话</option></select></div><div class="field"><label for="region-name">名称</label><input id="region-name" required maxlength="200"></div><div class="field"><label for="region-id">稳定标识（可选）</label><input id="region-id" maxlength="120" placeholder="留空时自动生成"></div><div class="field"><label for="region-session-id">会话标识（仅会话区域）</label><input id="region-session-id" maxlength="200"></div><button type="submit">创建区域</button><p id="region-create-message" class="notice" aria-live="polite"></p>';
-        const regionTree = document.createElement('div');
-        regionTree.id = 'region-tree';
-        regionTree.className = 'region-tree';
-        regionTree.setAttribute('aria-live', 'polite');
-        regionTree.textContent = '正在加载记忆区域树...';
-        const regionBindForm = document.createElement('form');
-        regionBindForm.innerHTML = '<h3>绑定项目根目录</h3><div class="field"><label for="bind-region">项目记忆区域</label><select id="bind-region" required></select></div><div class="field"><label for="bind-project-root">项目根目录</label><input id="bind-project-root" required></div><button type="submit">绑定项目</button><p id="region-bind-message" class="notice" aria-live="polite"></p>';
-        const regionWorktreeForm = document.createElement('form');
-        regionWorktreeForm.innerHTML = '<h3>显式关联 Worktree</h3><div class="field"><label for="worktree-region-root">Worktree 根目录</label><input id="worktree-region-root" required></div><div class="field"><label for="worktree-main-binding">主项目绑定</label><select id="worktree-main-binding" required></select></div><button type="submit">关联主项目绑定</button><p id="region-worktree-message" class="notice" aria-live="polite"></p>';
-        const regionBindingTable = document.createElement('table');
-        regionBindingTable.innerHTML = '<thead><tr><th>项目根目录</th><th>关系</th><th>区域</th><th>可用性</th><th>操作</th></tr></thead><tbody></tbody>';
-        const regionBindingScroll = document.createElement('div');
-        regionBindingScroll.className = 'table-scroll';
-        regionBindingScroll.append(regionBindingTable);
-        const regionMessage = document.createElement('p');
-        regionMessage.id = 'region-message';
-        regionMessage.className = 'notice';
-        regionMessage.setAttribute('aria-live', 'polite');
-        historyDiff.className = 'diff';
-        const sidebar = document.createElement('aside');
-        sidebar.className = 'sidebar';
-        sidebar.id = 'workspace-sidebar';
-        sidebar.innerHTML = '<div class="sidebar-brand">个人智能体记忆<small>Personal Agent Memory</small></div><nav aria-label="工作台导航"><button class="nav-button" data-view="overview" aria-current="page">概览</button><button class="nav-button" data-view="search">记忆检索</button><button class="nav-button" data-view="candidates">候选审核</button><button class="nav-button" data-view="documents">文档管理</button><div class="nav-group">管理与治理</div><button class="nav-button" data-view="regions">记忆区域</button><button class="nav-button" data-view="libraries">记忆库</button><button class="nav-button" data-view="bindings">项目绑定</button><button class="nav-button" data-view="sensitive">敏感隔离</button><button class="nav-button" data-view="history">历史恢复</button><button class="nav-button" data-view="privacy">隐私设置</button></nav>';
-        sidebar.querySelector('[data-view="regions"]').hidden = data.memory_kernel !== 'mem2';
-        const topbar = document.createElement('header');
-        topbar.className = 'topbar';
-        topbar.innerHTML = '<button type="button" id="nav-toggle" class="secondary" aria-label="展开或收起导航" aria-controls="workspace-sidebar" aria-expanded="false" title="展开或收起导航">☰</button><span class="connection ok" id="connection-status" role="status" aria-live="polite">服务已连接</span><span id="session-status" class="hint">会话有效期 24 小时</span><button type="button" id="logout" class="secondary" title="退出当前会话">退出</button>';
-        const workspace = document.createElement('div');
-        workspace.className = 'workspace';
-        topbar.querySelector('#logout').addEventListener('click', async (event) => {
-          const button = event.currentTarget;
-          button.disabled = true;
-          try {
-            await fetch('/api/v1/auth/logout', {method: 'POST', credentials: 'same-origin'});
-          } finally {
-            window.location.reload();
-          }
-        });
-        const makeView = (name, title, nodes) => {
-          const view = document.createElement('section');
-          view.className = 'view';
-          view.dataset.viewPanel = name;
-          view.hidden = name !== 'overview';
-          const viewTitle = document.createElement('h2');
-          viewTitle.textContent = title;
-          viewTitle.tabIndex = -1;
-          view.append(viewTitle, ...nodes);
-          workspace.append(view);
-          return view;
-        };
-        const overviewMetrics = document.createElement('div');
-        overviewMetrics.className = 'metric-grid';
-        overviewMetrics.innerHTML = '<div class="metric"><span>服务</span><strong id="metric-service">可用</strong></div><div class="metric"><span>记忆库</span><strong id="metric-libraries">--</strong></div><div class="metric"><span>待审核候选</span><strong id="metric-candidates">--</strong></div><div class="metric"><span>敏感隔离</span><strong id="metric-sensitive">--</strong></div>';
-        const overviewAlert = document.createElement('p');
-        overviewAlert.id = 'overview-alert';
-        overviewAlert.className = 'notice';
-        overviewAlert.textContent = '正在加载概览...';
-        const quickActions = document.createElement('div');
-        quickActions.className = 'quick-actions';
-        quickActions.innerHTML = '<button type="button" data-view="search">开始检索</button><button type="button" data-view="candidates" class="secondary">审核候选</button><button type="button" data-view="documents" class="secondary">管理文档</button>';
-        const serviceSection = document.createElement('div');
-        serviceSection.className = 'view-section';
-        serviceSection.append(statusHeading, statusList);
-        makeView('overview', '概览', [overviewMetrics, overviewAlert, quickActions, serviceSection]);
-        makeView('search', '记忆检索', [searchForm]);
-        makeView('candidates', '候选审核', [candidateHeading, candidateNotice, candidateStatus, candidateLayout]);
-        const documentsSection = document.createElement('div');
-        documentsSection.className = 'view-section';
-        documentsSection.append(editorLibrary, editorLayout);
-        const reconciliationSection = document.createElement('div');
-        reconciliationSection.className = 'view-section';
-        reconciliationSection.append(reconciliationHeading, reconciliationLayout);
-        makeView('documents', '文档管理', [documentsSection, reconciliationSection]);
-        const tableScroll = document.createElement('div'); tableScroll.className = 'table-scroll'; tableScroll.append(table);
-        makeView('regions', '记忆区域', [regionCreateForm, regionTree, regionBindForm, regionWorktreeForm, regionBindingScroll, regionMessage]);
-        makeView('libraries', '记忆库', [form, tableScroll]);
-        const bindingScroll = document.createElement('div'); bindingScroll.className = 'table-scroll'; bindingScroll.append(bindingTable);
-        makeView('bindings', '项目绑定', [bindingForm, worktreeForm, bindingScroll]);
-        makeView('sensitive', '敏感隔离', [sensitiveLayout]);
-        const historyControls = document.createElement('div');
-        historyControls.className = 'view-section';
-        const historyLibraryLabel = document.createElement('label');
-        historyLibraryLabel.textContent = '记忆库';
-        const historyLibraryControl = editorLibrary.cloneNode(true);
-        historyLibraryControl.id = 'history-library';
-        historyLibraryLabel.htmlFor = historyLibraryControl.id;
-        const historyDocumentLabel = document.createElement('label');
-        historyDocumentLabel.textContent = '文档';
-        historyDocumentLabel.htmlFor = 'history-document';
-        const historyDocument = document.createElement('select');
-        historyDocument.id = 'history-document';
-        historyDocument.setAttribute('aria-label', '要恢复的文档');
-        const historyMessage = document.createElement('p');
-        historyMessage.id = 'history-message';
-        historyMessage.className = 'notice';
-        historyMessage.setAttribute('aria-live', 'polite');
-        historyControls.append(historyLibraryLabel, historyLibraryControl, historyDocumentLabel, historyDocument, historyMessage);
-        makeView('history', '历史恢复', [historyControls, historyHeading, history, restoreAction, historyDiff, forgottenHeading, forgottenForm]);
-        makeView('privacy', '隐私设置', [retentionForm]);
-        root.append(topbar, workspace);
-        loginShell.prepend(sidebar);
-        const historyLibrary = historyLibraryControl;
-        historyLibrary.addEventListener('change', () => { editorLibrary.value = historyLibrary.value; editorLibrary.dispatchEvent(new Event('change')); });
-        historyDocument.addEventListener('change', () => { if (historyDocument.value) loadDocument(historyDocument.value); });
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Personal Agent Memory · mem2</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f5f7fb; --panel:#fff; --text:#18212f; --muted:#657083; --line:#d9dfeb; --accent:#275fce; --danger:#b42318; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 28px; background:#12233f; color:#fff; }
+    header h1 { margin:0; font-size:20px; }
+    main { max-width:1280px; margin:0 auto; padding:24px; display:grid; gap:18px; }
+    .grid { display:grid; grid-template-columns:minmax(260px,0.8fr) minmax(0,2fr); gap:18px; }
+    section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }
+    h2 { margin:0 0 12px; font-size:16px; }
+    h3 { margin:18px 0 8px; font-size:14px; color:var(--muted); }
+    label { display:block; margin:10px 0 4px; color:var(--muted); font-size:13px; }
+    input, select, textarea, button { font:inherit; }
+    input, select, textarea { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:transparent; color:inherit; }
+    textarea { min-height:220px; resize:vertical; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    button { border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:8px; padding:8px 12px; cursor:pointer; }
+    button.secondary { background:transparent; color:var(--accent); }
+    button.danger { border-color:var(--danger); background:var(--danger); }
+    button:disabled { opacity:.55; cursor:wait; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+    .row { display:flex; gap:8px; align-items:center; }
+    .row > * { flex:1; }
+    .muted { color:var(--muted); }
+    .notice { min-height:24px; padding:8px 10px; border-radius:8px; background:var(--bg); white-space:pre-wrap; }
+    .notice.error { color:var(--danger); }
+    .region-list, .document-list, .history-list { list-style:none; margin:0; padding:0; display:grid; gap:6px; max-height:360px; overflow:auto; }
+    .region-list button, .document-list button, .history-list button { width:100%; text-align:left; background:transparent; color:inherit; border:1px solid var(--line); }
+    .region-list button.active { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 10%,transparent); }
+    .result { border-top:1px solid var(--line); padding:12px 0; }
+    .result:first-child { border-top:0; }
+    pre { white-space:pre-wrap; overflow-wrap:anywhere; background:var(--bg); padding:12px; border-radius:8px; }
+    .hidden { display:none !important; }
+    @media (max-width: 840px) { .grid { grid-template-columns:1fr; } header { padding:16px; } main { padding:14px; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Personal Agent Memory</h1>
+  <div id="status" class="muted">正在连接 mem2…</div>
+</header>
+<main>
+  <section id="login-panel">
+    <h2>登录管理台</h2>
+    <p class="muted">使用本地守护进程的 API key。登录会创建同源、HttpOnly 管理会话 Cookie。</p>
+    <form id="login-form">
+      <label for="api-key">API key</label>
+      <input id="api-key" type="password" autocomplete="current-password" required>
+      <div class="actions"><button type="submit">登录</button></div>
+    </form>
+    <p id="login-message" class="notice" aria-live="polite"></p>
+  </section>
 
-        let projectLibraries = [];
-        let projectBindings = [];
-        let allLibraries = [];
-        let allRegions = [];
-        let regionBindings = [];
-        const currentRegionSessionId = crypto.randomUUID();
-        let activeDocument = null;
-        let deletionPreviewVersion = null;
-        let deletionPreviewToken = null;
-        let activeCandidate = null;
-        let activeSensitiveRecord = null;
-        let activeReconciliation = null;
-        let sensitiveOffset = 0;
-        const sensitivePageSize = 50;
-        const generations = {libraries: 0, candidates: 0, candidateGovernance: 0, sensitive: 0, retention: 0, reconciliation: 0, forgotten: 0, forgettingPreview: 0, history: 0, historyDiff: 0, bindings: 0, regions: 0};
-        const pending = new Set();
-        const buttonOperations = new WeakMap();
-        const bindingIntents = new Map();
-        let retentionPreviewContext = null;
-        let candidateSelectionGeneration = 0;
-        let sensitiveSelectionGeneration = 0;
-        let retentionSelectionGeneration = 0;
-        const historySelection = PamHistory.selectionStore();
-        const editorContext = PamHistory.contextStore();
-        const documentContextIsCurrent = (context) => {
-          const current = editorContext.snapshot();
-          return Boolean(
-            context && current && editorContext.isCurrent(context)
-            && editorLibrary.value === context.libraryId
-            && current.libraryId === context.libraryId
-            && current.path === context.path
-            && current.token === context.token
-          );
-        };
+  <div id="workspace" class="grid hidden">
+    <div>
+      <section>
+        <h2>记忆区域</h2>
+        <p class="muted">用户、专题、项目和会话区域共享同一个 mem2.0 存储。</p>
+        <ul id="region-list" class="region-list"></ul>
+        <h3>创建区域</h3>
+        <form id="region-form">
+          <label for="region-kind">类型</label>
+          <select id="region-kind"><option value="topic">专题</option><option value="project">项目</option></select>
+          <label for="region-name">名称</label>
+          <input id="region-name" required maxlength="200">
+          <label for="region-id">区域 ID（可选）</label>
+          <input id="region-id" maxlength="120" placeholder="自动生成">
+          <div class="actions"><button type="submit">创建区域</button></div>
+        </form>
+        <h3>绑定项目</h3>
+        <form id="binding-form">
+          <label for="binding-root">项目根目录</label>
+          <input id="binding-root" required placeholder="/path/to/project">
+          <label for="binding-region">项目区域</label>
+          <select id="binding-region"></select>
+          <div class="actions"><button type="submit">绑定</button></div>
+        </form>
+      </section>
+      <section style="margin-top:18px">
+        <h2>自动晋升</h2>
+        <p class="muted">对选中区域运行多目标晋升。敏感、冲突和证据不足的内容不会晋升。</p>
+        <div class="actions"><button id="promotion-button" type="button">运行晋升</button></div>
+        <p id="promotion-message" class="notice" aria-live="polite"></p>
+      </section>
+    </div>
 
-        const labels = {
-          ok: '正常', running: '运行中', error: '错误', not_configured: '未配置',
-          not_started: '尚未开始', scanning: '扫描中', building: '构建中', processing: '处理中', done: '已完成',
-          new: '新增', edit: '编辑', move: '移动', delete: '删除', conflict: '冲突',
-          pending: '待处理', approved: '已批准', rejected: '已拒绝',
-          project: '项目记忆库', user: '用户记忆库', worktree: 'Worktree 关联',
-          available: '可用', unavailable: '不可用', missing: '路径缺失', replaced: '路径已替换', ready: '就绪', stale: '待更新',
-          accepted: '已接受', bound: '已绑定', unbound: '未绑定',
-          exact_duplicate: '完全重复', possible_duplicate: '可能重复', replacement: '替代版本', unrelated: '独立记忆',
-          keep: '保留当前', adopt: '采用候选', merge: '合并新版本', scope: '条件并存',
-          quarantined: '已隔离', discarded: '已丢弃', unresolved: '未处理', acknowledge: '已知悉', discard: '已丢弃',
-          direct: '直接命中', graph_expansion: '图扩展', lexical: '文本命中',
-          decision: '决策', constraint: '约束', preference: '偏好',
-          domain_fact: '领域事实', reusable_experience: '可复用经验', external_reference: '外部参考',
-          procedure: '流程', lesson: '经验',
-        };
-        const regionKindLabels = {user: '用户记忆区域', topic: '专题记忆区域', project: '项目记忆区域', session: '会话记忆区域'};
-        const degradationLabels = {
-          graph_not_configured: '图索引未配置', graph_unavailable: '图索引不可用', graph_stale: '图索引待更新',
-          graph_error: '图索引异常', text_index_unavailable: '文本索引不可用', vector_index_unavailable: '向量索引不可用',
-          embedding_unavailable: '嵌入服务不可用', reranker_unavailable: '重排序服务不可用', tokenizer_fallback: '分词器回退',
-          budget_exhausted: '检索预算已用尽',
-        };
-        const display = (value) => labels[value] || value || '未知';
-        const formatSearchStatus = (payload) => {
-          if (payload.status === 'unbound') return {text: '此目录尚未绑定项目记忆库。', kind: 'error'};
-          const resultSummary = payload.results.length === 0 ? '没有找到匹配的记忆' : `找到 ${payload.results.length} 条结果`;
-          const degradation = (payload.degradation || []).map((reason) => degradationLabels[reason] || reason).join('、');
-          return {
-            text: `${resultSummary} · 图索引${display(payload.graph_index_status)}${payload.degraded ? ` · 已降级：${degradation}` : ''}。`,
-            kind: payload.degraded ? 'error' : 'success',
-          };
-        };
-        const statusTone = (value) => ['available', 'ready', 'ok', 'done', 'bound'].includes(value) ? 'ok' : ['error', 'unavailable', 'missing', 'replaced'].includes(value) ? 'bad' : 'warn';
-        const createStatusBadge = (value) => {
-          const badge = document.createElement('span');
-          badge.className = `badge ${statusTone(value)}`;
-          badge.dataset.status = value;
-          badge.textContent = display(value);
-          return badge;
-        };
-        const displaySensitiveSummary = (summary) => summary.replace(/^Sensitive content withheld/, '敏感内容已隐去');
-        const describeError = (failure, context) => {
-          const detail = failure?.detail;
-          const raw = typeof detail === 'string' ? detail : detail?.reason || JSON.stringify(detail || failure || '未知错误');
-          return `${context}：${raw}`;
-        };
-        const setMessage = (node, text, kind = '') => { node.className = `notice ${kind}`.trim(); node.textContent = text; };
-        const setBusy = (button, busy, label) => {
-          if (!button.dataset.label) button.dataset.label = button.textContent;
-          button.disabled = busy;
-          button.textContent = busy ? label : button.dataset.label;
-        };
-        const connectionStatus = topbar.querySelector('#connection-status');
-        const sessionStatus = topbar.querySelector('#session-status');
-        let requestSequence = 0;
-        let connectionObservation = 0;
-        const setConnectionStatus = (requestId, state, text) => {
-          if (requestId < connectionObservation) return;
-          connectionObservation = requestId;
-          connectionStatus.className = `connection ${state}`;
-          connectionStatus.textContent = text;
-        };
-        const observeConnectionResponse = (requestId, response) => {
-          if (requestId < connectionObservation) return;
-          connectionObservation = requestId;
-          if (response.status === 401) {
-            connectionStatus.className = 'connection warn';
-            connectionStatus.textContent = '认证已失效';
-            if (sessionStatus !== connectionStatus) sessionStatus.textContent = '会话已过期，请重新登录';
-            if (typeof window.setTimeout === 'function' && window.location?.reload) {
-              window.setTimeout(() => window.location.reload(), 0);
-            }
-          }
-          else if (response.ok) {
-            connectionStatus.className = 'connection ok';
-            connectionStatus.textContent = '服务已连接';
-          }
-        };
-        const nativeFetch = window.fetch.bind(window);
-        const request = async (input, options = {}) => {
-          const requestId = ++requestSequence;
-          try {
-            const requestOptions = {...options, credentials: 'same-origin'};
-            const response = await nativeFetch(input, requestOptions);
-            observeConnectionResponse(requestId, response);
-            return response;
-          }
-          catch (_error) {
-            setConnectionStatus(requestId, 'bad', '服务连接中断');
-            return {ok: false, networkError: true, json: async () => ({detail: '网络连接失败，请稍后重试。'})};
-          }
-        };
-        async function performOnce(name, button, busyLabel, action, messageNode = null, contextIsCurrent = () => true) {
-          if (pending.has(name)) return null;
-          const operation = Symbol(name);
-          pending.add(name); buttonOperations.set(button, operation); delete button.dataset.keepDisabled; setBusy(button, true, busyLabel);
-          try { return await action(); }
-          catch (_error) {
-            const nearbyMessage = messageNode || button.closest('form')?.querySelector('.notice') || button.closest('[data-view-panel]')?.querySelector('.notice');
-            if (nearbyMessage && contextIsCurrent()) setMessage(nearbyMessage, '操作失败：网络连接或响应异常，请重试。', 'error');
-            return null;
-          } finally {
-            pending.delete(name);
-            if (buttonOperations.get(button) === operation) {
-              buttonOperations.delete(button);
-              if (contextIsCurrent()) {
-                setBusy(button, false, busyLabel);
-                if (button.dataset.keepDisabled === 'true') button.disabled = true;
-              } else {
-                const currentDisabled = button.disabled;
-                button.textContent = button.dataset.label;
-                button.disabled = currentDisabled;
-              }
-              delete button.dataset.keepDisabled;
-            }
-          }
-        }
-        function openView(name) {
-          for (const panel of workspace.querySelectorAll('[data-view-panel]')) panel.hidden = panel.dataset.viewPanel !== name;
-          for (const button of loginShell.querySelectorAll('[data-view]')) {
-            if (!button.classList.contains('nav-button')) continue;
-            if (button.dataset.view === name) button.setAttribute('aria-current', 'page');
-            else button.removeAttribute('aria-current');
-          }
-          loginShell.classList.remove('nav-open');
-          topbar.querySelector('#nav-toggle').setAttribute('aria-expanded', 'false');
-          syncSidebarAccessibility();
-          workspace.querySelector(`[data-view-panel="${name}"]`)?.querySelector('h2')?.focus?.();
-        }
-        const narrowNavigation = window.matchMedia('(max-width: 860px)');
-        function syncSidebarAccessibility() {
-          const hidden = narrowNavigation.matches && !loginShell.classList.contains('nav-open');
-          sidebar.toggleAttribute('inert', hidden);
-          if (hidden) sidebar.setAttribute('aria-hidden', 'true');
-          else sidebar.removeAttribute('aria-hidden');
-        }
-        narrowNavigation.addEventListener('change', syncSidebarAccessibility);
-        syncSidebarAccessibility();
-        loginShell.addEventListener('click', (event) => { const target = event.target.closest('[data-view]'); if (target) openView(target.dataset.view); });
-        topbar.querySelector('#nav-toggle').addEventListener('click', (event) => {
-          const expanded = loginShell.classList.toggle('nav-open');
-          event.currentTarget.setAttribute('aria-expanded', String(expanded));
-          syncSidebarAccessibility();
-          if (expanded) {
-            requestAnimationFrame(() => {
-              sidebar.querySelector('.nav-button[aria-current="page"]')?.focus();
-            });
-          }
-        });
+    <div>
+      <section>
+        <h2>检索</h2>
+        <form id="search-form">
+          <label for="search-query">查询</label>
+          <input id="search-query" required placeholder="当前项目决策、偏好、领域事实…">
+          <div class="actions"><button type="submit">检索选中区域</button></div>
+        </form>
+        <p id="search-message" class="notice" aria-live="polite"></p>
+        <div id="search-results"></div>
+      </section>
 
-        const confirmDialog = document.createElement('dialog');
-        confirmDialog.setAttribute('aria-labelledby', 'confirm-title');
-        confirmDialog.setAttribute('aria-describedby', 'confirm-description');
-        confirmDialog.innerHTML = '<div class="dialog-body"><h2 id="confirm-title">确认操作</h2><p id="confirm-description"></p><div class="field" id="confirm-input-field" hidden><label for="confirm-input">请输入确认短语</label><input id="confirm-input" autocomplete="off"></div></div><div class="dialog-actions"><button type="button" id="confirm-cancel" class="secondary">取消</button><button type="button" id="confirm-accept" class="danger">确认</button></div>';
-        document.body.append(confirmDialog);
-        function confirmAction(title, description, phrase = '') {
-          confirmDialog.querySelector('#confirm-title').textContent = title;
-          confirmDialog.querySelector('#confirm-description').textContent = description;
-          const field = confirmDialog.querySelector('#confirm-input-field');
-          const input = confirmDialog.querySelector('#confirm-input');
-          field.hidden = !phrase; input.value = '';
-          const accept = confirmDialog.querySelector('#confirm-accept');
-          accept.disabled = Boolean(phrase);
-          input.oninput = () => { accept.disabled = input.value !== phrase; };
-          confirmDialog.showModal();
-          return new Promise((resolve) => {
-            confirmDialog.querySelector('#confirm-cancel').onclick = () => { confirmDialog.close(); resolve(false); };
-            accept.onclick = () => { confirmDialog.close(); resolve(true); };
-            confirmDialog.oncancel = () => resolve(false);
-          });
-        }
-
-        function fillSelect(select, options, valueFor, labelFor) {
-          const selected = select.value;
-          select.replaceChildren();
-          for (const optionValue of options) {
-            const option = document.createElement('option');
-            option.value = valueFor(optionValue);
-            option.textContent = labelFor(optionValue);
-            select.append(option);
-          }
-          if ([...select.options].some((option) => option.value === selected)) select.value = selected;
-        }
-
-        async function refresh() {
-          const generation = ++generations.libraries;
-          overviewAlert.textContent = '正在加载概览...';
-          const response = await request('/api/v1/libraries', {headers: {}});
-          if (generation !== generations.libraries) return;
-          let libraries = [];
-          if (response.ok) {
-            libraries = await response.json();
-          } else if (response.status !== 503) {
-            overviewAlert.className = 'notice error'; overviewAlert.textContent = '概览加载失败。请刷新页面重试。'; return;
-          }
-          if (generation !== generations.libraries) return;
-          allLibraries = libraries;
-          projectLibraries = libraries.filter((library) => library.kind === 'project');
-          fillSelect(editorLibrary, libraries, (library) => library.id, (library) => `${library.canonical_path}（${display(library.kind)}）`);
-          fillSelect(historyLibrary, libraries, (library) => library.id, (library) => `${library.canonical_path}（${display(library.kind)}）`);
-          historyLibrary.value = editorLibrary.value;
-          fillSelect(retentionForm.querySelector('#retention-library'), libraries, (library) => library.id, (library) => `${library.canonical_path}（${display(library.kind)}）`);
-          fillSelect(bindingForm.querySelector('#project-library'), projectLibraries, (library) => library.id, (library) => `${library.canonical_path} (${library.id})`);
-          const body = table.querySelector('tbody');
-          body.replaceChildren();
-          for (const library of libraries) {
-            const row = document.createElement('tr');
-            const values = [library.id, display(library.kind), library.canonical_path, library.availability, library.sync_status, library.graph_status, library.graph_progress, library.graph_last_error || '无'];
-            for (const [index, value] of values.entries()) {
-              const cell = document.createElement('td');
-              if ([3, 4, 5].includes(index)) cell.append(createStatusBadge(value));
-              else cell.textContent = value;
-              if (value === library.canonical_path) cell.className = 'path';
-              row.append(cell);
-            }
-            body.append(row);
-          }
-          if (!libraries.length) { const row = body.insertRow(); const cell = row.insertCell(); cell.colSpan = 8; cell.className = 'empty'; cell.textContent = '还没有记忆库，请使用上方表单注册。'; }
-          document.querySelector('#metric-libraries').textContent = String(libraries.length);
-          const [candidateResponse, sensitiveCount] = await Promise.all([
-            request('/api/v1/candidates?candidate_status=pending', {headers: {}}),
-            countSensitiveRecords(),
-          ]);
-          if (generation !== generations.libraries) return;
-          document.querySelector('#metric-candidates').textContent = candidateResponse.ok ? String((await candidateResponse.json()).length) : '加载失败';
-          document.querySelector('#metric-sensitive').textContent = sensitiveCount === null ? '加载失败' : String(sensitiveCount);
-          const indexProblems = libraries.filter((library) => ['error', 'unavailable'].includes(library.sync_status) || ['error', 'unavailable'].includes(library.graph_status));
-          overviewAlert.className = `notice ${indexProblems.length ? 'error' : 'success'}`;
-          overviewAlert.textContent = indexProblems.length ? `${indexProblems.length} 个记忆库存在索引异常，请进入记忆库查看详情。` : '服务、记忆库与索引状态已加载。';
-          await Promise.all([refreshBindings(), refreshRegions(), refreshCandidates(), refreshRetention(), refreshSensitiveQuarantine(), refreshDocuments()]);
-        }
-
-        async function countSensitiveRecords() {
-          let offset = 0; let total = 0;
-          while (true) {
-            const response = await request(`/api/v1/sensitive-quarantine?offset=${offset}&limit=${sensitivePageSize}`, {headers: {}});
-            if (!response.ok) return null;
-            const page = await response.json(); total += page.length;
-            if (page.length < sensitivePageSize) return total;
-            offset += sensitivePageSize;
-          }
-        }
-
-        async function restoreRecycledCandidate(item, button) {
-          const libraryId = retentionForm.querySelector('#retention-library').value;
-          const context = {libraryId, candidateId: item.candidate.id, selectionGeneration: retentionSelectionGeneration};
-          if (!await confirmAction('确认恢复候选记忆', `将从记忆库 ${libraryId} 的回收站恢复候选 ${item.candidate.id}。`)) return;
-          const message = retentionForm.querySelector('#retention-message');
-          await performOnce(`restore-${item.candidate.id}`, button, '正在恢复...', async () => {
-            const response = await request(`/api/v1/candidates/${item.candidate.id}/restore`, {method: 'POST', headers: {}});
-            if (context.selectionGeneration !== retentionSelectionGeneration || context.libraryId !== retentionForm.querySelector('#retention-library').value) return;
-            if (!response.ok) { setMessage(message, '候选记忆恢复失败。', 'error'); return; }
-            await Promise.all([refreshRetention(), refreshCandidates()]);
-            if (context.selectionGeneration === retentionSelectionGeneration && context.libraryId === retentionForm.querySelector('#retention-library').value) setMessage(message, '候选记忆已恢复。', 'success');
-          }, null, () => context.selectionGeneration === retentionSelectionGeneration && context.libraryId === retentionForm.querySelector('#retention-library').value);
-        }
-
-        async function refreshRetention() {
-          const generation = ++generations.retention;
-          const libraryId = retentionForm.querySelector('#retention-library').value;
-          const message = retentionForm.querySelector('#retention-message');
-          retentionPreviewContext = null;
-          retentionForm.querySelector('#retention-run').disabled = true;
-          retentionForm.querySelector('#retention-impact').textContent = '选择记忆库后可预览清理影响。';
-          if (!libraryId) { setMessage(message, '请先注册并选择记忆库。'); return; }
-          setMessage(message, '正在加载保留策略...');
-          const [policyResponse, recycleResponse] = await Promise.all([
-            request(`/api/v1/libraries/${libraryId}/retention-policy`, {headers: {}}),
-            request(`/api/v1/libraries/${libraryId}/candidate-recycle-bin`, {headers: {}}),
-          ]);
-          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
-          if (!policyResponse.ok || !recycleResponse.ok) { setMessage(message, '保留策略加载失败，请重试。', 'error'); return; }
-          const policy = await policyResponse.json();
-          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
-          for (const field of ['inbox_days', 'candidate_days', 'recycle_days', 'diagnostic_days']) retentionForm.querySelector(`#${field.replaceAll('_', '-')}`).value = policy[field];
-          retentionForm.querySelector('#early-inbox-cleanup').checked = policy.early_inbox_cleanup;
-          retentionForm.querySelector('#diagnostics-enabled').checked = policy.diagnostics_enabled;
-          const recycleBin = retentionForm.querySelector('#candidate-recycle-bin');
-          recycleBin.replaceChildren();
-          const recycleItems = await recycleResponse.json();
-          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
-          for (const item of recycleItems) {
-            const button = recycleBin.appendChild(document.createElement('button'));
-            button.type = 'button';
-            button.className = 'secondary';
-            button.textContent = `恢复 ${display(item.candidate.suggested_type)} · ${item.candidate.id}`;
-            button.addEventListener('click', () => restoreRecycledCandidate(item, button));
-          }
-          setMessage(message, '保留策略已加载。', 'success');
-        }
-
-        function invalidateRetentionPreview() {
-          retentionPreviewContext = null;
-          retentionForm.querySelector('#retention-run').disabled = true;
-        }
-
-        async function previewRetention() {
-          const libraryId = retentionForm.querySelector('#retention-library').value;
-          const generation = generations.retention;
-          const impact = retentionForm.querySelector('#retention-impact');
-          const runButton = retentionForm.querySelector('#retention-run');
-          retentionPreviewContext = null;
-          runButton.disabled = true;
-          impact.textContent = '正在计算清理影响...';
-          const response = await request(`/api/v1/libraries/${libraryId}/retention-cleanup/preview`, {headers: {}});
-          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return false;
-          if (!response.ok) { impact.textContent = '清理预览不可用，请稍后重试。'; return false; }
-          const payload = await response.json();
-          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return false;
-          const counts = payload.counts || payload;
-          const count = (name) => Number(counts[name] || 0);
-          impact.textContent = `预计影响\n采集收件箱：${count('inbox_rows')} 条\n候选移入回收站：${count('candidates_to_recycle')} 条\n候选永久删除：${count('candidates_to_delete')} 条\n受保护候选：${count('protected_candidates')} 条\n诊断记录：${count('diagnostic_rows')} 条`;
-          retentionPreviewContext = {
-            libraryId,
-            generation,
-            selectionGeneration: retentionSelectionGeneration,
-            summary: impact.textContent,
-            affectedCount: count('inbox_rows') + count('candidates_to_recycle') + count('candidates_to_delete') + count('diagnostic_rows'),
-          };
-          runButton.disabled = false;
-          return true;
-        }
-
-        async function runRetentionCleanup() {
-          const libraryId = retentionForm.querySelector('#retention-library').value;
-          const generation = generations.retention;
-          if (!retentionPreviewContext || retentionPreviewContext.libraryId !== libraryId || retentionPreviewContext.generation !== generation) {
-            setMessage(retentionForm.querySelector('#retention-message'), '请先为当前记忆库完成清理预览。', 'error');
-            return;
-          }
-          const preview = retentionPreviewContext;
-          const previewSummary = preview.summary.replaceAll('\n', '；');
-          if (!await confirmAction('确认立即清理', `记忆库 ${libraryId} 将按照当前保留策略清理数据，预计影响 ${preview.affectedCount} 条。${previewSummary}`)) return;
-          if (!retentionPreviewContext || retentionPreviewContext.libraryId !== libraryId || retentionPreviewContext.generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
-          const button = retentionForm.querySelector('#retention-run');
-          await performOnce(`retention-run-${libraryId}`, button, '正在清理...', async () => {
-            const response = await request(`/api/v1/libraries/${libraryId}/retention-cleanup`, {method: 'POST', headers: {}});
-            if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
-            if (response.ok) {
-              button.dataset.keepDisabled = 'true';
-              await Promise.all([refreshRetention(), refreshCandidates()]);
-              if (preview.selectionGeneration === retentionSelectionGeneration && libraryId === retentionForm.querySelector('#retention-library').value) setMessage(retentionForm.querySelector('#retention-message'), '保留数据清理完成。', 'success');
-            } else setMessage(retentionForm.querySelector('#retention-message'), '保留数据清理失败。', 'error');
-          }, null, () => generation === generations.retention && libraryId === retentionForm.querySelector('#retention-library').value);
-        }
-
-        async function refreshReconciliation(selectedId = activeReconciliation?.id) {
-          const generation = ++generations.reconciliation;
-          const libraryId = editorLibrary.value;
-          clearReconciliation(false);
-          if (!libraryId) { reconciliationList.innerHTML = '<p class="empty">请先选择记忆库。</p>'; return; }
-          reconciliationList.innerHTML = '<p class="empty">正在加载带外变更...</p>';
-          const response = await request(`/api/v1/libraries/${libraryId}/out-of-band-changes`, {headers: {}});
-          if (generation !== generations.reconciliation || libraryId !== editorLibrary.value) return;
-          if (!response.ok) { reconciliationList.innerHTML = '<p class="empty error">带外变更加载失败，请切换记忆库后重试。</p>'; return; }
-          const changes = await response.json();
-          if (generation !== generations.reconciliation || libraryId !== editorLibrary.value) return;
-          reconciliationList.replaceChildren();
-          for (const change of changes) {
-            const button = reconciliationList.appendChild(document.createElement('button'));
-            button.type = 'button';
-            button.className = 'secondary';
-            button.textContent = `${display(change.status)} · ${display(change.kind)} · ${change.base_path}`;
-            button.addEventListener('click', () => showReconciliation(change, {libraryId, generation}));
-          }
-          const selected = changes.find((change) => change.id === selectedId);
-          if (selected) showReconciliation(selected, {libraryId, generation});
-          if (!changes.length) reconciliationList.innerHTML = '<p class="empty">没有待处理的带外变更。</p>';
-        }
-
-        function clearReconciliation(invalidate = true) {
-          if (invalidate) ++generations.reconciliation;
-          activeReconciliation = null;
-          reconciliationList.replaceChildren();
-          reconciliationDetail.querySelector('#reconciliation-title').textContent = '请选择带外变更';
-          reconciliationDetail.querySelector('#reconciliation-status').textContent = '';
-          for (const id of ['reconciliation-base', 'reconciliation-platform', 'reconciliation-external']) reconciliationDetail.querySelector(`#${id}`).textContent = '';
-          reconciliationDetail.querySelector('#reconciliation-final').value = '';
-          reconciliationDetail.querySelector('#reconciliation-final').disabled = true;
-          reconciliationDetail.querySelector('#reconciliation-path').replaceChildren();
-          reconciliationDetail.querySelector('#reconciliation-path-field').hidden = true;
-          reconciliationDetail.querySelector('#reconciliation-import').disabled = true;
-          reconciliationDetail.querySelector('#reconciliation-restore').disabled = true;
-          setMessage(reconciliationDetail.querySelector('#reconciliation-message'), '');
-        }
-
-        function reconciliationContextIsCurrent(context) {
-          return context.generation === generations.reconciliation && context.libraryId === editorLibrary.value;
-        }
-
-        function showReconciliation(change, context) {
-          if (!reconciliationContextIsCurrent(context)) return;
-          activeReconciliation = {...change, uiContext: context};
-          reconciliationDetail.querySelector('#reconciliation-title').textContent = change.base_path;
-          const candidatePaths = change.external_candidates || [];
-          reconciliationDetail.querySelector('#reconciliation-status').textContent = `${display(change.status)} · ${display(change.kind)}${change.external_path ? ` · ${change.external_path}` : ''}${candidatePaths.length > 1 ? ` · 候选路径：${candidatePaths.join(', ')}` : ''}`;
-          reconciliationDetail.querySelector('#reconciliation-base').textContent = change.base;
-          reconciliationDetail.querySelector('#reconciliation-platform').textContent = change.platform;
-          reconciliationDetail.querySelector('#reconciliation-external').textContent = change.external_withheld
-            ? '（敏感内容已隐去：不会存储或展示）'
-            : candidatePaths.length > 1
-              ? `（移动目标不明确：${candidatePaths.join(', ')}）`
-              : change.external || '（已删除）';
-          const finalContent = reconciliationDetail.querySelector('#reconciliation-final');
-          const externalPath = reconciliationDetail.querySelector('#reconciliation-path');
-          const pathField = reconciliationDetail.querySelector('#reconciliation-path-field');
-          externalPath.replaceChildren();
-          if (candidatePaths.length > 1) {
-            const placeholder = document.createElement('option');
-            placeholder.value = '';
-            placeholder.textContent = '请选择候选路径';
-            externalPath.append(placeholder);
-            for (const path of candidatePaths) {
-              const option = document.createElement('option');
-              option.value = path;
-              option.textContent = path;
-              externalPath.append(option);
-            }
-          }
-          pathField.hidden = candidatePaths.length <= 1;
-          const requiresFinal = change.status === 'conflict' || change.external_withheld;
-          finalContent.disabled = !requiresFinal;
-          finalContent.value = change.external_withheld
-            ? ''
-            : requiresFinal
-              ? change.external || change.platform
-              : '';
-          const candidateMissing = candidatePaths.length > 1 && !externalPath.value;
-          reconciliationDetail.querySelector('#reconciliation-import').disabled =
-            (change.external_withheld && !finalContent.value.trim()) || candidateMissing;
-          reconciliationDetail.querySelector('#reconciliation-restore').disabled = candidateMissing;
-        }
-
-        async function resolveReconciliation(action) {
-          if (!activeReconciliation) return;
-          const selected = activeReconciliation;
-          const context = selected.uiContext;
-          if (!context || !reconciliationContextIsCurrent(context)) return;
-          const button = reconciliationDetail.querySelector(action === 'import' ? '#reconciliation-import' : '#reconciliation-restore');
-          if (!await confirmAction(action === 'import' ? '确认导入外部版本' : '确认恢复平台版本', `将处理 ${selected.base_path}，并创建新的记忆变更事务。`)) return;
-          if (!reconciliationContextIsCurrent(context) || activeReconciliation?.id !== selected.id) return;
-          await performOnce(`reconciliation-${selected.id}`, button, '正在提交...', async () => {
-          const resolution = PamHistory.reconciliationRequest(
-            context.libraryId,
-            selected,
-            action,
-            crypto.randomUUID(),
-            reconciliationDetail.querySelector('#reconciliation-final').value,
-            reconciliationDetail.querySelector('#reconciliation-path').value,
-          );
-          const response = await request(resolution.url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(resolution.body)});
-          const message = reconciliationDetail.querySelector('#reconciliation-message');
-          if (!reconciliationContextIsCurrent(context) || activeReconciliation?.id !== selected.id) return;
-          if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '带外变更处理失败'), 'error'); return; }
-          button.dataset.keepDisabled = 'true';
-          activeReconciliation = null;
-          await refreshDocuments();
-          if (editorLibrary.value === context.libraryId) setMessage(message, action === 'import' ? '已导入外部版本。' : '已恢复平台版本。', 'success');
-          }, null, () => reconciliationContextIsCurrent(context) && activeReconciliation?.id === selected.id);
-        }
-
-        async function refreshCandidates(selectedId = activeCandidate?.id) {
-          const generation = ++generations.candidates;
-          const statusQuery = candidateStatus.value ? `?candidate_status=${encodeURIComponent(candidateStatus.value)}` : '';
-          candidateList.innerHTML = '<p class="empty">正在加载候选记忆...</p>';
-          const response = await request(`/api/v1/candidates${statusQuery}`, {headers: {}});
-          if (generation !== generations.candidates) return;
-          if (!response.ok) { candidateList.innerHTML = '<p class="empty error">候选记忆加载失败，请重试。</p>'; return; }
-          const candidates = await response.json();
-          if (generation !== generations.candidates) return;
-          candidateList.replaceChildren();
-          for (const candidate of candidates) {
-            const button = candidateList.appendChild(document.createElement('button'));
-            button.type = 'button';
-            button.className = 'secondary';
-            button.textContent = `${display(candidate.status)} · ${display(candidate.suggested_type)} · ${candidate.id}`;
-            button.addEventListener('click', () => { ++candidateSelectionGeneration; showCandidate(candidate); });
-          }
-          const selected = candidates.find((candidate) => candidate.id === selectedId);
-          if (selected) await showCandidate(selected);
-          else if (activeCandidate && !selected) clearCandidate();
-          if (!candidates.length) candidateList.innerHTML = `<p class="empty">${candidateStatus.value ? '当前筛选条件下没有候选记忆。' : '还没有候选记忆。'}</p>`;
-        }
-
-        function clearCandidate() {
-          ++generations.candidateGovernance;
-          activeCandidate = null;
-          candidateDetail.querySelector('#candidate-title').textContent = '请选择候选记忆';
-          candidateDetail.querySelector('#candidate-sources').textContent = '';
-          clearCandidateGovernance();
-          candidateDetail.querySelector('#candidate-body').value = '';
-          candidateDetail.querySelector('#candidate-message').textContent = '';
-          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-pin', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = true;
-        }
-
-        function clearCandidateGovernance() {
-          candidateDetail.querySelector('#candidate-governance').textContent = '';
-          const current = candidateDetail.querySelector('#candidate-current');
-          current.hidden = true;
-          current.textContent = '';
-          const diff = candidateDetail.querySelector('#candidate-conflict-diff');
-          diff.hidden = true;
-          diff.textContent = '';
-          candidateDetail.querySelector('#candidate-resolve').disabled = true;
-        }
-
-        async function showCandidate(candidate) {
-          const governanceGeneration = ++generations.candidateGovernance;
-          activeCandidate = candidate;
-          const candidateId = candidate.id;
-          const pending = candidate.status === 'pending';
-          candidateDetail.querySelector('#candidate-title').textContent = `${display(candidate.suggested_type)} · ${display(candidate.status)}`;
-          candidateDetail.querySelector('#candidate-sources').textContent = `候选来源 · ${candidate.creator} 创建于 ${candidate.created_at} · ${candidate.source_references.join(' · ')}`;
-          candidateDetail.querySelector('#candidate-body').value = candidate.body;
-          candidateDetail.querySelector('#candidate-operator').value = candidate.operator || '';
-          candidateDetail.querySelector('#candidate-reason').value = candidate.reason || '';
-          for (const id of ['candidate-body', 'candidate-operator', 'candidate-reason', 'candidate-resolution', 'candidate-effective', 'candidate-condition', 'candidate-pin', 'candidate-save', 'candidate-approve', 'candidate-resolve', 'candidate-reject']) candidateDetail.querySelector(`#${id}`).disabled = !pending;
-          clearCandidateGovernance();
-          candidateDetail.querySelector('#candidate-message').textContent = candidate.published_path ? `已发布为 ${candidate.published_path}，提交 ${candidate.commit}` : '';
-          const response = await request(`/api/v1/candidates/${candidate.id}/governance`, {headers: {}});
-          if (governanceGeneration !== generations.candidateGovernance || activeCandidate?.id !== candidateId) return;
-          if (!response.ok) {
-            const failure = await response.json();
-            if (governanceGeneration === generations.candidateGovernance && activeCandidate?.id === candidateId) setMessage(candidateDetail.querySelector('#candidate-message'), describeError(failure, '候选治理信息加载失败'), 'error');
-            return;
-          }
-          const governance = await response.json();
-          if (governanceGeneration !== generations.candidateGovernance || activeCandidate?.id !== candidateId) return;
-          candidateDetail.querySelector('#candidate-governance').textContent = `${display(governance.classification)}${governance.target_path ? ` · ${governance.target_path}` : ''}${governance.effective_at ? ` · 生效于 ${governance.effective_at}` : ''}`;
-          const current = candidateDetail.querySelector('#candidate-current');
-          current.hidden = !governance.current;
-          current.textContent = governance.current ? `当前正式记忆（${governance.current.path}）\n来源：${governance.current.source_references.join(' · ')}\n来源创建时间：${governance.current.source_created_at || '不可用'}\n记录时间：${governance.current.recorded_at}\n生效时间：${governance.current.effective_at || '初始版本'}\n\n${governance.current.content}` : '';
-          const diff = candidateDetail.querySelector('#candidate-conflict-diff');
-          diff.hidden = !governance.diff;
-          diff.textContent = governance.diff || '';
-          candidateDetail.querySelector('#candidate-resolve').disabled = !pending || !['possible_duplicate', 'conflict'].includes(governance.classification);
-        }
-
-        async function candidateAction(action) {
-          if (!activeCandidate || activeCandidate.status !== 'pending') return;
-          const candidateId = activeCandidate.id;
-          const selectionGeneration = candidateSelectionGeneration;
-          const contextIsCurrent = () => selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId;
-          const button = candidateDetail.querySelector(`#candidate-${action === 'edit' ? 'save' : action}`);
-          await performOnce(`candidate-${candidateId}`, button, '正在提交...', async () => {
-          if (!contextIsCurrent() || activeCandidate.status !== 'pending') return;
-          const operator = candidateDetail.querySelector('#candidate-operator').value;
-          const reason = candidateDetail.querySelector('#candidate-reason').value;
-          const body = candidateDetail.querySelector('#candidate-body').value;
-          const url = action === 'edit' ? `/api/v1/candidates/${candidateId}` : `/api/v1/candidates/${candidateId}/${action}`;
-          const payload = action === 'edit' ? {body, operator, reason} : {operator, reason, operation_id: crypto.randomUUID()};
-          const response = await request(url, {method: action === 'edit' ? 'PUT' : 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
-          const message = candidateDetail.querySelector('#candidate-message');
-          if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
-          if (!response.ok) { const failure = await response.json(); if (selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId) setMessage(message, describeError(failure, '候选操作失败'), 'error'); return; }
-          const updatedCandidate = await response.json();
-          if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
-          activeCandidate = updatedCandidate;
-          if (activeCandidate.status !== 'pending') button.dataset.keepDisabled = 'true';
-          await refreshCandidates(activeCandidate.id);
-          if (action === 'approve') await refreshDocuments();
-          if (selectionGeneration === candidateSelectionGeneration && (!activeCandidate || activeCandidate.id === candidateId)) setMessage(message, action === 'edit' ? '候选记忆已保存。' : action === 'approve' ? '候选记忆已批准。' : '候选记忆已拒绝。', 'success');
-          }, null, contextIsCurrent);
-        }
-
-        async function resolveCandidate() {
-          if (!activeCandidate || activeCandidate.status !== 'pending') return;
-          const candidateId = activeCandidate.id;
-          const selectionGeneration = candidateSelectionGeneration;
-          const contextIsCurrent = () => selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId;
-          const button = candidateDetail.querySelector('#candidate-resolve');
-          await performOnce(`candidate-${candidateId}`, button, '正在裁决...', async () => {
-          if (!contextIsCurrent() || activeCandidate.status !== 'pending') return;
-          const action = candidateDetail.querySelector('#candidate-resolution').value;
-          const effective = candidateDetail.querySelector('#candidate-effective').value;
-          const payload = {
-            action,
-            operator: candidateDetail.querySelector('#candidate-operator').value,
-            reason: candidateDetail.querySelector('#candidate-reason').value,
-            operation_id: crypto.randomUUID(),
-            merged_body: action === 'merge' ? candidateDetail.querySelector('#candidate-body').value : null,
-            effective_at: effective ? new Date(effective).toISOString() : null,
-            condition: action === 'scope' ? candidateDetail.querySelector('#candidate-condition').value : null,
-          };
-          const response = await request(`/api/v1/candidates/${candidateId}/resolve`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
-          const message = candidateDetail.querySelector('#candidate-message');
-          if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
-          if (!response.ok) { const failure = await response.json(); if (selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId) setMessage(message, describeError(failure, '冲突裁决失败'), 'error'); return; }
-          const result = await response.json();
-          if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
-          activeCandidate = result.candidate;
-          button.dataset.keepDisabled = 'true';
-          await refreshCandidates(activeCandidate.id);
-          await refreshDocuments();
-          if (selectionGeneration === candidateSelectionGeneration && (!activeCandidate || activeCandidate.id === candidateId)) setMessage(message, '冲突裁决已提交。', 'success');
-          }, null, contextIsCurrent);
-        }
-
-        async function pinCandidate() {
-          if (!activeCandidate) return;
-          const candidateId = activeCandidate.id;
-          const selectionGeneration = candidateSelectionGeneration;
-          const contextIsCurrent = () => selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId;
-          const button = candidateDetail.querySelector('#candidate-pin');
-          await performOnce(`candidate-${candidateId}`, button, '正在置顶...', async () => {
-            if (!contextIsCurrent()) return;
-            const response = await request(`/api/v1/candidates/${candidateId}/pin`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pinned: true})});
-            const message = candidateDetail.querySelector('#candidate-message');
-            if (selectionGeneration !== candidateSelectionGeneration || activeCandidate?.id !== candidateId) return;
-            if (!response.ok) { setMessage(message, '候选记忆置顶失败。', 'error'); return; }
-            await refreshCandidates(candidateId);
-            if (selectionGeneration === candidateSelectionGeneration && activeCandidate?.id === candidateId) setMessage(message, '候选记忆已置顶。', 'success');
-          }, null, contextIsCurrent);
-        }
-
-        async function refreshSensitiveQuarantine(selectedId = activeSensitiveRecord?.id, selectionContext = null) {
-          const generation = ++generations.sensitive;
-          sensitiveList.replaceChildren();
-          sensitiveList.innerHTML = '<p class="empty">正在加载敏感隔离记录...</p>';
-          const response = await request(`/api/v1/sensitive-quarantine?offset=${sensitiveOffset}&limit=${sensitivePageSize + 1}`, {headers: {}});
-          if (generation !== generations.sensitive) return;
-          if (!response.ok) { sensitiveList.innerHTML = '<p class="empty error">敏感隔离记录加载失败，请重试。</p>'; sensitiveList.append(sensitivePagination); return; }
-          const payload = await response.json();
-          if (generation !== generations.sensitive) return;
-          const records = payload.slice(0, sensitivePageSize);
-          const hasNextPage = payload.length > sensitivePageSize;
-          sensitiveList.replaceChildren();
-          for (const record of records) {
-            const button = sensitiveList.appendChild(document.createElement('button'));
-            button.type = 'button';
-            button.dataset.recordId = record.id;
-            const status = record.resolved_at ? record.resolution : 'unresolved';
-            button.className = 'secondary';
-            button.textContent = `${display(record.disposition)} · ${display(status)} · ${record.created_at}`;
-            button.addEventListener('click', () => showSensitiveRecord(record));
-          }
-          sensitivePagination.querySelector('#sensitive-previous').disabled = sensitiveOffset === 0;
-          sensitivePagination.querySelector('#sensitive-next').disabled = !hasNextPage;
-          sensitivePagination.querySelector('#sensitive-page').textContent = `${sensitiveOffset + 1}-${sensitiveOffset + records.length}`;
-          sensitiveList.append(sensitivePagination);
-          if (selectionContext && (activeSensitiveRecord?.id !== selectionContext.recordId || sensitiveSelectionGeneration !== selectionContext.selectionGeneration)) return;
-          const selected = records.find((record) => record.id === selectedId);
-          if (selected) showSensitiveRecord(selected, selected.id !== activeSensitiveRecord?.id);
-          else clearSensitiveRecord();
-          if (!records.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = sensitiveOffset ? '本页没有记录，请返回上一页。' : '没有敏感隔离记录。'; sensitiveList.prepend(empty); }
-        }
-
-        function clearSensitiveRecord(invalidateSelection = true) {
-          if (invalidateSelection) ++sensitiveSelectionGeneration;
-          activeSensitiveRecord = null;
-          sensitiveDetail.querySelector('#sensitive-title').textContent = '请选择隔离记录';
-          sensitiveDetail.querySelector('#sensitive-summary').textContent = '';
-          sensitiveDetail.querySelector('#sensitive-metadata').textContent = '';
-          sensitiveDetail.querySelector('#sensitive-message').textContent = '';
-          sensitiveDetail.querySelector('#sensitive-acknowledge').disabled = true;
-          sensitiveDetail.querySelector('#sensitive-discard').disabled = true;
-        }
-
-        function showSensitiveRecord(record, invalidateSelection = true) {
-          if (invalidateSelection) ++sensitiveSelectionGeneration;
-          activeSensitiveRecord = record;
-          const open = !record.resolved_at;
-          sensitiveDetail.querySelector('#sensitive-title').textContent = `${display(record.disposition)} · ${display(open ? 'unresolved' : record.resolution)}`;
-          sensitiveDetail.querySelector('#sensitive-summary').textContent = displaySensitiveSummary(record.summary);
-          sensitiveDetail.querySelector('#sensitive-metadata').textContent = `${record.categories.join(', ')} · 创建于 ${record.created_at}${record.resolved_at ? ` · 处理于 ${record.resolved_at}` : ''}`;
-          sensitiveDetail.querySelector('#sensitive-message').textContent = open ? '' : `处理结果：${display(record.resolution)}`;
-          sensitiveDetail.querySelector('#sensitive-acknowledge').disabled = !open;
-          sensitiveDetail.querySelector('#sensitive-discard').disabled = !open;
-        }
-
-        async function resolveSensitiveRecord(resolution) {
-          if (!activeSensitiveRecord || activeSensitiveRecord.resolved_at) return;
-          const recordId = activeSensitiveRecord.id;
-          const selectionGeneration = sensitiveSelectionGeneration;
-          if (resolution === 'discard' && !await confirmAction('确认丢弃敏感记录', `丢弃隔离记录 ${recordId} 后无法恢复。`)) return;
-          const contextIsCurrent = () => activeSensitiveRecord?.id === recordId && sensitiveSelectionGeneration === selectionGeneration;
-          if (!contextIsCurrent()) return;
-          const button = sensitiveDetail.querySelector(resolution === 'acknowledge' ? '#sensitive-acknowledge' : '#sensitive-discard');
-          await performOnce(`sensitive-${recordId}`, button, '正在处理...', async () => {
-          const response = await request(`/api/v1/sensitive-quarantine/${recordId}/resolve`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({resolution})});
-          const message = sensitiveDetail.querySelector('#sensitive-message');
-          if (!contextIsCurrent()) return;
-          if (!response.ok) { const failure = await response.json(); if (contextIsCurrent()) setMessage(message, describeError(failure, '敏感记录处理失败'), 'error'); return; }
-          const resolvedRecord = await response.json();
-          if (!contextIsCurrent()) return;
-          activeSensitiveRecord = resolvedRecord;
-          showSensitiveRecord(resolvedRecord, false);
-          button.dataset.keepDisabled = 'true';
-          await refreshSensitiveQuarantine(recordId, {recordId, selectionGeneration});
-          if (contextIsCurrent()) setMessage(message, resolution === 'acknowledge' ? '已知悉此敏感记录。' : '敏感记录已丢弃。', 'success');
-          }, null, contextIsCurrent);
-        }
-
-        async function refreshDocuments() {
-          const selectedLibrary = editorLibrary.value;
-          const requestContext = editorContext.selectLibrary(selectedLibrary);
-          invalidateForgottenSelection(selectedLibrary ? '正在加载遗忘记忆...' : '请先选择记忆库。');
-          clearReconciliation();
-          reconciliationList.innerHTML = selectedLibrary ? '<p class="empty">正在加载带外变更...</p>' : '<p class="empty">请先选择记忆库。</p>';
-          documentTree.replaceChildren();
-          historyDocument.replaceChildren();
-          history.replaceChildren();
-          restoreAction.replaceChildren();
-          historySelection.clear();
-          historyDiff.textContent = '';
-          activeDocument = null;
-          deletionPreviewVersion = null;
-          deletionPreviewToken = null;
-          editor.querySelector('#document-path').textContent = '请从文档列表选择内容';
-          editor.querySelector('#document-meta').textContent = '生命周期、版本和来源将在此显示。';
-          editor.querySelector('#document-source').value = '';
-          editor.querySelector('#document-source').disabled = true;
-          editor.querySelector('#preview-change').disabled = true;
-          editor.querySelector('#save-change').disabled = true;
-          editor.querySelector('#preview-delete').disabled = true;
-          editor.querySelector('#confirm-delete').disabled = true;
-          const exportLink = editor.querySelector('#export-markdown');
-          exportLink.href = selectedLibrary
-            ? `/api/v1/libraries/${encodeURIComponent(selectedLibrary)}/export.md`
-            : '#';
-          exportLink.setAttribute('aria-disabled', String(!selectedLibrary));
-          editor.querySelector('#editor-message').textContent = selectedLibrary ? '正在加载文档...' : '请先选择记忆库。';
-          setMessage(historyMessage, selectedLibrary ? '正在加载文档列表...' : '请先选择记忆库。');
-          if (!selectedLibrary) return;
-          const response = await request(`/api/v1/libraries/${selectedLibrary}/documents`, {headers: {}});
-          if (!response.ok) { if (editorContext.isCurrent(requestContext)) setMessage(editor.querySelector('#editor-message'), '文档列表加载失败，请重试。', 'error'); return; }
-          if (!editorContext.isCurrent(requestContext)) return;
-          const documents = await response.json();
-          const placeholder = document.createElement('option');
-          placeholder.value = '';
-          placeholder.textContent = documents.length ? '请选择要恢复的文档' : '此记忆库还没有文档';
-          historyDocument.append(placeholder);
-          for (const item of documents) {
-            if (!editorContext.isCurrent(requestContext)) return;
-            const button = documentTree.appendChild(document.createElement('button'));
-            button.type = 'button';
-            button.textContent = `${item.path} · ${item.lifecycle || 'unknown'}`;
-            button.addEventListener('click', () => loadDocument(item.path));
-            const option = document.createElement('option');
-            option.value = item.path;
-            option.textContent = item.path;
-            historyDocument.append(option);
-          }
-          if (!documents.length) documentTree.innerHTML = '<p class="empty">此记忆库还没有文档。</p>';
-          setMessage(editor.querySelector('#editor-message'), documents.length ? '请选择文档进行查看或编辑。' : '此记忆库还没有文档。');
-          setMessage(historyMessage, documents.length ? '请选择文档，再查看可恢复的提交。' : '此记忆库还没有文档。');
-          await refreshHistory();
-          await refreshForgotten();
-          await refreshReconciliation();
-        }
-
-        async function loadDocument(path) {
-          restoreAction.replaceChildren();
-          historySelection.clear();
-          const selectedLibrary = editorLibrary.value;
-          const requestContext = editorContext.requestDocument(selectedLibrary, path);
-          setMessage(editor.querySelector('#editor-message'), `正在加载 ${path}...`);
-          const response = await request(`/api/v1/libraries/${selectedLibrary}/document?path=${encodeURIComponent(path)}`, {headers: {}});
-          if (!response.ok) { if (editorContext.isCurrent(requestContext)) setMessage(editor.querySelector('#editor-message'), `文档加载失败：${path}`, 'error'); return null; }
-          const loaded = await response.json();
-          const accepted = editorContext.acceptDocument(requestContext, loaded);
-          if (!accepted || selectedLibrary !== editorLibrary.value || accepted.libraryId !== selectedLibrary || accepted.path !== path) return null;
-          activeDocument = loaded;
-          historyDocument.value = activeDocument.path;
-          editor.querySelector('#document-path').textContent = activeDocument.path;
-          editor.querySelector('#document-meta').textContent = JSON.stringify({
-            lifecycle: activeDocument.lifecycle,
-            version: activeDocument.version,
-            source: activeDocument.source,
-            source_references: activeDocument.source_references,
-            metadata: activeDocument.metadata,
-          }, null, 2);
-          editor.querySelector('#document-source').value = activeDocument.content;
-          editor.querySelector('#document-source').disabled = false;
-          const canEdit = activeDocument.lifecycle === 'active'
-            && activeDocument.user_metadata?.restore_pending !== true;
-          editor.querySelector('#preview-change').disabled = !canEdit;
-          editor.querySelector('#save-change').disabled = !canEdit;
-          editor.querySelector('#preview-delete').disabled = false;
-          editor.querySelector('#confirm-delete').disabled = true;
-          editor.querySelector('#export-markdown').href = `/api/v1/libraries/${encodeURIComponent(selectedLibrary)}/export.md`;
-          deletionPreviewVersion = null;
-          deletionPreviewToken = null;
-          showEditorPanel('source');
-          setMessage(editor.querySelector('#editor-message'), '文档已加载。', 'success');
-          setMessage(historyMessage, `已选择 ${activeDocument.path}。`, 'success');
-          await refreshHistory();
-          return documentContextIsCurrent(accepted) ? accepted : null;
-        }
-
-        function showEditorPanel(panel) {
-          editor.querySelector('#document-source').hidden = panel !== 'source';
-          editor.querySelector('#document-preview').hidden = panel !== 'preview';
-          editor.querySelector('#document-diff').hidden = panel !== 'diff';
-          for (const name of ['source', 'preview', 'diff']) {
-            const tab = editor.querySelector(`#${name}-tab`);
-            const selected = name === panel;
-            tab.setAttribute('aria-selected', String(selected));
-            tab.tabIndex = selected ? 0 : -1;
-          }
-        }
-
-        async function previewChange(context = editorContext.snapshot(), panel = 'diff') {
-          if (!context || !context.path || !context.sourceVersion) return false;
-          const button = editor.querySelector('#preview-change');
-          if (pending.has(`preview-${context.token}`)) return false;
-          pending.add(`preview-${context.token}`); setBusy(button, true, '正在预览...');
-          const previewRequest = PamHistory.previewRequest(context);
-          let response;
-          try { response = await request(previewRequest.url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(previewRequest.body)}); }
-          finally { pending.delete(`preview-${context.token}`); setBusy(button, false, '正在预览...'); }
-          const message = editor.querySelector('#editor-message');
-          if (!editorContext.isCurrent(context)) return false;
-          if (!response.ok) { const failure = await response.json(); if (!editorContext.isCurrent(context)) return false; setMessage(message, describeError(failure, '变更预览失败'), 'error'); return false; }
-          const preview = await response.json();
-          if (!editorContext.isCurrent(context)) return false;
-          editor.querySelector('#document-preview').srcdoc = preview.rendered_html;
-          editor.querySelector('#document-diff').textContent = preview.diff || '没有变更。';
-          setMessage(message, '预览已更新。', 'success');
-          showEditorPanel(panel);
-          return true;
-        }
-
-        async function loadHistoryDiff(selectedLibrary, entry, actionContext) {
-          const pendingKey = `history-diff-${selectedLibrary}-${entry.commit}-${actionContext.token}`;
-          if (pending.has(pendingKey)) return false;
-          const selectionGeneration = ++generations.historyDiff;
-          pending.add(pendingKey);
-          historyDiff.textContent = '正在加载提交差异...';
-          restoreAction.replaceChildren();
-          historySelection.clear();
-          setMessage(historyMessage, `正在加载提交 ${entry.commit.slice(0, 12)} 的差异...`);
-          let diffResponse;
-          try { diffResponse = await request(`/api/v1/libraries/${selectedLibrary}/history/${entry.commit}/diff`, {headers: {}}); }
-          finally { pending.delete(pendingKey); }
-          if (!editorContext.isCurrent(actionContext) || selectionGeneration !== generations.historyDiff) return;
-          if (!diffResponse.ok) {
-            historyDiff.textContent = '提交差异加载失败。';
-            setMessage(historyMessage, '提交差异加载失败，请重试。', 'error');
-            const retry = document.createElement('button');
-            retry.type = 'button';
-            retry.textContent = '重试加载差异';
-            retry.addEventListener('click', () => loadHistoryDiff(selectedLibrary, entry, actionContext));
-            restoreAction.append(retry);
-            return;
-          }
-          const diffPayload = await diffResponse.json();
-          if (!editorContext.isCurrent(actionContext) || selectionGeneration !== generations.historyDiff) return;
-          historyDiff.textContent = diffPayload.diff || '该提交没有可显示的差异。';
-          const selection = historySelection.select(selectedLibrary, {
-            path: actionContext.path,
-            source_version: actionContext.sourceVersion,
-            token: actionContext.token,
-          }, entry.commit);
-          const restore = document.createElement('button');
-          restore.type = 'button';
-          restore.textContent = `从 ${selection.commit.slice(0, 12)} 恢复 ${selection.path}`;
-          restore.addEventListener('click', () => restoreDocument(selection));
-          restoreAction.append(restore);
-          setMessage(historyMessage, `已加载提交 ${selection.commit.slice(0, 12)} 的差异。`, 'success');
-        }
-
-        async function refreshHistory() {
-          const context = editorContext.snapshot();
-          const generation = ++generations.history;
-          ++generations.historyDiff;
-          history.replaceChildren();
-          if (!context || !context.libraryId) return;
-          history.innerHTML = '<p class="empty">正在加载本地历史...</p>';
-          const selectedLibrary = context.libraryId;
-          const versions = Array.isArray(activeDocument?.history) ? activeDocument.history : [];
-          const response = await request(`/api/v1/libraries/${selectedLibrary}/history`, {headers: {}});
-          if (!editorContext.isCurrent(context) || generation !== generations.history) return;
-          let entries = [];
-          if (response.ok) entries = await response.json();
-          else if (!versions.length) { history.innerHTML = '<p class="empty error">本地历史加载失败，请重试。</p>'; return; }
-          history.replaceChildren();
-          for (const version of versions) {
-            const commit = String(version.id || '');
-            if (!commit) continue;
-            const entry = {
-              commit,
-              subject: version.lifecycle || '版本',
-              authored_at: version.updated_at || version.created_at || '',
-              actor_type: version.source || 'mem2',
-              source: version.source || 'mem2',
-            };
-            const button = history.appendChild(document.createElement('button'));
-            button.type = 'button';
-            button.textContent = `${commit.slice(0, 12)}  ${entry.subject}`;
-            button.className = 'secondary';
-            button.title = `${entry.authored_at} · ${entry.actor_type} · ${entry.source}`;
-            button.addEventListener('click', async () => {
-              const actionContext = editorContext.snapshot();
-              if (!actionContext || !actionContext.path) { setMessage(historyMessage, '请先选择要恢复的文档。', 'error'); return; }
-              await loadHistoryDiff(selectedLibrary, entry, actionContext);
-            });
-          }
-          for (const entry of entries) {
-            if (!editorContext.isCurrent(context)) return;
-            const commit = String(entry.commit || entry.target_id || entry.id || '');
-            if (!commit) continue;
-            const normalized = {
-              ...entry,
-              commit,
-              subject: entry.subject || entry.action || '记忆事件',
-              authored_at: entry.authored_at || entry.occurred_at || '',
-              actor_type: entry.actor_type || entry.actor || '平台',
-              source: entry.source || '',
-            };
-            const statusLabels = {pending: '待完成', committed: '已提交', failed: '失败'};
-            const statusLabel = normalized.status
-              ? ` [${statusLabels[normalized.status] || normalized.status}]`
-              : '';
-            const button = history.appendChild(document.createElement('button'));
-            button.type = 'button';
-            button.textContent = `${normalized.commit.slice(0, 12)}  ${normalized.subject}${statusLabel}`;
-            button.className = 'secondary';
-            button.title = `${normalized.authored_at} · ${normalized.actor_type} · ${normalized.source || '初始化'}${statusLabel}`;
-            button.addEventListener('click', async () => {
-              const actionContext = editorContext.snapshot();
-              if (!actionContext || !actionContext.path) { setMessage(historyMessage, '请先选择要恢复的文档。', 'error'); return; }
-              await loadHistoryDiff(selectedLibrary, normalized, actionContext);
-            });
-          }
-          if (!history.children.length) history.innerHTML = '<p class="empty">还没有本地历史提交。</p>';
-        }
-
-        async function restoreDocument(selection) {
-          const context = editorContext.snapshot();
-          const selectionIsCurrent = () => documentContextIsCurrent(context)
-            && context.libraryId === selection.libraryId
-            && context.path === selection.path
-            && context.token === selection.contextToken;
-          if (!selectionIsCurrent()) return;
-          if (!await confirmAction('确认恢复历史版本', `将从提交 ${selection.commit.slice(0, 12)} 恢复 ${selection.path}，并创建新的记忆变更事务。`)) return;
-          if (!selectionIsCurrent()) return;
-          const restoreButton = restoreAction.querySelector('button');
-          await performOnce(`history-${selection.contextToken}`, restoreButton, '正在恢复...', async () => {
-          const restore = PamHistory.request(selection, crypto.randomUUID());
-          const response = await request(restore.url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(restore.body)});
-          if (!selectionIsCurrent()) return;
-          if (!response.ok) { const failure = await response.json(); if (!selectionIsCurrent()) return; setMessage(historyMessage, describeError(failure, '历史版本恢复失败'), 'error'); return; }
-          const restored = typeof response.json === 'function' ? await response.json() : {};
-          const nextPath = String(restored.id || selection.path);
-          restoreAction.replaceChildren();
-          historySelection.clear();
-          if (!selectionIsCurrent()) return;
-          const loadedContext = await loadDocument(nextPath);
-          if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === selection.libraryId && loadedContext.path === nextPath) setMessage(historyMessage, `已从 ${selection.commit.slice(0, 12)} 恢复 ${nextPath}。`, 'success');
-          }, null, selectionIsCurrent);
-        }
-
-        async function previewForgetting() {
-          const context = editorContext.snapshot();
-          if (!context || !context.path || !context.sourceVersion) return;
-          const pendingKey = `forget-preview-${context.token}`;
-          if (pending.has(pendingKey)) return false;
-          const requestGeneration = ++generations.forgettingPreview;
-          const button = editor.querySelector('#preview-delete');
-          pending.add(pendingKey); setBusy(button, true, '正在预览...');
-          let response;
-          try { response = await request(`/api/v1/libraries/${context.libraryId}/document/delete-preview`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path: context.path, expected_source_version: context.sourceVersion, operation_id: crypto.randomUUID()})}); }
-          finally { pending.delete(pendingKey); setBusy(button, false, '正在预览...'); }
-          if (!documentContextIsCurrent(context) || requestGeneration !== generations.forgettingPreview) return false;
-          const message = editor.querySelector('#editor-message');
-          if (!response.ok) { const failure = await response.json(); if (documentContextIsCurrent(context) && requestGeneration === generations.forgettingPreview) setMessage(message, describeError(failure, '删除影响预览失败'), 'error'); return false; }
-          const preview = await response.json();
-          if (!documentContextIsCurrent(context) || requestGeneration !== generations.forgettingPreview) return false;
-          editor.querySelector('#document-diff').textContent = JSON.stringify(preview, null, 2);
-          showEditorPanel('diff');
-          deletionPreviewVersion = context.sourceVersion;
-          deletionPreviewToken = preview.preview_token;
-          editor.querySelector('#confirm-delete').disabled = false;
-          setMessage(message, '请检查所有受影响的权威来源和派生数据，再确认删除。');
-          return true;
-        }
-
-        async function forgetDocument() {
-          const context = editorContext.snapshot();
-          if (!context || deletionPreviewVersion !== context.sourceVersion || !deletionPreviewToken) return;
-          const deleteMode = editor.querySelector('#delete-mode')?.value || 'forget';
-          const deleteModeLabels = {forget: '遗忘', archive: '归档', downweight: '降权', purge: '彻底删除'};
-          const deleteLabel = deleteModeLabels[deleteMode] || deleteMode;
-          if (!await confirmAction(`强化确认：${deleteLabel}记忆`, `此操作将对 ${context.path} 执行${deleteLabel}。`, context.path)) return;
-          if (!editorContext.isCurrent(context)) return;
-          const button = editor.querySelector('#confirm-delete');
-          await performOnce(`delete-${context.token}`, button, '正在删除...', async () => {
-          const operationId = crypto.randomUUID();
-          const deleteRequest = typeof PamHistory !== 'undefined' && typeof PamHistory.deleteRequest === 'function'
-            ? PamHistory.deleteRequest(context, deletionPreviewToken, operationId, deleteMode)
-            : {url: `/api/v1/libraries/${context.libraryId}/document`, body: {path: context.path, expected_source_version: context.sourceVersion, preview_token: deletionPreviewToken, operation_id: operationId, actor_type: 'user', source: 'web-delete', mode: deleteMode}};
-          const response = await request(deleteRequest.url, {method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(deleteRequest.body)});
-          const message = editor.querySelector('#editor-message');
-          if (!editorContext.isCurrent(context)) return;
-          if (!response.ok) { const failure = await response.json(); if (editorContext.isCurrent(context)) setMessage(message, describeError(failure, `记忆${deleteLabel}失败`), 'error'); return; }
-          await refreshDocuments();
-          const currentContext = editorContext.snapshot();
-          if (editorLibrary.value === context.libraryId && currentContext?.libraryId === context.libraryId && !currentContext.path) setMessage(message, `记忆已${deleteLabel}。`, 'success');
-          }, null, () => documentContextIsCurrent(context));
-        }
-
-        async function saveDocument() {
-          const context = editorContext.snapshot();
-          if (!context) return;
-          const button = editor.querySelector('#save-change');
-          await performOnce(`save-${context.token}`, button, '正在保存...', async () => {
-            if (!(await previewChange(context)) || !documentContextIsCurrent(context)) return;
-            const saveRequest = PamHistory.saveRequest(context, crypto.randomUUID(), editor.querySelector('#update-mode').value);
-            const response = await request(saveRequest.url, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(saveRequest.body)});
-            const message = editor.querySelector('#editor-message');
-            if (!documentContextIsCurrent(context)) return;
-            if (!response.ok) { const failure = await response.json(); if (!documentContextIsCurrent(context)) return; setMessage(message, describeError(failure, '文档保存失败'), 'error'); return; }
-            const saved = typeof response.json === 'function' ? await response.json() : {};
-            const nextPath = String(saved.id || context.path);
-            const loadedContext = await loadDocument(nextPath);
-            if (loadedContext && documentContextIsCurrent(loadedContext) && loadedContext.libraryId === context.libraryId && loadedContext.path === nextPath) setMessage(message, '文档已保存。', 'success');
-          }, null, () => documentContextIsCurrent(context));
-          const current = editorContext.snapshot();
-          button.disabled = !documentContextIsCurrent(current);
-        }
-
-        function invalidateForgottenSelection(messageText = '') {
-          ++generations.forgotten;
-          const memorySelect = forgottenForm.querySelector('#forgotten-memory');
-          const commitSelect = forgottenForm.querySelector('#forgotten-commit');
-          memorySelect.replaceChildren();
-          commitSelect.replaceChildren();
-          delete memorySelect.dataset.libraryId;
-          delete memorySelect.dataset.generation;
-          delete commitSelect.dataset.libraryId;
-          delete commitSelect.dataset.generation;
-          forgottenForm.querySelector('button[type="submit"]').disabled = true;
-          setMessage(forgottenForm.querySelector('#forgotten-message'), messageText);
-        }
-
-        async function refreshForgotten() {
-          const generation = ++generations.forgotten;
-          const libraryId = editorLibrary.value;
-          const memorySelect = forgottenForm.querySelector('#forgotten-memory');
-          const commitSelect = forgottenForm.querySelector('#forgotten-commit');
-          memorySelect.replaceChildren();
-          commitSelect.replaceChildren();
-          const submitButton = forgottenForm.querySelector('button[type="submit"]');
-          submitButton.disabled = true;
-          if (!libraryId) return;
-          const contextIsCurrent = () => generation === generations.forgotten && libraryId === editorLibrary.value;
-          const forgottenResponse = await request(`/api/v1/libraries/${libraryId}/forgotten`, {headers: {}});
-          if (!contextIsCurrent()) return;
-          if (!forgottenResponse.ok) { if (contextIsCurrent()) setMessage(forgottenForm.querySelector('#forgotten-message'), '遗忘记忆列表加载失败，请重试。', 'error'); return; }
-          const forgottenItems = await forgottenResponse.json();
-          if (!contextIsCurrent()) return;
-          for (const item of forgottenItems) {
-            const option = document.createElement('option');
-            option.value = item.id;
-            option.textContent = `${item.path} · 遗忘于 ${item.deleted_at}`;
-            memorySelect.append(option);
-          }
-          const populateCommitOptions = () => {
-            const selected = forgottenItems.find((item) => item.id === memorySelect.value);
-            commitSelect.replaceChildren();
-            for (const version of selected?.history || (selected ? [selected] : [])) {
-              const option = document.createElement('option');
-              option.value = version.id;
-              option.textContent = `${version.id.slice(0, 12)} · ${version.lifecycle || '版本'}`;
-              commitSelect.append(option);
-            }
-            commitSelect.value = selected?.id || '';
-            submitButton.disabled = !memorySelect.value || !commitSelect.value;
-          };
-          memorySelect.onchange = populateCommitOptions;
-          populateCommitOptions();
-          if (!contextIsCurrent()) { memorySelect.replaceChildren(); commitSelect.replaceChildren(); return; }
-          memorySelect.dataset.libraryId = libraryId;
-          memorySelect.dataset.generation = String(generation);
-          commitSelect.dataset.libraryId = libraryId;
-          commitSelect.dataset.generation = String(generation);
-          submitButton.disabled = !memorySelect.value || !commitSelect.value;
-        }
-
-        function renderRegionNode(parent, region, temporary = false) {
-          const node = document.createElement('div');
-          node.className = 'region-node';
-          const title = document.createElement('strong');
-          title.textContent = `${region.name}${temporary ? '（临时）' : ''}`;
-          const detail = document.createElement('small');
-          detail.textContent = `${regionKindLabels[region.kind] || region.kind} · ${region.space}${region.session_id ? ` · session=${region.session_id}` : ''}`;
-          node.append(title, detail);
-          parent.append(node);
-        }
-
-        async function refreshRegions() {
-          const generation = ++generations.regions;
-          const [treeResponse, bindingsResponse] = await Promise.all([
-            request(`/api/v1/regions/tree?session_id=${encodeURIComponent(currentRegionSessionId)}`, {headers: {}}),
-            request('/api/v1/project-bindings', {headers: {}}),
-          ]);
-          if (generation !== generations.regions) return;
-          if (!treeResponse.ok || !bindingsResponse.ok) {
-            regionTree.textContent = '记忆区域加载失败。';
-            setMessage(regionMessage, '请稍后刷新记忆区域。', 'error');
-            return;
-          }
-          const tree = await treeResponse.json();
-          regionBindings = await bindingsResponse.json();
-          allRegions = [tree.root, ...(tree.topics || []), ...(tree.projects || [])].filter(Boolean);
-          regionTree.replaceChildren();
-          if (tree.root) {
-            const rootSection = document.createElement('section');
-            const heading = document.createElement('h3');
-            heading.textContent = '用户记忆区域';
-            rootSection.append(heading);
-            renderRegionNode(rootSection, tree.root);
-            regionTree.append(rootSection);
-          }
-          const appendGroup = (title, nodes) => {
-            const section = document.createElement('section');
-            const heading = document.createElement('h3');
-            heading.textContent = title;
-            section.append(heading);
-            for (const node of nodes || []) renderRegionNode(section, node);
-            if (!(nodes || []).length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = '暂无区域'; section.append(empty); }
-            regionTree.append(section);
-          };
-          appendGroup('专题记忆区域', tree.topics);
-          appendGroup('项目记忆区域', tree.projects);
-          if (tree.current_session) {
-            const sessionSection = document.createElement('section');
-            const heading = document.createElement('h3');
-            heading.textContent = '当前会话';
-            sessionSection.append(heading);
-            renderRegionNode(sessionSection, tree.current_session, true);
-            regionTree.append(sessionSection);
-          }
-          const projectRegions = allRegions.filter((region) => region.kind === 'project');
-          fillSelect(regionBindForm.querySelector('#bind-region'), projectRegions, (region) => region.region_id, (region) => `${region.name} (${region.space})`);
-          fillSelect(regionWorktreeForm.querySelector('#worktree-main-binding'), regionBindings.filter((binding) => binding.kind === 'project'), (binding) => binding.binding_id, (binding) => `${binding.canonical_root} → ${binding.region_id}`);
-          const body = regionBindingTable.querySelector('tbody');
-          body.replaceChildren();
-          for (const binding of regionBindings) {
-            const row = document.createElement('tr');
-            for (const value of [binding.canonical_root, binding.kind, binding.region_id]) {
-              const cell = document.createElement('td');
-              cell.textContent = display(value);
-              if (value === binding.canonical_root) cell.className = 'path';
-              row.append(cell);
-            }
-            const availability = document.createElement('td');
-            availability.append(createStatusBadge(binding.availability));
-            row.append(availability);
-            const actions = document.createElement('td');
-            const remove = document.createElement('button');
-            remove.type = 'button';
-            remove.className = 'danger';
-            remove.textContent = '解除绑定';
-            remove.addEventListener('click', async () => {
-              if (!await confirmAction('确认解除区域绑定', `将解除 ${binding.canonical_root} 与 ${binding.region_id} 的显式绑定。`)) return;
-              await performOnce(`region-binding-${binding.binding_id}`, remove, '正在解除...', async () => {
-                const response = await request(`/api/v1/project-bindings/${binding.binding_id}`, {method: 'DELETE', headers: {}});
-                setMessage(regionMessage, response.ok ? '区域绑定已解除。' : '区域绑定解除失败。', response.ok ? 'success' : 'error');
-                if (response.ok) await refreshRegions();
-              });
-            });
-            actions.append(remove);
-            row.append(actions);
-            body.append(row);
-          }
-          if (!regionBindings.length) body.innerHTML = '<tr><td colspan="5" class="empty">还没有项目根目录绑定。</td></tr>';
-          setMessage(regionMessage, '记忆区域树和绑定已加载。', 'success');
-        }
-
-        async function refreshBindings() {
-          const generation = ++generations.bindings;
-          const response = await request('/api/v1/project-bindings', {headers: {}});
-          if (generation !== generations.bindings) return;
-          if (!response.ok) { bindingTable.querySelector('tbody').innerHTML = '<tr><td colspan="6" class="empty error">项目绑定加载失败，请重试。</td></tr>'; return; }
-          const bindings = await response.json();
-          if (generation !== generations.bindings) return;
-          projectBindings = bindings;
-          const directBindings = projectBindings.filter((binding) => binding.kind === 'project');
-          fillSelect(worktreeForm.querySelector('#main-binding'), directBindings, (binding) => binding.id, (binding) => `${binding.canonical_root} (${binding.id})`);
-          const body = bindingTable.querySelector('tbody');
-          body.replaceChildren();
-          for (const binding of projectBindings) {
-            const row = document.createElement('tr');
-            const values = [binding.project_id, display(binding.kind), binding.canonical_root, binding.library_id, binding.availability];
-            for (const [index, value] of values.entries()) {
-              const cell = document.createElement('td');
-              if (index === 4) cell.append(createStatusBadge(value));
-              else cell.textContent = value;
-              if (value === binding.canonical_root) cell.className = 'path';
-              row.append(cell);
-            }
-            const actions = document.createElement('td');
-            if (binding.kind === 'project') {
-              const librarySelect = document.createElement('select');
-              fillSelect(librarySelect, projectLibraries, (library) => library.id, (library) => library.canonical_path);
-              librarySelect.value = binding.library_id;
-              librarySelect.setAttribute('aria-label', `${binding.canonical_root} 的记忆库`);
-              librarySelect.addEventListener('change', () => queueBindingUpdate(binding.id, librarySelect));
-              actions.append(librarySelect);
-            }
-            const remove = document.createElement('button');
-            remove.type = 'button';
-            remove.className = 'danger';
-            remove.textContent = binding.kind === 'project' ? '解绑' : '移除关联';
-            remove.addEventListener('click', async () => {
-              if (!await confirmAction(binding.kind === 'project' ? '确认解绑项目' : '确认移除 Worktree 关联', `将移除 ${binding.canonical_root} 的当前关系。`)) return;
-              await performOnce(`binding-${binding.id}`, remove, '正在移除...', async () => {
-                const response = await request(`/api/v1/project-bindings/${binding.id}`, {method: 'DELETE', headers: {}});
-                setMessage(bindingForm.querySelector('#binding-message'), response.ok ? '项目关系已移除。' : '项目关系移除失败。', response.ok ? 'success' : 'error');
-                if (response.ok) await refreshBindings();
-              });
-            });
-            actions.append(remove);
-            row.append(actions);
-            body.append(row);
-          }
-          if (!projectBindings.length) body.innerHTML = '<tr><td colspan="6" class="empty">还没有项目绑定或 Worktree 关联。</td></tr>';
-        }
-
-        async function queueBindingUpdate(bindingId, select) {
-          let state = bindingIntents.get(bindingId);
-          if (!state) {
-            state = {desiredLibraryId: select.value, running: false, select};
-            bindingIntents.set(bindingId, state);
-          }
-          state.desiredLibraryId = select.value;
-          state.select = select;
-          select.disabled = true;
-          if (state.running) return;
-          state.running = true;
-          const message = bindingForm.querySelector('#binding-message');
-          try {
-            while (true) {
-              const libraryId = state.desiredLibraryId;
-              const response = await request(`/api/v1/project-bindings/${bindingId}`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({library_id: libraryId})});
-              if (libraryId !== state.desiredLibraryId) continue;
-              if (!response.ok) {
-                const failure = await response.json();
-                setMessage(message, describeError(failure, '项目记忆库更新失败'), 'error');
-                break;
-              }
-              setMessage(message, '项目记忆库已更新。', 'success');
-              await refreshBindings();
-              if (libraryId !== state.desiredLibraryId) continue;
-              break;
-            }
-          } finally {
-            state.running = false;
-            state.select.disabled = false;
-            bindingIntents.delete(bindingId);
-          }
-        }
-
-        form.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const button = form.querySelector('button[type="submit"]');
-          await performOnce('register-library', button, '正在注册...', async () => {
-          const response = await request('/api/v1/libraries', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({path: form.querySelector('#path').value, kind: form.querySelector('#kind').value, reuse_existing_git: form.querySelector('#reuse-existing-git').checked}),
-          });
-          const message = form.querySelector('#library-message');
-          if (!response.ok) {
-            const failure = await response.json();
-            setMessage(message, describeError(failure, '记忆库注册失败'), 'error');
-            return;
-          }
-          setMessage(message, '记忆库已注册。', 'success');
-          form.querySelector('#path').value = '';
-          await refresh();
-          });
-        });
-        bindingForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const button = bindingForm.querySelector('button[type="submit"]');
-          await performOnce('bind-project', button, '正在绑定...', async () => {
-          const response = await request('/api/v1/project-bindings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project_root: bindingForm.querySelector('#project-root').value, library_id: bindingForm.querySelector('#project-library').value})});
-          const message = bindingForm.querySelector('#binding-message');
-          if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '项目绑定失败'), 'error'); return; }
-          setMessage(message, '项目已绑定。', 'success');
-          bindingForm.querySelector('#project-root').value = '';
-          await refreshBindings();
-          });
-        });
-        worktreeForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const button = worktreeForm.querySelector('button[type="submit"]');
-          await performOnce('associate-worktree', button, '正在关联...', async () => {
-          const response = await request('/api/v1/project-bindings/worktrees', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({worktree_root: worktreeForm.querySelector('#worktree-root').value, main_project_binding_id: worktreeForm.querySelector('#main-binding').value})});
-          const message = worktreeForm.querySelector('#worktree-message');
-          if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, 'Worktree 关联失败'), 'error'); return; }
-          setMessage(message, 'Worktree 已关联。', 'success');
-          worktreeForm.querySelector('#worktree-root').value = '';
-          await refreshBindings();
-          });
-        });
-        regionCreateForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const button = regionCreateForm.querySelector('button[type="submit"]');
-          await performOnce('create-region', button, '正在创建...', async () => {
-            const kind = regionCreateForm.querySelector('#region-kind').value;
-            const regionId = regionCreateForm.querySelector('#region-id').value.trim();
-            const sessionId = regionCreateForm.querySelector('#region-session-id').value.trim();
-            const response = await request('/api/v1/regions', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind, name: regionCreateForm.querySelector('#region-name').value, region_id: regionId || null, session_id: kind === 'session' ? sessionId || currentRegionSessionId : null})});
-            const message = regionCreateForm.querySelector('#region-create-message');
-            if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '记忆区域创建失败'), 'error'); return; }
-            setMessage(message, '记忆区域已创建。', 'success');
-            regionCreateForm.querySelector('#region-name').value = '';
-            regionCreateForm.querySelector('#region-id').value = '';
-            regionCreateForm.querySelector('#region-session-id').value = '';
-            await refreshRegions();
-          });
-        });
-        regionBindForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const button = regionBindForm.querySelector('button[type="submit"]');
-          await performOnce('bind-region-project', button, '正在绑定...', async () => {
-            const response = await request('/api/v1/project-bindings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project_root: regionBindForm.querySelector('#bind-project-root').value, region_id: regionBindForm.querySelector('#bind-region').value})});
-            const message = regionBindForm.querySelector('#region-bind-message');
-            if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '项目根目录绑定失败'), 'error'); return; }
-            setMessage(message, '项目根目录已绑定。', 'success');
-            regionBindForm.querySelector('#bind-project-root').value = '';
-            await refreshRegions();
-          });
-        });
-        regionWorktreeForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const button = regionWorktreeForm.querySelector('button[type="submit"]');
-          await performOnce('associate-region-worktree', button, '正在关联...', async () => {
-            const response = await request('/api/v1/project-bindings/worktrees', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({worktree_root: regionWorktreeForm.querySelector('#worktree-region-root').value, main_project_binding_id: regionWorktreeForm.querySelector('#worktree-main-binding').value})});
-            const message = regionWorktreeForm.querySelector('#region-worktree-message');
-            if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, 'Worktree 显式关联失败'), 'error'); return; }
-            setMessage(message, 'Worktree 已显式继承主项目绑定。', 'success');
-            regionWorktreeForm.querySelector('#worktree-region-root').value = '';
-            await refreshRegions();
-          });
-        });
-        searchForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const button = searchForm.querySelector('button[type="submit"]');
-          const requestId = crypto.randomUUID(); searchForm.dataset.requestId = requestId;
-          await performOnce('search', button, '正在检索...', async () => {
-          setMessage(searchForm.querySelector('#search-message'), '正在检索记忆...');
-          const response = await request('/api/v1/search', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cwd: searchForm.querySelector('#search-cwd').value, query: searchForm.querySelector('#search-query').value})});
-          if (searchForm.dataset.requestId !== requestId) return;
-          const message = searchForm.querySelector('#search-message');
-          const results = searchForm.querySelector('#search-results');
-          results.replaceChildren();
-          if (!response.ok) { const failure = await response.json(); setMessage(message, describeError(failure, '记忆检索失败'), 'error'); return; }
-          const payload = await response.json();
-          if (searchForm.dataset.requestId !== requestId) return;
-          const searchStatus = formatSearchStatus(payload);
-          setMessage(message, searchStatus.text, searchStatus.kind);
-          for (const hit of payload.results) {
-            const article = document.createElement('article');
-            article.className = 'search-result';
-            const source = document.createElement('div');
-            source.className = 'source';
-            source.textContent = `${hit.path}:${hit.start_line}-${hit.end_line} · ${hit.heading || '无标题'} · ${display(hit.classification)}${hit.graph_hop ? ` · 图跳数 ${hit.graph_hop}` : ''} · ${hit.source_version}`;
-            const content = document.createElement('pre');
-            content.textContent = hit.content;
-            article.append(source, content);
-            results.append(article);
-          }
-          });
-        });
-        candidateStatus.addEventListener('change', () => { ++candidateSelectionGeneration; refreshCandidates(); });
-        candidateDetail.querySelector('#candidate-pin').addEventListener('click', pinCandidate);
-        retentionForm.querySelector('#retention-library').addEventListener('change', () => { ++retentionSelectionGeneration; refreshRetention(); });
-        for (const control of retentionForm.querySelectorAll('input')) control.addEventListener('input', invalidateRetentionPreview);
-        retentionForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const button = retentionForm.querySelector('button[type="submit"]');
-          const libraryId = retentionForm.querySelector('#retention-library').value;
-          const generation = generations.retention;
-          invalidateRetentionPreview();
-          await performOnce(`retention-policy-${libraryId}`, button, '正在保存...', async () => {
-          const payload = {
-            inbox_days: Number(retentionForm.querySelector('#inbox-days').value),
-            candidate_days: Number(retentionForm.querySelector('#candidate-days').value),
-            recycle_days: Number(retentionForm.querySelector('#recycle-days').value),
-            early_inbox_cleanup: retentionForm.querySelector('#early-inbox-cleanup').checked,
-            diagnostics_enabled: retentionForm.querySelector('#diagnostics-enabled').checked,
-            diagnostic_days: Number(retentionForm.querySelector('#diagnostic-days').value),
-          };
-          const response = await request(`/api/v1/libraries/${libraryId}/retention-policy`, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
-          if (generation !== generations.retention || libraryId !== retentionForm.querySelector('#retention-library').value) return;
-          setMessage(retentionForm.querySelector('#retention-message'), response.ok ? '保留策略已保存。' : '保留策略保存失败。', response.ok ? 'success' : 'error');
-          if (response.ok) await previewRetention();
-          });
-        });
-        retentionForm.querySelector('#retention-preview').addEventListener('click', async (event) => {
-          const libraryId = retentionForm.querySelector('#retention-library').value;
-          await performOnce(`retention-preview-${libraryId}`, event.currentTarget, '正在预览...', previewRetention, retentionForm.querySelector('#retention-message'));
-        });
-        retentionForm.querySelector('#retention-run').addEventListener('click', runRetentionCleanup);
-        retentionForm.querySelector('#diagnostics-clear').addEventListener('click', async () => {
-          if (!await confirmAction('确认清除诊断', '将删除当前保留的诊断数据。')) return;
-          const button = retentionForm.querySelector('#diagnostics-clear');
-          await performOnce('diagnostics-clear', button, '正在清除...', async () => {
-            const response = await request('/api/v1/diagnostics', {method: 'DELETE', headers: {}});
-            setMessage(retentionForm.querySelector('#retention-message'), response.ok ? '诊断数据已清除。' : '诊断数据清除失败。', response.ok ? 'success' : 'error');
-          });
-        });
-        candidateDetail.querySelector('#candidate-save').addEventListener('click', () => candidateAction('edit'));
-        candidateDetail.querySelector('#candidate-approve').addEventListener('click', () => candidateAction('approve'));
-        candidateDetail.querySelector('#candidate-resolve').addEventListener('click', resolveCandidate);
-        candidateDetail.querySelector('#candidate-reject').addEventListener('click', () => candidateAction('reject'));
-        sensitiveDetail.querySelector('#sensitive-acknowledge').addEventListener('click', () => resolveSensitiveRecord('acknowledge'));
-        sensitiveDetail.querySelector('#sensitive-discard').addEventListener('click', () => resolveSensitiveRecord('discard'));
-        sensitivePagination.querySelector('#sensitive-previous').addEventListener('click', () => { sensitiveOffset = Math.max(0, sensitiveOffset - sensitivePageSize); refreshSensitiveQuarantine(); });
-        sensitivePagination.querySelector('#sensitive-next').addEventListener('click', () => { sensitiveOffset += sensitivePageSize; refreshSensitiveQuarantine(); });
-        sensitivePagination.querySelector('#sensitive-refresh').addEventListener('click', () => refreshSensitiveQuarantine());
-        editorLibrary.addEventListener('change', async () => { historyLibrary.value = editorLibrary.value; await refreshDocuments(); });
-        reconciliationDetail.querySelector('#reconciliation-import').addEventListener('click', () => resolveReconciliation('import'));
-        reconciliationDetail.querySelector('#reconciliation-restore').addEventListener('click', () => resolveReconciliation('restore'));
-        reconciliationDetail.querySelector('#reconciliation-final').addEventListener('input', (event) => {
-          const candidatePaths = activeReconciliation?.external_candidates || [];
-          reconciliationDetail.querySelector('#reconciliation-import').disabled =
-            (activeReconciliation?.external_withheld && !event.target.value.trim())
-            || (candidatePaths.length > 1 && !reconciliationDetail.querySelector('#reconciliation-path').value);
-        });
-        reconciliationDetail.querySelector('#reconciliation-path').addEventListener('change', (event) => {
-          reconciliationDetail.querySelector('#reconciliation-import').disabled =
-            !event.target.value
-            || (activeReconciliation?.external_withheld && !reconciliationDetail.querySelector('#reconciliation-final').value.trim());
-          reconciliationDetail.querySelector('#reconciliation-restore').disabled = !event.target.value;
-        });
-        editor.querySelector('#source-tab').addEventListener('click', () => showEditorPanel('source'));
-        editor.querySelector('#preview-tab').addEventListener('click', () => previewChange(editorContext.snapshot(), 'preview'));
-        editor.querySelector('#diff-tab').addEventListener('click', () => previewChange());
-        const editorTabs = [...editor.querySelectorAll('[role="tab"]')];
-        for (const [index, tab] of editorTabs.entries()) {
-          tab.tabIndex = index === 0 ? 0 : -1;
-          tab.addEventListener('keydown', (event) => {
-            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-            event.preventDefault();
-            const targetIndex = event.key === 'Home' ? 0 : event.key === 'End' ? editorTabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + editorTabs.length) % editorTabs.length;
-            editorTabs[targetIndex].focus();
-            editorTabs[targetIndex].click();
-          });
-        }
-        editor.querySelector('#preview-change').addEventListener('click', () => previewChange());
-        editor.querySelector('#preview-delete').addEventListener('click', previewForgetting);
-        editor.querySelector('#confirm-delete').addEventListener('click', forgetDocument);
-        editor.querySelector('#document-source').addEventListener('input', () => {
-          editorContext.edit(editor.querySelector('#document-source').value);
-          restoreAction.replaceChildren();
-          historySelection.clear();
-          deletionPreviewVersion = null;
-          deletionPreviewToken = null;
-          editor.querySelector('#confirm-delete').disabled = true;
-        });
-        forgottenForm.addEventListener('submit', async (event) => {
-          event.preventDefault();
-          const libraryId = editorLibrary.value;
-          const tombstone = forgottenForm.querySelector('#forgotten-memory');
-          const commit = forgottenForm.querySelector('#forgotten-commit');
-          const tombstoneId = tombstone.value;
-          const selectedCommit = commit.value;
-          const restoreGeneration = generations.forgotten;
-          const restoreContextIsCurrent = () => editorLibrary.value === libraryId
-            && generations.forgotten === restoreGeneration
-            && tombstone.dataset.libraryId === libraryId
-            && Number(tombstone.dataset.generation) === restoreGeneration
-            && commit.dataset.libraryId === libraryId
-            && Number(commit.dataset.generation) === restoreGeneration
-            && tombstone.value === tombstoneId
-            && commit.value === selectedCommit;
-          if (!tombstoneId || !selectedCommit || !restoreContextIsCurrent()) return;
-          if (!await confirmAction('确认恢复遗忘记忆', `将恢复 ${tombstone.options[tombstone.selectedIndex].textContent}，并创建新的记忆变更事务。`)) return;
-          if (!restoreContextIsCurrent()) return;
-          const button = forgottenForm.querySelector('button[type="submit"]');
-          await performOnce('forgotten-restore', button, '正在恢复...', async () => {
-          if (!restoreContextIsCurrent()) return;
-          const response = await request(`/api/v1/libraries/${libraryId}/forgotten/restore`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tombstone_id: tombstoneId, commit: selectedCommit, operation_id: crypto.randomUUID(), actor_type: 'user', source: 'web-forgotten-history'})});
-          const message = forgottenForm.querySelector('#forgotten-message');
-          if (!restoreContextIsCurrent()) return;
-          if (!response.ok) { const failure = await response.json(); if (restoreContextIsCurrent()) setMessage(message, describeError(failure, '遗忘记忆恢复失败'), 'error'); return; }
-          const expectedRefreshGeneration = restoreGeneration + 2;
-          await refreshDocuments();
-          const currentContext = editorContext.snapshot();
-          if (editorLibrary.value === libraryId
-              && generations.forgotten === expectedRefreshGeneration
-              && tombstone.dataset.libraryId === libraryId
-              && Number(tombstone.dataset.generation) === expectedRefreshGeneration
-              && commit.dataset.libraryId === libraryId
-              && Number(commit.dataset.generation) === expectedRefreshGeneration
-              && currentContext?.libraryId === libraryId
-              && !currentContext.path) setMessage(message, '遗忘记忆已通过新事务恢复。', 'success');
-          }, null, restoreContextIsCurrent);
-        });
-        editor.querySelector('#save-change').addEventListener('click', saveDocument);
-        await refresh();
-      }
-
-      document.querySelector('#root').addEventListener('submit', async (event) => {
-        event.preventDefault();
-        const keyInput = document.querySelector('#key');
-        const connect = document.querySelector('#connect');
-        const loginMessage = document.querySelector('#message');
-        const apiKey = keyInput.value;
-        if (!apiKey) { loginMessage.className = 'error'; loginMessage.textContent = '请输入 API 密钥。'; return; }
-        connect.disabled = true;
-        connect.textContent = '正在连接...';
-        try {
-          const login = await fetch('/api/v1/auth/session', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({api_key: apiKey}),
-          });
-          if (!login.ok) {
-            loginMessage.className = 'error';
-            loginMessage.textContent = login.status === 401 ? '认证失败，请检查 API 密钥。' : '登录服务暂不可用，请稍后重试。';
-            return;
-          }
-          keyInput.value = '';
-          const response = await fetch('/api/v1/status', {credentials: 'same-origin'});
-          if (!response.ok) {
-            loginMessage.className = 'error';
-            loginMessage.textContent = '会话建立失败，请稍后重试。';
-            return;
-          }
-          await enterWorkspace(await response.json());
-        } catch (_error) {
-          loginMessage.className = 'error';
-          loginMessage.textContent = '无法连接服务，请检查服务状态后重试。';
-        } finally {
-          connect.disabled = false;
-          connect.textContent = '进入管理工作台';
-        }
+      <section style="margin-top:18px">
+        <h2>记忆单元</h2>
+        <ul id="document-list" class="document-list"></ul>
+        <label for="document-content">内容</label>
+        <textarea id="document-content" spellcheck="false"></textarea>
+        <div class="actions">
+          <button id="save-document" type="button">保存更正</button>
+          <button id="delete-document" class="danger" type="button">遗忘记忆</button>
+          <button id="load-history" class="secondary" type="button">查看审计</button>
+        </div>
+        <p id="document-message" class="notice" aria-live="polite"></p>
+        <ul id="history-list" class="history-list"></ul>
+      </section>
+    </div>
+  </div>
+</main>
+<script>
+(() => {
+  const state = { regions: [], selectedRegion: null, selectedPath: null, sourceVersion: null };
+  const $ = (id) => document.getElementById(id);
+  const setMessage = (element, text, error = false) => {
+    element.textContent = text;
+    element.classList.toggle('error', error);
+  };
+  async function request(url, options = {}) {
+    const response = await fetch(url, { credentials: 'same-origin', ...options });
+    if (response.status === 401) {
+      showLogin();
+      throw new Error('认证已失效，请重新登录。');
+    }
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try { const body = await response.json(); if (body.detail) detail = body.detail; } catch {}
+      throw new Error(detail);
+    }
+    if (response.status === 204) return null;
+    const type = response.headers.get('content-type') || '';
+    return type.includes('application/json') ? response.json() : response.text();
+  }
+  function showLogin() {
+    $('login-panel').classList.remove('hidden');
+    $('workspace').classList.add('hidden');
+  }
+  function showWorkspace() {
+    $('login-panel').classList.add('hidden');
+    $('workspace').classList.remove('hidden');
+  }
+  function regionLabel(region) { return `${region.name} · ${region.kind} · ${region.region_id}`; }
+  function renderRegions() {
+    const list = $('region-list');
+    list.replaceChildren();
+    const bindingSelect = $('binding-region');
+    bindingSelect.replaceChildren();
+    for (const region of state.regions.filter((item) => item.kind === 'project')) {
+      const option = document.createElement('option');
+      option.value = region.region_id;
+      option.textContent = regionLabel(region);
+      bindingSelect.append(option);
+    }
+    for (const region of state.regions) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = regionLabel(region);
+      button.classList.toggle('active', state.selectedRegion === region.region_id);
+      button.addEventListener('click', () => selectRegion(region.region_id));
+      item.append(button);
+      list.append(item);
+    }
+  }
+  async function loadRegions() {
+    state.regions = await request('/api/v1/regions');
+    if (!state.selectedRegion && state.regions.length) state.selectedRegion = state.regions[0].region_id;
+    renderRegions();
+  }
+  async function loadStatus() {
+    const status = await request('/api/v1/status');
+    $('status').textContent = `${status.memory_kernel} · ${status.memory_kernel_status}`;
+    showWorkspace();
+  }
+  async function selectRegion(regionId) {
+    state.selectedRegion = regionId;
+    state.selectedPath = null;
+    state.sourceVersion = null;
+    renderRegions();
+    await loadDocuments();
+  }
+  async function loadDocuments() {
+    const list = $('document-list');
+    list.replaceChildren();
+    $('document-content').value = '';
+    setMessage($('document-message'), '');
+    if (!state.selectedRegion) return;
+    const documents = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/documents`);
+    for (const document of documents) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = String(document.path);
+      button.addEventListener('click', () => loadDocument(String(document.path)));
+      item.append(button);
+      list.append(item);
+    }
+    setMessage($('document-message'), documents.length ? '选择一条记忆单元进行检视。' : '当前区域没有记忆单元。');
+  }
+  async function loadDocument(path) {
+    state.selectedPath = path;
+    const document = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/document?path=${encodeURIComponent(path)}`);
+    state.sourceVersion = String(document.source_version);
+    $('document-content').value = String(document.content);
+    $('history-list').replaceChildren();
+    setMessage($('document-message'), `已加载 ${path}，来源版本 ${state.sourceVersion}。`);
+  }
+  async function saveDocument() {
+    if (!state.selectedRegion || !state.selectedPath) return;
+    const button = $('save-document');
+    button.disabled = true;
+    try {
+      const updated = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/document`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          path: state.selectedPath,
+          content: $('document-content').value,
+          expected_source_version: state.sourceVersion,
+          operation_id: crypto.randomUUID(),
+          actor_type: 'user',
+          source: 'web',
+        }),
       });
-
-      (async () => {
-        try {
-          const response = await fetch('/api/v1/status', {credentials: 'same-origin'});
-          if (response.ok) await enterWorkspace(await response.json());
-          else if (response.status === 401) document.querySelector('#message').textContent = '会话已过期，请重新输入 API 密钥。';
-        } catch (_error) {
-          document.querySelector('#message').textContent = '无法连接服务，请检查服务状态后重试。';
-        }
-      })();
-    </script>
-  </body>
+      state.sourceVersion = String(updated.source_version);
+      setMessage($('document-message'), '更正已保存并写入持久化审计。');
+      await loadDocuments();
+    } catch (error) {
+      setMessage($('document-message'), error.message, true);
+    } finally { button.disabled = false; }
+  }
+  async function deleteDocument() {
+    if (!state.selectedRegion || !state.selectedPath) return;
+    const button = $('delete-document');
+    button.disabled = true;
+    try {
+      const preview = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/document/delete-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: state.selectedPath, expected_source_version: state.sourceVersion, operation_id: crypto.randomUUID() }),
+      });
+      await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/document`, {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          path: state.selectedPath,
+          expected_source_version: state.sourceVersion,
+          preview_token: preview.preview_token,
+          operation_id: crypto.randomUUID(),
+          actor_type: 'user',
+          source: 'web-delete',
+          mode: 'forget',
+        }),
+      });
+      setMessage($('document-message'), '记忆已遗忘，可在审计记录中核对。');
+      await loadDocuments();
+    } catch (error) {
+      setMessage($('document-message'), error.message, true);
+    } finally { button.disabled = false; }
+  }
+  async function loadHistory() {
+    if (!state.selectedRegion) return;
+    const history = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/history?limit=50`);
+    const list = $('history-list');
+    list.replaceChildren();
+    for (const entry of history) {
+      const item = document.createElement('li');
+      item.textContent = `${entry.occurred_at || entry.authored_at || ''} · ${entry.action} · ${entry.target_id || entry.subject || ''}`;
+      list.append(item);
+    }
+    setMessage($('document-message'), history.length ? '已加载持久化审计记录。' : '当前区域没有审计记录。');
+  }
+  async function runSearch(event) {
+    event.preventDefault();
+    if (!state.selectedRegion) return;
+    setMessage($('search-message'), '正在检索…');
+    const packageValue = await request('/api/v1/search', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ region_id: state.selectedRegion, query: $('search-query').value, token_budget: 10000 }),
+    });
+    const container = $('search-results');
+    container.replaceChildren();
+    for (const result of packageValue.results || []) {
+      const article = document.createElement('article');
+      article.className = 'result';
+      const heading = document.createElement('strong');
+      heading.textContent = `${result.path} · ${result.source_type} · ${result.source_version}`;
+      const content = document.createElement('p');
+      content.textContent = result.content;
+      article.append(heading, content);
+      container.append(article);
+    }
+    const budget = packageValue.budget || {};
+    setMessage($('search-message'), `${(packageValue.results || []).length} 条结果，使用 ${budget.used_tokens ?? 0}/${budget.effective_tokens ?? 10000} token。`);
+  }
+  async function createRegion(event) {
+    event.preventDefault();
+    try {
+      const body = { kind: $('region-kind').value, name: $('region-name').value };
+      if ($('region-id').value.trim()) body.region_id = $('region-id').value.trim();
+      const region = await request('/api/v1/regions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      state.selectedRegion = region.region_id;
+      $('region-form').reset();
+      await loadRegions();
+      await loadDocuments();
+    } catch (error) { setMessage($('status'), error.message, true); }
+  }
+  async function bindProject(event) {
+    event.preventDefault();
+    try {
+      await request('/api/v1/project-bindings', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ project_root: $('binding-root').value, region_id: $('binding-region').value }),
+      });
+      setMessage($('document-message'), '项目绑定已保存。');
+    } catch (error) { setMessage($('document-message'), error.message, true); }
+  }
+  async function runPromotion() {
+    if (!state.selectedRegion) return;
+    const button = $('promotion-button');
+    button.disabled = true;
+    try {
+      const job = await request('/api/v1/promotions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ source_region_ids: [state.selectedRegion] }),
+      });
+      setMessage($('promotion-message'), `晋升任务已排队：${job.job_id}`);
+    } catch (error) { setMessage($('promotion-message'), error.message, true); }
+    finally { button.disabled = false; }
+  }
+  $('login-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      await request('/api/v1/auth/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ api_key: $('api-key').value }),
+      });
+      $('login-form').reset();
+      await loadStatus();
+      await loadRegions();
+      await loadDocuments();
+    } catch (error) { setMessage($('login-message'), error.message, true); }
+  });
+  $('search-form').addEventListener('submit', (event) => runSearch(event).catch((error) => setMessage($('search-message'), error.message, true)));
+  $('region-form').addEventListener('submit', createRegion);
+  $('binding-form').addEventListener('submit', bindProject);
+  $('save-document').addEventListener('click', saveDocument);
+  $('delete-document').addEventListener('click', deleteDocument);
+  $('load-history').addEventListener('click', () => loadHistory().catch((error) => setMessage($('document-message'), error.message, true)));
+  $('promotion-button').addEventListener('click', runPromotion);
+  loadStatus().then(async () => { await loadRegions(); await loadDocuments(); }).catch(() => showLogin());
+})();
+</script>
+</body>
 </html>

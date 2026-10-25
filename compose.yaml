@@ -3,11 +3,10 @@ services:
     build:
       context: .
       target: runtime
-    command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--library-root", "/project-roots", "--host", "127.0.0.1", "--port", "7331", "--embedding-url", "http://127.0.0.1:18080", "--embedding-model", "deterministic-test-model", "--reranker-url", "http://127.0.0.1:18080", "--reranker-model", "deterministic-reranker", "--graph-url", "http://127.0.0.1:18080", "--graph-model", "deterministic-graph", "--model-timeout", "0.3", "--model-retries", "1"]
+    command: ["serve", "--state-dir", "/state", "--library-root", "/memory-libraries", "--host", "127.0.0.1", "--port", "7331"]
     volumes:
       - platform-state:/state
       - memory-libraries:/memory-libraries
-      - project-roots:/project-roots
     environment:
       PERSONAL_AGENT_MEMORY_RETENTION_NOW: ${PERSONAL_AGENT_MEMORY_RETENTION_NOW:-2026-09-07T00:00:00Z}
     healthcheck:
@@ -27,42 +26,6 @@ services:
       timeout: 2s
       retries: 30
 
-  fake-model:
-    build:
-      context: .
-      target: runtime
-    network_mode: "service:daemon"
-    entrypoint: ["python", "-m", "uvicorn"]
-    command: ["personal_agent_memory.fake_model:app", "--host", "127.0.0.1", "--port", "18080"]
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/health')"]
-      interval: 1s
-      timeout: 2s
-      retries: 30
-    depends_on:
-      daemon:
-        condition: service_started
-
-  acceptance:
-    build:
-      context: .
-      target: acceptance
-    network_mode: "service:daemon"
-    entrypoint: ["python", "/app/tests/docker_acceptance.py"]
-    environment:
-      API_KEY_FILE: /state/api-key
-    volumes:
-      - platform-state:/state:ro
-      - memory-libraries:/memory-libraries
-      - project-roots:/project-roots
-      - ./tests:/app/tests:ro
-    depends_on:
-      daemon:
-        condition: service_healthy
-      fake-model:
-        condition: service_healthy
-
 volumes:
   platform-state:
   memory-libraries:
-  project-roots:

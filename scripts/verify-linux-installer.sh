@@ -8,8 +8,10 @@ install_config_dir="$config_home/personal-agent-memory"
 install_config_path="$install_config_dir/install.json"
 unit_path="$config_home/systemd/user/$service_name"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
+web_port=7331
 check_only=false
 installer_arguments=()
+install_arguments=()
 
 if [[ "${PAM_INSTALL_ACCEPTANCE_CUSTOM_DIRS:-}" == "1" ]]; then
   state_dir="$HOME/installer acceptance/platform state"
@@ -66,9 +68,6 @@ with Path(sys.argv[1]).open("rb") as stream:
     print(tomllib.load(stream)["project"]["version"])
 PY
 )"
-old_version="0.0.0"
-legacy_commit="9383eba03a8ec8901ec51c29a467265cec86c433"
-[[ "$target_version" != "$old_version" ]] || skip "release version must be newer than $old_version"
 account_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
 [[ "$HOME" == "$account_home" ]] || skip "HOME must be the dedicated account home: $account_home"
 systemctl --user show-environment >/dev/null 2>&1 || skip "a working systemd user bus is required"
@@ -120,39 +119,6 @@ esac
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/pam-linux-installer.XXXXXX")"
 repo_status_before="$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)"
 repo_remotes_before="$(git -C "$repo_root" remote -v)"
-old_release="$work_root/old-release"
-mkdir -p "$old_release"
-git -C "$repo_root" archive "$legacy_commit" | tar -C "$old_release" -xf -
-"$python_command" - "$old_release" "$old_version" <<'PY'
-import json
-from pathlib import Path
-import sys
-import tomllib
-
-root = Path(sys.argv[1])
-old_version = sys.argv[2]
-with (root / "pyproject.toml").open("rb") as stream:
-    release_version = tomllib.load(stream)["project"]["version"]
-replacements = {
-    root / "pyproject.toml": (
-        f'version = "{release_version}"',
-        f'version = "{old_version}"',
-    ),
-    root / "src/personal_agent_memory/__init__.py": (
-        f'__version__ = "{release_version}"',
-        f'__version__ = "{old_version}"',
-    ),
-    root / "plugins/personal-agent-memory/.codex-plugin/plugin.json": (
-        f'"version": "{release_version}"',
-        f'"version": "{old_version}"',
-    ),
-}
-for path, (current, old) in replacements.items():
-    content = path.read_text(encoding="utf-8")
-    if content.count(current) != 1:
-        raise SystemExit(f"could not prepare old release version in {path}")
-    path.write_text(content.replace(current, old), encoding="utf-8")
-PY
 
 cleanup() {
   status=$?
@@ -169,18 +135,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$old_release/install.sh" "${installer_arguments[@]}" >"$work_root/install-old.out"
+# The normal scenario starts with a Codex marketplace owned by the user. The installer must
+# adopt it without taking ownership or deleting it during uninstall. The purge scenario starts
+# from a clean account and verifies installer-managed marketplace cleanup.
+if [[ "$acceptance_scenario" == "normal" ]]; then
+  codex plugin marketplace add "$repo_root" --json >"$work_root/marketplace-preexisting.json"
+  install_arguments=(--adopt-marketplace)
+fi
+
+"$repo_root/install.sh" "${install_arguments[@]}" "${installer_arguments[@]}" \
+  >"$work_root/install.out"
 if [[ "${PAM_INSTALL_ACCEPTANCE_MISSING_UV:-}" == "1" &&
-  "${PAM_INSTALL_ACCEPTANCE_SCENARIO:-all}" == "normal" ]]; then
+  "$acceptance_scenario" == "normal" ]]; then
   [[ "$uv_initially_available" == false ]]
   command -v uv >/dev/null 2>&1
   printf 'missing uv bootstrap acceptance passed\n' >"$work_root/uv-bootstrap.out"
 fi
 systemctl --user is-enabled "$service_name" | grep -qx enabled
 systemctl --user is-active "$service_name" | grep -qx active
-uv tool list | grep -Eq "^personal-agent-memory v${old_version//./\\.}$"
-codex plugin list --json >"$work_root/plugins-old.json"
-"$python_command" - "$work_root/plugins-old.json" "$old_version" <<'PY'
+uv tool list | grep -Eq "^personal-agent-memory v${target_version//./\\.}$"
+codex plugin list --json >"$work_root/plugins-installed.json"
+"$python_command" - "$work_root/plugins-installed.json" "$target_version" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -195,30 +170,20 @@ assert len(matches) == 1
 assert matches[0]["version"] == sys.argv[2]
 PY
 
+daemon_command="$(command -v personal-agent-memory)"
+"$daemon_command" serve --help >"$work_root/serve-help.out"
+if grep -q -- '--memory-kernel' "$work_root/serve-help.out"; then
+  printf 'installed CLI still exposes the removed memory kernel flag\n' >&2
+  exit 1
+fi
 key_file="$state_dir/api-key"
-"$python_command" - "$install_config_path" "$unit_path" "$state_dir" "$library_root" "$key_file" \
-  <<'PY'
-import json
-from pathlib import Path
-import stat
-import sys
-
-config_path, unit_path, state_dir, library_root, key_file = map(Path, sys.argv[1:6])
-metadata = json.loads(config_path.read_text(encoding="utf-8"))
-assert metadata == {
-    "schema_version": 1,
-    "state_dir": str(state_dir),
-    "library_root": str(library_root),
-    "library_root_ownership": "user-content-never-delete",
-}
-assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
-assert key_file.read_text(encoding="utf-8").strip() not in config_path.read_text(
-    encoding="utf-8"
-)
-unit = unit_path.read_text(encoding="utf-8")
-assert f'--state-dir "{state_dir}"' in unit
-assert f'--library-root "{library_root}"' in unit
-PY
+[[ -s "$key_file" ]]
+[[ "$(cat "$state_dir/mem2/VERSION")" == "jiuwen-memory-0.2.0" ]]
+[[ ! -e "$state_dir/platform.sqlite3" ]]
+unit_text="$(cat "$unit_path")"
+[[ "$unit_text" != *"--memory-kernel"* ]]
+[[ "$unit_text" == *"--state-dir \"$state_dir\""* ]]
+[[ "$unit_text" == *"--library-root \"$library_root\""* ]]
 
 systemctl --user restart "$service_name"
 "$python_command" - "$key_file" <<'PY'
@@ -247,177 +212,9 @@ else:
 PY
 
 project_root="$work_root/project"
-memory_path="$library_root/installer-acceptance"
-mkdir -p "$project_root" "$memory_path"
-printf '# Installer acceptance\n\nInstaller acceptance fact.\n' >"$memory_path/memory.md"
-
-"$python_command" - "$key_file" "$memory_path" "$project_root" <<'PY'
-import json
-import pathlib
-import sys
-import urllib.request
-
-key = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
-headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-
-def post(path, payload):
-    request = urllib.request.Request(
-        f"http://127.0.0.1:7331{path}",
-        data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return json.load(response)
-
-library = post("/api/v1/libraries", {"path": sys.argv[2], "kind": "project"})
-post("/api/v1/project-bindings", {"project_root": sys.argv[3], "library_id": library["id"]})
-post("/mcp/candidates", {
-    "library_id": library["id"],
-    "suggested_type": "decision",
-    "body": "# Upgrade candidate\\n\\nPreserve this pending candidate.\\n",
-    "source_references": ["codex-session:upgrade#assistant-final"],
-    "creator": "codex",
-    "idempotency_key": "linux-installer-upgrade-candidate",
-})
-post("/api/v1/capture/events", {
-    "event_id": "linux-installer-upgrade-event",
-    "session_id": "linux-installer-upgrade-session",
-    "turn_id": "linux-installer-upgrade-turn",
-    "event_kind": "user",
-    "content": "Preserve this captured event during upgrade.",
-    "occurred_at": "2026-09-08T00:00:00Z",
-    "cwd": sys.argv[3],
-})
-PY
-
-cp "$state_dir/api-key" "$work_root/api-key.before"
-cp "$memory_path/memory.md" "$work_root/memory.before"
-"$python_command" - "$state_dir/platform.sqlite3" "$work_root/state.before.json" <<'PY'
-import json
-import sqlite3
-from pathlib import Path
-import sys
-
-database, output = map(Path, sys.argv[1:])
-tables = (
-    "memory_libraries",
-    "project_bindings",
-    "candidate_memories",
-    "candidate_audit",
-    "capture_inbox",
-)
-with sqlite3.connect(database) as connection:
-    snapshot = {
-        table: connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
-        for table in tables
-    }
-for required in (
-    "memory_libraries",
-    "project_bindings",
-    "candidate_memories",
-    "candidate_audit",
-    "capture_inbox",
-):
-    assert snapshot[required], f"upgrade fixture did not create {required} data"
-output.write_text(json.dumps(snapshot, sort_keys=True), encoding="utf-8")
-PY
-
-if [[ "$acceptance_scenario" == "normal" ]]; then
-  "$repo_root/install.sh" --adopt-marketplace >"$work_root/install-upgrade.out"
-else
-  codex plugin remove personal-agent-memory@personal-agent-memory --json >/dev/null
-  codex plugin marketplace remove personal-agent-memory --json >/dev/null
-  "$repo_root/install.sh" >"$work_root/install-upgrade.out"
-fi
-"$repo_root/install.sh" >"$work_root/install-reinstall.out"
-systemctl --user is-enabled "$service_name" | grep -qx enabled
-systemctl --user is-active "$service_name" | grep -qx active
-[[ "$(personal-agent-memory --version)" == "$target_version" ]]
-cmp "$work_root/api-key.before" "$state_dir/api-key"
-cmp "$work_root/memory.before" "$memory_path/memory.md"
-[[ "$(cat "$state_dir/mem2/VERSION")" == "jiuwen-memory-0.2.0" ]]
-mapfile -t managed_paths < <("$python_command" - "$install_config_path" \
-  "$state_dir" "$library_root" "$target_version" \
-  "$repo_root" "$old_release" "$(command -v uv)" "$(command -v personal-agent-memory)" \
-  "$unit_path" "$codex_home" "$acceptance_scenario" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-uninstall_sha256 = metadata.pop("uninstall_sha256")
-uninstall_path = Path(metadata.pop("uninstall_path"))
-unit_sha256 = metadata.pop("unit_sha256")
-plugin_registration_source = Path(metadata.pop("plugin_registration_source"))
-plugin_install_path = Path(metadata.pop("plugin_install_path"))
-plugin_tree_sha256 = metadata.pop("plugin_tree_sha256")
-scenario = sys.argv[11]
-expected = {
-    "schema_version": 1,
-    "state_dir": sys.argv[2],
-    "library_root": sys.argv[3],
-    "library_root_ownership": "user-content-never-delete",
-    "state_dir_ownership": "legacy-managed-contents",
-    "installed_version": sys.argv[4],
-    "marketplace_ownership": (
-        "preexisting" if scenario == "normal" else "installer-managed"
-    ),
-    "marketplace_source": sys.argv[5],
-    "marketplace_update_pending": False,
-    "uninstall_ownership": "installer-managed",
-    "uv_path": sys.argv[7],
-    "daemon_path": sys.argv[8],
-    "unit_path": sys.argv[9],
-    "codex_home": sys.argv[10],
-    "plugin_id": "personal-agent-memory@personal-agent-memory",
-    "plugin_version": sys.argv[4],
-}
-if scenario == "normal":
-    expected["marketplace_previous_source"] = sys.argv[6]
-assert metadata == expected
-assert "state_ownership_token" not in metadata
-assert len(uninstall_sha256) == 64
-assert all(character in "0123456789abcdef" for character in uninstall_sha256)
-assert len(unit_sha256) == 64
-assert all(character in "0123456789abcdef" for character in unit_sha256)
-assert len(plugin_tree_sha256) == 64
-assert all(character in "0123456789abcdef" for character in plugin_tree_sha256)
-assert uninstall_path.is_file()
-assert uninstall_path.name == "personal-agent-memory-uninstall"
-assert plugin_registration_source.is_dir()
-assert plugin_install_path.is_dir()
-print(uninstall_path)
-print(metadata["uv_path"])
-print(plugin_registration_source)
-print(plugin_install_path)
-PY
-)
-uninstall_command=${managed_paths[0]}
-managed_uv_path=${managed_paths[1]}
-managed_plugin_registration_source=${managed_paths[2]}
-managed_plugin_install_path=${managed_paths[3]}
-
-codex plugin list --json >"$work_root/plugins.json"
-plugin_root="$("$python_command" - "$work_root/plugins.json" "$target_version" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-plugins = json.load(open(sys.argv[1], encoding="utf-8"))["installed"]
-matches = [item for item in plugins if item["pluginId"] == "personal-agent-memory@personal-agent-memory"]
-assert len(matches) == 1
-assert matches[0]["version"] == sys.argv[2]
-source = matches[0].get("source")
-assert isinstance(source, dict)
-installed_path = source.get("path")
-assert isinstance(installed_path, str)
-assert Path(installed_path).is_dir()
-print(installed_path)
-PY
-)"
-[[ "$(readlink -f "$plugin_root")" == \
-  "$(readlink -f "$managed_plugin_registration_source")" ]]
+user_content="$library_root/installer-acceptance"
+mkdir -p "$project_root" "$user_content"
+printf 'Installer acceptance user content.\n' >"$user_content/notes.txt"
 
 "$python_command" - "$key_file" "$project_root" <<'PY'
 import json
@@ -449,7 +246,11 @@ assert request("/api/v1/regions/tree")["root"]["region_id"] == "user"
 region = request(
     "/api/v1/regions",
     method="POST",
-    payload={"kind": "project", "name": "Installer acceptance", "region_id": "installer-acceptance"},
+    payload={
+        "kind": "project",
+        "name": "Installer acceptance",
+        "region_id": "installer-acceptance",
+    },
 )
 request(
     "/api/v1/project-bindings",
@@ -493,6 +294,179 @@ assert search["result"]["isError"] is False
 assert search["result"]["structuredContent"]["results"]
 PY
 
+cp "$key_file" "$work_root/api-key.before"
+cp "$state_dir/.personal-agent-memory-owned.json" "$work_root/state-owner.before"
+cp "$state_dir/mem2/VERSION" "$work_root/VERSION.before"
+cp "$user_content/notes.txt" "$work_root/user-content.before"
+stat -c '%d:%i' "$state_dir/mem2/regions.sqlite3" >"$work_root/regions-inode.before"
+stat -c '%d:%i' "$state_dir/mem2/memory.sqlite3" >"$work_root/memory-inode.before"
+
+"$repo_root/install.sh" "${install_arguments[@]}" "${installer_arguments[@]}" \
+  >"$work_root/install-reinstall.out"
+systemctl --user is-enabled "$service_name" | grep -qx enabled
+systemctl --user is-active "$service_name" | grep -qx active
+[[ "$(personal-agent-memory --version)" == "$target_version" ]]
+cmp "$work_root/api-key.before" "$key_file"
+cmp "$work_root/state-owner.before" "$state_dir/.personal-agent-memory-owned.json"
+cmp "$work_root/VERSION.before" "$state_dir/mem2/VERSION"
+cmp "$work_root/user-content.before" "$user_content/notes.txt"
+cmp "$work_root/regions-inode.before" <(stat -c '%d:%i' "$state_dir/mem2/regions.sqlite3")
+cmp "$work_root/memory-inode.before" <(stat -c '%d:%i' "$state_dir/mem2/memory.sqlite3")
+[[ "$(cat "$state_dir/mem2/VERSION")" == "jiuwen-memory-0.2.0" ]]
+[[ ! -e "$state_dir/platform.sqlite3" ]]
+
+mapfile -t managed_paths < <("$python_command" - "$install_config_path" \
+  "$state_dir" "$library_root" "$target_version" "$repo_root" \
+  "$(command -v uv)" "$(command -v personal-agent-memory)" "$unit_path" \
+  "$codex_home" "$acceptance_scenario" "$web_port" <<'PY'
+import json
+from pathlib import Path
+import re
+import stat
+import sys
+
+config_path = Path(sys.argv[1])
+metadata = json.loads(config_path.read_text(encoding="utf-8"))
+uninstall_sha256 = metadata.pop("uninstall_sha256")
+uninstall_path = Path(metadata.pop("uninstall_path"))
+unit_sha256 = metadata.pop("unit_sha256")
+state_ownership_token = metadata.pop("state_ownership_token")
+plugin_registration_source = Path(metadata.pop("plugin_registration_source"))
+plugin_install_path = Path(metadata.pop("plugin_install_path"))
+plugin_tree_sha256 = metadata.pop("plugin_tree_sha256")
+scenario = sys.argv[10]
+expected = {
+    "schema_version": 1,
+    "port": int(sys.argv[11]),
+    "state_dir": sys.argv[2],
+    "library_root": sys.argv[3],
+    "library_root_ownership": "user-content-never-delete",
+    "state_dir_ownership": "installer-created-exclusive",
+    "installed_version": sys.argv[4],
+    "marketplace_ownership": (
+        "preexisting" if scenario == "normal" else "installer-managed"
+    ),
+    "marketplace_source": sys.argv[5],
+    "marketplace_update_pending": False,
+    "uninstall_ownership": "installer-managed",
+    "uv_path": sys.argv[6],
+    "daemon_path": sys.argv[7],
+    "unit_path": sys.argv[8],
+    "codex_home": sys.argv[9],
+    "plugin_id": "personal-agent-memory@personal-agent-memory",
+    "plugin_version": sys.argv[4],
+}
+assert metadata == expected
+for digest in (uninstall_sha256, unit_sha256, plugin_tree_sha256, state_ownership_token):
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+assert uninstall_path.is_file()
+assert uninstall_path.name == "personal-agent-memory-uninstall"
+assert plugin_registration_source.is_dir()
+assert plugin_install_path.is_dir()
+assert str(config_path.read_text(encoding="utf-8")).find(
+    Path(sys.argv[2], "api-key").read_text(encoding="utf-8").strip()
+) == -1
+print(uninstall_path)
+print(metadata["uv_path"])
+print(plugin_registration_source)
+print(plugin_install_path)
+PY
+)
+uninstall_command=${managed_paths[0]}
+managed_uv_path=${managed_paths[1]}
+managed_plugin_registration_source=${managed_paths[2]}
+managed_plugin_install_path=${managed_paths[3]}
+
+codex plugin list --json >"$work_root/plugins.json"
+plugin_root="$("$python_command" - "$work_root/plugins.json" "$target_version" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+plugins = json.load(open(sys.argv[1], encoding="utf-8"))["installed"]
+matches = [
+    item
+    for item in plugins
+    if item["pluginId"] == "personal-agent-memory@personal-agent-memory"
+]
+assert len(matches) == 1
+assert matches[0]["version"] == sys.argv[2]
+source = matches[0].get("source")
+assert isinstance(source, dict)
+installed_path = source.get("path")
+assert isinstance(installed_path, str)
+assert Path(installed_path).is_dir()
+print(installed_path)
+PY
+)"
+[[ "$(readlink -f "$plugin_root")" == \
+  "$(readlink -f "$managed_plugin_registration_source")" ]]
+
+"$python_command" - "$key_file" "$project_root" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.request
+
+key = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+def request(path, *, method="GET", payload=None):
+    data = None if payload is None else json.dumps(payload).encode()
+    request_headers = dict(headers)
+    if data is None:
+        request_headers.pop("Content-Type")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:7331{path}",
+        data=data,
+        headers=request_headers,
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+health = request("/mcp/health")
+assert health["memory_kernel"] == "mem2"
+assert health["memory_kernel_status"] in {"ready", "degraded"}
+regions = request("/api/v1/regions")
+assert any(region["region_id"] == "installer-acceptance" for region in regions)
+assert request("/api/v1/regions/installer-acceptance")["region_id"] == "installer-acceptance"
+assert request(
+    "/mcp/project-bindings/resolve",
+    method="POST",
+    payload={"cwd": sys.argv[2]},
+)["status"] == "bound"
+search = request(
+    "/mcp",
+    method="POST",
+    payload={
+        "jsonrpc": "2.0",
+        "id": "linux-installer-reinstall",
+        "method": "tools/call",
+        "params": {
+            "name": "memory_search",
+            "arguments": {
+                "region_ids": ["installer-acceptance"],
+                "query": "Installer acceptance fact",
+            },
+        },
+    },
+)
+assert search["result"]["isError"] is False
+assert search["result"]["structuredContent"]["results"]
+project_search = request(
+    "/api/v1/search",
+    method="POST",
+    payload={
+        "cwd": sys.argv[2],
+        "query": "Installer acceptance fact",
+        "token_budget": 10_000,
+    },
+)
+assert project_search["results"]
+PY
+
 export PLUGIN_DATA="$work_root/plugin-data"
 "$python_command" - "$project_root" <<'PY' | \
   node "$managed_plugin_install_path/scripts/recall.mjs" >"$work_root/hook.out"
@@ -521,29 +495,6 @@ print(json.dumps({
 PY
 [[ -z "$(find "$PLUGIN_DATA/spool" -maxdepth 1 -name 'event-*.json' -print -quit 2>/dev/null)" ]]
 
-"$python_command" - "$state_dir/platform.sqlite3" "$work_root/state.after.json" <<'PY'
-import json
-import sqlite3
-from pathlib import Path
-import sys
-
-database, output = map(Path, sys.argv[1:])
-tables = (
-    "memory_libraries",
-    "project_bindings",
-    "candidate_memories",
-    "candidate_audit",
-    "capture_inbox",
-)
-with sqlite3.connect(database) as connection:
-    snapshot = {
-        table: connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
-        for table in tables
-    }
-output.write_text(json.dumps(snapshot, sort_keys=True), encoding="utf-8")
-PY
-cmp "$work_root/state.before.json" "$work_root/state.after.json"
-
 systemctl --user stop "$service_name"
 "$python_command" - "$project_root" <<'PY' | node "$plugin_root/scripts/recall.mjs" >"$work_root/fail-open.out"
 import json
@@ -571,37 +522,18 @@ fi
 if [[ "$acceptance_scenario" == "normal" ]]; then
   [[ -e "$state_dir/api-key" ]]
   [[ -e "$state_dir/mem2/VERSION" ]]
+  [[ -e "$state_dir/.personal-agent-memory-owned.json" ]]
   [[ -e "$install_config_path" ]]
   cmp "$work_root/api-key.before" "$state_dir/api-key"
-  "$python_command" - "$state_dir/platform.sqlite3" \
-    "$work_root/state.after-uninstall.json" <<'PY'
-import json
-import sqlite3
-from pathlib import Path
-import sys
-
-database, output = map(Path, sys.argv[1:])
-tables = (
-    "memory_libraries",
-    "project_bindings",
-    "candidate_memories",
-    "candidate_audit",
-    "capture_inbox",
-)
-with sqlite3.connect(database) as connection:
-    snapshot = {
-        table: connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
-        for table in tables
-    }
-output.write_text(json.dumps(snapshot, sort_keys=True), encoding="utf-8")
-PY
-  cmp "$work_root/state.before.json" "$work_root/state.after-uninstall.json"
+  cmp "$work_root/state-owner.before" "$state_dir/.personal-agent-memory-owned.json"
+  cmp "$work_root/VERSION.before" "$state_dir/mem2/VERSION"
+  [[ ! -e "$state_dir/platform.sqlite3" ]]
 else
   [[ ! -e "$state_dir" ]]
   [[ ! -e "$install_config_path" ]]
 fi
 [[ -e "$library_root" ]]
-cmp "$work_root/memory.before" "$memory_path/memory.md"
+cmp "$work_root/user-content.before" "$user_content/notes.txt"
 codex plugin list --json >"$work_root/plugins-after-uninstall.json"
 codex plugin marketplace list --json >"$work_root/marketplaces-after-uninstall.json"
 "$managed_uv_path" tool list >"$work_root/tools-after-uninstall.txt"

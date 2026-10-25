@@ -12,7 +12,7 @@ from personal_agent_memory.config import Settings
 
 
 def _app(state_dir: Path):
-    return create_app(Settings(state_dir=state_dir, memory_kernel="mem2"))
+    return create_app(Settings(state_dir=state_dir))
 
 
 def _headers(state_dir: Path) -> dict[str, str]:

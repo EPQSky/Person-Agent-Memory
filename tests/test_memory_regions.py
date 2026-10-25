@@ -10,7 +10,7 @@ from personal_agent_memory.config import Settings
 
 
 def _app(state_dir: Path):
-    return create_app(Settings(state_dir=state_dir, memory_kernel="mem2"))
+    return create_app(Settings(state_dir=state_dir))
 
 
 def _headers(state_dir: Path) -> dict[str, str]:
@@ -309,10 +309,16 @@ def test_management_ui_exposes_region_tree_and_explicit_bindings(tmp_path: Path)
         response = client.get("/")
         assert response.status_code == 200
         body = response.text
-        assert 'data-view="regions"' in body
-        assert "regionTree.id = 'region-tree'" in body
-        assert "/api/v1/regions/tree" in body
-        assert "/api/v1/project-bindings/worktrees" in body
+        assert 'id="region-list"' in body
+        assert "/api/v1/regions" in body
+        assert "/api/v1/project-bindings" in body
+        assert "/api/v1/promotions" in body
+        assert "/api/v1/search" in body
+        assert "/document/delete-preview" in body
+        assert "/history" in body
+        assert "/api/v1/candidates" not in body
+        assert "candidate" not in body.lower()
+        assert "editor_history.js" not in body
 
 
 def test_region_write_idempotency_is_isolated_by_region(tmp_path: Path) -> None:

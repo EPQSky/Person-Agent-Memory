@@ -240,46 +240,10 @@ def _allocate_results(
         included.append(result)
         return counter.count(content)
 
-    def include_history_group(
-        group: Sequence[dict[str, object]], content_limit: int
-    ) -> int | None:
-        metadata = [_result_metadata(item) for item in group]
-        if metadata_tokens([*included, *metadata]) > metadata_limit:
-            return None
-        remaining = content_limit
-        packaged: list[dict[str, object]] = []
-        used = 0
-        for index, (item, item_metadata) in enumerate(zip(group, metadata, strict=True)):
-            item_limit = remaining // (len(group) - index)
-            content, truncated = counter.truncate(str(item["content"]), item_limit)
-            if not content:
-                return None
-            item_used = counter.count(content)
-            packaged.append({**item_metadata, "content": content, "truncated": truncated})
-            used += item_used
-            remaining -= item_used
-        included.extend(packaged)
-        return used
-
     direct_results = [item for item in results if item.get("classification") != "graph_expansion"]
     graph_results = [item for item in results if item.get("classification") == "graph_expansion"]
-    history_groups: dict[str, list[dict[str, object]]] = {}
-    ordinary_direct: list[dict[str, object]] = []
-    for item in direct_results:
-        if item.get("source_type") == "markdown_history":
-            chain_id = str(item.get("history_chain_id", item["chunk_id"]))
-            history_groups.setdefault(chain_id, []).append(item)
-        else:
-            ordinary_direct.append(item)
     direct_capacity = direct_limit
-    for group in history_groups.values():
-        remaining = direct_capacity - direct_used
-        if remaining <= 0:
-            break
-        used = include_history_group(group, remaining)
-        if used is not None:
-            direct_used += used
-    for item in ordinary_direct:
+    for item in direct_results:
         remaining = direct_capacity - direct_used
         if remaining <= 0:
             break
@@ -307,11 +271,7 @@ def _allocate_results(
     for item in included:
         if unused_capacity <= 0:
             break
-        if (
-            item.get("classification") == "graph_expansion"
-            or item.get("source_type") == "markdown_history"
-            or not item.get("truncated")
-        ):
+        if item.get("classification") == "graph_expansion" or not item.get("truncated"):
             continue
         source_content = str(direct_by_id[str(item["chunk_id"])]["content"])
         old_tokens = counter.count(str(item["content"]))
@@ -322,11 +282,7 @@ def _allocate_results(
         direct_used += added
         unused_capacity -= added
     for source in direct_results:
-        if (
-            unused_capacity <= 0
-            or source.get("source_type") == "markdown_history"
-            or str(source["chunk_id"]) in included_direct_ids
-        ):
+        if unused_capacity <= 0 or str(source["chunk_id"]) in included_direct_ids:
             continue
         before_metadata = metadata_tokens(
             [{**item, "content": ""} for item in included]
@@ -371,9 +327,6 @@ def _allocation_limits(
     direct_limit = math.floor(available * 0.60)
     graph_limit = math.floor(available * 0.30)
     metadata_limit = math.floor(available * 0.10)
-    if any(item.get("source_type") == "markdown_history" for item in results):
-        metadata_limit += graph_limit
-        graph_limit = 0
     return direct_limit, graph_limit, metadata_limit
 
 
@@ -461,22 +414,6 @@ def _fit_package_to_budget(
         )
         target_index = graph_index if graph_index is not None else len(results) - 1
         target = results[target_index]
-        history_chain_id = (
-            str(target.get("history_chain_id"))
-            if target.get("source_type") == "markdown_history"
-            else None
-        )
-        if history_chain_id is not None:
-            results[:] = [
-                item
-                for item in results
-                if not (
-                    item.get("source_type") == "markdown_history"
-                    and str(item.get("history_chain_id")) == history_chain_id
-                )
-            ]
-            used = _recalculate_telemetry(payload, counter, effective_budget)
-            continue
         if allocation["metadata_used"] > allocation["metadata_limit"]:
             results.pop(target_index)
             used = _recalculate_telemetry(payload, counter, effective_budget)

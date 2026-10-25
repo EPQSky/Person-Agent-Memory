@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import shutil
 import sqlite3
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -24,7 +21,7 @@ from personal_agent_memory.memory_kernel import (
 
 
 def _app(state_dir: Path):
-    return create_app(Settings(state_dir=state_dir, memory_kernel="mem2"))
+    return create_app(Settings(state_dir=state_dir))
 
 
 def _headers(state_dir: Path) -> dict[str, str]:
@@ -168,19 +165,13 @@ def test_list_inspect_and_markdown_export_show_region_memory(tmp_path: Path) -> 
 
         page = client.get("/")
         assert page.status_code == 200
-        assert 'id="document-meta"' in page.text
+        for element in ("region-list", "document-list", "document-content", "history-list"):
+            assert f'id="{element}"' in page.text
 
-        libraries = client.get("/api/v1/libraries", headers=headers)
-        assert libraries.status_code == 200
-        assert libraries.json() == [
-            {
-                "id": "governance",
-                "library_id": "governance",
-                "canonical_path": "memory://governance",
-                "kind": "topic",
-                "availability": "available",
-            }
-        ]
+        regions = client.get("/api/v1/regions", headers=headers)
+        assert regions.status_code == 200
+        assert any(item["region_id"] == "governance" for item in regions.json())
+        assert client.get("/api/v1/libraries", headers=headers).status_code == 404
 
         documents = _documents(client, headers)
         assert len(documents) == 1
@@ -541,10 +532,9 @@ def test_management_contract_exposes_source_version_preview_diff_and_controls(
 
         page = client.get("/")
         assert page.status_code == 200
-        for control in ("update-mode", "delete-mode", "export-markdown"):
+        for control in ("save-document", "delete-document", "load-history", "promotion-button"):
             assert f'id="{control}"' in page.text
-        assert "statusLabels" in page.text
-        assert "待完成" in page.text
+        assert "/api/v1/candidates" not in page.text
 
         history = _history(client, headers)
         assert history
@@ -683,135 +673,6 @@ def test_restore_document_rejects_cross_document_history(tmp_path: Path) -> None
         )
         assert rejected.status_code == 404, rejected.text
         assert _inspect(client, headers, other_id)["content"] == "文档乙内容"
-
-
-def test_web_editor_history_builds_mode_specific_requests(tmp_path: Path) -> None:
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("Node.js is required for the Web editor regression")
-    script_path = (
-        Path(__file__).parents[1]
-        / "src"
-        / "personal_agent_memory"
-        / "static"
-        / "editor_history.js"
-    )
-    program = """
-const api = require(process.argv[1]);
-const store = api.contextStore();
-store.selectLibrary('governance');
-const request = store.requestDocument('governance', 'unit-one');
-const loaded = store.acceptDocument(request, {
-  path: 'unit-one', source_version: 'revision-one', content: 'before'
-});
-const edited = store.edit('after');
-console.log(JSON.stringify({
-  save: api.saveRequest(edited, 'save-one', 'overwrite'),
-  remove: api.deleteRequest(edited, 'preview-one', 'delete-one', 'archive'),
-}));
-"""
-    result = subprocess.run(
-        [node, "-e", program, str(script_path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    payload = json.loads(result.stdout)
-    assert payload["save"]["body"]["mode"] == "overwrite"
-    assert payload["save"]["body"]["expected_source_version"] == "revision-one"
-    assert payload["remove"] == {
-        "url": "/api/v1/libraries/governance/document",
-        "body": {
-            "path": "unit-one",
-            "expected_source_version": "revision-one",
-            "preview_token": "preview-one",
-            "operation_id": "delete-one",
-            "actor_type": "user",
-            "source": "web-delete",
-            "mode": "archive",
-        },
-    }
-
-
-def test_web_editor_follows_new_version_identity_after_save_and_restore() -> None:
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("Node.js is required for the Web editor regression")
-    html_path = (
-        Path(__file__).parents[1]
-        / "src"
-        / "personal_agent_memory"
-        / "static"
-        / "index.html"
-    )
-    program = """
-const fs = require('fs');
-const html = fs.readFileSync(process.argv[1], 'utf8');
-function section(startMarker, endMarker) {
-  const start = html.indexOf(startMarker);
-  const end = html.indexOf(endMarker, start);
-  if (start < 0 || end < 0) throw new Error(`missing ${startMarker}`);
-  return html.slice(start, end);
-}
-const message = {textContent: '', kind: ''};
-const setMessage = (node, text, kind) => { node.textContent = text; node.kind = kind; };
-const describeError = () => 'failed';
-const performOnce = async (_name, _button, _label, action) => await action();
-const crypto = {randomUUID: () => 'operation'};
-async function savedPath() {
-  const context = {
-    token: 1, libraryId: 'g', path: 'old-id', sourceVersion: 'rev', content: 'after'
-  };
-  const button = {disabled: false, dataset: {}};
-  const editor = {querySelector: (selector) => selector === '#save-change' ? button
-    : selector === '#editor-message' ? message : {value: 'supersede'}};
-  const editorContext = {snapshot: () => context, isCurrent: () => true};
-  const editorLibrary = {value: 'g'};
-  const documentContextIsCurrent = () => true;
-  const previewChange = async () => true;
-  const loaded = [];
-  const loadDocument = async (path) => { loaded.push(path); return {libraryId: 'g', path}; };
-  const PamHistory = {saveRequest: () => ({url: '/save', body: {}})};
-  const request = async () => ({ok: true, json: async () => ({id: 'new-id'})});
-  eval(section(
-    'async function saveDocument()', '\\n\\n        function invalidateForgottenSelection'
-  ));
-  await saveDocument();
-  return loaded;
-}
-async function restoredPath() {
-  const context = {token: 1, libraryId: 'g', path: 'old-id', sourceVersion: 'rev'};
-  const selection = {libraryId: 'g', path: 'old-id', commit: 'old-version', contextToken: 1};
-  const button = {disabled: false, dataset: {}};
-  const editorContext = {snapshot: () => context, isCurrent: () => true};
-  const editorLibrary = {value: 'g'};
-  const documentContextIsCurrent = () => true;
-  const confirmAction = async () => true;
-  const loaded = [];
-  const loadDocument = async (path) => { loaded.push(path); return {libraryId: 'g', path}; };
-  const PamHistory = {request: () => ({url: '/restore', body: {}})};
-  const request = async () => ({ok: true, json: async () => ({id: 'restored-id'})});
-  const restoreAction = {replaceChildren() {}, querySelector() { return button; }};
-  const historySelection = {clear() {}};
-  const historyMessage = {textContent: '', kind: ''};
-  eval(section(
-    'async function restoreDocument(selection)', '\\n\\n        async function previewForgetting'
-  ));
-  await restoreDocument(selection);
-  return loaded;
-}
-Promise.all([savedPath(), restoredPath()]).then(([saved, restored]) => {
-  console.log(JSON.stringify({saved, restored}));
-});
-"""
-    result = subprocess.run(
-        [node, "-e", program, str(html_path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    payload = json.loads(result.stdout)
-    assert payload == {"saved": ["new-id"], "restored": ["restored-id"]}
 
 
 def test_governance_rejects_illegal_lifecycle_without_partial_write(

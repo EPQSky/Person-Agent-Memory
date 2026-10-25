@@ -33,7 +33,7 @@ def result(
         "start_line": 3,
         "end_line": 3,
         "source_version": "a" * 64,
-        "source_type": "markdown",
+        "source_type": "mem2",
         "classification": classification,
         "score": 0.75,
         "retrieval_sources": ["full_text" if classification == "direct" else "graph"],
@@ -383,23 +383,28 @@ def test_final_fallback_telemetry_uses_a_conservative_normalized_count(
 
 def test_rest_and_mcp_budget_success_is_monotonic(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
-    roots = tmp_path / "libraries"
-    memory = roots / "project"
-    memory.mkdir(parents=True)
-    (memory / "memory.md").write_text(
-        "# Memory\n\nContinuousBudgetNeedle evidence.", encoding="utf-8"
-    )
-
-    with TestClient(create_app(Settings(state_dir=state_dir, library_roots=(roots,)))) as client:
+    with TestClient(create_app(Settings(state_dir=state_dir))) as client:
         key = (state_dir / "api-key").read_text(encoding="utf-8").strip()
         headers = {"Authorization": f"Bearer {key}"}
-        registered = client.post(
-            "/api/v1/libraries",
+        region = client.post(
+            "/api/v1/regions",
             headers=headers,
-            json={"path": str(memory), "kind": "project"},
+            json={"kind": "project", "name": "Budget project", "region_id": "budget-project"},
         )
-        assert registered.status_code == 201
-        library_id = registered.json()["id"]
+        assert region.status_code == 201, region.text
+        written = client.post(
+            "/api/v1/memories",
+            headers=headers,
+            json={
+                "region_id": "budget-project",
+                "content": "ContinuousBudgetNeedle evidence.",
+                "memory_type": "domain_fact",
+                "source_references": ["test:context-budget"],
+                "actor": "test",
+                "idempotency_key": "context-budget-write",
+            },
+        )
+        assert written.status_code == 201, written.text
 
         for endpoint in ("/api/v1/search", "/mcp/search"):
             for model, final_budget in (
@@ -413,7 +418,7 @@ def test_rest_and_mcp_budget_success_is_monotonic(tmp_path: Path) -> None:
                         endpoint,
                         headers=headers,
                         json={
-                            "library_id": library_id,
+                            "region_id": "budget-project",
                             "query": "ContinuousBudgetNeedle",
                             "token_budget": token_budget,
                             "target_model": model,
@@ -433,39 +438,41 @@ def test_rest_and_mcp_budget_success_is_monotonic(tmp_path: Path) -> None:
                         for item in package["results"]
                     )
                 assert seen_success
-
-
-def test_search_contract_requires_explicit_scope_and_user_library(tmp_path: Path) -> None:
+def test_search_contract_requires_explicit_scope_and_user_region(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
-    roots = tmp_path / "libraries"
-    project_memory = roots / "project"
-    user_memory = roots / "user"
     project = tmp_path / "project-root"
-    project_memory.mkdir(parents=True)
-    user_memory.mkdir()
     project.mkdir()
-    (project_memory / "project.md").write_text(
-        "# Project\n\nSharedNeedle project.", encoding="utf-8"
-    )
-    (user_memory / "user.md").write_text("# User\n\nSharedNeedle user.", encoding="utf-8")
 
-    with TestClient(create_app(Settings(state_dir=state_dir, library_roots=(roots,)))) as client:
+    with TestClient(create_app(Settings(state_dir=state_dir))) as client:
         key = (state_dir / "api-key").read_text(encoding="utf-8").strip()
         headers = {"Authorization": f"Bearer {key}"}
 
-        def register(path: Path, kind: str) -> dict[str, object]:
-            response = client.post(
-                "/api/v1/libraries", headers=headers, json={"path": str(path), "kind": kind}
+        for payload in (
+            {"kind": "project", "name": "Project", "region_id": "project-region"},
+            {"kind": "user", "name": "User", "region_id": "user"},
+        ):
+            assert client.post("/api/v1/regions", headers=headers, json=payload).status_code == 201
+        for region_id, content in (
+            ("project-region", "SharedNeedle project."),
+            ("user", "SharedNeedle user."),
+        ):
+            written = client.post(
+                "/api/v1/memories",
+                headers=headers,
+                json={
+                    "region_id": region_id,
+                    "content": content,
+                    "memory_type": "domain_fact",
+                    "source_references": ["test:search-scope"],
+                    "actor": "test",
+                    "idempotency_key": f"scope-{region_id}",
+                },
             )
-            assert response.status_code == 201
-            return response.json()
-
-        project_library = register(project_memory, "project")
-        user_library = register(user_memory, "user")
+            assert written.status_code == 201, written.text
         assert client.post(
             "/api/v1/project-bindings",
             headers=headers,
-            json={"project_root": str(project), "library_id": project_library["id"]},
+            json={"project_root": str(project), "region_id": "project-region"},
         ).status_code == 201
 
         missing = client.post("/mcp/search", headers=headers, json={"query": "SharedNeedle"})
@@ -474,7 +481,7 @@ def test_search_contract_requires_explicit_scope_and_user_library(tmp_path: Path
             headers=headers,
             json={
                 "cwd": str(project),
-                "library_id": user_library["id"],
+                "region_id": "user",
                 "query": "SharedNeedle",
             },
         )
@@ -500,54 +507,47 @@ def test_search_contract_requires_explicit_scope_and_user_library(tmp_path: Path
             "detail"
         ]
 
-        unbound = tmp_path / "unbound"
-        unbound.mkdir()
-        blank_unbound = client.post(
+        blank = client.post(
             "/mcp/search",
             headers=headers,
-            json={"cwd": str(unbound), "query": "   "},
+            json={"cwd": str(project), "query": "   "},
         )
-        assert blank_unbound.status_code == 422
-        assert blank_unbound.json()["detail"] == "search query must not be empty"
+        assert blank.status_code == 422
+        assert blank.json()["detail"] == "search query must not be empty"
 
         project_result = client.post(
             "/mcp/search",
             headers=headers,
             json={"cwd": str(project), "query": "SharedNeedle", "token_budget": 4_000},
         ).json()
-        assert [item["path"] for item in project_result["results"]] == ["project.md"]
         assert project_result["scope"]["kind"] == "project_cwd"
         assert project_result["trust"]["classification"] == "untrusted_data"
+        assert len(project_result["results"]) == 1
+        assert project_result["results"][0]["content"] == "SharedNeedle project."
+        assert project_result["results"][0]["path"].startswith("memory://")
 
         user_result = client.post(
             "/mcp/search",
             headers=headers,
-            json={"library_id": user_library["id"], "query": "SharedNeedle"},
+            json={"region_id": "user", "query": "SharedNeedle"},
         ).json()
-        assert [item["path"] for item in user_result["results"]] == ["user.md"]
-        assert user_result["scope"] == {
-            "kind": "explicit_library",
-            "library_id": user_library["id"],
-        }
+        assert user_result["scope"]["kind"] == "explicit_region"
+        assert user_result["scope"]["region_id"] == "user"
+        assert len(user_result["results"]) == 1
         hit = user_result["results"][0]
-        assert set(
-            (
-                "content",
-                "library_id",
-                "path",
-                "heading",
-                "start_line",
-                "end_line",
-                "source_type",
-                "classification",
-                "score",
-                "source_version",
-                "degraded",
-                "degradation",
-            )
-        ).issubset(hit)
-
-
+        assert hit["content"] == "SharedNeedle user."
+        assert hit["source_type"] == "mem2"
+        assert hit["path"].startswith("memory://")
+        assert {
+            "content",
+            "library_id",
+            "path",
+            "source_version",
+            "classification",
+            "score",
+            "degraded",
+            "degradation",
+        } <= set(hit)
 def test_cross_region_package_enforces_region_graph_and_source_structure_caps() -> None:
     def cross_result(
         content: str,

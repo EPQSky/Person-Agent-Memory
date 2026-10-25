@@ -1482,8 +1482,7 @@ if recorded and (
     raise SystemExit(
         f"existing install metadata does not prove ownership of user service definition: {unit_path}"
     )
-def unit_content(daemon_command: str, *, cross_kernel_upgrade: bool) -> bytes:
-    kernel_argument = ' --memory-kernel "mem2"' if cross_kernel_upgrade else ""
+def unit_content(daemon_command: str, *, kernel_argument: str = "") -> bytes:
     return f'''[Unit]
 Description=Personal Agent Memory daemon
 After=network.target
@@ -1498,8 +1497,14 @@ RestartSec=2
 WantedBy=default.target
 '''.encode("utf-8")
 
-payload = unit_content(sys.argv[2], cross_kernel_upgrade=True)
-legacy_payload = unit_content(legacy_daemon_command, cross_kernel_upgrade=False)
+payload = unit_content(sys.argv[2])
+previous_payload = unit_content(
+    sys.argv[2], kernel_argument=' --memory-kernel "mem2"'
+)
+legacy_payload = unit_content(legacy_daemon_command)
+previous_legacy_payload = unit_content(
+    legacy_daemon_command, kernel_argument=' --memory-kernel "mem2"'
+)
 if unit_path.parent.resolve() != unit_path.parent:
     raise SystemExit(f"user service directory is not a lexical directory: {unit_path.parent}")
 directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -1541,6 +1546,8 @@ def current_state() -> tuple[str, tuple[int, int] | None]:
                 )
         elif digest not in {
             hashlib.sha256(legacy_payload).hexdigest(),
+            hashlib.sha256(previous_legacy_payload).hexdigest(),
+            hashlib.sha256(previous_payload).hexdigest(),
             hashlib.sha256(payload).hexdigest(),
         }:
             raise SystemExit(
