@@ -29,9 +29,7 @@ def validate_library_id(library_id: str) -> str:
     if not identifier:
         raise ValueError("library_id must not be blank")
     if len(identifier) > MAX_LIBRARY_ID_LENGTH:
-        raise ValueError(
-            f"library_id exceeds the {MAX_LIBRARY_ID_LENGTH}-character scope limit"
-        )
+        raise ValueError(f"library_id exceeds the {MAX_LIBRARY_ID_LENGTH}-character scope limit")
     return identifier
 
 
@@ -92,9 +90,7 @@ class SearchMemoryRequest:
             self.region_ids is not None,
         )
         if sum(selectors) != 1:
-            raise ValueError(
-                "exactly one of cwd, library_id, region_id, or region_ids is required"
-            )
+            raise ValueError("exactly one of cwd, library_id, region_id, or region_ids is required")
         if self.region_ids is not None:
             if not self.region_ids:
                 raise ValueError("at least one memory region is required")
@@ -157,6 +153,33 @@ class AuditMemoryRequest:
 class EvolveMemoryRequest:
     session_id: str | None = None
     deadline: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionRunRequest:
+    source_region_ids: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_region_ids is None:
+            return
+        if not self.source_region_ids:
+            raise ValueError("at least one source memory region is required")
+        normalized = tuple(value.strip() for value in self.source_region_ids)
+        if any(not value for value in normalized):
+            raise ValueError("source memory region identifiers must not be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("source memory regions must not contain duplicates")
+        object.__setattr__(self, "source_region_ids", normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionStatusRequest:
+    job_id: str
+
+    def __post_init__(self) -> None:
+        if not self.job_id.strip():
+            raise ValueError("promotion job_id must not be blank")
+        object.__setattr__(self, "job_id", self.job_id.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +430,10 @@ class MemoryKernelPort(Protocol):
 
     async def evolve(self, request: EvolveMemoryRequest) -> dict[str, int]: ...
 
+    async def start_promotion(self, request: PromotionRunRequest) -> dict[str, object]: ...
+
+    def promotion_status(self, request: PromotionStatusRequest) -> dict[str, object]: ...
+
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]: ...
 
     def create_region(self, request: CreateMemoryRegionRequest) -> dict[str, object]: ...
@@ -435,33 +462,23 @@ class MemoryKernelPort(Protocol):
         self, request: ListOutOfBandChangesRequest
     ) -> list[dict[str, object]]: ...
 
-    def out_of_band_change(
-        self, request: OutOfBandChangeRequest
-    ) -> dict[str, object]: ...
+    def out_of_band_change(self, request: OutOfBandChangeRequest) -> dict[str, object]: ...
 
     async def resolve_out_of_band_change(
         self, request: ResolveOutOfBandChangeRequest
     ) -> dict[str, str]: ...
 
-    def list_candidates(
-        self, request: ListCandidatesRequest
-    ) -> list[dict[str, object]]: ...
+    def list_candidates(self, request: ListCandidatesRequest) -> list[dict[str, object]]: ...
 
     def candidate_governance_queue(
         self, request: CandidateGovernanceListRequest
     ) -> list[dict[str, object]]: ...
 
-    def candidate_governance(
-        self, request: CandidateGovernanceRequest
-    ) -> dict[str, object]: ...
+    def candidate_governance(self, request: CandidateGovernanceRequest) -> dict[str, object]: ...
 
-    async def decide_candidate(
-        self, request: CandidateDecisionRequest
-    ) -> dict[str, object]: ...
+    async def decide_candidate(self, request: CandidateDecisionRequest) -> dict[str, object]: ...
 
-    async def pin_candidate(
-        self, request: CandidatePinRequest
-    ) -> dict[str, object]: ...
+    async def pin_candidate(self, request: CandidatePinRequest) -> dict[str, object]: ...
 
     def list_recycled_candidates(
         self, request: CandidateRecycleListRequest
@@ -471,9 +488,7 @@ class MemoryKernelPort(Protocol):
         self, request: CandidateRestoreRequest
     ) -> dict[str, object]: ...
 
-    def list_documents(
-        self, request: ListDocumentsRequest
-    ) -> list[dict[str, object]]: ...
+    def list_documents(self, request: ListDocumentsRequest) -> list[dict[str, object]]: ...
 
     def preview_document_update(
         self, request: PreviewDocumentUpdateRequest
@@ -491,9 +506,7 @@ class MemoryKernelPort(Protocol):
 
     async def restore_document(self, request: RestoreDocumentRequest) -> dict[str, str]: ...
 
-    def get_retention_policy(
-        self, request: RetentionPolicyRequest
-    ) -> dict[str, object]: ...
+    def get_retention_policy(self, request: RetentionPolicyRequest) -> dict[str, object]: ...
 
     async def update_retention_policy(
         self, request: UpdateRetentionPolicyRequest
@@ -509,13 +522,9 @@ class MemoryKernelPort(Protocol):
 
     def clear_diagnostics(self, request: ClearDiagnosticsRequest) -> int: ...
 
-    def list_capture_events(
-        self, request: CaptureEventsRequest
-    ) -> list[dict[str, object]]: ...
+    def list_capture_events(self, request: CaptureEventsRequest) -> list[dict[str, object]]: ...
 
-    def list_capture_rounds(
-        self, request: CaptureRoundsRequest
-    ) -> list[dict[str, object]]: ...
+    def list_capture_rounds(self, request: CaptureRoundsRequest) -> list[dict[str, object]]: ...
 
     def list_sensitive_quarantine(
         self, request: SensitiveQuarantineListRequest
@@ -594,10 +603,13 @@ class LegacyMemoryKernel:
             return {"status": "not_configured", "backend": "legacy"}
         with closing(sqlite3.connect(self._state.database_path)) as connection:
             if library_id is not None:
-                if connection.execute(
-                    "SELECT 1 FROM memory_libraries WHERE id = ?",
-                    (library_id,),
-                ).fetchone() is None:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM memory_libraries WHERE id = ?",
+                        (library_id,),
+                    ).fetchone()
+                    is None
+                ):
                     raise LibraryRegistrationError("memory library not found")
                 row = connection.execute(
                     """SELECT status, total_documents, projected_documents,
@@ -757,6 +769,14 @@ class LegacyMemoryKernel:
         )
         return {"queued": queued}
 
+    async def start_promotion(self, request: PromotionRunRequest) -> dict[str, object]:
+        del request
+        raise MemoryKernelUnavailableError("automatic promotion requires the mem2 memory kernel")
+
+    def promotion_status(self, request: PromotionStatusRequest) -> dict[str, object]:
+        del request
+        raise MemoryKernelUnavailableError("automatic promotion requires the mem2 memory kernel")
+
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]:
         return self._state.resolve_project_binding(request.cwd)
 
@@ -780,9 +800,7 @@ class LegacyMemoryKernel:
     def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]:
         return self._state.bind_project(request.project_root, request.region_id).payload()
 
-    def associate_worktree_region(
-        self, request: AssociateWorktreeRegionRequest
-    ) -> dict[str, str]:
+    def associate_worktree_region(self, request: AssociateWorktreeRegionRequest) -> dict[str, str]:
         return self._state.associate_worktree(
             request.worktree_root, request.main_project_binding_id
         ).payload()
@@ -791,16 +809,12 @@ class LegacyMemoryKernel:
         return [binding.payload() for binding in self._state.list_project_bindings()]
 
     def update_region_binding(self, request: UpdateRegionBindingRequest) -> dict[str, str]:
-        return self._state.update_project_binding(
-            request.binding_id, request.region_id
-        ).payload()
+        return self._state.update_project_binding(request.binding_id, request.region_id).payload()
 
     def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
         self._state.delete_project_binding(request.binding_id)
 
-    async def scan_library(
-        self, request: ScanLibraryRequest
-    ) -> dict[str, int | str]:
+    async def scan_library(self, request: ScanLibraryRequest) -> dict[str, int | str]:
         async with self._state.library_write_lock(request.library_id):
             return self._state.reconcile_library(request.library_id)
 
@@ -809,9 +823,7 @@ class LegacyMemoryKernel:
     ) -> list[dict[str, object]]:
         return self._state.list_out_of_band_changes(request.library_id)
 
-    def out_of_band_change(
-        self, request: OutOfBandChangeRequest
-    ) -> dict[str, object]:
+    def out_of_band_change(self, request: OutOfBandChangeRequest) -> dict[str, object]:
         return self._state.out_of_band_change(request.library_id, request.change_id)
 
     async def resolve_out_of_band_change(
@@ -829,9 +841,7 @@ class LegacyMemoryKernel:
                 request.external_path,
             )
 
-    def list_candidates(
-        self, request: ListCandidatesRequest
-    ) -> list[dict[str, object]]:
+    def list_candidates(self, request: ListCandidatesRequest) -> list[dict[str, object]]:
         return self._state.list_candidates(request.library_id, request.status)
 
     def candidate_governance_queue(
@@ -839,14 +849,10 @@ class LegacyMemoryKernel:
     ) -> list[dict[str, object]]:
         return self._state.list_candidate_governance(request.classification)
 
-    def candidate_governance(
-        self, request: CandidateGovernanceRequest
-    ) -> dict[str, object]:
+    def candidate_governance(self, request: CandidateGovernanceRequest) -> dict[str, object]:
         return self._state.candidate_governance(request.memory_id)
 
-    async def decide_candidate(
-        self, request: CandidateDecisionRequest
-    ) -> dict[str, object]:
+    async def decide_candidate(self, request: CandidateDecisionRequest) -> dict[str, object]:
         if request.decision == "approve":
             return await self._mutate_candidate(
                 request.memory_id,
@@ -883,14 +889,10 @@ class LegacyMemoryKernel:
             ),
         )
 
-    async def pin_candidate(
-        self, request: CandidatePinRequest
-    ) -> dict[str, object]:
+    async def pin_candidate(self, request: CandidatePinRequest) -> dict[str, object]:
         return await self._mutate_candidate(
             request.memory_id,
-            lambda: self._state.set_candidate_pinned(
-                request.memory_id, request.pinned
-            ),
+            lambda: self._state.set_candidate_pinned(request.memory_id, request.pinned),
         )
 
     def list_recycled_candidates(
@@ -906,14 +908,10 @@ class LegacyMemoryKernel:
             lambda: self._state.restore_recycled_candidate(request.memory_id),
         )
 
-    def list_documents(
-        self, request: ListDocumentsRequest
-    ) -> list[dict[str, object]]:
+    def list_documents(self, request: ListDocumentsRequest) -> list[dict[str, object]]:
         return self._state.list_documents(request.library_id)
 
-    def preview_document_update(
-        self, request: PreviewDocumentUpdateRequest
-    ) -> dict[str, object]:
+    def preview_document_update(self, request: PreviewDocumentUpdateRequest) -> dict[str, object]:
         return self._state.preview_document_edit(
             request.library_id,
             request.path,
@@ -931,14 +929,10 @@ class LegacyMemoryKernel:
                 request.expected_revision,
             )
 
-    def list_forgotten(
-        self, request: ListForgottenRequest
-    ) -> list[dict[str, object]]:
+    def list_forgotten(self, request: ListForgottenRequest) -> list[dict[str, object]]:
         return self._state.list_forgotten_memories(request.library_id)
 
-    async def restore_forgotten(
-        self, request: RestoreForgottenRequest
-    ) -> dict[str, str]:
+    async def restore_forgotten(self, request: RestoreForgottenRequest) -> dict[str, str]:
         async with self._state.library_write_lock(request.library_id):
             return self._state.restore_forgotten_memory(
                 request.library_id,
@@ -952,9 +946,7 @@ class LegacyMemoryKernel:
     def history_diff(self, request: HistoryDiffRequest) -> dict[str, object]:
         return self._state.history_diff(request.library_id, request.commit)
 
-    async def restore_document(
-        self, request: RestoreDocumentRequest
-    ) -> dict[str, str]:
+    async def restore_document(self, request: RestoreDocumentRequest) -> dict[str, str]:
         async with self._state.library_write_lock(request.library_id):
             return self._state.restore_document(
                 request.library_id,
@@ -966,9 +958,7 @@ class LegacyMemoryKernel:
                 request.source,
             )
 
-    def get_retention_policy(
-        self, request: RetentionPolicyRequest
-    ) -> dict[str, object]:
+    def get_retention_policy(self, request: RetentionPolicyRequest) -> dict[str, object]:
         return self._state.retention_policy(request.library_id)
 
     async def update_retention_policy(
@@ -991,23 +981,17 @@ class LegacyMemoryKernel:
         async with self._state.library_write_lock(request.library_id):
             return self._state.preview_retention_cleanup(request.library_id)
 
-    async def run_retention_cleanup(
-        self, request: RetentionCleanupRequest
-    ) -> dict[str, object]:
+    async def run_retention_cleanup(self, request: RetentionCleanupRequest) -> dict[str, object]:
         async with self._state.library_write_lock(request.library_id):
             return self._state.run_retention_cleanup(request.library_id)
 
     def clear_diagnostics(self, request: ClearDiagnosticsRequest) -> int:
         return self._state.clear_diagnostics()
 
-    def list_capture_events(
-        self, request: CaptureEventsRequest
-    ) -> list[dict[str, object]]:
+    def list_capture_events(self, request: CaptureEventsRequest) -> list[dict[str, object]]:
         return self._state.list_capture_events(request.session_id)
 
-    def list_capture_rounds(
-        self, request: CaptureRoundsRequest
-    ) -> list[dict[str, object]]:
+    def list_capture_rounds(self, request: CaptureRoundsRequest) -> list[dict[str, object]]:
         return self._state.list_capture_rounds(request.session_id)
 
     def list_sensitive_quarantine(
@@ -1018,9 +1002,7 @@ class LegacyMemoryKernel:
     def resolve_sensitive_quarantine(
         self, request: SensitiveQuarantineResolutionRequest
     ) -> dict[str, object]:
-        return self._state.resolve_sensitive_quarantine(
-            request.record_id, request.resolution
-        )
+        return self._state.resolve_sensitive_quarantine(request.record_id, request.resolution)
 
     def _ingest_capture(self, request: CaptureMemoryRequest) -> dict[str, object]:
         return self._state.ingest_capture_event(
@@ -1088,6 +1070,12 @@ class UnavailableMemoryKernel:
     async def evolve(self, request: EvolveMemoryRequest) -> dict[str, int]:
         self._raise()
 
+    async def start_promotion(self, request: PromotionRunRequest) -> dict[str, object]:
+        self._raise()
+
+    def promotion_status(self, request: PromotionStatusRequest) -> dict[str, object]:
+        self._raise()
+
     def resolve_region(self, request: ResolveRegionRequest) -> dict[str, str]:
         self._raise()
 
@@ -1106,9 +1094,7 @@ class UnavailableMemoryKernel:
     def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]:
         self._raise()
 
-    def associate_worktree_region(
-        self, request: AssociateWorktreeRegionRequest
-    ) -> dict[str, str]:
+    def associate_worktree_region(self, request: AssociateWorktreeRegionRequest) -> dict[str, str]:
         self._raise()
 
     def list_region_bindings(self) -> list[dict[str, str]]:
@@ -1120,9 +1106,7 @@ class UnavailableMemoryKernel:
     def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
         self._raise()
 
-    async def scan_library(
-        self, request: ScanLibraryRequest
-    ) -> dict[str, int | str]:
+    async def scan_library(self, request: ScanLibraryRequest) -> dict[str, int | str]:
         self._raise()
 
     def list_out_of_band_changes(
@@ -1130,9 +1114,7 @@ class UnavailableMemoryKernel:
     ) -> list[dict[str, object]]:
         self._raise()
 
-    def out_of_band_change(
-        self, request: OutOfBandChangeRequest
-    ) -> dict[str, object]:
+    def out_of_band_change(self, request: OutOfBandChangeRequest) -> dict[str, object]:
         self._raise()
 
     async def resolve_out_of_band_change(
@@ -1140,9 +1122,7 @@ class UnavailableMemoryKernel:
     ) -> dict[str, str]:
         self._raise()
 
-    def list_candidates(
-        self, request: ListCandidatesRequest
-    ) -> list[dict[str, object]]:
+    def list_candidates(self, request: ListCandidatesRequest) -> list[dict[str, object]]:
         self._raise()
 
     def candidate_governance_queue(
@@ -1150,19 +1130,13 @@ class UnavailableMemoryKernel:
     ) -> list[dict[str, object]]:
         self._raise()
 
-    def candidate_governance(
-        self, request: CandidateGovernanceRequest
-    ) -> dict[str, object]:
+    def candidate_governance(self, request: CandidateGovernanceRequest) -> dict[str, object]:
         self._raise()
 
-    async def decide_candidate(
-        self, request: CandidateDecisionRequest
-    ) -> dict[str, object]:
+    async def decide_candidate(self, request: CandidateDecisionRequest) -> dict[str, object]:
         self._raise()
 
-    async def pin_candidate(
-        self, request: CandidatePinRequest
-    ) -> dict[str, object]:
+    async def pin_candidate(self, request: CandidatePinRequest) -> dict[str, object]:
         self._raise()
 
     def list_recycled_candidates(
@@ -1175,14 +1149,10 @@ class UnavailableMemoryKernel:
     ) -> dict[str, object]:
         self._raise()
 
-    def list_documents(
-        self, request: ListDocumentsRequest
-    ) -> list[dict[str, object]]:
+    def list_documents(self, request: ListDocumentsRequest) -> list[dict[str, object]]:
         self._raise()
 
-    def preview_document_update(
-        self, request: PreviewDocumentUpdateRequest
-    ) -> dict[str, object]:
+    def preview_document_update(self, request: PreviewDocumentUpdateRequest) -> dict[str, object]:
         self._raise()
 
     async def preview_document_delete(
@@ -1190,27 +1160,19 @@ class UnavailableMemoryKernel:
     ) -> dict[str, object]:
         self._raise()
 
-    def list_forgotten(
-        self, request: ListForgottenRequest
-    ) -> list[dict[str, object]]:
+    def list_forgotten(self, request: ListForgottenRequest) -> list[dict[str, object]]:
         self._raise()
 
-    async def restore_forgotten(
-        self, request: RestoreForgottenRequest
-    ) -> dict[str, str]:
+    async def restore_forgotten(self, request: RestoreForgottenRequest) -> dict[str, str]:
         self._raise()
 
     def history_diff(self, request: HistoryDiffRequest) -> dict[str, object]:
         self._raise()
 
-    async def restore_document(
-        self, request: RestoreDocumentRequest
-    ) -> dict[str, str]:
+    async def restore_document(self, request: RestoreDocumentRequest) -> dict[str, str]:
         self._raise()
 
-    def get_retention_policy(
-        self, request: RetentionPolicyRequest
-    ) -> dict[str, object]:
+    def get_retention_policy(self, request: RetentionPolicyRequest) -> dict[str, object]:
         self._raise()
 
     async def update_retention_policy(
@@ -1223,22 +1185,16 @@ class UnavailableMemoryKernel:
     ) -> dict[str, object]:
         self._raise()
 
-    async def run_retention_cleanup(
-        self, request: RetentionCleanupRequest
-    ) -> dict[str, object]:
+    async def run_retention_cleanup(self, request: RetentionCleanupRequest) -> dict[str, object]:
         self._raise()
 
     def clear_diagnostics(self, request: ClearDiagnosticsRequest) -> int:
         self._raise()
 
-    def list_capture_events(
-        self, request: CaptureEventsRequest
-    ) -> list[dict[str, object]]:
+    def list_capture_events(self, request: CaptureEventsRequest) -> list[dict[str, object]]:
         self._raise()
 
-    def list_capture_rounds(
-        self, request: CaptureRoundsRequest
-    ) -> list[dict[str, object]]:
+    def list_capture_rounds(self, request: CaptureRoundsRequest) -> list[dict[str, object]]:
         self._raise()
 
     def list_sensitive_quarantine(
@@ -1262,5 +1218,6 @@ def select_memory_kernel(settings: Settings, state: PlatformState) -> MemoryKern
         settings.state_dir,
         embedding=settings.embedding,
         embedding_dimension=settings.embedding_dimension,
+        graph=settings.graph,
         regions=regions,
     )

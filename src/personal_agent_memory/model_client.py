@@ -103,9 +103,7 @@ class OpenAICompatibleClient:
             "reranker": threading.BoundedSemaphore(
                 reranker.max_concurrency if reranker is not None else 1
             ),
-            "graph": threading.BoundedSemaphore(
-                graph.max_concurrency if graph is not None else 1
-            ),
+            "graph": threading.BoundedSemaphore(graph.max_concurrency if graph is not None else 1),
         }
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -257,6 +255,68 @@ class OpenAICompatibleClient:
             raise ModelServiceError("candidate extraction returned malformed JSON") from error
         if not isinstance(decoded, dict):
             raise ModelServiceError("candidate extraction returned malformed JSON")
+        return decoded
+
+    def classify_promotion(
+        self,
+        content: str,
+        context: dict[str, object],
+    ) -> dict[str, object]:
+        endpoint = self.graph
+        if endpoint is None:
+            raise ModelServiceError("promotion classification LLM is not configured")
+        response = self._request(
+            "graph",
+            endpoint,
+            "/v1/chat/completions",
+            {
+                "model": endpoint.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "promotion-classifier-v1: return one JSON object with category, "
+                            "confidence, explicit, topic_id, and reason. category must be one "
+                            "of user, topic, project, conflict, sensitive, or retain. Use user "
+                            "only for a stable personal preference, relationship, goal, "
+                            "constraint, or long-term fact that applies across projects. Use "
+                            "topic only for generalizable skill, course, or domain knowledge "
+                            "and select exactly one matching topic_id from topic_regions. Use "
+                            "project for repository, path, branch, deployment, or task-specific "
+                            "facts. explicit is true only when the user explicitly stated the "
+                            "fact; assistant inference alone is not explicit. Never promote "
+                            "secrets, credentials, conflict, transient progress, or unsupported "
+                            "speculation. Return confidence from 0 to 1."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {"content": content, "context": context},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    },
+                ],
+                "response_format": {"type": "json_object"},
+                **self.candidate_profile.payload(),
+            },
+        )
+        choices = response.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            raise ModelServiceError("promotion classification returned malformed data")
+        choice = choices[0]
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise ModelServiceError("promotion classification returned malformed data")
+        raw_content = choice["message"].get("content")
+        if not isinstance(raw_content, str):
+            raise ModelServiceError("promotion classification returned malformed data")
+        try:
+            decoded = json.loads(raw_content)
+        except json.JSONDecodeError as error:
+            raise ModelServiceError("promotion classification returned malformed JSON") from error
+        if not isinstance(decoded, dict):
+            raise ModelServiceError("promotion classification returned malformed JSON")
         return decoded
 
     def _request(

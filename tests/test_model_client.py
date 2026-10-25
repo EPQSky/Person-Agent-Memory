@@ -25,9 +25,10 @@ class _ModelContractHandler(BaseHTTPRequestHandler):
             type(self).requests.append((self.path, payload))
         if self.path == "/v1/embeddings":
             response: dict[str, object] = {
-                "data": [{"index": index, "embedding": [1.0, 0.0]} for index, _ in enumerate(
-                    payload["input"]
-                )]
+                "data": [
+                    {"index": index, "embedding": [1.0, 0.0]}
+                    for index, _ in enumerate(payload["input"])
+                ]
             }
         elif self.path == "/v1/rerank":
             response = {
@@ -38,13 +39,7 @@ class _ModelContractHandler(BaseHTTPRequestHandler):
             }
         else:
             response = {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps({"entities": [], "relations": []})
-                        }
-                    }
-                ]
+                "choices": [{"message": {"content": json.dumps({"entities": [], "relations": []})}}]
             }
         body = json.dumps(response).encode("utf-8")
         self.send_response(200)
@@ -134,3 +129,29 @@ def test_task_profiles_are_independent_and_optional_top_k_is_not_forced() -> Non
         assert chat_requests[0]["top_k"] == 7
         assert chat_requests[1]["max_tokens"] == 222
         assert "top_k" not in chat_requests[1]
+
+
+def test_promotion_classifier_uses_bounded_candidate_profile() -> None:
+    with _model_contract_server() as (base_url, handler):
+        client = OpenAICompatibleClient(
+            None,
+            None,
+            ModelEndpoint(base_url, "graph-model"),
+        )
+
+        result = client.classify_promotion(
+            "I prefer concise answers",
+            {"topic_regions": [{"topic_id": "rust", "name": "Rust"}]},
+        )
+
+        assert isinstance(result, dict)
+        request = next(
+            payload for path, payload in handler.requests if path == "/v1/chat/completions"
+        )
+        assert request["temperature"] == 0
+        assert request["top_p"] == 1
+        assert request["max_tokens"] == 2048
+        assert "top_k" not in request
+        prompt = json.dumps(request["messages"], ensure_ascii=False)
+        assert "promotion-classifier-v1" in prompt
+        assert "topic_regions" in prompt
