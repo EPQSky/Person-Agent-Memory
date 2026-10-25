@@ -530,9 +530,10 @@ def create_app(
         if selected_kernel.kind != "legacy" or platform_state.connection is None:
             raise PlatformStateUnavailableError("legacy platform state is not started")
 
-    def status_payload() -> dict[str, str | int | bool]:
+    async def status_payload() -> dict[str, str | int | bool]:
         key = key_store.read()
-        kernel_health = selected_kernel.health()
+        kernel_health = await asyncio.to_thread(selected_kernel.health)
+        graph_status = await asyncio.to_thread(selected_kernel.graph_status)
         legacy_running = (
             selected_kernel.kind == "legacy" and platform_state.connection is not None
         )
@@ -543,6 +544,7 @@ def create_app(
             "memory_kernel": kernel_health.kind,
             "memory_kernel_status": kernel_health.status,
             "memory_kernel_detail": kernel_health.detail,
+            "graph_index_status": str(graph_status.get("status", "not_configured")),
             "startup_count": platform_state.startup_count,
             "previous_shutdown_clean": platform_state.previous_shutdown_clean,
             "api_key_fingerprint": key_store.fingerprint(key),
@@ -580,12 +582,12 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/api/v1/status", dependencies=[Depends(authenticate)])
-    def api_status() -> dict[str, str | int | bool]:
-        return status_payload()
+    async def api_status() -> dict[str, str | int | bool]:
+        return await status_payload()
 
     @app.get("/mcp/health", dependencies=[Depends(authenticate)])
-    def mcp_status() -> dict[str, str | int | bool]:
-        return status_payload()
+    async def mcp_status() -> dict[str, str | int | bool]:
+        return await status_payload()
 
     @app.post("/api/v1/auth/rotate", dependencies=[Depends(authenticate)])
     def rotate_key() -> dict[str, str]:
@@ -809,6 +811,18 @@ def create_app(
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def rebuild_graph_index(library_id: str) -> dict[str, object]:
+        if selected_kernel.kind != "legacy":
+            try:
+                return await selected_kernel.rebuild_graph(library_id)
+            except MemoryRecordNotFoundError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+                ) from error
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=str(error),
+                ) from error
         try:
             require_legacy_state()
             async with platform_state.library_write_lock(library_id):
@@ -827,6 +841,21 @@ def create_app(
         dependencies=[Depends(authenticate)],
     )
     async def graph_status(library_id: str) -> dict[str, object]:
+        if selected_kernel.kind != "legacy":
+            try:
+                return await asyncio.to_thread(
+                    selected_kernel.graph_status,
+                    library_id,
+                )
+            except MemoryRecordNotFoundError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+                ) from error
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=str(error),
+                ) from error
         try:
             return platform_state.graph_status(library_id)
         except LibraryRegistrationError as error:

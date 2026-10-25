@@ -29,7 +29,16 @@ from jiuwen_memory.common.type_def import (
 from jiuwen_memory.storage._support import scope_dims, wrap_backend
 from jiuwen_memory.storage.base import StoreType
 from jiuwen_memory.storage.fulltext import FulltextStore
-from jiuwen_memory.storage.types import Document, ScoredID, TextQuery, VectorRecord
+from jiuwen_memory.storage.graph import GraphStore
+from jiuwen_memory.storage.types import (
+    Document,
+    Edge,
+    GraphQuery,
+    Node,
+    ScoredID,
+    TextQuery,
+    VectorRecord,
+)
 from jiuwen_memory.storage.vector_impl.milvus_vector import (
     MilvusVectorStore as _JiuwenMilvusVectorStore,
 )
@@ -83,13 +92,9 @@ def _compile_metadata_filter(expr: FilterExpr | None) -> str:
         if expr.op in _CMP_OPS:
             return f"{field} {_CMP_OPS[expr.op]} {_literal(expr.value)}"
         if expr.op is FilterOp.IN:
-            return "(" + " || ".join(
-                f"{field} == {_literal(item)}" for item in expr.value
-            ) + ")"
+            return "(" + " || ".join(f"{field} == {_literal(item)}" for item in expr.value) + ")"
         if expr.op is FilterOp.NOT_IN:
-            comparisons = " && ".join(
-                f"{field} != {_literal(item)}" for item in expr.value
-            )
+            comparisons = " && ".join(f"{field} != {_literal(item)}" for item in expr.value)
             return f"(not exists({field}) || ({comparisons}))"
         if expr.op is FilterOp.CONTAINS:
             return f"json_contains({field}, {_literal(expr.value)})"
@@ -109,6 +114,32 @@ def _compile_metadata_filter(expr: FilterExpr | None) -> str:
 def _scope_expression(scope: Scope) -> str:
     return " && ".join(
         f"scope_{dimension} == {_literal(value)}" for dimension, value in scope_dims(scope)
+    )
+
+
+def _scope_key(scope: Scope) -> tuple[str, ...]:
+    return tuple(
+        str(getattr(scope, field_name.removeprefix("scope_"))) for field_name in _SCOPE_FIELDS
+    )
+
+
+def _graph_scope_value(value: str) -> str:
+    return "e:" if value == "" else f"v:{value}"
+
+
+def _decode_graph_scope_value(value: str) -> str:
+    if value == "e:":
+        return ""
+    if value.startswith("v:"):
+        return value[2:]
+    return value
+
+
+def _graph_scope_expression(scope: Scope) -> str:
+    return " && ".join(
+        f"scope_{field_name.removeprefix('scope_')} == "
+        f"{_literal(_graph_scope_value(str(getattr(scope, field_name.removeprefix('scope_')))))}"
+        for field_name in _SCOPE_FIELDS
     )
 
 
@@ -477,10 +508,7 @@ class MilvusLiteFulltextStore(FulltextStore):  # type: ignore[misc]
         except Exception as exc:
             raise BackendError(f"milvus fulltext search: {exc}") from exc
         hits = results[0] if results else []
-        return [
-            ScoredID(id=_hit_id(hit), score=-float(hit["distance"]))
-            for hit in hits
-        ]
+        return [ScoredID(id=_hit_id(hit), score=-float(hit["distance"])) for hit in hits]
 
     def close(self) -> None:
         with self._lock:
@@ -488,6 +516,600 @@ class MilvusLiteFulltextStore(FulltextStore):  # type: ignore[misc]
             self._connection.close()
 
     def __enter__(self) -> MilvusLiteFulltextStore:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
+
+class MilvusLiteGraphStore(GraphStore):  # type: ignore[misc]
+    """Persistent property graph backed by two Milvus Lite collections.
+
+    Nodes and edges use the same scope fields as the vector/fulltext adapters.
+    The adapter performs BFS in Python because Milvus Lite does not provide a
+    graph traversal API. Collections are shared by the local runtime and are
+    therefore safe to close and reopen.
+    """
+
+    _READ_LIMIT = 16_384
+
+    def __init__(
+        self,
+        *,
+        uri: str | Path,
+        collection: str = "agent_memory_graph_nodes",
+        edge_collection: str = "agent_memory_graph_edges",
+        consistency_level: str = "Strong",
+        scope_field_max_length: int = 256,
+        id_max_length: int = 512,
+    ) -> None:
+        normalized, _ = _normalized_uri(uri)
+        self._connection = _MilvusLiteConnection(normalized)
+        self._collection = collection
+        self._edge_collection = edge_collection
+        self._consistency = consistency_level
+        self._scope_len = scope_field_max_length + 2
+        self._id_len = id_max_length
+        self._physical_id_len = id_max_length + 5 * (scope_field_max_length + 1)
+        self._lock = threading.RLock()
+        self._nodes_ready = False
+        self._edges_ready = False
+        self._closed = False
+        self._diagnostics: dict[tuple[str, ...], str] = {}
+
+    def _get_client(self) -> Any:
+        with self._lock:
+            if self._closed:
+                raise BackendError("Milvus Lite graph store is closed")
+            client = self._connection.client
+            if not self._nodes_ready:
+                self._ensure_collection(client, self._collection, node=True)
+                self._nodes_ready = True
+            if not self._edges_ready:
+                self._ensure_collection(client, self._edge_collection, node=False)
+                self._edges_ready = True
+            return client
+
+    def _ensure_collection(self, client: Any, collection: str, *, node: bool) -> None:
+        if client.has_collection(collection):
+            client.load_collection(collection)
+            return
+        schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field(
+            "id",
+            DataType.VARCHAR,
+            is_primary=True,
+            max_length=self._physical_id_len,
+        )
+        schema.add_field("logical_id", DataType.VARCHAR, max_length=self._id_len)
+        for field_name in _SCOPE_FIELDS:
+            schema.add_field(field_name, DataType.VARCHAR, max_length=self._scope_len)
+        if node:
+            schema.add_field("label", DataType.VARCHAR, max_length=256)
+            schema.add_field("properties", DataType.JSON)
+        else:
+            schema.add_field("source", DataType.VARCHAR, max_length=self._id_len)
+            schema.add_field("target", DataType.VARCHAR, max_length=self._id_len)
+            schema.add_field("relation", DataType.VARCHAR, max_length=256)
+            schema.add_field("properties", DataType.JSON)
+        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=2)
+        index_params = client.prepare_index_params()
+        index_params.add_index(
+            field_name="embedding",
+            index_type="FLAT",
+            metric_type="COSINE",
+        )
+        client.create_collection(
+            collection_name=collection,
+            schema=schema,
+            index_params=index_params,
+            consistency_level=self._consistency,
+        )
+        client.load_collection(collection)
+
+    def store_type(self) -> StoreType:
+        return StoreType.GRAPH
+
+    def health(self) -> None:
+        try:
+            client = self._get_client()
+            client.get_collection_stats(self._collection)
+            client.get_collection_stats(self._edge_collection)
+        except Exception as exc:
+            raise BackendError(f"milvus graph health: {exc}") from exc
+
+    @staticmethod
+    def _node_row(scope: Scope, node: Node) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "id": _physical_id(scope, node.id),
+            "logical_id": node.id,
+            "label": node.label[:256],
+            "properties": node.properties,
+            "embedding": [0.0, 0.0],
+        }
+        for field_name in _SCOPE_FIELDS:
+            row[field_name] = _graph_scope_value(
+                str(getattr(scope, field_name.removeprefix("scope_")))
+            )
+        return row
+
+    @staticmethod
+    def _edge_row(scope: Scope, edge: Edge) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "id": _physical_id(scope, edge.id),
+            "logical_id": edge.id,
+            "source": edge.source,
+            "target": edge.target,
+            "relation": edge.relation[:256],
+            "properties": edge.properties,
+            "embedding": [0.0, 0.0],
+        }
+        for field_name in _SCOPE_FIELDS:
+            row[field_name] = _graph_scope_value(
+                str(getattr(scope, field_name.removeprefix("scope_")))
+            )
+        return row
+
+    @staticmethod
+    def _node_from_row(row: dict[str, Any]) -> Node:
+        return Node(
+            id=str(row.get("logical_id") or _logical_id(str(row["id"]))),
+            label=str(row.get("label") or ""),
+            properties=dict(row.get("properties") or {}),
+        )
+
+    @staticmethod
+    def _edge_from_row(row: dict[str, Any]) -> Edge:
+        return Edge(
+            id=str(row.get("logical_id") or _logical_id(str(row["id"]))),
+            source=str(row.get("source") or ""),
+            target=str(row.get("target") or ""),
+            relation=str(row.get("relation") or ""),
+            properties=dict(row.get("properties") or {}),
+        )
+
+    def _existing_ids(self, scope: Scope, collection: str, ids: list[str]) -> set[str]:
+        if not ids:
+            return set()
+        values = ", ".join(_literal(_physical_id(scope, item)) for item in ids)
+        filter_expression = f"id in [{values}] && {_graph_scope_expression(scope)}"
+        rows = self._get_client().query(
+            collection,
+            filter=filter_expression,
+            output_fields=["logical_id"],
+            consistency_level=self._consistency,
+        )
+        return {str(row["logical_id"]) for row in rows}
+
+    def clear_diagnostics(self, scope: Scope | None = None) -> None:
+        with self._lock:
+            if scope is None:
+                self._diagnostics.clear()
+            else:
+                self._diagnostics.pop(_scope_key(scope), None)
+
+    def last_error(self, scope: Scope | None = None) -> str | None:
+        with self._lock:
+            if scope is None:
+                return next(iter(self._diagnostics.values()), None)
+            return self._diagnostics.get(_scope_key(scope))
+
+    def _set_diagnostic(self, scope: Scope, error: Exception) -> None:
+        with self._lock:
+            self._diagnostics[_scope_key(scope)] = f"{type(error).__name__}: {error}"
+
+    def _query_rows(
+        self,
+        collection: str,
+        filter_expression: str,
+        fields: list[str],
+        *,
+        page_size: int | None = None,
+    ) -> list[dict[str, Any]]:
+        client = self._get_client()
+        limit = max(1, min(page_size or self._READ_LIMIT, self._READ_LIMIT))
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = client.query(
+                collection,
+                filter=filter_expression,
+                output_fields=fields,
+                limit=limit,
+                offset=offset,
+                consistency_level=self._consistency,
+            )
+            page_rows = [dict(row) for row in page]
+            rows.extend(page_rows)
+            if len(page_rows) < limit:
+                break
+            offset += len(page_rows)
+        return rows
+
+    def _all_rows(
+        self,
+        scope: Scope,
+        collection: str,
+        fields: list[str],
+        *,
+        page_size: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._query_rows(
+            collection,
+            _graph_scope_expression(scope),
+            fields,
+            page_size=page_size,
+        )
+
+    def insert(
+        self,
+        scope: Scope,
+        nodes: list[Node] | None = None,
+        edges: list[Edge] | None = None,
+    ) -> None:
+        nodes = nodes or []
+        edges = edges or []
+        try:
+            with wrap_backend("milvus graph insert"):
+                existing_nodes = self._existing_ids(
+                    scope, self._collection, [node.id for node in nodes]
+                )
+                if existing_nodes:
+                    raise ConflictError(entity="node", key=next(iter(existing_nodes)))
+                existing_edges = self._existing_ids(
+                    scope, self._edge_collection, [edge.id for edge in edges]
+                )
+                if existing_edges:
+                    raise ConflictError(entity="edge", key=next(iter(existing_edges)))
+                client = self._get_client()
+                if nodes:
+                    client.insert(
+                        self._collection,
+                        data=[self._node_row(scope, node) for node in nodes],
+                    )
+                if edges:
+                    signatures = {
+                        (
+                            edge.source,
+                            edge.target,
+                            edge.relation,
+                            json.dumps(edge.properties, ensure_ascii=False, sort_keys=True),
+                        )
+                        for edge in (
+                            self._edge_from_row(row)
+                            for row in self._all_rows(
+                                scope,
+                                self._edge_collection,
+                                [
+                                    "id",
+                                    "logical_id",
+                                    "source",
+                                    "target",
+                                    "relation",
+                                    "properties",
+                                ],
+                            )
+                        )
+                    }
+                    fresh_edges: list[Edge] = []
+                    for edge in edges:
+                        signature = (
+                            edge.source,
+                            edge.target,
+                            edge.relation,
+                            json.dumps(
+                                edge.properties,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                        )
+                        if signature in signatures:
+                            continue
+                        signatures.add(signature)
+                        fresh_edges.append(edge)
+                    if fresh_edges:
+                        client.insert(
+                            self._edge_collection,
+                            data=[self._edge_row(scope, edge) for edge in fresh_edges],
+                        )
+        except (ConflictError, NotFoundError):
+            raise
+        except Exception as error:
+            self._set_diagnostic(scope, error)
+            raise
+        else:
+            self.clear_diagnostics(scope)
+
+    def update(
+        self,
+        scope: Scope,
+        nodes: list[Node] | None = None,
+        edges: list[Edge] | None = None,
+    ) -> None:
+        nodes = nodes or []
+        edges = edges or []
+        try:
+            with wrap_backend("milvus graph update"):
+                missing_nodes = {node.id for node in nodes} - self._existing_ids(
+                    scope, self._collection, [node.id for node in nodes]
+                )
+                if missing_nodes:
+                    raise NotFoundError(entity="node", key=next(iter(missing_nodes)))
+                missing_edges = {edge.id for edge in edges} - self._existing_ids(
+                    scope, self._edge_collection, [edge.id for edge in edges]
+                )
+                if missing_edges:
+                    raise NotFoundError(entity="edge", key=next(iter(missing_edges)))
+                client = self._get_client()
+                if nodes:
+                    client.upsert(
+                        self._collection,
+                        data=[self._node_row(scope, node) for node in nodes],
+                    )
+                if edges:
+                    client.upsert(
+                        self._edge_collection,
+                        data=[self._edge_row(scope, edge) for edge in edges],
+                    )
+        except (ConflictError, NotFoundError):
+            raise
+        except Exception as error:
+            self._set_diagnostic(scope, error)
+            raise
+        else:
+            self.clear_diagnostics(scope)
+
+    def clear(self, scope: Scope) -> None:
+        """Remove every node and edge in one scope without touching other scopes."""
+        try:
+            with wrap_backend("milvus graph clear"):
+                client = self._get_client()
+                client.delete(self._edge_collection, filter=_graph_scope_expression(scope))
+                client.delete(self._collection, filter=_graph_scope_expression(scope))
+        except Exception as error:
+            self._set_diagnostic(scope, error)
+            raise
+        else:
+            self.clear_diagnostics(scope)
+
+    def delete(
+        self,
+        scope: Scope,
+        node_ids: list[str] | None = None,
+        edge_ids: list[str] | None = None,
+    ) -> None:
+        node_ids = node_ids or []
+        edge_ids = list(edge_ids or [])
+        try:
+            with wrap_backend("milvus graph delete"):
+                if node_ids:
+                    node_set = set(node_ids)
+                    for row in self._all_rows(
+                        scope,
+                        self._edge_collection,
+                        ["logical_id", "source", "target"],
+                    ):
+                        if str(row.get("source")) in node_set or str(row.get("target")) in node_set:
+                            edge_ids.append(str(row["logical_id"]))
+                client = self._get_client()
+                if edge_ids:
+                    values = ", ".join(
+                        _literal(_physical_id(scope, item)) for item in dict.fromkeys(edge_ids)
+                    )
+                    client.delete(
+                        self._edge_collection,
+                        filter=f"id in [{values}] && {_graph_scope_expression(scope)}",
+                    )
+                if node_ids:
+                    values = ", ".join(
+                        _literal(_physical_id(scope, item)) for item in dict.fromkeys(node_ids)
+                    )
+                    client.delete(
+                        self._collection,
+                        filter=f"id in [{values}] && {_graph_scope_expression(scope)}",
+                    )
+        except (ConflictError, NotFoundError):
+            raise
+        except Exception as error:
+            self._set_diagnostic(scope, error)
+            raise
+        else:
+            self.clear_diagnostics(scope)
+
+    def get(self, scope: Scope, node_ids: list[str]) -> list[Node]:
+        if not node_ids:
+            return []
+        values = ", ".join(_literal(_physical_id(scope, item)) for item in node_ids)
+        rows = self._get_client().query(
+            self._collection,
+            filter=f"id in [{values}] && {_graph_scope_expression(scope)}",
+            output_fields=["id", "logical_id", "label", "properties"],
+            consistency_level=self._consistency,
+        )
+        return [self._node_from_row(dict(row)) for row in rows]
+
+    def search(self, scope: Scope, query: GraphQuery) -> list[Node]:
+        return [
+            node
+            for node, _ in self.traverse(
+                scope,
+                query.start_id,
+                depth=query.depth,
+                relation=query.relation,
+                limit=query.limit,
+            )
+        ]
+
+    def traverse(
+        self,
+        scope: Scope,
+        start_id: str,
+        *,
+        depth: int,
+        relation: str | None = None,
+        limit: int = 100,
+    ) -> list[tuple[Node, int]]:
+        return [
+            (node, hop)
+            for node, hop, _ in self.traverse_many(
+                scope,
+                [start_id],
+                depth=depth,
+                relation=relation,
+                limit=limit,
+            )
+        ]
+
+    def traverse_many(
+        self,
+        scope: Scope,
+        start_ids: list[str],
+        *,
+        depth: int,
+        relation: str | None = None,
+        limit: int = 100,
+    ) -> list[tuple[Node, int, str]]:
+        """Expand several seeds with one paginated edge scan and bounded BFS."""
+        starts = list(dict.fromkeys(start_ids))
+        max_results = max(limit, 0)
+        max_depth = max(depth, 0)
+        if not starts or max_results == 0 or max_depth == 0:
+            return []
+        edges = [
+            self._edge_from_row(row)
+            for row in self._all_rows(
+                scope,
+                self._edge_collection,
+                ["id", "logical_id", "source", "target", "relation", "properties"],
+            )
+        ]
+        adjacency: dict[str, list[str]] = {}
+        for edge in edges:
+            if relation is not None and edge.relation != relation:
+                continue
+            adjacency.setdefault(edge.source, []).append(edge.target)
+            adjacency.setdefault(edge.target, []).append(edge.source)
+        for neighbors in adjacency.values():
+            neighbors.sort()
+        visited = set(starts)
+        frontier = [(start_id, start_id) for start_id in starts]
+        reached: list[tuple[str, int, str]] = []
+        for hop in range(1, max_depth + 1):
+            next_frontier: list[tuple[str, str]] = []
+            stop = False
+            for node_id, origin_id in frontier:
+                for neighbor in adjacency.get(node_id, []):
+                    if neighbor in visited:
+                        continue
+                    visited.add(neighbor)
+                    next_frontier.append((neighbor, origin_id))
+                    reached.append((neighbor, hop, origin_id))
+                    if len(reached) >= max_results:
+                        stop = True
+                        break
+                if stop:
+                    break
+            frontier = next_frontier
+            if stop or not frontier:
+                break
+        nodes_by_id = {
+            node.id: node for node in self.get(scope, [node_id for node_id, _, _ in reached])
+        }
+        return [
+            (nodes_by_id[node_id], hop, origin_id)
+            for node_id, hop, origin_id in reached
+            if node_id in nodes_by_id
+        ]
+
+    def seed_ids(self, scope: Scope, tokens: set[str]) -> list[str]:
+        if not tokens:
+            return []
+        rows = self._all_rows(
+            scope,
+            self._collection,
+            ["logical_id", "label", "properties"],
+        )
+        result: list[str] = []
+        for row in rows:
+            node = self._node_from_row(row)
+            content = str(node.properties.get("content", ""))
+            if any(token and token in content for token in tokens):
+                result.append(node.id)
+        return result
+
+    def node_ids(self, scope: Scope) -> list[str]:
+        return [
+            str(row["logical_id"])
+            for row in self._all_rows(scope, self._collection, ["logical_id"])
+        ]
+
+    def projection_nodes(self, scope: Scope) -> list[Node]:
+        return [
+            self._node_from_row(row)
+            for row in self._all_rows(
+                scope,
+                self._collection,
+                ["id", "logical_id", "label", "properties"],
+            )
+        ]
+
+    def projection_edges(self, scope: Scope) -> list[Edge]:
+        return [
+            self._edge_from_row(row)
+            for row in self._all_rows(
+                scope,
+                self._edge_collection,
+                ["id", "logical_id", "source", "target", "relation", "properties"],
+            )
+        ]
+
+    def edge_endpoints(self, scope: Scope) -> list[tuple[str, str]]:
+        return [
+            (str(row["source"]), str(row["target"]))
+            for row in self._all_rows(
+                scope,
+                self._edge_collection,
+                ["source", "target"],
+            )
+        ]
+
+    def graph_scopes(self) -> list[Scope]:
+        fields = list(_SCOPE_FIELDS)
+        rows = [
+            *self._query_rows(self._collection, "", fields),
+            *self._query_rows(self._edge_collection, "", fields),
+        ]
+        scopes: dict[tuple[str, ...], Scope] = {}
+        for row in rows:
+            values = tuple(str(row[field]) for field in _SCOPE_FIELDS)
+            if values in scopes:
+                continue
+            decoded = tuple(_decode_graph_scope_value(value) for value in values)
+            scopes[values] = Scope(
+                org=decoded[0],
+                space=decoded[1],
+                user=decoded[2],
+                agent=decoded[3],
+                session=decoded[4],
+            )
+        return list(scopes.values())
+
+    def counts(self, scope: Scope | None = None) -> dict[str, int]:
+        filter_expression = "" if scope is None else _graph_scope_expression(scope)
+        nodes = self._query_rows(self._collection, filter_expression, ["id"])
+        edges = self._query_rows(self._edge_collection, filter_expression, ["id"])
+        return {"nodes": len(nodes), "edges": len(edges)}
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._nodes_ready = False
+            self._edges_ready = False
+            self._connection.close()
+
+    def __enter__(self) -> MilvusLiteGraphStore:
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:

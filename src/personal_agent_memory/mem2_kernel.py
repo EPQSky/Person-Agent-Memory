@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
 import hashlib
 import json
@@ -33,9 +34,17 @@ from jiuwen_memory.common.embedder.base import Embedder, EmbedderProducer
 from jiuwen_memory.common.embedder.embedder_impl.openai_embedder import OpenAIEmbedder
 from jiuwen_memory.common.type_def import memory_key
 from jiuwen_memory.common.type_def.memory_codec import dumps
-from jiuwen_memory.control import DeleteMode, DeleteSelector, MemoryPatch, UpdateMode
-from jiuwen_memory.storage import FulltextStore, VectorStore
+from jiuwen_memory.construction import EvolveMode
+from jiuwen_memory.control import (
+    DeleteMode,
+    DeleteSelector,
+    JobStatus,
+    MemoryPatch,
+    UpdateMode,
+)
+from jiuwen_memory.storage import FulltextStore, GraphStore, VectorStore
 from jiuwen_memory.storage.fulltext import FulltextProducer
+from jiuwen_memory.storage.graph import GraphProducer
 from jiuwen_memory.storage.kv import load_units
 from jiuwen_memory.storage.types import ScoredID, TextQuery
 from jiuwen_memory.storage.vector import VectorProducer
@@ -96,6 +105,7 @@ from personal_agent_memory.regions import (
 )
 from personal_agent_memory.storage import (
     MilvusLiteFulltextStore,
+    MilvusLiteGraphStore,
     MilvusLiteVectorStore,
     SQLiteAuditLogger,
     SQLiteKVStore,
@@ -104,6 +114,8 @@ from personal_agent_memory.storage import (
 _STORE_TARGET = "personal-agent-memory-local"
 _AUDIT_TARGET = "personal-agent-memory-sqlite"
 _EMBEDDER_TARGET = "personal-agent-memory-openai"
+_GRAPH_PROJECTION_SCHEMA = 2
+_GRAPH_PROJECTION_MANIFEST_SCHEMA = 1
 _LOCAL_ORG = "local"
 _LOCAL_USER = "local"
 _LOCAL_AGENT = "personal-agent-memory"
@@ -187,6 +199,17 @@ def _build_fulltext_store(config: Any) -> FulltextStore:
     return store
 
 
+@GraphProducer.register(_STORE_TARGET)  # type: ignore[untyped-decorator]
+def _build_graph_store(config: Any) -> GraphStore:
+    store = MilvusLiteGraphStore(
+        uri=str(config.get("uri")),
+        collection=str(config.get("collection")),
+        edge_collection=str(config.get("edge_collection")),
+    )
+    _remember_store(store)
+    return store
+
+
 @AuditProducer.register(_AUDIT_TARGET)  # type: ignore[untyped-decorator]
 def _build_audit_logger(config: Any) -> AuditLogger:
     logger = SQLiteAuditLogger(str(config.get("db_path")))
@@ -224,6 +247,7 @@ class _RuntimeBundle:
     runtime: MemoryRuntime
     kv_store: SQLiteKVStore
     stores: tuple[object, ...]
+    graph_store: MilvusLiteGraphStore | None
 
 
 class Mem2MemoryKernel(UnavailableMemoryKernel):
@@ -253,8 +277,17 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._vector_degradation = "embedding_not_configured"
         self._embedding_detail = "embedding endpoint is not configured; vector recall is disabled"
         self._embedding_api_key_cache: str | None = None
+        self._graph_errors: dict[str, str] = {}
+        self._graph_projection_path = self._state_dir / "mem2" / "graph_projection_errors.json"
+        self._graph_projection_manifest_path = (
+            self._state_dir / "mem2" / "graph_projection_manifests.json"
+        )
+        self._graph_projection_lock = threading.RLock()
+        self._graph_projection_errors = self._load_graph_projection_errors()
+        self._graph_projection_manifests = self._load_graph_projection_manifests()
         self._lock = threading.RLock()
         self._maintenance_lock = threading.RLock()
+        self._graph_write_lock = threading.RLock()
         self._governance_locks: dict[str, threading.RLock] = {}
         self._governance_locks_guard = threading.Lock()
         self._idempotency_locks: dict[tuple[str, str], tuple[threading.Lock, int]] = {}
@@ -290,7 +323,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 return
             finally:
                 _STORE_COLLECTOR.reset(token)
-            self._bundle = _RuntimeBundle(runtime, kv_store, tuple(stores))
+            graph_store = next(
+                (store for store in stores if isinstance(store, MilvusLiteGraphStore)),
+                None,
+            )
+            self._bundle = _RuntimeBundle(runtime, kv_store, tuple(stores), graph_store)
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close)
@@ -339,6 +376,1087 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             kind=self.kind,
             status="ready",
             detail="JiuwenMemory 0.2.0 runtime",
+        )
+
+    def graph_status(self, library_id: str | None = None) -> dict[str, object]:
+        with self._lock:
+            bundle = self._bundle
+        if bundle is None or bundle.graph_store is None:
+            return {
+                "status": "not_configured",
+                "backend": "milvus-lite",
+                "library_id": library_id or "",
+                "total_documents": 0,
+                "projected_documents": 0,
+                "last_error": "",
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        identifier = validate_library_id(library_id) if library_id is not None else None
+        region = self._graph_region_or_none(identifier) if identifier is not None else None
+        region_id = region.region_id if region is not None else identifier or ""
+        try:
+            bundle.graph_store.health()
+            counts = {"nodes": 0, "edges": 0}
+            store_errors: list[str] = []
+            projection_issues: list[str] = []
+            projection_errors: list[str] = []
+            transient_errors: list[str] = []
+            active_documents = 0
+            projected_documents = 0
+            if identifier is None:
+                scopes = self._graph_status_scopes(bundle)
+            elif region is None:
+                scopes = [_scope_for_normalized_library(identifier)]
+            else:
+                scopes = self._region_scopes(bundle, region)
+            with self._graph_write_lock:
+                for scope in scopes:
+                    scope_counts = bundle.graph_store.counts(scope)
+                    counts["nodes"] += int(scope_counts.get("nodes", 0))
+                    counts["edges"] += int(scope_counts.get("edges", 0))
+                    expected, actual, mismatch = self._graph_projection_snapshot(
+                        bundle,
+                        scope,
+                    )
+                    active_documents += expected
+                    projected_documents += actual
+                    if mismatch is not None:
+                        projection_issues.append(mismatch)
+                    store_error = self._graph_store_error(bundle, scope)
+                    if store_error is not None:
+                        store_errors.append(store_error)
+                    projection_error = self._graph_projection_error(scope=scope)
+                    if projection_error is not None:
+                        projection_errors.append(projection_error)
+                    transient_error = self._graph_error_for(scope=scope)
+                    if transient_error is not None:
+                        transient_errors.append(transient_error)
+            if region is not None:
+                for projection_error in self._graph_projection_errors_for_region(region):
+                    if projection_error not in projection_errors:
+                        projection_errors.append(projection_error)
+                for transient_error in self._graph_errors_for_region(region):
+                    if transient_error not in transient_errors:
+                        transient_errors.append(transient_error)
+        except Exception as error:
+            detail = str(error)
+            return {
+                "status": "degraded",
+                "backend": "milvus-lite",
+                "library_id": region_id,
+                "detail": detail,
+                "total_documents": 0,
+                "projected_documents": 0,
+                "last_error": detail,
+                "updated_at": datetime.now(UTC).isoformat(),
+                "nodes": 0,
+                "edges": 0,
+            }
+        if identifier is None:
+            projection_error = self._any_graph_projection_error()
+            transient_error = self._any_graph_error()
+        else:
+            projection_error = (
+                projection_errors[0]
+                if projection_errors
+                else self._graph_projection_error(
+                    region_id=region.region_id if region is not None else identifier
+                )
+            )
+            transient_error = (
+                transient_errors[0]
+                if transient_errors
+                else self._graph_error_for(
+                    region_id=region.region_id if region is not None else identifier
+                )
+            )
+        detail = (
+            projection_error
+            or (projection_issues[0] if projection_issues else None)
+            or (store_errors[0] if store_errors else None)
+            or transient_error
+            or "one-hop graph expansion available"
+        )
+        degraded = bool(projection_error or projection_issues or store_errors or transient_error)
+        return {
+            "status": "degraded" if degraded else "ready",
+            "backend": "milvus-lite",
+            "library_id": region_id,
+            "detail": detail,
+            "total_documents": active_documents,
+            "projected_documents": projected_documents,
+            "last_error": "" if not degraded else detail,
+            "updated_at": datetime.now(UTC).isoformat(),
+            **counts,
+        }
+
+    async def rebuild_graph(self, library_id: str) -> dict[str, object]:
+        return await asyncio.to_thread(self._rebuild_graph_serialized, library_id)
+
+    def _rebuild_graph_serialized(self, library_id: str) -> dict[str, object]:
+        identifier = validate_library_id(library_id)
+        with (
+            self._maintenance_lock,
+            self._governance_region_lock(identifier),
+            self._graph_write_lock,
+        ):
+            return self._rebuild_graph(identifier)
+
+    def _rebuild_graph(self, library_id: str) -> dict[str, object]:
+        bundle = self._require_bundle()
+        identifier = validate_library_id(library_id)
+        region = self._graph_region_or_none(identifier)
+        region_id = region.region_id if region is not None else identifier
+        if bundle.graph_store is None:
+            return {"library_id": region_id, "status": "not_configured", "job_id": ""}
+        job_ids: list[str] = []
+        failure: str | None = None
+        failure_scope: Scope | None = None
+        scopes: list[Scope] = []
+        try:
+            bundle.graph_store.health()
+            scopes = (
+                self._region_scopes(bundle, region)
+                if region is not None
+                else [_scope_for_normalized_library(identifier)]
+            )
+            for scope in scopes:
+                clear_diagnostics = getattr(bundle.graph_store, "clear_diagnostics", None)
+                if callable(clear_diagnostics):
+                    clear_diagnostics(scope)
+                bundle.graph_store.clear(scope)
+                job_id = self._associate_graph_scope(
+                    bundle,
+                    scope,
+                    region_id=region.region_id if region is not None else None,
+                )
+                if job_id is None:
+                    failure_scope = scope
+                    failure = self._graph_error_for(scope=scope) or "graph association failed"
+                    break
+                job_ids.append(job_id)
+                self._verify_graph_projection(bundle, scope)
+        except Exception as error:
+            failure = str(error)
+        if failure is not None:
+            if failure_scope is not None:
+                self._set_graph_error(failure, scope=failure_scope)
+                self._set_graph_projection_error(failure, scope=failure_scope)
+            elif region is None:
+                library_scope = _scope_for_normalized_library(identifier)
+                self._set_graph_error(failure, scope=library_scope)
+                self._set_graph_projection_error(failure, scope=library_scope)
+            else:
+                self._set_graph_error(failure, region_id=region_id)
+                self._set_graph_projection_error(failure, region_id=region_id)
+            return {
+                "library_id": region_id,
+                "status": "degraded",
+                "detail": failure,
+                "job_id": job_ids[0] if job_ids else "",
+                "job_ids": job_ids,
+            }
+        self._clear_graph_error(region_id=region_id)
+        if region is not None:
+            self._clear_graph_errors_for_region(region)
+            self._clear_graph_projection_errors_for_region(region)
+        else:
+            self._clear_graph_projection_error(scope=_scope_for_normalized_library(identifier))
+            self._clear_graph_projection_error(region_id=identifier)
+            self._clear_graph_error(region_id=identifier)
+        return {
+            "library_id": region_id,
+            "status": "ready",
+            "job_id": job_ids[0] if job_ids else "",
+            "job_ids": job_ids,
+            "graph": self.graph_status(region_id),
+        }
+
+    def _verify_graph_projection(self, bundle: _RuntimeBundle, scope: Scope) -> None:
+        graph_store = bundle.graph_store
+        if graph_store is None:
+            return
+        store_error = self._graph_store_error(bundle, scope)
+        if store_error is not None:
+            raise MemoryKernelUnavailableError(store_error)
+        _, _, mismatch = self._graph_projection_snapshot(bundle, scope)
+        if mismatch is not None:
+            raise MemoryKernelUnavailableError(mismatch)
+
+    def _active_graph_units(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+    ) -> list[MemoryUnit]:
+        return sorted(
+            (
+                unit
+                for unit in self._units_in_scope(bundle, scope)
+                if unit.system_metadata.get("middle") != "true"
+                and unit.lifecycle.value == "active"
+                and unit.user_metadata.get("restore_pending") is not True
+            ),
+            key=lambda unit: unit.id,
+        )
+
+    def _graph_projection_contents(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        units: list[MemoryUnit],
+    ) -> tuple[int, int, str | None]:
+        units_by_id = {unit.id: unit for unit in units}
+        expected = set(units_by_id)
+        graph_store = bundle.graph_store
+        node_ids = getattr(graph_store, "node_ids", None)
+        if graph_store is None or not callable(node_ids):
+            return len(expected), len(expected), None
+        try:
+            actual = set(node_ids(scope))
+        except Exception as error:
+            return (
+                len(expected),
+                0,
+                f"graph projection read failed: {error}",
+            )
+        edge_endpoints = getattr(graph_store, "edge_endpoints", None)
+        dangling_edges = 0
+        if callable(edge_endpoints):
+            try:
+                dangling_edges = sum(
+                    1
+                    for source, target in edge_endpoints(scope)
+                    if source not in actual or target not in actual
+                )
+            except Exception as error:
+                return (
+                    len(expected),
+                    len(actual),
+                    f"graph edge projection read failed: {error}",
+                )
+        stale_nodes = 0
+        get_nodes = getattr(graph_store, "get", None)
+        if callable(get_nodes):
+            try:
+                projected_nodes = get_nodes(scope, sorted(expected & actual))
+            except Exception as error:
+                return (
+                    len(expected),
+                    len(actual),
+                    f"graph node projection read failed: {error}",
+                )
+            for node in projected_nodes:
+                unit = units_by_id.get(node.id)
+                if unit is None:
+                    continue
+                if node.label != unit.tier.value or node.properties.get("content") != unit.content:
+                    stale_nodes += 1
+        missing = expected - actual
+        extra = actual - expected
+        if not missing and not extra and dangling_edges == 0 and stale_nodes == 0:
+            return len(expected), len(actual), None
+        return (
+            len(expected),
+            len(actual),
+            "graph projection mismatch: "
+            f"missing={len(missing)} extra={len(extra)} "
+            f"dangling_edges={dangling_edges} stale_nodes={stale_nodes}",
+        )
+
+    def _graph_projection_snapshot(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+    ) -> tuple[int, int, str | None]:
+        units = self._active_graph_units(bundle, scope)
+        expected_count, actual_count, mismatch = self._graph_projection_contents(
+            bundle,
+            scope,
+            units,
+        )
+        if mismatch is not None:
+            return expected_count, actual_count, mismatch
+        if not units and actual_count == 0:
+            return expected_count, actual_count, None
+        manifest = self._graph_projection_manifest(scope)
+        if manifest is None:
+            return (
+                expected_count,
+                actual_count,
+                "graph projection manifest missing; rebuild required",
+            )
+        try:
+            kv_fingerprint = self._graph_kv_fingerprint(units)
+            graph_fingerprint = self._graph_projection_fingerprint(bundle, scope)
+        except Exception as error:
+            return (
+                expected_count,
+                actual_count,
+                f"graph projection fingerprint read failed: {error}",
+            )
+        if (
+            manifest["kv_fingerprint"] == kv_fingerprint
+            and manifest["graph_fingerprint"] == graph_fingerprint
+        ):
+            return expected_count, actual_count, None
+        edge_mismatch = self._graph_edge_mismatch(bundle, scope, units)
+        return (
+            expected_count,
+            actual_count,
+            edge_mismatch or "graph projection changed after verification; rebuild required",
+        )
+
+    @staticmethod
+    def _graph_properties_fingerprint(properties: Mapping[str, Any]) -> str:
+        return json.dumps(
+            dict(properties),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    @classmethod
+    def _graph_edge_signature(
+        cls,
+        source: str,
+        target: str,
+        relation: str,
+        properties: Mapping[str, Any],
+    ) -> tuple[str, str, str, str]:
+        left, right = sorted((str(source), str(target)))
+        return (
+            left,
+            right,
+            str(relation),
+            cls._graph_properties_fingerprint(properties),
+        )
+
+    @classmethod
+    def _graph_kv_fingerprint(cls, units: list[MemoryUnit]) -> str:
+        payload = [
+            {
+                "id": unit.id,
+                "content": unit.content,
+                "tier": unit.tier.value,
+            }
+            for unit in units
+        ]
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _graph_projection_fingerprint(
+        cls,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+    ) -> str:
+        graph_store = bundle.graph_store
+        if graph_store is None:
+            return ""
+        projection_nodes = getattr(graph_store, "projection_nodes", None)
+        projection_edges = getattr(graph_store, "projection_edges", None)
+        if not callable(projection_nodes) or not callable(projection_edges):
+            return "unavailable"
+        nodes = sorted(
+            (
+                node.id,
+                node.label,
+                cls._graph_properties_fingerprint(node.properties),
+            )
+            for node in projection_nodes(scope)
+        )
+        edges = sorted(
+            (
+                edge.source,
+                edge.target,
+                edge.relation,
+                cls._graph_properties_fingerprint(edge.properties),
+            )
+            for edge in projection_edges(scope)
+        )
+        return hashlib.sha256(
+            json.dumps(
+                {"nodes": nodes, "edges": edges},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _expected_graph_edge_signatures(
+        cls,
+        bundle: _RuntimeBundle,
+        units: list[MemoryUnit],
+    ) -> set[tuple[str, str, str, str]] | None:
+        engine = getattr(bundle.runtime.api, "_engine", None)
+        evolver = getattr(engine, "_evolver", None)
+        associator = getattr(evolver, "_associator", None)
+        associate = getattr(associator, "associate", None)
+        if not callable(associate):
+            return None
+        relations = associate(list(units))
+        return {
+            cls._graph_edge_signature(
+                relation.source_id,
+                relation.target_id,
+                relation.relation,
+                getattr(relation, "metadata", {}) or {},
+            )
+            for relation in relations
+        }
+
+    @classmethod
+    def _actual_graph_edge_signatures(
+        cls,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+    ) -> set[tuple[str, str, str, str]] | None:
+        graph_store = bundle.graph_store
+        projection_edges = getattr(graph_store, "projection_edges", None)
+        if not callable(projection_edges):
+            return None
+        return {
+            cls._graph_edge_signature(
+                edge.source,
+                edge.target,
+                edge.relation,
+                edge.properties,
+            )
+            for edge in projection_edges(scope)
+        }
+
+    def _graph_edge_mismatch(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        units: list[MemoryUnit],
+    ) -> str | None:
+        try:
+            expected = self._expected_graph_edge_signatures(bundle, units)
+            actual = self._actual_graph_edge_signatures(bundle, scope)
+        except Exception as error:
+            return f"graph edge projection verification failed: {error}"
+        if expected is None or actual is None:
+            return None
+        missing = expected - actual
+        stale = actual - expected
+        if not missing and not stale:
+            return None
+        return (
+            "graph edge projection mismatch: "
+            f"expected_edges={len(expected)} actual_edges={len(actual)} "
+            f"missing_edges={len(missing)} stale_edges={len(stale)}"
+        )
+
+    def _record_graph_projection(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+    ) -> None:
+        units = self._active_graph_units(bundle, scope)
+        _, _, mismatch = self._graph_projection_contents(bundle, scope, units)
+        if mismatch is not None:
+            raise MemoryKernelUnavailableError(mismatch)
+        expected = self._expected_graph_edge_signatures(bundle, units)
+        actual = self._actual_graph_edge_signatures(bundle, scope)
+        if expected is None or actual is None:
+            raise MemoryKernelUnavailableError("graph edge projection verification is unavailable")
+        if expected != actual:
+            raise MemoryKernelUnavailableError(
+                self._graph_edge_mismatch(bundle, scope, units) or "graph edge projection mismatch"
+            )
+        key = self._graph_projection_key(None, scope)
+        manifest = {
+            "kv_fingerprint": self._graph_kv_fingerprint(units),
+            "graph_fingerprint": self._graph_projection_fingerprint(bundle, scope),
+        }
+        with self._graph_projection_lock:
+            self._graph_projection_manifests[key] = manifest
+            self._persist_graph_projection_manifests_locked()
+
+    def _associate_graph_scope(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        *,
+        region_id: str | None = None,
+    ) -> str | None:
+        with self._graph_write_lock:
+            return self._associate_graph_scope_locked(
+                bundle,
+                scope,
+                region_id=region_id,
+            )
+
+    def _associate_graph_scope_locked(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        *,
+        region_id: str | None = None,
+    ) -> str | None:
+        if bundle.graph_store is None:
+            return None
+        try:
+            security = _security_for(scope)
+            job_id = bundle.runtime.api.evolve(
+                scope,
+                EvolveMode.ASSOCIATE,
+                security=security,
+            )
+            job_error = self._evolve_job_error(bundle, str(job_id))
+            if job_error is not None:
+                raise MemoryKernelUnavailableError(job_error)
+            store_error = self._graph_store_error(bundle, scope)
+            if store_error is not None:
+                raise MemoryKernelUnavailableError(store_error)
+            if region_id is not None:
+                self._prune_inactive_graph_nodes(
+                    bundle,
+                    scope,
+                    region_id=region_id,
+                )
+            self._record_graph_projection(bundle, scope)
+            self._clear_graph_error(region_id=region_id, scope=scope)
+            self._clear_graph_projection_error(scope=scope)
+            return str(job_id)
+        except Exception as error:
+            failure = str(error)
+            self._set_graph_error(
+                failure,
+                region_id=region_id,
+                scope=scope,
+            )
+            self._set_graph_projection_error(failure, scope=scope)
+            return None
+
+    @staticmethod
+    def _evolve_job_error(bundle: _RuntimeBundle, job_id: str) -> str | None:
+        api = bundle.runtime.api
+        engine = getattr(api, "_engine", None)
+        scheduler = getattr(engine, "_scheduler", None)
+        status = getattr(scheduler, "status", None)
+        if not callable(status):
+            return None
+        try:
+            job = status(job_id)
+        except Exception:
+            return None
+        if getattr(job, "status", None) != JobStatus.FAILED:
+            return None
+        detail = getattr(job, "detail", {})
+        error = detail.get("error") or detail.get("error_type")
+        return f"graph association job failed: {error or 'unknown error'}"
+
+    @staticmethod
+    def _graph_store_error(bundle: _RuntimeBundle, scope: Scope) -> str | None:
+        graph_store = bundle.graph_store
+        if graph_store is None:
+            return None
+        last_error = getattr(graph_store, "last_error", None)
+        if not callable(last_error):
+            return None
+        try:
+            error = last_error(scope)
+        except Exception as read_error:
+            return f"graph diagnostics unavailable: {read_error}"
+        return None if error is None else str(error)
+
+    def _graph_projection_error(
+        self,
+        *,
+        region_id: str | None = None,
+        scope: Scope | None = None,
+    ) -> str | None:
+        key = self._graph_projection_key(region_id, scope)
+        if not key:
+            return None
+        with self._graph_projection_lock:
+            return self._graph_projection_errors.get(key)
+
+    def _any_graph_projection_error(self) -> str | None:
+        with self._graph_projection_lock:
+            return next(iter(self._graph_projection_errors.values()), None)
+
+    @staticmethod
+    def _graph_error_key(region_id: str | None, scope: Scope | None) -> str:
+        if scope is not None:
+            return Mem2MemoryKernel._graph_projection_key(None, scope)
+        if region_id is not None:
+            return Mem2MemoryKernel._graph_projection_key(region_id, None)
+        return ""
+
+    @staticmethod
+    def _graph_projection_key(region_id: str | None, scope: Scope | None) -> str:
+        if scope is not None:
+            payload = json.dumps(
+                [scope.org, scope.space, scope.user, scope.agent, scope.session],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            encoded = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+            return f"@scope/v2:{encoded}"
+        if region_id is not None:
+            encoded = (
+                base64.urlsafe_b64encode(region_id.encode("utf-8")).decode("ascii").rstrip("=")
+            )
+            return f"@region/v2:{encoded}"
+        return ""
+
+    @staticmethod
+    def _decode_graph_projection_key(
+        key: str,
+    ) -> tuple[str | None, Scope | None]:
+        prefix = ""
+        if key.startswith("@scope/v2:"):
+            prefix = "@scope/v2:"
+        elif key.startswith("@region/v2:"):
+            prefix = "@region/v2:"
+        else:
+            return None, None
+        encoded = key.removeprefix(prefix)
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            decoded = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+            if prefix == "@region/v2:":
+                return decoded, None
+            payload = json.loads(decoded)
+        except (ValueError, UnicodeError, json.JSONDecodeError):
+            return None, None
+        if not isinstance(payload, list) or len(payload) != 5:
+            return None, None
+        return None, Scope(
+            org=str(payload[0]),
+            space=str(payload[1]),
+            user=str(payload[2]),
+            agent=str(payload[3]),
+            session=str(payload[4]),
+        )
+
+    @staticmethod
+    def _scope_matches_region(scope: Scope, region: MemoryRegion) -> bool:
+        return scope.space == region.space and (
+            region.kind != "session" or scope.session == (region.session_id or "")
+        )
+
+    def _set_graph_error(
+        self,
+        error: str,
+        *,
+        region_id: str | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        key = self._graph_error_key(region_id, scope)
+        with self._graph_projection_lock:
+            self._graph_errors[key] = error
+
+    def _clear_graph_error(
+        self,
+        *,
+        region_id: str | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        key = self._graph_error_key(region_id, scope)
+        with self._graph_projection_lock:
+            self._graph_errors.pop(key, None)
+
+    def _graph_error_for(
+        self,
+        *,
+        region_id: str | None = None,
+        scope: Scope | None = None,
+    ) -> str | None:
+        key = self._graph_error_key(region_id, scope)
+        with self._graph_projection_lock:
+            return self._graph_errors.get(key)
+
+    def _any_graph_error(self) -> str | None:
+        with self._graph_projection_lock:
+            return next(iter(self._graph_errors.values()), None)
+
+    def _load_graph_projection_errors(self) -> dict[str, str]:
+        try:
+            payload = json.loads(self._graph_projection_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        current_schema = payload.get("schema") == _GRAPH_PROJECTION_SCHEMA
+        raw_errors = payload.get("errors") if current_schema else payload
+        if not isinstance(raw_errors, dict):
+            return {}
+        errors: dict[str, str] = {}
+        for raw_key, raw_error in raw_errors.items():
+            if not str(raw_error):
+                continue
+            key = str(raw_key)
+            if current_schema:
+                if not key.startswith(("@scope/v2:", "@region/v2:")):
+                    continue
+            elif key.startswith("region:"):
+                key = self._graph_projection_key(
+                    region_id=key.removeprefix("region:"),
+                    scope=None,
+                )
+            elif key.startswith("scope:"):
+                continue
+            else:
+                continue
+            errors[key] = str(raw_error)
+        return errors
+
+    def _persist_graph_projection_errors_locked(self) -> None:
+        self._graph_projection_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._graph_projection_path.with_name(f"{self._graph_projection_path.name}.tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "schema": _GRAPH_PROJECTION_SCHEMA,
+                    "errors": self._graph_projection_errors,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self._graph_projection_path)
+
+    def _load_graph_projection_manifests(self) -> dict[str, dict[str, str]]:
+        try:
+            payload = json.loads(self._graph_projection_manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != _GRAPH_PROJECTION_MANIFEST_SCHEMA
+            or not isinstance(payload.get("projections"), dict)
+        ):
+            return {}
+        manifests: dict[str, dict[str, str]] = {}
+        for raw_key, raw_manifest in payload["projections"].items():
+            key = str(raw_key)
+            if not key.startswith("@scope/v2:") or not isinstance(raw_manifest, dict):
+                continue
+            kv_fingerprint = raw_manifest.get("kv_fingerprint")
+            graph_fingerprint = raw_manifest.get("graph_fingerprint")
+            if not isinstance(kv_fingerprint, str) or not isinstance(
+                graph_fingerprint,
+                str,
+            ):
+                continue
+            manifests[key] = {
+                "kv_fingerprint": kv_fingerprint,
+                "graph_fingerprint": graph_fingerprint,
+            }
+        return manifests
+
+    def _persist_graph_projection_manifests_locked(self) -> None:
+        self._graph_projection_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._graph_projection_manifest_path.with_name(
+            f"{self._graph_projection_manifest_path.name}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(
+                {
+                    "schema": _GRAPH_PROJECTION_MANIFEST_SCHEMA,
+                    "projections": self._graph_projection_manifests,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self._graph_projection_manifest_path)
+
+    def _graph_projection_manifest(
+        self,
+        scope: Scope,
+    ) -> dict[str, str] | None:
+        key = self._graph_projection_key(None, scope)
+        with self._graph_projection_lock:
+            manifest = self._graph_projection_manifests.get(key)
+            return None if manifest is None else dict(manifest)
+
+    def _set_graph_projection_error(
+        self,
+        error: str,
+        *,
+        region_id: str | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        key = self._graph_projection_key(region_id, scope)
+        if not key:
+            return
+        with self._graph_projection_lock:
+            self._graph_projection_errors[key] = error
+            try:
+                self._persist_graph_projection_errors_locked()
+            except OSError as persist_error:
+                self._set_graph_error(
+                    f"graph projection status persist failed: {persist_error}",
+                    region_id=region_id,
+                    scope=scope,
+                )
+
+    def _clear_graph_projection_error(
+        self,
+        *,
+        region_id: str | None = None,
+        scope: Scope | None = None,
+    ) -> None:
+        key = self._graph_projection_key(region_id, scope)
+        if not key:
+            return
+        with self._graph_projection_lock:
+            if self._graph_projection_errors.pop(key, None) is None:
+                return
+            try:
+                self._persist_graph_projection_errors_locked()
+            except OSError as persist_error:
+                self._set_graph_error(
+                    f"graph projection status persist failed: {persist_error}",
+                    region_id=region_id,
+                    scope=scope,
+                )
+
+    def _clear_graph_projection_errors_for_region(
+        self,
+        region: MemoryRegion,
+    ) -> None:
+        region_key = self._graph_projection_key(region.region_id, None)
+        with self._graph_projection_lock:
+            stale_keys = []
+            for key in self._graph_projection_errors:
+                region_id, scope = self._decode_graph_projection_key(key)
+                if key == region_key or (
+                    scope is not None and self._scope_matches_region(scope, region)
+                ):
+                    stale_keys.append(key)
+            if not stale_keys:
+                return
+            for key in stale_keys:
+                self._graph_projection_errors.pop(key, None)
+            try:
+                self._persist_graph_projection_errors_locked()
+            except OSError as persist_error:
+                self._set_graph_error(
+                    f"graph projection status persist failed: {persist_error}",
+                    region_id=region.region_id,
+                )
+
+    def _clear_graph_errors_for_region(self, region: MemoryRegion) -> None:
+        region_key = self._graph_projection_key(region.region_id, None)
+        with self._graph_projection_lock:
+            stale_keys = []
+            for key in self._graph_errors:
+                region_id, scope = self._decode_graph_projection_key(key)
+                if key == region_key or (
+                    scope is not None and self._scope_matches_region(scope, region)
+                ):
+                    stale_keys.append(key)
+            for key in stale_keys:
+                self._graph_errors.pop(key, None)
+
+    def _graph_projection_errors_for_region(
+        self,
+        region: MemoryRegion,
+    ) -> list[str]:
+        region_key = self._graph_projection_key(region.region_id, None)
+        with self._graph_projection_lock:
+            errors = []
+            for key, error in self._graph_projection_errors.items():
+                region_id, scope = self._decode_graph_projection_key(key)
+                if key == region_key or (
+                    scope is not None and self._scope_matches_region(scope, region)
+                ):
+                    errors.append(error)
+            return errors
+
+    def _graph_errors_for_region(self, region: MemoryRegion) -> list[str]:
+        region_key = self._graph_projection_key(region.region_id, None)
+        with self._graph_projection_lock:
+            errors = []
+            for key, error in self._graph_errors.items():
+                region_id, scope = self._decode_graph_projection_key(key)
+                if key == region_key or (
+                    scope is not None and self._scope_matches_region(scope, region)
+                ):
+                    errors.append(error)
+            return errors
+
+    def _remove_graph_nodes(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        node_ids: list[str],
+        region_id: str,
+    ) -> None:
+        with self._graph_write_lock:
+            self._remove_graph_nodes_locked(bundle, scope, node_ids, region_id)
+
+    def _remove_graph_nodes_locked(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        node_ids: list[str],
+        region_id: str,
+    ) -> None:
+        graph_store = bundle.graph_store
+        if graph_store is None or not node_ids:
+            return
+        try:
+            graph_store.delete(scope, node_ids=node_ids)
+            self._record_graph_projection(bundle, scope)
+        except Exception as error:
+            failure = f"graph cleanup failed: {error}"
+            self._set_graph_error(failure, region_id=region_id)
+            self._set_graph_projection_error(failure, scope=scope)
+
+    def _prune_inactive_graph_nodes(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        *,
+        region_id: str,
+    ) -> None:
+        graph_store = bundle.graph_store
+        if graph_store is None:
+            return
+        node_ids = getattr(graph_store, "node_ids", None)
+        if not callable(node_ids):
+            return
+        active_ids = {
+            unit.id
+            for unit in self._units_in_scope(bundle, scope)
+            if unit.system_metadata.get("middle") != "true"
+            and unit.lifecycle.value == "active"
+            and unit.user_metadata.get("restore_pending") is not True
+        }
+        try:
+            stale_ids = sorted(set(node_ids(scope)) - active_ids)
+            if stale_ids:
+                graph_store.delete(scope, node_ids=stale_ids)
+        except Exception as error:
+            failure = f"graph projection cleanup failed: {error}"
+            self._set_graph_error(failure, region_id=region_id)
+            self._set_graph_projection_error(failure, scope=scope)
+            raise MemoryKernelUnavailableError(failure) from error
+
+    def _reproject_graph_scope(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        *,
+        region_id: str,
+    ) -> None:
+        with self._graph_write_lock:
+            self._reproject_graph_scope_locked(
+                bundle,
+                scope,
+                region_id=region_id,
+            )
+
+    def _reproject_graph_scope_locked(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        *,
+        region_id: str,
+    ) -> None:
+        graph_store = bundle.graph_store
+        if graph_store is None:
+            return
+        try:
+            clear_diagnostics = getattr(graph_store, "clear_diagnostics", None)
+            if callable(clear_diagnostics):
+                clear_diagnostics(scope)
+            graph_store.clear(scope)
+            job_id = self._associate_graph_scope(
+                bundle,
+                scope,
+                region_id=region_id,
+            )
+            if job_id is None:
+                return
+            self._verify_graph_projection(bundle, scope)
+        except Exception as error:
+            failure = f"graph reprojection failed: {error}"
+            self._set_graph_error(failure, region_id=region_id)
+            self._set_graph_projection_error(failure, scope=scope)
+
+    def _region_id_for_scope(self, scope: Scope) -> str | None:
+        for region in self._regions.list_regions():
+            if region.space != scope.space:
+                continue
+            if region.kind != "session":
+                return region.region_id
+            if scope.session and scope.session == region.session_id:
+                return region.region_id
+            if not scope.session and not region.session_id:
+                return region.region_id
+        return None
+
+    def _graph_region_or_none(self, library_id: str) -> MemoryRegion | None:
+        try:
+            return self._regions.require_region(library_id)
+        except RegionError:
+            return None
+
+    @staticmethod
+    def _graph_status_scopes(bundle: _RuntimeBundle) -> list[Scope]:
+        scopes = list(bundle.kv_store.scopes())
+        graph_scopes = getattr(bundle.graph_store, "graph_scopes", None)
+        if callable(graph_scopes):
+            for scope in graph_scopes():
+                if scope not in scopes:
+                    scopes.append(scope)
+        return scopes
+
+    def _region_scopes(self, bundle: _RuntimeBundle, region: MemoryRegion) -> list[Scope]:
+        scopes = []
+        for scope in bundle.kv_store.scopes():
+            if scope.space != region.space:
+                continue
+            if region.kind == "session" and scope.session != (region.session_id or ""):
+                continue
+            scopes.append(scope)
+        graph_scopes = getattr(bundle.graph_store, "graph_scopes", None)
+        if callable(graph_scopes):
+            for scope in graph_scopes():
+                if scope.space != region.space:
+                    continue
+                if region.kind == "session" and scope.session != (region.session_id or ""):
+                    continue
+                if scope not in scopes:
+                    scopes.append(scope)
+        base_session = region.session_id if region.kind == "session" else ""
+        for agent in _SEARCH_AGENTS:
+            expected = _scope_for_region(
+                region,
+                session_id=base_session,
+                agent=agent,
+            )
+            if expected not in scopes:
+                scopes.append(expected)
+        return sorted(
+            scopes,
+            key=lambda scope: (
+                scope.space,
+                scope.agent,
+                scope.session,
+                scope.user,
+                scope.org,
+            ),
         )
 
     async def write(self, request: MemoryWriteRequest) -> dict[str, object]:
@@ -398,9 +1516,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 scope = _scope_for_normalized_library(request.library_id)
                 identity = request.library_id
             request_hash = _write_request_hash(request)
-            existing_id = self._reserve_idempotency(
-                identity, request.idempotency_key, request_hash
-            )
+            existing_id = self._reserve_idempotency(identity, request.idempotency_key, request_hash)
             if existing_id is not None:
                 return _write_response(request, existing_id, status="existing")
             user_metadata = {
@@ -459,9 +1575,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
         except Exception:
             if isinstance(request, CreateMemoryRequest):
-                self._release_pending_idempotency(
-                    _write_identity(request), request.idempotency_key
-                )
+                self._release_pending_idempotency(_write_identity(request), request.idempotency_key)
             elif isinstance(request, CaptureMemoryRequest):
                 try:
                     self._purge_capture_units(bundle, scope, request.event_id)
@@ -473,9 +1587,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise
         if not units:
             if isinstance(request, CreateMemoryRequest):
-                self._release_pending_idempotency(
-                    _write_identity(request), request.idempotency_key
-                )
+                self._release_pending_idempotency(_write_identity(request), request.idempotency_key)
             elif isinstance(request, CaptureMemoryRequest):
                 try:
                     self._purge_capture_units(bundle, scope, request.event_id)
@@ -517,9 +1629,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     def _search(self, request: SearchMemoryRequest) -> dict[str, object]:
         if request.session_id is not None:
-            request = replace(
-                request, session_id=_normalize_session_id(request.session_id)
-            )
+            request = replace(request, session_id=_normalize_session_id(request.session_id))
         if request.topic_id is not None:
             request = replace(
                 request,
@@ -530,9 +1640,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             return self._search_regions(bundle, request)
         if request.region_id is not None:
             region = self._regions.require_region(request.region_id)
-            return self._search_region_session(
-                bundle, request, region, "explicit_region"
-            )
+            return self._search_region_session(bundle, request, region, "explicit_region")
         if request.library_id is not None:
             library_id = validate_library_id(request.library_id)
             normalized = replace(request, library_id=library_id)
@@ -545,9 +1653,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             request.cwd or "", request.session_id
         )
         if resolved_region is not None:
-            return self._search_region_session(
-                bundle, request, resolved_region, "project_cwd"
-            )
+            return self._search_region_session(bundle, request, resolved_region, "project_cwd")
         if request.topic_id is not None:
             topic_id = request.topic_id.strip()
             if not topic_id:
@@ -698,6 +1804,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         merged: dict[str, dict[str, object]] = {}
         degradation: list[str] = []
         vector_statuses: set[str] = set()
+        graph_statuses: set[str] = set()
         for scope, region in targets:
             scoped_request = replace(
                 request,
@@ -715,6 +1822,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     if reason_text not in degradation:
                         degradation.append(reason_text)
             vector_statuses.add(str(response.get("vector_index_status", "degraded")))
+            graph_statuses.add(str(response.get("graph_index_status", "degraded")))
             raw_results = response.get("results", [])
             if not isinstance(raw_results, list):
                 continue
@@ -728,22 +1836,30 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 item_id = str(item.get("document_id", ""))
                 previous = merged.get(item_id)
                 item_score = float(str(item.get("score", 0.0)))
-                previous_score = (
-                    0.0 if previous is None else float(str(previous.get("score", 0.0)))
-                )
+                previous_score = 0.0 if previous is None else float(str(previous.get("score", 0.0)))
                 if previous is None or item_score > previous_score:
                     merged[item_id] = item
-        results = sorted(
+        ranked = sorted(
             merged.values(),
             key=lambda item: float(str(item.get("score", 0.0))),
             reverse=True,
-        )[: max(1, min(request.limit, 100))]
+        )
+        results = _truncate_search_results(
+            ranked,
+            max(1, min(request.limit, 100)),
+        )
         if vector_statuses == {"ready"}:
             vector_status = "ready"
         elif "degraded" in vector_statuses:
             vector_status = "degraded"
         else:
             vector_status = "not_configured"
+        if graph_statuses == {"ready"}:
+            graph_status = "ready"
+        elif "degraded" in graph_statuses:
+            graph_status = "degraded"
+        else:
+            graph_status = "not_configured"
         return {
             "status": "bound",
             "scope": {
@@ -759,7 +1875,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "degraded": bool(degradation),
             "degradation": degradation,
             "vector_index_status": vector_status,
-            "graph_index_status": "not_configured",
+            "graph_index_status": graph_status,
             "results": results,
         }
 
@@ -779,6 +1895,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             items, failed = self._keyword_fallback(bundle, scope, request)
             if failed:
                 degradation.append("fulltext_unavailable")
+            items = self._append_graph_expansions(
+                bundle, scope, items, request, degradation, region
+            )
+            graph_status = self._graph_ready_status(bundle, scope, region)
             return _search_response(
                 request,
                 scope,
@@ -786,6 +1906,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 [],
                 degradation,
                 vector_status="not_configured",
+                graph_status=graph_status,
                 region=region,
             )
         try:
@@ -805,6 +1926,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             units, failed = self._keyword_fallback(bundle, scope, request)
             if failed and "fulltext_unavailable" not in degradation:
                 degradation.append("fulltext_unavailable")
+            units = self._append_graph_expansions(
+                bundle, scope, units, request, degradation, region
+            )
+            graph_status = self._graph_ready_status(bundle, scope, region)
             return _search_response(
                 request,
                 scope,
@@ -812,6 +1937,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 [],
                 degradation,
                 vector_status="degraded",
+                graph_status=graph_status,
                 region=region,
             )
 
@@ -840,6 +1966,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             if vector_failed
             else "ready"
         )
+        items = self._append_graph_expansions(bundle, scope, items, request, degradation, region)
+        graph_status = self._graph_ready_status(bundle, scope, region)
         return _search_response(
             request,
             scope,
@@ -847,8 +1975,192 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             reported_errors,
             degradation,
             vector_status=vector_status,
+            graph_status=graph_status,
             region=region,
         )
+
+    def _graph_ready_status(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        region: MemoryRegion | None,
+    ) -> str:
+        if bundle.graph_store is None:
+            return "not_configured"
+        with self._graph_write_lock:
+            return self._graph_ready_status_locked(bundle, scope, region)
+
+    def _graph_ready_status_locked(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        region: MemoryRegion | None,
+    ) -> str:
+        graph_store = bundle.graph_store
+        assert graph_store is not None
+        transient_error = self._graph_error_for(scope=scope)
+        if transient_error is None and region is not None:
+            transient_error = self._graph_error_for(region_id=region.region_id)
+        if transient_error is not None:
+            return "degraded"
+        projection_error = self._graph_projection_error(scope=scope)
+        if projection_error is None and region is not None:
+            projection_error = self._graph_projection_error(region_id=region.region_id)
+        if (
+            projection_error is None
+            and region is None
+            and scope.space.startswith(LIBRARY_SCOPE_PREFIX)
+        ):
+            projection_error = self._graph_projection_error(
+                region_id=scope.space.removeprefix(LIBRARY_SCOPE_PREFIX)
+            )
+        if projection_error is not None:
+            return "degraded"
+        if self._graph_store_error(bundle, scope):
+            return "degraded"
+        try:
+            graph_store.health()
+            _, _, mismatch = self._graph_projection_snapshot(bundle, scope)
+            if mismatch is not None:
+                return "degraded"
+        except Exception:
+            return "degraded"
+        return "ready"
+
+    def _append_graph_expansions(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        items: list[Any],
+        request: SearchMemoryRequest,
+        degradation: list[str],
+        region: MemoryRegion | None,
+    ) -> list[Any]:
+        graph_store = bundle.graph_store
+        if graph_store is None:
+            return list(items)
+        with self._graph_write_lock:
+            return self._append_graph_expansions_locked(
+                bundle,
+                scope,
+                items,
+                request,
+                degradation,
+                region,
+            )
+
+    def _append_graph_expansions_locked(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        items: list[Any],
+        request: SearchMemoryRequest,
+        degradation: list[str],
+        region: MemoryRegion | None,
+    ) -> list[Any]:
+        graph_store = bundle.graph_store
+        if graph_store is None:
+            return list(items)
+        projection_error = self._graph_projection_error(scope=scope)
+        if projection_error is None and region is not None:
+            projection_error = self._graph_projection_error(region_id=region.region_id)
+        if (
+            projection_error is None
+            and region is None
+            and scope.space.startswith(LIBRARY_SCOPE_PREFIX)
+        ):
+            projection_error = self._graph_projection_error(
+                region_id=scope.space.removeprefix(LIBRARY_SCOPE_PREFIX)
+            )
+        if projection_error is not None:
+            self._set_graph_error(
+                projection_error,
+                region_id=region.region_id if region is not None else None,
+                scope=scope,
+            )
+            if "graph_unavailable" not in degradation:
+                degradation.append("graph_unavailable")
+            return list(items)
+        store_error = self._graph_store_error(bundle, scope)
+        if store_error is not None:
+            self._set_graph_error(
+                store_error,
+                region_id=region.region_id if region is not None else None,
+                scope=scope,
+            )
+            if "graph_unavailable" not in degradation:
+                degradation.append("graph_unavailable")
+            return list(items)
+        _, _, projection_mismatch = self._graph_projection_snapshot(bundle, scope)
+        if projection_mismatch is not None:
+            self._set_graph_error(
+                projection_mismatch,
+                region_id=region.region_id if region is not None else None,
+                scope=scope,
+            )
+            if "graph_unavailable" not in degradation:
+                degradation.append("graph_unavailable")
+            return list(items)
+        try:
+            graph_store.health()
+            if not items:
+                return list(items)
+            direct_ids = {
+                str(item.id if isinstance(item, MemoryUnit) else item.unit_id)
+                for item in items
+                if isinstance(item, MemoryUnit) or hasattr(item, "unit_id")
+            }
+            if not direct_ids:
+                return list(items)
+            seeds = graph_store.get(scope, sorted(direct_ids))
+            if not seeds:
+                return list(items)
+            depth = max(1, min(request.max_graph_hops, 2))
+            limit = max(1, min(request.limit, 100))
+            traversed = graph_store.traverse_many(
+                scope,
+                [seed.id for seed in seeds],
+                depth=depth,
+                limit=limit,
+            )
+            units_by_id = {
+                unit.id: unit
+                for unit in load_units(
+                    bundle.kv_store,
+                    scope,
+                    [node.id for node, _, _ in traversed],
+                )
+            }
+            expanded: list[dict[str, object]] = []
+            for node, hop, seed_id in traversed:
+                unit = units_by_id.get(node.id)
+                if unit is None:
+                    continue
+                if unit.lifecycle.value != "active":
+                    continue
+                if unit.user_metadata.get("restore_pending") is True:
+                    continue
+                payload = _result_item(unit, request)
+                payload["classification"] = "graph_expansion"
+                payload["graph_hop"] = hop
+                payload["graph_object_type"] = "node"
+                payload["graph_source_id"] = seed_id
+                payload["retrieval_sources"] = ["graph"]
+                expanded.append(payload)
+            self._clear_graph_error(
+                region_id=region.region_id if region is not None else None,
+                scope=scope,
+            )
+            return [*items, *expanded]
+        except Exception as error:
+            self._set_graph_error(
+                str(error),
+                region_id=region.region_id if region is not None else None,
+                scope=scope,
+            )
+            if "graph_unavailable" not in degradation:
+                degradation.append("graph_unavailable")
+            return list(items)
 
     def _scope_for_cwd(self, cwd: str, session_id: str | None) -> Scope:
         scope, _ = self._scope_for_cwd_with_region(cwd, session_id)
@@ -893,9 +2205,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         except Exception:
             return [], True
 
-    def list_documents(
-        self, request: ListDocumentsRequest
-    ) -> list[dict[str, object]]:
+    def list_documents(self, request: ListDocumentsRequest) -> list[dict[str, object]]:
         bundle = self._require_bundle()
         region = self._governance_region(request.library_id)
         payloads = {
@@ -941,9 +2251,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     async def update(self, request: MemoryUpdateRequest) -> dict[str, object]:
         return await asyncio.to_thread(self._update_document_serialized, request)
 
-    def _update_document_serialized(
-        self, request: MemoryUpdateRequest
-    ) -> dict[str, object]:
+    def _update_document_serialized(self, request: MemoryUpdateRequest) -> dict[str, object]:
         if not isinstance(request, DocumentUpdateRequest):
             return self._update_document(request)
         with self._governance_region_lock(request.library_id):
@@ -994,6 +2302,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 detail={"previous_unit_id": unit.id},
             )
             raise
+        if bundle.graph_store is not None:
+            self._reproject_graph_scope(
+                bundle,
+                scope,
+                region_id=region.region_id,
+            )
         self._finish_governance_event(
             event_id,
             status="committed",
@@ -1003,9 +2317,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         )
         return _unit_payload(updated, region)
 
-    def preview_document_update(
-        self, request: PreviewDocumentUpdateRequest
-    ) -> dict[str, object]:
+    def preview_document_update(self, request: PreviewDocumentUpdateRequest) -> dict[str, object]:
         bundle = self._require_bundle()
         region = self._governance_region(request.library_id)
         _, unit = self._find_region_unit(bundle, region, request.path)
@@ -1028,9 +2340,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     ) -> dict[str, object]:
         return await asyncio.to_thread(self._preview_document_delete, request)
 
-    def _preview_document_delete(
-        self, request: PreviewDocumentDeleteRequest
-    ) -> dict[str, object]:
+    def _preview_document_delete(self, request: PreviewDocumentDeleteRequest) -> dict[str, object]:
         bundle = self._require_bundle()
         region = self._governance_region(request.library_id)
         _, unit = self._find_region_unit(bundle, region, request.path)
@@ -1092,6 +2402,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 detail={"mode": request.mode},
             )
             raise
+        if deleted and request.mode != "downweight":
+            deleted_ids = (
+                [str(item) for item in deleted] if isinstance(deleted, list) else [unit.id]
+            )
+            self._remove_graph_nodes(
+                bundle,
+                scope,
+                list(dict.fromkeys(deleted_ids)),
+                region.region_id,
+            )
         detail: dict[str, object] = {
             "deleted": bool(deleted),
             "mode": request.mode,
@@ -1102,9 +2422,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 if refreshed:
                     forgotten = refreshed[0]
                     forgotten.temporal.t_invalid = datetime.now(UTC)
-                    bundle.kv_store.update(
-                        scope, memory_key(forgotten.id), dumps(forgotten)
-                    )
+                    bundle.kv_store.update(scope, memory_key(forgotten.id), dumps(forgotten))
             except Exception:
                 # The deletion already succeeded. Keep it successful and leave
                 # a durable audit marker instead of returning a false 500.
@@ -1123,9 +2441,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "deleted": "true" if deleted else "false",
         }
 
-    def list_forgotten(
-        self, request: ListForgottenRequest
-    ) -> list[dict[str, object]]:
+    def list_forgotten(self, request: ListForgottenRequest) -> list[dict[str, object]]:
         bundle = self._require_bundle()
         region = self._governance_region(request.library_id)
         pairs = self._region_unit_pairs(bundle, region)
@@ -1138,26 +2454,20 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             chain = _version_chain(unit, pairs)
             if any(item.lifecycle.value == "active" for _, item in chain):
                 continue
-            latest_forgotten = [
-                item for _, item in chain if item.lifecycle.value == "forgotten"
-            ][-1]
+            latest_forgotten = [item for _, item in chain if item.lifecycle.value == "forgotten"][
+                -1
+            ]
             if unit.id != latest_forgotten.id:
                 continue
             payload = _unit_payload(unit, region)
-            payload["history"] = [
-                _unit_payload(item, region) for _, item in chain
-            ]
+            payload["history"] = [_unit_payload(item, region) for _, item in chain]
             forgotten.append(payload)
         return forgotten
 
-    async def restore_forgotten(
-        self, request: RestoreForgottenRequest
-    ) -> dict[str, str]:
+    async def restore_forgotten(self, request: RestoreForgottenRequest) -> dict[str, str]:
         return await asyncio.to_thread(self._restore_forgotten_serialized, request)
 
-    def _restore_forgotten_serialized(
-        self, request: RestoreForgottenRequest
-    ) -> dict[str, str]:
+    def _restore_forgotten_serialized(self, request: RestoreForgottenRequest) -> dict[str, str]:
         with self._governance_region_lock(request.library_id):
             return self._restore_forgotten(request)
 
@@ -1170,19 +2480,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryGovernanceError("memory is not forgotten")
         chain = _version_chain(unit, pairs)
         chain_ids = {item.id for _, item in chain}
-        forgotten_versions = [
-            item for _, item in chain if item.lifecycle.value == "forgotten"
-        ]
+        forgotten_versions = [item for _, item in chain if item.lifecycle.value == "forgotten"]
         latest_forgotten = forgotten_versions[-1]
         if unit.id != latest_forgotten.id:
-            raise MemoryLifecycleConflictError(
-                "restore must use the latest forgotten version"
-            )
+            raise MemoryLifecycleConflictError("restore must use the latest forgotten version")
         old_scope, old = self._find_region_unit(bundle, region, request.commit)
         if old.id not in chain_ids:
-            raise MemoryRecordNotFoundError(
-                "memory version not found in document history"
-            )
+            raise MemoryRecordNotFoundError("memory version not found in document history")
         active_versions = [
             item
             for _, item in pairs
@@ -1195,9 +2499,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
         ]
         if active_versions:
-            raise MemoryLifecycleConflictError(
-                "forgotten memory already has an active version"
-            )
+            raise MemoryLifecycleConflictError("forgotten memory already has an active version")
         event_id = self._begin_governance_event(
             region.region_id,
             latest_forgotten.id,
@@ -1254,9 +2556,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         restored_unit.provenance = [old.id]
         restored_unit.user_metadata.pop("restore_pending", None)
         try:
-            bundle.kv_store.update(
-                old_scope, memory_key(restored_unit.id), dumps(restored_unit)
-            )
+            bundle.kv_store.update(old_scope, memory_key(restored_unit.id), dumps(restored_unit))
         except Exception:
             try:
                 bundle.runtime.api.delete(
@@ -1321,6 +2621,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryKernelUnavailableError(
                 "forgotten memory restore could not persist its version link"
             ) from None
+        if bundle.graph_store is not None:
+            self._reproject_graph_scope(
+                bundle,
+                old_scope,
+                region_id=region.region_id,
+            )
         self._finish_governance_event(
             event_id,
             status="committed",
@@ -1351,14 +2657,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "diff": _content_diff(unit.content, current.content),
         }
 
-    async def restore_document(
-        self, request: RestoreDocumentRequest
-    ) -> dict[str, str]:
+    async def restore_document(self, request: RestoreDocumentRequest) -> dict[str, str]:
         return await asyncio.to_thread(self._restore_document_serialized, request)
 
-    def _restore_document_serialized(
-        self, request: RestoreDocumentRequest
-    ) -> dict[str, str]:
+    def _restore_document_serialized(self, request: RestoreDocumentRequest) -> dict[str, str]:
         with self._governance_region_lock(request.library_id):
             return self._restore_document(request)
 
@@ -1375,9 +2677,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         pairs = self._region_unit_pairs(bundle, region)
         chain_ids = {item.id for _, item in _version_chain(current, pairs)}
         if old.id not in chain_ids:
-            raise MemoryRecordNotFoundError(
-                "memory version not found in document history"
-            )
+            raise MemoryRecordNotFoundError("memory version not found in document history")
         _require_revision(current, request.expected_revision)
         _require_active(current, "history restore")
         event_id = self._begin_governance_event(
@@ -1416,6 +2716,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 detail={"restored_from": old.id, "previous_unit_id": current.id},
             )
             raise
+        if bundle.graph_store is not None:
+            self._reproject_graph_scope(
+                bundle,
+                scope,
+                region_id=region.region_id,
+            )
         self._finish_governance_event(
             event_id,
             status="committed",
@@ -1507,9 +2813,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 ),
             )
             if cursor.lastrowid is None:
-                raise MemoryKernelUnavailableError(
-                    "governance audit event was not persisted"
-                )
+                raise MemoryKernelUnavailableError("governance audit event was not persisted")
             return cursor.lastrowid
 
     def _finish_governance_event(
@@ -1540,9 +2844,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             # failure must not turn a committed mutation into a false 500.
             return
 
-    def _governance_audit_events(
-        self, region_id: str, limit: int
-    ) -> list[dict[str, str]]:
+    def _governance_audit_events(self, region_id: str, limit: int) -> list[dict[str, str]]:
         with closing(self._maintenance_db()) as connection:
             rows = connection.execute(
                 """SELECT id, unit_id, action, actor, source, operation_id,
@@ -1663,17 +2965,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     def _evolve_locked(self, request: EvolveMemoryRequest) -> dict[str, int]:
         bundle = self._require_bundle()
         session_id = (
-            _normalize_session_id(request.session_id)
-            if request.session_id is not None
-            else None
+            _normalize_session_id(request.session_id) if request.session_id is not None else None
         )
         created = 0
-        scopes = [
+        all_scopes = [
             scope
             for scope in bundle.kv_store.scopes()
-            if scope.space not in {"user"}
-            and (session_id is None or scope.session == session_id)
+            if session_id is None or scope.session == session_id
         ]
+        scopes = [scope for scope in all_scopes if scope.space not in {"user"}]
+        target_scopes: list[Scope] = []
         for scope in scopes:
             units = self._units_in_scope(bundle, scope)
             captured = [
@@ -1711,13 +3012,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 source_fingerprint = _source_fingerprint(source_ids)
                 target_scope = _scope_for_region(
                     region,
-                    session_id=(
-                        region.session_id or ""
-                        if region.kind == "session"
-                        else ""
-                    ),
+                    session_id=(region.session_id or "" if region.kind == "session" else ""),
                     agent=scope.agent,
                 )
+                if target_scope not in target_scopes:
+                    target_scopes.append(target_scope)
                 status, memory_id = self._reserve_evolution(
                     evolve_key,
                     scope.session,
@@ -1791,11 +3090,28 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     raise
                 self._complete_evolution(evolve_key, added_units[0].id)
                 created += 1
+        if bundle.graph_store is not None:
+            with self._graph_write_lock:
+                graph_scopes = list(all_scopes)
+                for scope in bundle.kv_store.scopes():
+                    if session_id is not None and scope.session != session_id:
+                        continue
+                    if scope not in graph_scopes:
+                        graph_scopes.append(scope)
+                for scope in target_scopes:
+                    if scope not in graph_scopes:
+                        graph_scopes.append(scope)
+                for scope in graph_scopes:
+                    if request.deadline is not None and time.monotonic() >= request.deadline:
+                        break
+                    self._associate_graph_scope(
+                        bundle,
+                        scope,
+                        region_id=self._region_id_for_scope(scope),
+                    )
         return {"queued": created}
 
-    def get_retention_policy(
-        self, request: RetentionPolicyRequest
-    ) -> dict[str, object]:
+    def get_retention_policy(self, request: RetentionPolicyRequest) -> dict[str, object]:
         region = self._session_region(request.library_id)
         days = self._retention_days(region.region_id)
         return self._retention_payload(region, days)
@@ -1805,9 +3121,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     ) -> dict[str, object]:
         return await asyncio.to_thread(self._update_retention_policy, request)
 
-    def _update_retention_policy(
-        self, request: UpdateRetentionPolicyRequest
-    ) -> dict[str, object]:
+    def _update_retention_policy(self, request: UpdateRetentionPolicyRequest) -> dict[str, object]:
         region = self._session_region(request.library_id)
         if request.inbox_days < 0:
             raise ValueError("retention days cannot be negative")
@@ -1827,9 +3141,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     ) -> dict[str, object]:
         return await asyncio.to_thread(self._preview_retention_cleanup, request)
 
-    def _preview_retention_cleanup(
-        self, request: RetentionCleanupRequest
-    ) -> dict[str, object]:
+    def _preview_retention_cleanup(self, request: RetentionCleanupRequest) -> dict[str, object]:
         region = self._session_region(request.library_id)
         plan = self._retention_plan(region)
         return {
@@ -1844,14 +3156,19 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             },
         }
 
-    async def run_retention_cleanup(
-        self, request: RetentionCleanupRequest
-    ) -> dict[str, object]:
+    async def run_retention_cleanup(self, request: RetentionCleanupRequest) -> dict[str, object]:
         return await asyncio.to_thread(self._run_retention_cleanup, request)
 
-    def _run_retention_cleanup(
-        self, request: RetentionCleanupRequest
-    ) -> dict[str, object]:
+    def _run_retention_cleanup(self, request: RetentionCleanupRequest) -> dict[str, object]:
+        region = self._session_region(request.library_id)
+        with (
+            self._maintenance_lock,
+            self._governance_region_lock(region.region_id),
+            self._graph_write_lock,
+        ):
+            return self._run_retention_cleanup_locked(request)
+
+    def _run_retention_cleanup_locked(self, request: RetentionCleanupRequest) -> dict[str, object]:
         bundle = self._require_bundle()
         region = self._session_region(request.library_id)
         plan = self._retention_plan(region)
@@ -1863,6 +3180,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     mode=DeleteMode.ARCHIVE,
                 ),
                 security=_security_for(scope),
+            )
+            self._remove_graph_nodes(
+                bundle,
+                scope,
+                [unit.id for unit in units],
+                region.region_id,
             )
         return {
             "library_id": region.region_id,
@@ -1876,9 +3199,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             },
         }
 
-    def list_capture_events(
-        self, request: CaptureEventsRequest
-    ) -> list[dict[str, object]]:
+    def list_capture_events(self, request: CaptureEventsRequest) -> list[dict[str, object]]:
         bundle = self._require_bundle()
         session_id = request.session_id.strip() if request.session_id is not None else None
         events: list[dict[str, object]] = []
@@ -1900,23 +3221,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "event_kind": _metadata_text(unit, "event_kind"),
                         "content": unit.content,
                         "occurred_at": _metadata_text(unit, "occurred_at"),
-                        "received_at": (
-                            received.isoformat() if received is not None else ""
-                        ),
+                        "received_at": (received.isoformat() if received is not None else ""),
                         "consolidated_at": None,
                     }
                 )
         events.sort(key=lambda item: (str(item["received_at"]), str(item["event_id"])))
         return events
 
-    def list_capture_rounds(
-        self, request: CaptureRoundsRequest
-    ) -> list[dict[str, object]]:
+    def list_capture_rounds(self, request: CaptureRoundsRequest) -> list[dict[str, object]]:
         events = self.list_capture_events(CaptureEventsRequest(session_id=request.session_id))
-        consolidated = {
-            (session_id, turn_id)
-            for session_id, turn_id in self._evolution_turns()
-        }
+        consolidated = {(session_id, turn_id) for session_id, turn_id in self._evolution_turns()}
         rounds: dict[tuple[str, str, str], dict[str, object]] = {}
         for event in events:
             key = (
@@ -1940,9 +3254,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "updated_at": event["received_at"],
                 }
             else:
-                current["updated_at"] = max(
-                    str(current["updated_at"]), str(event["received_at"])
-                )
+                current["updated_at"] = max(str(current["updated_at"]), str(event["received_at"]))
         return sorted(
             rounds.values(),
             key=lambda item: (str(item["updated_at"]), str(item["turn_id"])),
@@ -1985,9 +3297,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         cutoff = datetime.now(UTC) - timedelta(days=self._retention_days(region.region_id))
         expired: list[tuple[Scope, MemoryUnit]] = []
         for agent in _SEARCH_AGENTS:
-            scope = _scope_for_region(
-                region, session_id=region.session_id, agent=agent
-            )
+            scope = _scope_for_region(region, session_id=region.session_id, agent=agent)
             for unit in self._units_in_scope(bundle, scope):
                 if unit.lifecycle.value != "active" or not _is_capture_unit(unit):
                     continue
@@ -2000,9 +3310,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         bundle = self._require_bundle()
         count = 0
         for agent in _SEARCH_AGENTS:
-            scope = _scope_for_region(
-                region, session_id=region.session_id, agent=agent
-            )
+            scope = _scope_for_region(region, session_id=region.session_id, agent=agent)
             count += sum(
                 1
                 for unit in self._units_in_scope(bundle, scope)
@@ -2046,9 +3354,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 )
             return
         with connection:
-            connection.execute(
-                "ALTER TABLE capture_evolutions RENAME TO capture_evolutions_v1"
-            )
+            connection.execute("ALTER TABLE capture_evolutions RENAME TO capture_evolutions_v1")
             connection.execute(_SESSION_RETENTION_SCHEMA)
             connection.execute(_CAPTURE_EVOLUTIONS_SCHEMA)
             connection.execute(_GOVERNANCE_AUDIT_SCHEMA)
@@ -2067,9 +3373,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     def _ensure_governance_schema(connection: sqlite3.Connection) -> None:
         columns = {
             str(row[1]): row
-            for row in connection.execute(
-                "PRAGMA table_info(governance_events)"
-            ).fetchall()
+            for row in connection.execute("PRAGMA table_info(governance_events)").fetchall()
         }
         if "status" not in columns:
             with connection:
@@ -2200,11 +3504,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         except Exception:
             return False
         visible_ids = {str(document.id) for document in documents}
-        return (
-            visible_ids == set(unit_ids)
-            if expected
-            else not visible_ids.intersection(unit_ids)
-        )
+        return visible_ids == set(unit_ids) if expected else not visible_ids.intersection(unit_ids)
 
     def _evolution_visible(
         self,
@@ -2219,10 +3519,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         parts = {_metadata_int(unit, "evolve_part") for unit in units}
         if parts != set(range(expected_parts)):
             return False
-        if any(
-            _metadata_text(unit, "source_fingerprint") != source_fingerprint
-            for unit in units
-        ):
+        if any(_metadata_text(unit, "source_fingerprint") != source_fingerprint for unit in units):
             return False
         return self._fulltext_visible(
             bundle,
@@ -2469,9 +3766,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     def bind_project_region(self, request: BindProjectRegionRequest) -> dict[str, str]:
         return self._regions.bind_project(request.project_root, request.region_id).payload()
 
-    def associate_worktree_region(
-        self, request: AssociateWorktreeRegionRequest
-    ) -> dict[str, str]:
+    def associate_worktree_region(self, request: AssociateWorktreeRegionRequest) -> dict[str, str]:
         return self._regions.associate_worktree(
             request.worktree_root, request.main_project_binding_id
         ).payload()
@@ -2480,9 +3775,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         return [binding.payload() for binding in self._regions.list_bindings()]
 
     def update_region_binding(self, request: UpdateRegionBindingRequest) -> dict[str, str]:
-        return self._regions.update_binding(
-            request.binding_id, request.region_id
-        ).payload()
+        return self._regions.update_binding(request.binding_id, request.region_id).payload()
 
     def delete_region_binding(self, request: DeleteRegionBindingRequest) -> None:
         self._regions.delete_binding(request.binding_id)
@@ -2549,6 +3842,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "default": store("agent_memory_fulltext"),
                 "layers_l0": store("agent_memory_fulltext_l0"),
                 "layers_l1": store("agent_memory_fulltext_l1"),
+            },
+            "graph_store": {
+                "default": {
+                    "target": _STORE_TARGET,
+                    "params": {
+                        "uri": milvus_uri,
+                        "collection": "agent_memory_graph_nodes",
+                        "edge_collection": "agent_memory_graph_edges",
+                    },
+                }
             },
             "audit": {
                 "default": {
@@ -2649,9 +3952,7 @@ def _normalize_session_id(value: str) -> str:
     if not normalized:
         raise ValueError("session_id must not be blank")
     if len(normalized) > MAX_SESSION_ID_LENGTH:
-        raise ValueError(
-            f"session_id exceeds the {MAX_SESSION_ID_LENGTH}-character scope limit"
-        )
+        raise ValueError(f"session_id exceeds the {MAX_SESSION_ID_LENGTH}-character scope limit")
     return normalized
 
 
@@ -2671,9 +3972,7 @@ def _validate_occurred_at(value: str) -> str:
             raise ValueError("occurred_at must include a valid timezone offset")
         parsed.astimezone(UTC)
     except (ValueError, OverflowError) as error:
-        raise ValueError(
-            "occurred_at must be a valid ISO-8601 timestamp with timezone"
-        ) from error
+        raise ValueError("occurred_at must be a valid ISO-8601 timestamp with timezone") from error
     return value
 
 
@@ -2814,11 +4113,7 @@ def _parse_timestamp(value: str) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return (
-            parsed.replace(tzinfo=UTC)
-            if parsed.tzinfo is None
-            else parsed.astimezone(UTC)
-        )
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
     except (ValueError, OverflowError):
         return None
 
@@ -2938,17 +4233,15 @@ def _search_response(
     degradation: list[str],
     *,
     vector_status: str,
+    graph_status: str = "not_configured",
     region: MemoryRegion | None = None,
 ) -> dict[str, object]:
     visible_items = [
         item
         for item in items
-        if not (
-            isinstance(item, MemoryUnit)
-            and item.user_metadata.get("restore_pending") is True
-        )
+        if not (isinstance(item, MemoryUnit) and item.user_metadata.get("restore_pending") is True)
     ]
-    results = [_result_item(item, request) for item in visible_items]
+    results = [_result_payload(item, request) for item in visible_items]
     if region is not None:
         for result in results:
             result["region_id"] = region.region_id
@@ -2973,8 +4266,8 @@ def _search_response(
         "degraded": bool(degradation),
         "degradation": degradation,
         "vector_index_status": vector_status,
-        "graph_index_status": "not_configured",
-        "results": results[: max(1, min(request.limit, 100))],
+        "graph_index_status": graph_status,
+        "results": _truncate_search_results(results, max(1, min(request.limit, 100))),
     }
     if request.library_id is not None:
         response["library_id"] = request.library_id
@@ -3144,6 +4437,35 @@ def _content_diff(before: str, after: str) -> str:
             tofile="after",
         )
     )
+
+
+def _truncate_search_results(
+    results: list[dict[str, object]], limit: int
+) -> list[dict[str, object]]:
+    direct = [item for item in results if item.get("classification") != "graph_expansion"]
+    graph = [item for item in results if item.get("classification") == "graph_expansion"]
+    if limit <= 1:
+        return (direct or graph)[: max(limit, 0)]
+    if not graph:
+        return direct[:limit]
+    graph_slots = min(len(graph), max(1, limit // 5))
+    if limit > 1:
+        graph_slots = min(graph_slots, limit - 1)
+    direct_slots = max(0, limit - graph_slots)
+    selected = direct[:direct_slots] + graph[:graph_slots]
+    remaining = limit - len(selected)
+    if remaining > 0:
+        selected.extend(direct[direct_slots:][:remaining])
+        remaining = limit - len(selected)
+    if remaining > 0:
+        selected.extend(graph[graph_slots:][:remaining])
+    return selected[:limit]
+
+
+def _result_payload(item: Any, request: SearchMemoryRequest) -> dict[str, object]:
+    if isinstance(item, dict):
+        return {str(key): value for key, value in item.items()}
+    return _result_item(item, request)
 
 
 def _result_item(item: Any, request: SearchMemoryRequest) -> dict[str, object]:
