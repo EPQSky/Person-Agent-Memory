@@ -18,7 +18,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 from jiuwen_memory.api import (
     Context,
@@ -137,6 +137,8 @@ class _PromotionDecision(TypedDict):
     confidence: float
     explicit: bool
     topic_id: str | None
+    claim_subject: str
+    claim_value: str
     reason: str
     status: str
 
@@ -144,6 +146,9 @@ class _PromotionDecision(TypedDict):
 class _PromotionOutcome(TypedDict):
     created: bool
     decision: dict[str, object]
+
+
+_PromotionClassified = tuple[_PromotionCandidate, _PromotionDecision, MemoryRegion]
 
 
 _LOCAL_ORG = "local"
@@ -211,6 +216,9 @@ CREATE TABLE IF NOT EXISTS promotion_records (
     classification TEXT NOT NULL,
     confidence REAL NOT NULL,
     audit_event_id INTEGER,
+    evidence_kind TEXT NOT NULL DEFAULT 'explicit',
+    source_unit_ids TEXT NOT NULL DEFAULT '[]',
+    source_region_ids TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 )"""
 _MAINTENANCE_SCHEMA = (
@@ -3256,35 +3264,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             promoted = 0
             skipped = 0
             failed = 0
+            conflict_groups = 0
+            classified: list[_PromotionClassified] = []
             for candidate in candidates:
                 try:
                     decision = self._classify_promotion_candidate(candidate, topics)
-                    target = self._promotion_target(candidate, decision, topics)
-                    if target is None or decision["status"] != "promote":
-                        skipped += 1
-                        decisions.append(
-                            {
-                                "source_unit_id": candidate["unit"].id,
-                                "source_region_id": candidate["region"].region_id,
-                                "classification": decision["category"],
-                                "confidence": decision["confidence"],
-                                "status": "skipped",
-                                "reason": decision["reason"],
-                            }
-                        )
-                        continue
-                    outcome = self._apply_promotion(
-                        bundle,
-                        job_id,
-                        candidate,
-                        target,
-                        decision,
-                    )
-                    if outcome["created"]:
-                        promoted += 1
-                    else:
-                        skipped += 1
-                    decisions.append(outcome["decision"])
                 except Exception as error:
                     failed += 1
                     decisions.append(
@@ -3295,6 +3279,200 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                             "reason": str(error),
                         }
                     )
+                    continue
+                target = self._promotion_target(candidate, decision, topics)
+                if decision["category"] == "sensitive":
+                    self._record_promotion_skip(
+                        job_id,
+                        candidate,
+                        decision,
+                        action="sensitive",
+                        reason="sensitive content requires manual review",
+                    )
+                    skipped += 1
+                    decisions.append(
+                        self._promotion_skip_payload(
+                            candidate,
+                            decision,
+                            target,
+                            status="skipped",
+                            reason="sensitive content requires manual review",
+                        )
+                    )
+                    continue
+                if decision["category"] == "conflict":
+                    conflict_groups += 1
+                    if target is not None:
+                        self._record_promotion_conflict(
+                            job_id,
+                            decision["claim_subject"] or candidate["unit"].id,
+                            target,
+                            (candidate["unit"].content,),
+                            [(candidate, decision, target)],
+                        )
+                    else:
+                        self._record_promotion_skip(
+                            job_id,
+                            candidate,
+                            decision,
+                            action="conflict",
+                            reason="classifier reported a conflict without a promotion target",
+                        )
+                    skipped += 1
+                    decisions.append(
+                        self._promotion_skip_payload(
+                            candidate,
+                            decision,
+                            target,
+                            status="skipped",
+                            reason="classifier reported a conflict",
+                        )
+                    )
+                    continue
+                if target is None:
+                    self._record_promotion_skip(
+                        job_id,
+                        candidate,
+                        decision,
+                        action="promotion_skip",
+                        reason=decision["reason"],
+                    )
+                    skipped += 1
+                    decisions.append(
+                        self._promotion_skip_payload(
+                            candidate,
+                            decision,
+                            target,
+                            status="skipped",
+                            reason=decision["reason"],
+                        )
+                    )
+                    continue
+                classified.append((candidate, decision, target))
+
+            conflicts = self._promotion_conflict_groups(classified)
+            conflict_groups += len(conflicts)
+            conflicted_units: set[str] = set()
+            for (subject, _target_id, values), items in conflicts.items():
+                target = items[0][2]
+                self._record_promotion_conflict(
+                    job_id,
+                    subject,
+                    target,
+                    values,
+                    items,
+                )
+                for candidate, decision, _ in items:
+                    conflicted_units.add(candidate["unit"].id)
+                    skipped += 1
+                    decisions.append(
+                        self._promotion_skip_payload(
+                            candidate,
+                            decision,
+                            target,
+                            status="conflict",
+                            reason="conflicting sources for the same claim",
+                        )
+                    )
+
+            groups: dict[tuple[str, ...], list[_PromotionClassified]] = {}
+            for item in classified:
+                if item[0]["unit"].id in conflicted_units:
+                    continue
+                subject = _normalize_promotion_text(item[1]["claim_subject"])
+                value = _normalize_promotion_claim_value(item[1]["claim_value"])
+                if subject and value:
+                    key = ("claim", subject, value, item[2].region_id)
+                else:
+                    key = (
+                        "content",
+                        _normalize_promotion_text(item[0]["unit"].content),
+                        "",
+                        item[2].region_id,
+                    )
+                groups.setdefault(key, []).append(item)
+
+            for items in groups.values():
+                source_ids = {
+                    source_id
+                    for candidate, _, _ in items
+                    for source_id in self._promotion_evidence_source_ids(candidate)
+                }
+                source_region_ids = {
+                    candidate["region"].region_id for candidate, _, _ in items
+                }
+                explicit_ok = any(
+                    decision["status"] == "promote" and candidate["explicit"]
+                    for candidate, decision, _ in items
+                )
+                if not explicit_ok and len(source_region_ids) < 2:
+                    for candidate, decision, target in items:
+                        self._record_promotion_skip(
+                            job_id,
+                            candidate,
+                            decision,
+                            action="promotion_skip",
+                            reason="insufficient independent evidence",
+                        )
+                        skipped += 1
+                        decisions.append(
+                            self._promotion_skip_payload(
+                                candidate,
+                                decision,
+                                target,
+                                status="skipped",
+                                reason="insufficient independent evidence",
+                                source_unit_ids=sorted(source_ids),
+                            )
+                        )
+                    continue
+                evidence_kind = "explicit" if explicit_ok else "multi_source"
+                representative = min(
+                    items,
+                    key=lambda item: (item[0]["region"].region_id, item[0]["unit"].id),
+                )
+                candidate, decision, target = representative
+                promotion_decision = cast(
+                    _PromotionDecision,
+                    {
+                        **decision,
+                        "status": "promote",
+                        "reason": (
+                            "explicit high-confidence statement"
+                            if explicit_ok
+                            else f"repeated by {len(source_region_ids)} independent sources"
+                        ),
+                    },
+                )
+                try:
+                    outcome = self._apply_promotion(
+                        bundle,
+                        job_id,
+                        [item[0] for item in items],
+                        target,
+                        promotion_decision,
+                        evidence_kind,
+                    )
+                except Exception as error:
+                    failed += 1
+                    decisions.append(
+                        {
+                            "source_unit_id": candidate["unit"].id,
+                            "source_region_id": candidate["region"].region_id,
+                            "status": "failed",
+                            "reason": str(error),
+                        }
+                    )
+                    continue
+                outcome_status = str(outcome["decision"].get("status", ""))
+                if outcome_status == "conflict":
+                    conflict_groups += 1
+                    skipped += 1
+                elif outcome["created"]:
+                    promoted += 1
+                else:
+                    skipped += 1
+                decisions.append(outcome["decision"])
             self._update_promotion_job(
                 job_id,
                 status="completed",
@@ -3304,6 +3482,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "promoted": promoted,
                     "skipped": skipped,
                     "failed": failed,
+                    "conflict_groups": conflict_groups,
+                    "evidence_groups": len(groups),
                     "decisions": decisions,
                 },
             )
@@ -3378,6 +3558,203 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "error": str(row[7]),
         }
 
+    @staticmethod
+    def _promotion_skip_payload(
+        candidate: _PromotionCandidate,
+        decision: _PromotionDecision,
+        target: MemoryRegion | None,
+        *,
+        status: str,
+        reason: str,
+        source_unit_ids: list[str] | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "source_unit_id": candidate["unit"].id,
+            "source_region_id": candidate["region"].region_id,
+            "classification": decision["category"],
+            "confidence": decision["confidence"],
+            "status": status,
+            "reason": reason,
+        }
+        if target is not None:
+            payload["target_region_id"] = target.region_id
+        if source_unit_ids is not None:
+            payload["source_unit_ids"] = source_unit_ids
+        return payload
+
+    def _promotion_conflict_groups(
+        self,
+        classified: list[_PromotionClassified],
+    ) -> dict[tuple[str, str, tuple[str, ...]], list[_PromotionClassified]]:
+        claims: dict[tuple[str, str], dict[str, list[_PromotionClassified]]] = {}
+        for item in classified:
+            candidate, decision, target = item
+            subject = _normalize_promotion_text(decision["claim_subject"])
+            value = _normalize_promotion_claim_value(decision["claim_value"])
+            if not subject or not value:
+                continue
+            claims.setdefault((target.region_id, subject), {}).setdefault(value, []).append(item)
+
+        conflicts: dict[tuple[str, str, tuple[str, ...]], list[_PromotionClassified]] = {}
+        for (target_id, subject), values in claims.items():
+            if len(values) < 2:
+                continue
+            items = [item for batch in values.values() for item in batch]
+            source_ids = {
+                source_id
+                for candidate, _, _ in items
+                for source_id in self._promotion_evidence_source_ids(candidate)
+            }
+            if len(source_ids) < 2:
+                continue
+            if not _promotion_values_conflict(subject, tuple(values)):
+                continue
+            conflicts[(subject, target_id, tuple(sorted(values)))] = items
+        return conflicts
+
+    def _promotion_evidence_source_ids(self, candidate: _PromotionCandidate) -> tuple[str, ...]:
+        user_sources = tuple(
+            source
+            for source in candidate["source_units"]
+            if _metadata_text(source, "event_kind") == "user"
+        )
+        if user_sources:
+            return tuple(dict.fromkeys(str(source.id) for source in user_sources))
+        return (str(candidate["unit"].id),)
+
+    def _record_promotion_skip(
+        self,
+        job_id: str,
+        candidate: _PromotionCandidate,
+        decision: _PromotionDecision,
+        *,
+        action: str,
+        reason: str,
+    ) -> None:
+        source_unit_ids = self._promotion_evidence_source_ids(candidate)
+        detail = {
+            "job_id": job_id,
+            "source_unit_ids": list(source_unit_ids),
+            "source_region_id": candidate["region"].region_id,
+            "source_region_kind": candidate["region"].kind,
+            "classification": decision["category"],
+            "confidence": decision["confidence"],
+            "reason": reason,
+        }
+        operation_material = [
+            action,
+            candidate["region"].region_id,
+            candidate["unit"].id,
+            hashlib.sha256(candidate["unit"].content.encode("utf-8")).hexdigest(),
+            reason,
+        ]
+        operation_id = f"{action}:" + hashlib.sha256(
+            json.dumps(operation_material, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        self._record_promotion_audit(
+            action=action,
+            region_id=candidate["region"].region_id,
+            unit_id=candidate["unit"].id,
+            operation_id=operation_id,
+            job_id=job_id,
+            detail=detail,
+        )
+
+    def _record_promotion_conflict(
+        self,
+        job_id: str,
+        subject: str,
+        target: MemoryRegion,
+        values: tuple[str, ...],
+        items: list[_PromotionClassified],
+    ) -> None:
+        source_regions = {
+            candidate["region"].region_id: candidate["region"]
+            for candidate, _, _ in items
+        }
+        source_unit_ids = sorted(
+            {
+                str(source.id)
+                for candidate, _, _ in items
+                for source in (
+                    candidate["source_units"] or (candidate["unit"],)
+                )
+            }
+        )
+        detail = {
+            "job_id": job_id,
+            "claim_subject": subject,
+            "conflicting_values": sorted(values),
+            "source_unit_ids": source_unit_ids,
+            "source_region_ids": sorted(source_regions),
+            "target_region_id": target.region_id,
+        }
+        conflict_key = hashlib.sha256(
+            json.dumps(
+                [target.region_id, subject, sorted(values)],
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        for region_id, region in sorted(source_regions.items()):
+            unit_id = next(
+                candidate["unit"].id
+                for candidate, _, _ in items
+                if candidate["region"].region_id == region_id
+            )
+            self._record_promotion_audit(
+                action="conflict",
+                region_id=region.region_id,
+                unit_id=unit_id,
+                operation_id=f"conflict:{conflict_key}:{region_id}",
+                job_id=job_id,
+                detail=detail,
+            )
+
+    def _record_promotion_audit(
+        self,
+        *,
+        action: str,
+        region_id: str,
+        unit_id: str,
+        operation_id: str,
+        job_id: str,
+        detail: Mapping[str, object],
+    ) -> None:
+        serialized_detail = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        with closing(self._maintenance_db()) as connection, connection:
+            row = connection.execute(
+                """SELECT id FROM governance_events
+                   WHERE operation_id = ? AND action = ?
+                   ORDER BY id LIMIT 1""",
+                (operation_id, action),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """INSERT INTO governance_events
+                       (region_id, unit_id, action, actor, source, operation_id,
+                        before_content, after_content, detail, status, created_at)
+                       VALUES (?, ?, ?, 'platform:auto-promotion', ?,
+                               ?, '', '', ?, 'committed', ?)""",
+                    (
+                        region_id,
+                        unit_id,
+                        action,
+                        f"promotion:{job_id}",
+                        operation_id,
+                        serialized_detail,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+                return
+            connection.execute(
+                """UPDATE governance_events
+                   SET region_id = ?, unit_id = ?, source = ?, detail = ?,
+                       status = 'committed'
+                   WHERE id = ?""",
+                (region_id, unit_id, f"promotion:{job_id}", serialized_detail, int(row[0])),
+            )
+
     def _promotion_candidates(
         self,
         bundle: _RuntimeBundle,
@@ -3437,6 +3814,59 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         return tuple(load_units(bundle.kv_store, scope, list(dict.fromkeys(source_ids))))
 
     @staticmethod
+    def _promotion_group_sources(
+        candidates: list[_PromotionCandidate],
+    ) -> tuple[
+        tuple[MemoryUnit, ...],
+        list[str],
+        list[str],
+        list[str],
+        list[dict[str, str]],
+        list[str],
+    ]:
+        source_units: list[MemoryUnit] = []
+        seen_units: set[str] = set()
+        source_references: list[str] = []
+        source_regions: list[dict[str, str]] = []
+        source_region_ids: list[str] = []
+        for candidate in candidates:
+            units = candidate["source_units"] or (candidate["unit"],)
+            for source in units:
+                if source.id in seen_units:
+                    continue
+                seen_units.add(str(source.id))
+                source_units.append(source)
+            region = candidate["region"]
+            if region.region_id not in source_region_ids:
+                source_region_ids.append(region.region_id)
+                source_regions.append(
+                    {"region_id": region.region_id, "region_kind": region.kind}
+                )
+            source_references.extend(
+                _promotion_source_references(
+                    candidate["unit"],
+                    candidate["source_units"],
+                    region,
+                )
+            )
+        source_ids = [str(source.id) for source in source_units]
+        source_event_ids = list(
+            dict.fromkeys(
+                event_id
+                for source in source_units
+                if (event_id := _metadata_text(source, "event_id"))
+            )
+        )
+        return (
+            tuple(source_units),
+            source_ids,
+            source_event_ids,
+            list(dict.fromkeys(source_references)),
+            source_regions,
+            source_region_ids,
+        )
+
+    @staticmethod
     def _promotion_has_explicit_source(
         unit: MemoryUnit,
         source_units: tuple[MemoryUnit, ...],
@@ -3488,8 +3918,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         decision: _PromotionDecision,
         topics: list[MemoryRegion],
     ) -> MemoryRegion | None:
-        if decision.get("status") != "promote":
-            return None
         source_region = candidate["region"]
         category = decision["category"]
         target: MemoryRegion | None
@@ -3513,32 +3941,203 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self,
         bundle: _RuntimeBundle,
         job_id: str,
-        candidate: _PromotionCandidate,
+        candidates: list[_PromotionCandidate],
         target: MemoryRegion,
         decision: _PromotionDecision,
+        evidence_kind: str,
     ) -> _PromotionOutcome:
+        if not candidates:
+            raise ValueError("promotion requires at least one candidate")
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (candidate["region"].region_id, candidate["unit"].id),
+        )
+        candidate = ordered[0]
         unit = candidate["unit"]
         source_region = candidate["region"]
-        source_units = candidate["source_units"]
         promotion_key = _promotion_key(unit.content, target.region_id)
         target_scope = _scope_for_region(target)
+        (
+            source_units,
+            source_ids,
+            source_event_ids,
+            source_references,
+            source_regions,
+            source_region_ids,
+        ) = self._promotion_group_sources(ordered)
         with (
             self._maintenance_lock,
             self._promotion_lock,
             self._governance_region_lock(target.region_id),
             self._graph_write_lock,
         ):
-            if self._promotion_record_exists(promotion_key):
+            conflict = self._promotion_existing_conflict(
+                bundle,
+                target_scope,
+                decision,
+                promotion_key=promotion_key,
+            )
+            if conflict is not None:
+                conflict_unit, existing_value, new_value = conflict
+                self._record_promotion_conflict(
+                    job_id,
+                    decision["claim_subject"],
+                    target,
+                    (existing_value, new_value),
+                    [(item, decision, target) for item in ordered],
+                )
                 return {
                     "created": False,
                     "decision": {
                         "source_unit_id": unit.id,
                         "source_region_id": source_region.region_id,
+                        "source_unit_ids": source_ids,
+                        "source_region_ids": source_region_ids,
                         "classification": str(decision["category"]),
                         "confidence": decision["confidence"],
+                        "evidence_kind": evidence_kind,
+                        "status": "conflict",
+                        "target_region_id": target.region_id,
+                        "conflict_unit_id": conflict_unit.id,
+                        "reason": "promotion conflicts with an existing target claim",
+                    },
+                }
+            record = self._promotion_record(promotion_key)
+            if record is not None:
+                target_unit = next(
+                    (
+                        candidate_unit
+                        for candidate_unit in self._units_in_scope(bundle, target_scope)
+                        if candidate_unit.id == record["target_unit_id"]
+                        and candidate_unit.lifecycle.value == "active"
+                    ),
+                    None,
+                )
+                if target_unit is None:
+                    return {
+                        "created": False,
+                        "decision": {
+                            "source_unit_id": unit.id,
+                            "source_region_id": source_region.region_id,
+                            "source_unit_ids": source_ids,
+                            "source_region_ids": source_region_ids,
+                            "classification": str(decision["category"]),
+                            "confidence": decision["confidence"],
+                            "evidence_kind": evidence_kind,
+                            "status": "skipped",
+                            "target_region_id": target.region_id,
+                            "reason": "promotion target is no longer active",
+                        },
+                    }
+                expected_hash = _metadata_text(
+                    target_unit,
+                    "promotion_claim_content_hash",
+                )
+                current_hash = hashlib.sha256(
+                    target_unit.content.encode("utf-8")
+                ).hexdigest()
+                target_changed = (
+                    _normalize_promotion_text(target_unit.content)
+                    != _normalize_promotion_text(unit.content)
+                    or (bool(expected_hash) and expected_hash != current_hash)
+                )
+                if target_changed:
+                    existing_subject, existing_value = _promotion_claim_signature(
+                        target_unit.content
+                    )
+                    existing_subject = _normalize_promotion_text(existing_subject)
+                    existing_value = _normalize_promotion_claim_value(existing_value)
+                    if not existing_subject or not existing_value:
+                        existing_subject = _normalize_promotion_text(
+                            _metadata_text(target_unit, "promotion_claim_subject")
+                        )
+                        existing_value = _normalize_promotion_claim_value(
+                            _metadata_text(target_unit, "promotion_claim_value")
+                        )
+                    if (
+                        existing_subject
+                        and existing_value
+                        and _promotion_subjects_compatible(
+                            existing_subject,
+                            _normalize_promotion_text(decision["claim_subject"]),
+                        )
+                        and _promotion_values_conflict(
+                            existing_subject,
+                            (existing_value, decision["claim_value"]),
+                        )
+                    ):
+                        self._record_promotion_conflict(
+                            job_id,
+                            decision["claim_subject"],
+                            target,
+                            (existing_value, decision["claim_value"]),
+                            [(item, decision, target) for item in ordered],
+                        )
+                        return {
+                            "created": False,
+                            "decision": {
+                                "source_unit_id": unit.id,
+                                "source_region_id": source_region.region_id,
+                                "source_unit_ids": source_ids,
+                                "source_region_ids": source_region_ids,
+                                "classification": str(decision["category"]),
+                                "confidence": decision["confidence"],
+                                "evidence_kind": evidence_kind,
+                                "status": "conflict",
+                                "target_region_id": target.region_id,
+                                "conflict_unit_id": target_unit.id,
+                                "reason": "corrected target conflicts with late source",
+                            },
+                        }
+                    self._record_promotion_skip(
+                        job_id,
+                        candidate,
+                        decision,
+                        action="promotion_skip",
+                        reason="promotion target was corrected after promotion",
+                    )
+                    return {
+                        "created": False,
+                        "decision": {
+                            "source_unit_id": unit.id,
+                            "source_region_id": source_region.region_id,
+                            "source_unit_ids": source_ids,
+                            "source_region_ids": source_region_ids,
+                            "classification": str(decision["category"]),
+                            "confidence": decision["confidence"],
+                            "evidence_kind": evidence_kind,
+                            "status": "skipped",
+                            "target_region_id": target.region_id,
+                            "target_unit_id": target_unit.id,
+                            "reason": "promotion target was corrected after promotion",
+                        },
+                    }
+                merged_unit_ids, merged_region_ids = self._merge_promotion_sources(
+                    bundle,
+                    target_scope,
+                    target_unit,
+                    record,
+                    source_ids,
+                    source_event_ids,
+                    source_references,
+                    source_regions,
+                    source_region_ids,
+                    evidence_kind,
+                )
+                return {
+                    "created": False,
+                    "decision": {
+                        "source_unit_id": unit.id,
+                        "source_region_id": source_region.region_id,
+                        "source_unit_ids": merged_unit_ids,
+                        "source_region_ids": merged_region_ids,
+                        "classification": str(decision["category"]),
+                        "confidence": decision["confidence"],
+                        "evidence_kind": evidence_kind,
                         "status": "skipped",
                         "target_region_id": target.region_id,
-                        "reason": "duplicate promotion key",
+                        "target_unit_id": target_unit.id,
+                        "reason": "promotion already persisted; merged new sources",
                     },
                 }
             existing = self._promoted_target(bundle, target_scope, promotion_key)
@@ -3546,11 +4145,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 self._persist_promotion(
                     existing,
                     target,
-                    unit,
-                    source_region,
+                    ordered,
+                    source_units,
+                    source_references,
                     job_id,
                     promotion_key,
                     decision,
+                    evidence_kind,
                 )
                 if bundle.graph_store is not None:
                     self._associate_graph_scope(
@@ -3563,8 +4164,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "decision": {
                         "source_unit_id": unit.id,
                         "source_region_id": source_region.region_id,
+                        "source_unit_ids": source_ids,
+                        "source_region_ids": source_region_ids,
                         "classification": str(decision["category"]),
                         "confidence": decision["confidence"],
+                        "evidence_kind": evidence_kind,
                         "status": "skipped",
                         "target_region_id": target.region_id,
                         "target_unit_id": existing.id,
@@ -3572,17 +4176,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     },
                 }
 
-            source_ids = [str(source.id) for source in source_units] or [unit.id]
-            source_event_ids = [
-                _metadata_text(source, "event_id")
-                for source in source_units
-                if _metadata_text(source, "event_id")
-            ]
-            source_references = _promotion_source_references(
-                unit,
-                source_units,
-                source_region,
-            )
             added: MemoryUnit | None = None
             try:
                 units = bundle.runtime.api.add(
@@ -3596,10 +4189,21 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "promotion_job_id": job_id,
                         "promotion_classification": str(decision["category"]),
                         "promotion_confidence": float(decision["confidence"]),
+                        "promotion_claim_subject": decision["claim_subject"],
+                        "promotion_claim_value": decision["claim_value"],
+                        "promotion_claim_content_hash": hashlib.sha256(
+                            unit.content.encode("utf-8")
+                        ).hexdigest(),
+                        "promotion_evidence_kind": evidence_kind,
+                        "promotion_evidence_count": len(source_ids),
                         "source_unit_ids": source_ids,
                         "source_event_ids": source_event_ids,
                         "source_region_id": source_region.region_id,
                         "source_region_kind": source_region.kind,
+                        "source_region_ids": source_region_ids,
+                        "source_region_kinds": [
+                            region["region_kind"] for region in source_regions
+                        ],
                         "source_references": source_references,
                         "provenance": source_ids,
                         "region_id": target.region_id,
@@ -3619,11 +4223,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 self._persist_promotion(
                     added,
                     target,
-                    unit,
-                    source_region,
+                    ordered,
+                    source_units,
+                    source_references,
                     job_id,
                     promotion_key,
                     decision,
+                    evidence_kind,
                 )
                 if bundle.graph_store is not None:
                     self._associate_graph_scope(
@@ -3648,8 +4254,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "decision": {
                     "source_unit_id": unit.id,
                     "source_region_id": source_region.region_id,
+                    "source_unit_ids": source_ids,
+                    "source_region_ids": source_region_ids,
                     "classification": str(decision["category"]),
                     "confidence": decision["confidence"],
+                    "evidence_kind": evidence_kind,
                     "status": "promoted",
                     "target_region_id": target.region_id,
                     "target_unit_id": added.id,
@@ -3657,13 +4266,213 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 },
             }
 
-    def _promotion_record_exists(self, promotion_key: str) -> bool:
+    def _promotion_record(self, promotion_key: str) -> dict[str, object] | None:
         with closing(self._maintenance_db()) as connection:
             row = connection.execute(
-                "SELECT 1 FROM promotion_records WHERE promotion_key = ?",
+                """SELECT target_unit_id, source_unit_ids, source_region_ids,
+                          audit_event_id, evidence_kind
+                   FROM promotion_records WHERE promotion_key = ?""",
                 (promotion_key,),
             ).fetchone()
-        return row is not None
+        if row is None:
+            return None
+        try:
+            source_unit_ids = json.loads(str(row[1]))
+        except json.JSONDecodeError:
+            source_unit_ids = []
+        try:
+            source_region_ids = json.loads(str(row[2]))
+        except json.JSONDecodeError:
+            source_region_ids = []
+        return {
+            "target_unit_id": str(row[0]),
+            "source_unit_ids": source_unit_ids if isinstance(source_unit_ids, list) else [],
+            "source_region_ids": (
+                source_region_ids if isinstance(source_region_ids, list) else []
+            ),
+            "audit_event_id": int(row[3]) if row[3] is not None else None,
+            "evidence_kind": str(row[4]),
+        }
+
+    def _promotion_existing_conflict(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        decision: _PromotionDecision,
+        *,
+        promotion_key: str,
+    ) -> tuple[MemoryUnit, str, str] | None:
+        subject = _normalize_promotion_text(decision["claim_subject"])
+        value = _normalize_promotion_claim_value(decision["claim_value"])
+        if not subject or not value:
+            return None
+        for unit in self._units_in_scope(bundle, scope):
+            if unit.lifecycle.value != "active":
+                continue
+            if _metadata_text(unit, "promotion_key") == promotion_key:
+                continue
+            content_hash = hashlib.sha256(unit.content.encode("utf-8")).hexdigest()
+            if _metadata_text(unit, "promotion_claim_content_hash") == content_hash:
+                existing_subject = _normalize_promotion_text(
+                    _metadata_text(unit, "promotion_claim_subject")
+                )
+                existing_value = _normalize_promotion_claim_value(
+                    _metadata_text(unit, "promotion_claim_value")
+                )
+            else:
+                existing_subject = ""
+                existing_value = ""
+            if not existing_subject or not existing_value:
+                existing_subject, existing_value = _promotion_claim_signature(unit.content)
+                existing_subject = _normalize_promotion_text(existing_subject)
+                existing_value = _normalize_promotion_claim_value(existing_value)
+            if not existing_subject or not existing_value:
+                continue
+            if (
+                not _promotion_subjects_compatible(existing_subject, subject)
+                or existing_value == value
+            ):
+                continue
+            if _promotion_values_conflict(subject, (existing_value, value)):
+                return unit, existing_value, value
+        return None
+
+    def _merge_promotion_sources(
+        self,
+        bundle: _RuntimeBundle,
+        target_scope: Scope,
+        target_unit: MemoryUnit,
+        record: Mapping[str, object],
+        source_ids: list[str],
+        source_event_ids: list[str],
+        source_references: list[str],
+        source_regions: list[dict[str, str]],
+        source_region_ids: list[str],
+        evidence_kind: str,
+    ) -> tuple[list[str], list[str]]:
+        existing_unit_ids = _metadata_strings(target_unit, "source_unit_ids")
+        if not existing_unit_ids:
+            existing_unit_ids = _metadata_strings(target_unit, "provenance")
+        existing_region_ids = _metadata_strings(target_unit, "source_region_ids")
+        existing_region_kinds = _metadata_strings(target_unit, "source_region_kinds")
+        if not existing_region_ids:
+            existing_region = _metadata_text(target_unit, "source_region_id")
+            existing_kind = _metadata_text(target_unit, "source_region_kind")
+            existing_region_ids = [existing_region] if existing_region else []
+            existing_region_kinds = [existing_kind] if existing_kind else []
+        if not existing_unit_ids:
+            record_units = record.get("source_unit_ids")
+            if isinstance(record_units, list):
+                existing_unit_ids = [str(value) for value in record_units]
+        if not existing_region_ids:
+            record_regions = record.get("source_region_ids")
+            if isinstance(record_regions, list):
+                existing_region_ids = [str(value) for value in record_regions]
+
+        merged_unit_ids = list(dict.fromkeys([*existing_unit_ids, *source_ids]))
+        merged_region_ids = list(dict.fromkeys([*existing_region_ids, *source_region_ids]))
+        kind_by_region = dict(zip(existing_region_ids, existing_region_kinds, strict=False))
+        for region in source_regions:
+            kind_by_region[str(region["region_id"])] = str(region["region_kind"])
+        merged_region_kinds = [
+            kind_by_region[region_id]
+            for region_id in merged_region_ids
+            if region_id in kind_by_region
+        ]
+        merged_source_regions = [
+            {"region_id": region_id, "region_kind": kind_by_region[region_id]}
+            for region_id in merged_region_ids
+            if region_id in kind_by_region
+        ]
+        merged_event_ids = list(
+            dict.fromkeys(
+                [
+                    *_metadata_strings(target_unit, "source_event_ids"),
+                    *source_event_ids,
+                ]
+            )
+        )
+        merged_references = list(
+            dict.fromkeys(
+                [
+                    *_metadata_strings(target_unit, "source_references"),
+                    *source_references,
+                ]
+            )
+        )
+        new_unit_ids = set(merged_unit_ids) - set(existing_unit_ids)
+        new_region_ids = set(merged_region_ids) - set(existing_region_ids)
+        if not new_unit_ids and not new_region_ids:
+            return merged_unit_ids, merged_region_ids
+        merged_evidence_kind = (
+            "multi_source"
+            if (
+                evidence_kind == "multi_source"
+                or str(record.get("evidence_kind") or "") == "multi_source"
+                or len(merged_unit_ids) > 1
+            )
+            else "explicit"
+        )
+        metadata_updates: dict[str, object] = {
+            "source_unit_ids": merged_unit_ids,
+            "source_event_ids": merged_event_ids,
+            "source_region_ids": merged_region_ids,
+            "source_region_kinds": merged_region_kinds,
+            "source_references": merged_references,
+            "provenance": merged_unit_ids,
+            "promotion_evidence_kind": merged_evidence_kind,
+            "promotion_evidence_count": len(merged_unit_ids),
+        }
+        target_unit.user_metadata.update(metadata_updates)
+        target_unit.provenance = merged_unit_ids
+        bundle.kv_store.update(
+            target_scope,
+            memory_key(target_unit.id),
+            dumps(target_unit),
+        )
+        audit_id = record.get("audit_event_id")
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """UPDATE promotion_records
+                   SET source_unit_ids = ?, source_region_ids = ?, evidence_kind = ?
+                   WHERE promotion_key = ?""",
+                (
+                    json.dumps(merged_unit_ids, ensure_ascii=False),
+                    json.dumps(merged_region_ids, ensure_ascii=False),
+                    merged_evidence_kind,
+                    _metadata_text(target_unit, "promotion_key"),
+                ),
+            )
+            if isinstance(audit_id, int):
+                row = connection.execute(
+                    "SELECT detail FROM governance_events WHERE id = ?",
+                    (audit_id,),
+                ).fetchone()
+                detail: dict[str, object] = {}
+                if row is not None:
+                    try:
+                        parsed = json.loads(str(row[0]))
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        detail = parsed
+                detail.update(
+                    {
+                        "source_unit_ids": merged_unit_ids,
+                        "source_region_ids": merged_region_ids,
+                        "source_regions": merged_source_regions,
+                        "source_references": merged_references,
+                        "evidence_kind": merged_evidence_kind,
+                    }
+                )
+                connection.execute(
+                    "UPDATE governance_events SET detail = ? WHERE id = ?",
+                    (
+                        json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                        audit_id,
+                    ),
+                )
+        return merged_unit_ids, merged_region_ids
 
     def _promoted_target(
         self,
@@ -3685,18 +4494,43 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self,
         target_unit: MemoryUnit,
         target: MemoryRegion,
-        source_unit: MemoryUnit,
-        source_region: MemoryRegion,
+        candidates: list[_PromotionCandidate],
+        source_units: tuple[MemoryUnit, ...],
+        source_references: list[str],
         job_id: str,
         promotion_key: str,
         decision: _PromotionDecision,
+        evidence_kind: str,
     ) -> int:
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (candidate["region"].region_id, candidate["unit"].id),
+        )
+        source_unit = ordered[0]["unit"]
+        source_region = ordered[0]["region"]
+        source_ids = [str(unit.id) for unit in source_units] or [str(source_unit.id)]
+        source_region_ids = list(
+            dict.fromkeys(candidate["region"].region_id for candidate in ordered)
+        )
+        source_regions = [
+            {"region_id": region_id, "region_kind": next(
+                candidate["region"].kind
+                for candidate in ordered
+                if candidate["region"].region_id == region_id
+            )}
+            for region_id in source_region_ids
+        ]
         detail = {
             "source_unit_id": source_unit.id,
+            "source_unit_ids": source_ids,
             "source_region_id": source_region.region_id,
             "source_region_kind": source_region.kind,
+            "source_region_ids": source_region_ids,
+            "source_regions": source_regions,
+            "source_references": source_references,
             "classification": decision["category"],
             "confidence": decision["confidence"],
+            "evidence_kind": evidence_kind,
             "job_id": job_id,
         }
         with closing(self._maintenance_db()) as connection, connection:
@@ -3751,8 +4585,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                    (promotion_key, job_id, source_unit_id, source_region_id,
                     source_region_kind, target_region_id, target_region_kind,
                     target_unit_id, classification, confidence, audit_event_id,
-                    created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    evidence_kind, source_unit_ids, source_region_ids, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     promotion_key,
                     job_id,
@@ -3765,6 +4599,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     str(decision["category"]),
                     float(decision["confidence"]),
                     audit_id,
+                    evidence_kind,
+                    json.dumps(source_ids, ensure_ascii=False),
+                    json.dumps(source_region_ids, ensure_ascii=False),
                     datetime.now(UTC).isoformat(),
                 ),
             )
@@ -3989,6 +4826,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     @staticmethod
     def _ensure_maintenance_schema(connection: sqlite3.Connection) -> None:
         connection.executescript(_PROMOTION_SCHEMA)
+        Mem2MemoryKernel._ensure_promotion_schema(connection)
         columns = {
             str(row[1]): row
             for row in connection.execute("PRAGMA table_info(capture_evolutions)").fetchall()
@@ -4028,6 +4866,59 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                    FROM capture_evolutions_v1"""
             )
             connection.execute("DROP TABLE capture_evolutions_v1")
+
+    @staticmethod
+    def _ensure_promotion_schema(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(promotion_records)").fetchall()
+        }
+        additions = {
+            "evidence_kind": "TEXT NOT NULL DEFAULT 'explicit'",
+            "source_unit_ids": "TEXT NOT NULL DEFAULT '[]'",
+            "source_region_ids": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        missing = [name for name in additions if name not in columns]
+        if not missing:
+            return
+        with connection:
+            for name in missing:
+                connection.execute(
+                    f"ALTER TABLE promotion_records ADD COLUMN {name} {additions[name]}"
+                )
+            rows = connection.execute(
+                """SELECT promotion_key, source_unit_id, source_region_id,
+                          source_unit_ids, source_region_ids
+                   FROM promotion_records"""
+            ).fetchall()
+            for row in rows:
+                promotion_key = str(row[0])
+                source_unit_ids = str(row[3])
+                source_region_ids = str(row[4])
+                assignments: list[str] = []
+                values: list[str] = []
+                if source_unit_ids in {"", "[]"}:
+                    assignments.append("source_unit_ids = ?")
+                    values.append(
+                        json.dumps([str(row[1])], ensure_ascii=False)
+                        if row[1]
+                        else "[]"
+                    )
+                if source_region_ids in {"", "[]"}:
+                    assignments.append("source_region_ids = ?")
+                    values.append(
+                        json.dumps([str(row[2])], ensure_ascii=False)
+                        if row[2]
+                        else "[]"
+                    )
+                if not assignments:
+                    continue
+                values.append(promotion_key)
+                connection.execute(
+                    f"UPDATE promotion_records SET {', '.join(assignments)} "
+                    "WHERE promotion_key = ?",
+                    tuple(values),
+                )
 
     @staticmethod
     def _ensure_governance_schema(connection: sqlite3.Connection) -> None:
@@ -5197,6 +6088,119 @@ def _promotion_source_references(
     return list(dict.fromkeys(references))
 
 
+_PREFERENCE_CATEGORY_WORDS = {
+    "tab": "indentation",
+    "tabs": "indentation",
+    "space": "indentation",
+    "spaces": "indentation",
+    "制表符": "indentation",
+    "空格": "indentation",
+    "dark": "theme",
+    "light": "theme",
+    "深色": "theme",
+    "浅色": "theme",
+    "concise": "verbosity",
+    "detailed": "verbosity",
+    "verbose": "verbosity",
+    "简洁": "verbosity",
+    "详细": "verbosity",
+    "large": "size",
+    "small": "size",
+    "compact": "size",
+    "大": "size",
+    "小": "size",
+    "blue": "color",
+    "green": "color",
+    "red": "color",
+    "yellow": "color",
+    "蓝": "color",
+    "绿": "color",
+    "红": "color",
+    "黄": "color",
+}
+
+
+def _preference_category(value: str) -> str:
+    folded = value.casefold()
+    words = re.findall(r"[a-z0-9_.-]+", folded)
+    for word in reversed(words):
+        if word in _PREFERENCE_CATEGORY_WORDS:
+            return _PREFERENCE_CATEGORY_WORDS[word]
+    for term, category in _PREFERENCE_CATEGORY_WORDS.items():
+        if term in folded:
+            return category
+    return words[-1] if words else ""
+
+
+def _promotion_claim_signature(content: str) -> tuple[str, str]:
+    text = _normalize_promotion_text(content)
+    match = re.match(r"^(?:i|we)\s+(prefer|like|use|need|want)\s+(.+)$", text)
+    if match:
+        value = match.group(2).strip().rstrip(".!。")
+        subject_noun = _preference_category(value)
+        return (
+            f"user:{match.group(1)}:{subject_noun}",
+            value,
+        ) if subject_noun else ("", "")
+    match = re.match(r"^我(偏好|喜欢|习惯|通常|希望|一直)(.+)$", text)
+    if match:
+        value = match.group(2).strip().rstrip(".!。")
+        subject_noun = _preference_category(value)
+        return (
+            f"user:preference:{subject_noun}",
+            value,
+        ) if subject_noun else ("", "")
+    match = re.match(r"^(.+?)\s+(?:is|are|means|requires|uses)\s+(.+)$", text)
+    if match:
+        return (
+            match.group(1).strip(),
+            match.group(2).strip().rstrip(".!。"),
+        )
+    match = re.match(r"^(.+?)(是|为|使用|需要)(.+)$", text)
+    if match:
+        return (
+            match.group(1).strip(),
+            match.group(3).strip().rstrip(".!。"),
+        )
+    return "", ""
+
+
+def _promotion_values_conflict(subject: str, values: tuple[str, ...]) -> bool:
+    normalized = [
+        _normalize_promotion_text(value)
+        for value in values
+        if value.strip()
+    ]
+    if len(set(normalized)) < 2:
+        return False
+    negation = re.compile(r"^(?:not|no|never|without)\b|^[非不无未]")
+    negated = [bool(negation.search(value)) for value in normalized]
+    if any(negated) and not all(negated):
+        return True
+    if subject.startswith("user:prefer"):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:target|mode|theme|status|state|version|branch|path|port|"
+            r"default|setting|count|size|language|database|style|indentation|"
+            r"verbosity|color|font|speed)\b",
+            subject.casefold(),
+        )
+    )
+
+
+def _normalize_promotion_claim_value(value: str) -> str:
+    return _normalize_promotion_text(value).strip(" .!。！?？,，;；:")
+
+
+def _promotion_subjects_compatible(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if left == "user:preference" and right.startswith("user:prefer"):
+        return True
+    return right == "user:preference" and left.startswith("user:prefer")
+
+
 def _heuristic_promotion_decision(
     content: str,
     context: Mapping[str, object],
@@ -5311,28 +6315,33 @@ def _validated_promotion_decision(
         raise ValueError("promotion classifier returned an invalid confidence")
     explicit = raw.get("explicit") is True
     topic_id = str(raw.get("topic_id") or "").strip() or None
+    claim_subject = str(raw.get("claim_subject") or raw.get("subject") or "").strip()
+    claim_value = str(raw.get("claim_value") or raw.get("value") or "").strip()
+    if not claim_subject:
+        claim_subject, claim_value = _promotion_claim_signature(content)
     reason = str(raw.get("reason") or "").strip() or "classified by promotion policy"
     if inspect_sensitive_text(content) is not None:
         category = "sensitive"
         confidence = 1.0
         explicit = False
         reason = "sensitive content requires manual review"
+    status = "skip"
     if category in {"user", "topic"}:
         if not explicit_source or not explicit:
-            category = "retain"
             reason = "promotion requires an explicit source statement"
         elif float(confidence) < 0.9:
-            category = "retain"
             reason = "promotion confidence is below 0.90"
         elif category == "topic" and topic_id not in topic_ids:
-            category = "retain"
             reason = "promotion topic does not match an existing topic region"
-    status = "promote" if category in {"user", "topic"} else "skip"
+        else:
+            status = "promote"
     return {
         "category": category,
         "confidence": float(confidence),
         "explicit": explicit,
         "topic_id": topic_id,
+        "claim_subject": claim_subject,
+        "claim_value": claim_value,
         "reason": reason,
         "status": status,
     }
