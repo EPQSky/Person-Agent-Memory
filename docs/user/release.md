@@ -4,6 +4,8 @@
 `uninstall.sh` 和对应源码归档。先审查本地文件，再执行安装。生产安装不要使用
 `curl | sh`。
 
+面向用户的安装、模型配置和日常使用说明见 [使用说明](usage.md)。
+
 ## 产品范围
 
 本发行版只使用 `JiuwenMemory 0.2.0` 记忆内核。系统通过用户、专题、项目和会话记忆
@@ -117,6 +119,19 @@ codex plugin add personal-agent-memory@personal-agent-memory
 
 手动路径适合开发或手工管理的服务。手动路径不创建发行版管理的用户级服务，也不创建
 稳定卸载器。需要完整生命周期时，请使用发行版安装器。
+
+## 开发环境
+
+开发和测试需要 Python 3.11-3.13、`uv`、Node.js 和 Git：
+
+```bash
+uv sync --all-extras
+uv run personal-agent-memory serve \
+  --state-dir ~/.local/share/personal-agent-memory
+```
+
+开发命令不会创建用户级服务，也不会自动安装全局 Codex 插件。服务只接受回环地址。
+测试和静态检查命令见“发行验证”。
 
 ## 服务管理
 

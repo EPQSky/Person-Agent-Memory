@@ -75,7 +75,7 @@ def test_runtime_manifests_do_not_reference_removed_kernel_surfaces() -> None:
         root / "install.sh",
         root / "uninstall.sh",
         root / "README.md",
-        root / "docs/release.md",
+        root / "docs/user/release.md",
     )
     forbidden = (
         "personal_agent_memory.fake_model",

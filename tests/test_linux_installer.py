@@ -4389,7 +4389,7 @@ def test_real_lifecycle_verifier_selects_supported_versioned_python(
 
 
 def test_linux_release_contract_documents_assets_and_lifecycle() -> None:
-    release = (ROOT / "docs/release.md").read_text(encoding="utf-8")
+    release = (ROOT / "docs/user/release.md").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     required_sections = (
         "## 产品范围",
