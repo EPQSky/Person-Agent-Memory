@@ -225,6 +225,8 @@ def test_capture_routes_to_project_topic_and_isolated_chat_regions(tmp_path: Pat
         )
         assert project_result["scope"]["kind"] == "project_cwd"
         assert {item["region_id"] for item in project_result["results"]} == {"project-one"}
+        assert "fulltext_unavailable" not in project_result["degradation"]
+        assert "vector_unavailable" not in project_result["degradation"]
 
         topic_result = _search(
             client,

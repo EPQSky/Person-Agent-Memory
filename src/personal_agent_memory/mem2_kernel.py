@@ -1829,33 +1829,28 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         targets: list[tuple[Scope, MemoryRegion]] = []
         base_session = region.session_id if region.kind == "session" else ""
         for agent in _SEARCH_AGENTS:
-            targets.append(
-                (
-                    _scope_for_region(
-                        region,
-                        session_id=base_session,
-                        agent=agent,
-                    ),
-                    region,
-                )
+            base_scope = _scope_for_region(
+                region,
+                session_id=base_session,
+                agent=agent,
             )
+            if self._scope_has_units(bundle, base_scope):
+                targets.append((base_scope, region))
             if request.session_id and region.kind != "session":
-                targets.append(
-                    (
-                        _scope_for_region(
-                            region,
-                            session_id=request.session_id,
-                            agent=agent,
-                        ),
-                        region,
-                    )
+                session_scope = _scope_for_region(
+                    region,
+                    session_id=request.session_id,
+                    agent=agent,
                 )
+                if self._scope_has_units(bundle, session_scope):
+                    targets.append((session_scope, region))
         response = self._search_across(
             bundle,
             request,
             targets,
             scope_kind=scope_kind,
             region_ids=[region.region_id],
+            regions_by_id={region.region_id: region},
         )
         response["library_id"] = region.region_id
         response["region_id"] = region.region_id
@@ -1888,25 +1883,26 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
         targets: list[tuple[Scope, MemoryRegion]] = []
         for agent in _SEARCH_AGENTS:
-            targets.append(
-                (_scope_for_region(user_region, session_id="", agent=agent), user_region)
+            user_scope = _scope_for_region(user_region, session_id="", agent=agent)
+            if self._scope_has_units(bundle, user_scope):
+                targets.append((user_scope, user_region))
+            session_scope = _scope_for_region(
+                session_region,
+                session_id=session_region.session_id,
+                agent=agent,
             )
-            targets.append(
-                (
-                    _scope_for_region(
-                        session_region,
-                        session_id=session_region.session_id,
-                        agent=agent,
-                    ),
-                    session_region,
-                )
-            )
+            if self._scope_has_units(bundle, session_scope):
+                targets.append((session_scope, session_region))
         return self._search_across(
             bundle,
             request,
             targets,
             scope_kind="user_and_session",
             region_ids=[user_region.region_id, session_region.region_id],
+            regions_by_id={
+                user_region.region_id: user_region,
+                session_region.region_id: session_region,
+            },
         )
 
     def _search_regions(
@@ -1922,33 +1918,28 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         for region in regions:
             base_session = region.session_id if region.kind == "session" else ""
             for agent in _SEARCH_AGENTS:
-                targets.append(
-                    (
-                        _scope_for_region(
-                            region,
-                            session_id=base_session,
-                            agent=agent,
-                        ),
-                        region,
-                    )
+                base_scope = _scope_for_region(
+                    region,
+                    session_id=base_session,
+                    agent=agent,
                 )
+                if self._scope_has_units(bundle, base_scope):
+                    targets.append((base_scope, region))
                 if request.session_id and region.kind != "session":
-                    targets.append(
-                        (
-                            _scope_for_region(
-                                region,
-                                session_id=request.session_id,
-                                agent=agent,
-                            ),
-                            region,
-                        )
+                    session_scope = _scope_for_region(
+                        region,
+                        session_id=request.session_id,
+                        agent=agent,
                     )
+                    if self._scope_has_units(bundle, session_scope):
+                        targets.append((session_scope, region))
         return self._search_across(
             bundle,
             request,
             targets,
             scope_kind="explicit_regions",
             region_ids=list(region_ids),
+            regions_by_id={region.region_id: region for region in regions},
         )
 
     def _search_across(
@@ -1959,12 +1950,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         *,
         scope_kind: str,
         region_ids: list[str],
+        regions_by_id: Mapping[str, MemoryRegion],
     ) -> dict[str, object]:
         merged: dict[str, dict[str, object]] = {}
         degradation: list[str] = []
         vector_statuses: set[str] = set()
         graph_statuses: set[str] = set()
-        regions_by_id = {region.region_id: region for _, region in targets}
         groups: dict[str, dict[str, object]] = {}
         group_vector_statuses: dict[str, set[str]] = {}
         group_graph_statuses: dict[str, set[str]] = {}
@@ -2126,7 +2117,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "session_id": request.session_id,
                 "topic_id": request.topic_id,
                 "region_ids": region_ids,
-                "spaces": list(dict.fromkeys(region.space for _, region in targets)),
+                "spaces": list(
+                    dict.fromkeys(region.space for region in regions_by_id.values())
+                ),
             },
             "region_ids": region_ids,
             "query": request.query,
@@ -4941,6 +4934,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             rounds.values(),
             key=lambda item: (str(item["updated_at"]), str(item["turn_id"])),
         )
+
+    @staticmethod
+    def _scope_has_units(bundle: _RuntimeBundle, scope: Scope) -> bool:
+        try:
+            return bool(bundle.kv_store.list(scope, limit=1).entries)
+        except Exception:
+            return True
 
     def _units_in_scope(self, bundle: _RuntimeBundle, scope: Scope) -> list[MemoryUnit]:
         rows = bundle.kv_store.scan(scope, "/memory/")
