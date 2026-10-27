@@ -311,13 +311,16 @@ def test_delete_semantics(
 
         history = _history(client, headers)
         event = next(item for item in history if item["action"] == f"delete:{mode}")
-        assert event["before_content"] == f"删除前内容-{mode}"
         if mode == "forget":
+            assert event["before_content"] == ""
+            assert event["content_redacted"] == "true"
             forgotten = client.get(
                 "/api/v1/libraries/governance/forgotten", headers=headers
             )
             assert forgotten.status_code == 200
             assert {item["id"] for item in forgotten.json()} == {unit_id}
+        else:
+            assert event["before_content"] == f"删除前内容-{mode}"
 
 
 def test_restore_old_content_creates_new_version(tmp_path: Path) -> None:

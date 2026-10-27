@@ -16,6 +16,7 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
+    Query,
     Request,
     Response,
     status,
@@ -54,6 +55,7 @@ from personal_agent_memory.memory_kernel import (
     HistoryDiffRequest,
     ListDocumentsRequest,
     ListForgottenRequest,
+    ListMemoriesRequest,
     ManagedMemoryKernelPort,
     MemoryGovernanceError,
     MemoryIdempotencyConflictError,
@@ -1037,6 +1039,54 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             raise mutation_error(error) from error
 
     @app.get(
+        "/api/v1/libraries/{library_id}/memories",
+        dependencies=[Depends(authenticate)],
+    )
+    async def list_memories(
+        request: Request,
+        library_id: str,
+        cursor: str | None = Query(default=None, max_length=2_048),
+        q: str | None = Query(default=None, max_length=500),
+        memory_type: str | None = Query(default=None, max_length=100),
+        lifecycle: str | None = Query(default=None, max_length=32),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> dict[str, object]:
+        allowed = {"cursor", "q", "memory_type", "lifecycle", "limit"}
+        unknown = sorted(set(request.query_params) - allowed)
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"unknown memory list parameter: {', '.join(unknown)}",
+            )
+        try:
+            return await asyncio.to_thread(
+                selected_kernel.list_memories,
+                ListMemoriesRequest(
+                    library_id=library_id,
+                    cursor=cursor,
+                    q=q,
+                    memory_type=memory_type,
+                    lifecycle=lifecycle,
+                    limit=limit,
+                ),
+            )
+        except (MemoryGovernanceError, ValueError) as error:
+            raise mutation_error(error) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/memories/{memory_id}",
+        dependencies=[Depends(authenticate)],
+    )
+    async def read_memory(library_id: str, memory_id: str) -> dict[str, object]:
+        try:
+            return await asyncio.to_thread(
+                selected_kernel.inspect_memory,
+                DocumentInspectRequest(library_id=library_id, path=memory_id),
+            )
+        except MemoryGovernanceError as error:
+            raise mutation_error(error) from error
+
+    @app.get(
         "/api/v1/libraries/{library_id}/export.md",
         dependencies=[Depends(authenticate)],
         response_class=PlainTextResponse,
@@ -1131,7 +1181,10 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
         "/api/v1/libraries/{library_id}/document",
         dependencies=[Depends(authenticate)],
     )
-    async def delete_document(library_id: str, deletion: DocumentDelete) -> dict[str, str]:
+    async def delete_document(
+        library_id: str,
+        deletion: DocumentDelete,
+    ) -> dict[str, object]:
         try:
             return await selected_kernel.delete(
                 DeleteMemoryRequest(
@@ -1180,10 +1233,17 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             raise mutation_error(error) from error
 
     @app.get("/api/v1/libraries/{library_id}/history", dependencies=[Depends(authenticate)])
-    async def library_history(library_id: str, limit: int = 50) -> list[dict[str, str]]:
+    async def library_history(
+        library_id: str,
+        limit: int = Query(default=50, ge=1, le=1000),
+        target_id: str | None = Query(default=None, max_length=500),
+    ) -> list[dict[str, str]]:
         try:
-            return selected_kernel.audit(AuditMemoryRequest(library_id=library_id, limit=limit))
-        except MemoryGovernanceError as error:
+            return await asyncio.to_thread(
+                selected_kernel.audit,
+                AuditMemoryRequest(library_id=library_id, limit=limit, target_id=target_id),
+            )
+        except (MemoryGovernanceError, ValueError) as error:
             raise mutation_error(error) from error
 
     @app.get(
