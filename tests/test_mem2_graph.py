@@ -2212,8 +2212,7 @@ def test_consolidation_keeps_graph_error_from_capture_scope(
         payload = search.json()
         assert payload["graph_index_status"] == "degraded"
         assert "graph_unavailable" in payload["degradation"]
-        assert payload["results"]
-        assert all(item["classification"] == "direct" for item in payload["results"])
+        assert payload["results"] == []
 
 
 def test_capture_updates_graph_and_keeps_search_ready(

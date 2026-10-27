@@ -839,14 +839,48 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             ) from error
 
     @app.get("/api/v1/capture/events", dependencies=[Depends(authenticate)])
-    async def capture_events(session_id: str | None = None) -> list[dict[str, object]]:
-        return selected_kernel.list_capture_events(CaptureEventsRequest(session_id=session_id))
+    async def capture_events(
+        session_id: Annotated[str | None, Query(max_length=MAX_SESSION_ID_LENGTH)] = None,
+        region_id: Annotated[str | None, Query(max_length=MAX_REGION_ID_LENGTH)] = None,
+        turn_id: Annotated[str | None, Query(max_length=200)] = None,
+    ) -> list[dict[str, object]]:
+        try:
+            return selected_kernel.list_capture_events(
+                CaptureEventsRequest(
+                    session_id=session_id,
+                    region_id=region_id,
+                    turn_id=turn_id,
+                )
+            )
+        except RegionError as error:
+            raise region_error(error) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
 
 
 
     @app.get("/api/v1/capture/rounds", dependencies=[Depends(authenticate)])
-    async def capture_rounds(session_id: str | None = None) -> list[dict[str, object]]:
-        return selected_kernel.list_capture_rounds(CaptureRoundsRequest(session_id=session_id))
+    async def capture_rounds(
+        session_id: Annotated[str | None, Query(max_length=MAX_SESSION_ID_LENGTH)] = None,
+        region_id: Annotated[str | None, Query(max_length=MAX_REGION_ID_LENGTH)] = None,
+        turn_id: Annotated[str | None, Query(max_length=200)] = None,
+    ) -> list[dict[str, object]]:
+        try:
+            return selected_kernel.list_capture_rounds(
+                CaptureRoundsRequest(
+                    session_id=session_id,
+                    region_id=region_id,
+                    turn_id=turn_id,
+                )
+            )
+        except RegionError as error:
+            raise region_error(error) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
 
 
 

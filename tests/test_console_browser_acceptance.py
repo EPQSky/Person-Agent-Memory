@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -559,5 +560,580 @@ def test_console_login_region_memory_detail_and_governance(
             assert page.get_by_role("button", name="保存更正").is_disabled()
             assert page.get_by_role("button", name="遗忘记忆").is_disabled()
             page.unroute(list_route)
+        finally:
+            browser.close()
+
+
+def test_console_raw_session_keeps_questions_out_of_formal_memory(
+    live_app: tuple[str, str, Path],
+) -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    sync_playwright = playwright_api.sync_playwright
+    expect = playwright_api.expect
+    base_url, api_key, state_dir = live_app
+    headers = {"Authorization": f"Bearer {api_key}"}
+    project_root = state_dir.parent / "raw-session-project"
+    project_root.mkdir()
+
+    with httpx.Client(
+        base_url=base_url,
+        headers=headers,
+        timeout=10,
+        trust_env=False,
+    ) as client:
+        region = client.post(
+            "/api/v1/regions",
+            json={
+                "kind": "project",
+                "name": "原始会话验收区域",
+                "region_id": "raw-session-acceptance",
+            },
+        )
+        assert region.status_code == 201, region.text
+        binding = client.post(
+            "/api/v1/project-bindings",
+            json={
+                "project_root": str(project_root),
+                "region_id": "raw-session-acceptance",
+            },
+        )
+        assert binding.status_code == 201, binding.text
+        memory = client.post(
+            "/api/v1/memories",
+            json={
+                "region_id": "raw-session-acceptance",
+                "content": "浏览器验收：项目使用 uv sync 管理依赖。",
+                "memory_type": "constraint",
+                "source_references": ["session:raw-session-acceptance"],
+                "actor": "browser-acceptance",
+                "idempotency_key": "raw-session-formal-memory",
+            },
+        )
+        assert memory.status_code == 201, memory.text
+        question = "帮我分析下当前项目"
+        for event in (
+            {
+                "event_id": "raw-question",
+                "session_id": "raw-session",
+                "turn_id": "completed-turn",
+                "event_kind": "user",
+                "content": question,
+                "occurred_at": "2026-10-27T06:00:00Z",
+            },
+            {
+                "event_id": "raw-answer",
+                "session_id": "raw-session",
+                "turn_id": "completed-turn",
+                "event_kind": "assistant",
+                "content": "当前项目分析已完成。",
+                "occurred_at": "2026-10-27T06:00:01Z",
+            },
+            {
+                "event_id": "raw-incomplete",
+                "session_id": "raw-session",
+                "turn_id": "incomplete-turn",
+                "event_kind": "user",
+                "content": "尚未完成的后续问题",
+                "occurred_at": "2026-10-27T06:00:02Z",
+            },
+        ):
+            captured = client.post(
+                "/api/v1/capture/events",
+                json={**event, "cwd": str(project_root)},
+            )
+            assert captured.status_code == 202, captured.text
+        assistant_only = client.post(
+            "/api/v1/capture/events",
+            json={
+                "event_id": "assistant-only",
+                "session_id": "assistant-only-session",
+                "turn_id": "assistant-only-turn",
+                "event_kind": "assistant",
+                "content": "只有助手回复的正文",
+                "occurred_at": "2026-10-27T06:00:03Z",
+                "cwd": str(project_root),
+            },
+        )
+        assert assistant_only.status_code == 202, assistant_only.text
+        consolidated = client.post(
+            "/api/v1/capture/consolidate",
+            json={"session_id": "raw-session"},
+        )
+        assert consolidated.status_code == 202, consolidated.text
+        for event in (
+            {
+                "event_id": "ready-question",
+                "session_id": "ready-session",
+                "turn_id": "ready-turn",
+                "event_kind": "user",
+                "content": "等待提炼的完整回合",
+                "occurred_at": "2026-10-27T06:00:10Z",
+            },
+            {
+                "event_id": "ready-answer",
+                "session_id": "ready-session",
+                "turn_id": "ready-turn",
+                "event_kind": "assistant",
+                "content": "等待提炼的助手最终回复",
+                "occurred_at": "2026-10-27T06:00:11Z",
+            },
+        ):
+            captured = client.post(
+                "/api/v1/capture/events",
+                json={**event, "cwd": str(project_root)},
+            )
+            assert captured.status_code == 202, captured.text
+        empty_region = client.post(
+            "/api/v1/regions",
+            json={
+                "kind": "project",
+                "name": "空原始会话区域",
+                "region_id": "raw-empty",
+            },
+        )
+        assert empty_region.status_code == 201, empty_region.text
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            executable_path=str(CHROME),
+            headless=True,
+            args=["--no-sandbox", "--no-proxy-server", "--proxy-bypass-list=*"],
+        )
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            page.goto(base_url, wait_until="domcontentloaded")
+            page.get_by_label("API key").fill(api_key)
+            page.get_by_role("button", name="登录").click()
+            page.get_by_role(
+                "button", name="原始会话验收区域 · project · raw-session-acceptance"
+            ).click()
+
+            memory_tab = page.get_by_role("tab", name="记忆")
+            raw_tab = page.get_by_role("tab", name="原始会话")
+            expect(memory_tab).to_have_attribute("aria-selected", "true")
+            formal_card = page.get_by_role(
+                "button", name="查看记忆：浏览器验收：项目使用 uv sync 管理依赖。"
+            )
+            formal_card.wait_for()
+            expect(page.locator("#memory-workspace").get_by_text(question)).to_have_count(0)
+
+            raw_tab.click()
+            expect(raw_tab).to_have_attribute("aria-selected", "true")
+            expect(memory_tab).to_have_attribute("aria-selected", "false")
+            expect(page.locator("#memory-workspace")).to_be_hidden()
+            expect(page.locator("#raw-session-workspace")).to_be_visible()
+            page.get_by_role(
+                "button", name="查看原始会话：raw-session"
+            ).click()
+            expect(page.get_by_text(question, exact=True)).to_be_visible()
+            expect(page.get_by_text("完成", exact=True)).to_be_visible()
+            expect(page.get_by_text("待完成", exact=True)).to_be_visible()
+            expect(
+                page.get_by_text("缺少助手最终回复，回合尚未完成。", exact=True)
+            ).to_be_visible()
+            expect(
+                page.get_by_text("缺少用户消息，回合尚未完成。", exact=True)
+            ).to_have_count(0)
+            page.get_by_role(
+                "button", name="查看原始会话：assistant-only-session"
+            ).click()
+            expect(
+                page.get_by_text("缺少用户消息，回合尚未完成。", exact=True)
+            ).to_be_visible()
+            expect(page.get_by_text("只有助手回复的正文", exact=True)).to_be_visible()
+            expect(
+                page.get_by_text("缺少助手最终回复，回合尚未完成。", exact=True)
+            ).to_have_count(0)
+            page.get_by_role(
+                "button", name="查看原始会话：ready-session"
+            ).click()
+            expect(page.get_by_text("待提炼", exact=True)).to_be_visible()
+            expect(page.locator("#raw-session-workspace input")).to_have_count(0)
+            expect(page.get_by_role("button", name="重新提炼")).to_have_count(0)
+
+            memory_tab.click()
+            formal_card.wait_for()
+            expect(page.locator("#memory-workspace").get_by_text(question)).to_have_count(0)
+
+            raw_tab.click()
+            page.get_by_role(
+                "button", name="空原始会话区域 · project · raw-empty"
+            ).click()
+            expect(
+                page.get_by_text("当前区域没有原始会话记录。", exact=True)
+            ).to_be_visible()
+            memory_tab.click()
+            expect(
+                page.get_by_text("当前区域或筛选条件下没有正式语义记忆。", exact=True)
+            ).to_be_visible()
+
+            raw_tab.click()
+            rounds_route = "**/api/v1/capture/rounds?*"
+            page.route(
+                rounds_route,
+                lambda route: route.fulfill(
+                    status=500,
+                    content_type="application/json",
+                    body='{"detail":"forced raw session failure"}',
+                ),
+            )
+            page.get_by_role(
+                "button", name="原始会话验收区域 · project · raw-session-acceptance"
+            ).click()
+            expect(page.get_by_text("加载原始会话失败", exact=False)).to_be_visible()
+            page.unroute(rounds_route)
+
+            legacy_event_time = "2026-10-27T08:00:00+00:00"
+            legacy_user = {
+                "record_type": "capture_event",
+                "event_id": "legacy-user",
+                "session_id": "legacy-session",
+                "turn_id": "legacy-turn",
+                "region_id": "raw-session-acceptance",
+                "event_kind": "user",
+                "content": "旧捕获问题",
+                "unit_id": "legacy-user",
+                "occurred_at": legacy_event_time,
+                "received_at": legacy_event_time,
+                "legacy": True,
+            }
+            legacy_assistant = {
+                **legacy_user,
+                "event_id": "legacy-assistant",
+                "event_kind": "assistant",
+                "content": "旧捕获助手回复",
+                "unit_id": "legacy-assistant",
+            }
+            legacy_diagnostic = {
+                "record_type": "evolved_diagnostic",
+                "diagnostic_kind": "legacy_evolved",
+                "event_id": "",
+                "session_id": "legacy-session",
+                "turn_id": "legacy-turn",
+                "region_id": "raw-session-acceptance",
+                "event_kind": "",
+                "content": "旧提炼单元正文",
+                "unit_id": "legacy-diagnostic",
+                "occurred_at": "",
+                "received_at": legacy_event_time,
+                "legacy": True,
+            }
+            archived_completed_diagnostic = {
+                **legacy_diagnostic,
+                "turn_id": "archived-completed-turn",
+                "content": "归档完成诊断正文",
+                "unit_id": "archived-completed-diagnostic",
+                "received_at": "2026-10-27T08:01:00+00:00",
+            }
+            archived_failed_diagnostic = {
+                **legacy_diagnostic,
+                "turn_id": "archived-failed-turn",
+                "content": "归档失败诊断正文",
+                "unit_id": "archived-failed-diagnostic",
+                "received_at": "2026-10-27T08:02:00+00:00",
+            }
+            page.route(
+                rounds_route,
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        [
+                            {
+                                "session_id": "legacy-session",
+                                "turn_id": "legacy-turn",
+                                "region_id": "raw-session-acceptance",
+                                "status": "pending",
+                                "distillation_status": "pending_distillation",
+                                "failure_reason": "",
+                                "started_at": legacy_event_time,
+                                "updated_at": legacy_event_time,
+                                "received_at": legacy_event_time,
+                                "events": [legacy_user, legacy_assistant, legacy_diagnostic],
+                                "user_message": legacy_user,
+                                "assistant_final": legacy_assistant,
+                                "diagnostics": [legacy_diagnostic],
+                            },
+                            {
+                                "session_id": "legacy-session",
+                                "turn_id": "archived-completed-turn",
+                                "region_id": "raw-session-acceptance",
+                                "status": "done",
+                                "distillation_status": "completed",
+                                "memory_id": "archived-completed-memory",
+                                "failure_reason": "",
+                                "started_at": "2026-10-27T08:01:00+00:00",
+                                "updated_at": "2026-10-27T08:01:00+00:00",
+                                "received_at": "2026-10-27T08:01:00+00:00",
+                                "events": [archived_completed_diagnostic],
+                                "user_message": None,
+                                "assistant_final": None,
+                                "diagnostics": [archived_completed_diagnostic],
+                            },
+                            {
+                                "session_id": "legacy-session",
+                                "turn_id": "archived-failed-turn",
+                                "region_id": "raw-session-acceptance",
+                                "status": "failed",
+                                "distillation_status": "failed",
+                                "memory_id": None,
+                                "failure_reason": "归档后失败原因",
+                                "started_at": "2026-10-27T08:02:00+00:00",
+                                "updated_at": "2026-10-27T08:02:00+00:00",
+                                "received_at": "2026-10-27T08:02:00+00:00",
+                                "events": [archived_failed_diagnostic],
+                                "user_message": None,
+                                "assistant_final": None,
+                                "diagnostics": [archived_failed_diagnostic],
+                            },
+                            {
+                                "session_id": "empty-round-session",
+                                "turn_id": "empty-round-turn",
+                                "region_id": "raw-session-acceptance",
+                                "status": "pending",
+                                "distillation_status": "pending_completion",
+                                "failure_reason": "",
+                                "started_at": "2026-10-27T08:03:00+00:00",
+                                "updated_at": "2026-10-27T08:03:00+00:00",
+                                "received_at": "2026-10-27T08:03:00+00:00",
+                                "events": [],
+                                "user_message": None,
+                                "assistant_final": None,
+                                "diagnostics": [],
+                            },
+                        ],
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            page.get_by_role(
+                "button", name="原始会话验收区域 · project · raw-session-acceptance"
+            ).click()
+            page.get_by_role(
+                "button", name="查看原始会话：legacy-session"
+            ).click()
+            expect(page.get_by_text("旧捕获问题", exact=True)).to_be_visible()
+            expect(page.get_by_text("旧捕获助手回复", exact=True)).to_be_visible()
+            expect(
+                page.get_by_text("只读诊断 / 旧提炼单元", exact=True)
+            ).to_have_count(3)
+            expect(page.get_by_text("旧提炼单元正文", exact=True)).to_be_visible()
+            expect(page.get_by_text("归档完成诊断正文", exact=True)).to_be_visible()
+            expect(page.get_by_text("归档失败诊断正文", exact=True)).to_be_visible()
+            round_list = page.locator("#raw-round-list")
+            expect(round_list.get_by_text("完成", exact=True)).to_be_visible()
+            expect(round_list.get_by_text("失败", exact=True)).to_be_visible()
+            expect(round_list.get_by_text("回合已完成提炼状态。", exact=True)).to_be_visible()
+            expect(
+                round_list.get_by_text("提炼失败：归档后失败原因", exact=True)
+            ).to_be_visible()
+            expect(
+                round_list.get_by_text("缺少助手最终回复，回合尚未完成。", exact=True)
+            ).to_have_count(0)
+            page.get_by_role(
+                "button", name="查看原始会话：empty-round-session"
+            ).click()
+            expect(
+                round_list.get_by_text(
+                    "回合消息不完整，缺少用户消息和助手最终回复。",
+                    exact=True,
+                )
+            ).to_be_visible()
+            expect(
+                round_list.get_by_text("缺少用户消息，回合尚未完成。", exact=True)
+            ).to_have_count(0)
+            expect(
+                round_list.get_by_text("缺少助手最终回复，回合尚未完成。", exact=True)
+            ).to_have_count(0)
+            page.unroute(rounds_route)
+        finally:
+            browser.close()
+
+
+def test_console_archived_real_retention_rounds_keep_stable_timeline(
+    live_app: tuple[str, str, Path],
+) -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    sync_playwright = playwright_api.sync_playwright
+    expect = playwright_api.expect
+    base_url, api_key, state_dir = live_app
+    headers = {"Authorization": f"Bearer {api_key}"}
+    project_root = state_dir.parent / "retention-browser-project"
+    project_root.mkdir()
+    session_id = "retention-browser-session"
+    region_id = ""
+
+    with httpx.Client(
+        base_url=base_url,
+        headers=headers,
+        timeout=10,
+        trust_env=False,
+    ) as client:
+        for turn_id, marker, base_second in (
+            ("turn-a-completed", "REALRETENTION-COMPLETED", 0),
+            ("turn-b-failed", "REALRETENTION-FAILED", 10),
+        ):
+            for event_id, kind, content, second in (
+                (f"{turn_id}-user", "user", f"{marker} 提问", "00"),
+                (f"{turn_id}-assistant", "assistant", f"{marker} 最终回复", "01"),
+            ):
+                captured = client.post(
+                    "/api/v1/capture/events",
+                    json={
+                        "event_id": event_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "event_kind": kind,
+                        "content": content,
+                        "occurred_at": (
+                            f"2020-01-01T00:00:{base_second + int(second):02d}Z"
+                        ),
+                        "cwd": str(project_root),
+                    },
+                )
+                assert captured.status_code == 202, captured.text
+                captured_region_id = str(captured.json()["region_id"])
+                if region_id:
+                    assert captured_region_id == region_id
+                else:
+                    region_id = captured_region_id
+        regions = client.get("/api/v1/regions", headers=headers)
+        assert regions.status_code == 200, regions.text
+        region_payload = next(
+            item for item in regions.json() if item["region_id"] == region_id
+        )
+        consolidated = client.post(
+            "/api/v1/capture/consolidate",
+            json={"session_id": session_id},
+        )
+        assert consolidated.status_code == 202, consolidated.text
+        assert consolidated.json()["queued"] == 2
+
+        with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+            connection.execute(
+                """UPDATE capture_evolutions
+                   SET status = 'pending', memory_id = NULL, completed_at = NULL,
+                       last_error = ?
+                   WHERE session_id = ? AND turn_id = ?""",
+                ("真实归档失败原因", session_id, "turn-b-failed"),
+            )
+
+        before = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"region_id": region_id, "session_id": session_id},
+        )
+        assert before.status_code == 200, before.text
+        before_by_turn = {item["turn_id"]: item for item in before.json()}
+        assert before_by_turn["turn-b-failed"]["distillation_status"] == "failed"
+        assert before_by_turn["turn-b-failed"]["failure_reason"] == "真实归档失败原因"
+        completed_times = (
+            before_by_turn["turn-a-completed"]["started_at"],
+            before_by_turn["turn-a-completed"]["received_at"],
+            before_by_turn["turn-a-completed"]["updated_at"],
+        )
+        failed_times = (
+            before_by_turn["turn-b-failed"]["started_at"],
+            before_by_turn["turn-b-failed"]["received_at"],
+            before_by_turn["turn-b-failed"]["updated_at"],
+        )
+
+        policy = client.put(
+            f"/api/v1/libraries/{region_id}/retention-policy",
+            headers=headers,
+            json={"inbox_days": 0},
+        )
+        assert policy.status_code == 200, policy.text
+        cleaned = client.post(
+            f"/api/v1/libraries/{region_id}/retention-cleanup",
+            headers=headers,
+        )
+        assert cleaned.status_code == 200, cleaned.text
+        assert cleaned.json()["counts"]["captures_archived"] == 4
+
+        after = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"region_id": region_id, "session_id": session_id},
+        )
+        assert after.status_code == 200, after.text
+        archived = after.json()
+        assert [item["turn_id"] for item in archived] == [
+            "turn-a-completed",
+            "turn-b-failed",
+        ]
+        by_turn = {item["turn_id"]: item for item in archived}
+        completed_round = by_turn["turn-a-completed"]
+        failed_round = by_turn["turn-b-failed"]
+        assert completed_round["distillation_status"] == "completed"
+        assert completed_round["memory_id"]
+        assert completed_round["created_at"]
+        assert (
+            completed_round["started_at"],
+            completed_round["received_at"],
+            completed_round["updated_at"],
+        ) == completed_times
+        assert completed_round["completed_at"]
+        assert failed_round["distillation_status"] == "failed"
+        assert failed_round["failure_reason"] == "真实归档失败原因"
+        assert failed_round["completed_at"] is None
+        assert failed_round["created_at"]
+        assert (
+            failed_round["started_at"],
+            failed_round["received_at"],
+            failed_round["updated_at"],
+        ) == failed_times
+        assert completed_round["diagnostics"]
+        assert failed_round["diagnostics"]
+        starts = [
+            datetime.fromisoformat(str(item["started_at"]).replace("Z", "+00:00")).astimezone(
+                UTC
+            )
+            for item in archived
+        ]
+        assert starts == sorted(starts)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            executable_path=str(CHROME),
+            headless=True,
+            args=["--no-sandbox", "--no-proxy-server", "--proxy-bypass-list=*"],
+        )
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            page.goto(base_url, wait_until="domcontentloaded")
+            page.get_by_label("API key").fill(api_key)
+            page.get_by_role("button", name="登录").click()
+            page.get_by_role(
+                "button",
+                name=(
+                    f"{region_payload['name']} · {region_payload['kind']} · {region_id}"
+                ),
+            ).click()
+            page.get_by_role("tab", name="原始会话").click()
+            page.get_by_role(
+                "button", name="查看原始会话：retention-browser-session"
+            ).click()
+            round_list = page.locator("#raw-round-list")
+            expect(round_list.get_by_text("完成", exact=True)).to_be_visible()
+            expect(round_list.get_by_text("失败", exact=True)).to_be_visible()
+            expect(
+                round_list.get_by_text("回合已完成提炼状态。", exact=True)
+            ).to_be_visible()
+            expect(
+                round_list.get_by_text("提炼失败：真实归档失败原因", exact=True)
+            ).to_be_visible()
+            expect(
+                round_list.get_by_text("REALRETENTION-COMPLETED 提问", exact=False)
+            ).to_be_visible()
+            expect(
+                round_list.get_by_text("REALRETENTION-FAILED 最终回复", exact=False)
+            ).to_be_visible()
+            expect(page.locator("#raw-round-list h3")).to_have_text(
+                ["回合 turn-a-completed", "回合 turn-b-failed"]
+            )
+            round_times = page.locator("#raw-round-list .raw-round-time")
+            expect(round_times).to_have_count(2)
+            assert all("—" not in text for text in round_times.all_text_contents())
         finally:
             browser.close()

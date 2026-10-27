@@ -946,6 +946,8 @@ def build_context_package(
     for key in ("project_id", "library_id", "region_id", "region_ids", "space"):
         if key in raw:
             payload[key] = raw[key]
+    if isinstance(raw.get("retrieval_errors"), list):
+        payload["retrieval_errors"] = raw["retrieval_errors"]
     raw_scope = raw.get("scope")
     if (
         isinstance(raw_scope, dict)

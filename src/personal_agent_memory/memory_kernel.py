@@ -352,11 +352,15 @@ class RetentionCleanupRequest:
 @dataclass(frozen=True, slots=True)
 class CaptureEventsRequest:
     session_id: str | None = None
+    region_id: str | None = None
+    turn_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CaptureRoundsRequest:
     session_id: str | None = None
+    region_id: str | None = None
+    turn_id: str | None = None
 
 
 MemoryWriteRequest: TypeAlias = CreateMemoryRequest | CaptureMemoryRequest
