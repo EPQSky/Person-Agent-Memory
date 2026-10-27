@@ -11,6 +11,18 @@ MAX_SCOPE_SPACE_LENGTH = 256
 LIBRARY_SCOPE_PREFIX = "library:"
 CWD_SCOPE_PREFIX = "cwd:"
 MAX_LIBRARY_ID_LENGTH = MAX_SCOPE_SPACE_LENGTH - len(LIBRARY_SCOPE_PREFIX)
+MEMORY_PAGE_SIZE = 50
+FORMAL_MEMORY_TYPES = frozenset(
+    {
+        "decision",
+        "constraint",
+        "preference",
+        "domain_fact",
+        "reusable_experience",
+        "external_reference",
+    }
+)
+VISIBLE_MEMORY_LIFECYCLES = frozenset({"active", "superseded", "archived"})
 
 
 def validate_library_id(library_id: str) -> str:
@@ -126,6 +138,14 @@ class DeleteMemoryRequest:
 class AuditMemoryRequest:
     library_id: str
     limit: int = 50
+    target_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.target_id is not None:
+            normalized = self.target_id.strip()
+            if not normalized:
+                raise ValueError("target_id must not be blank")
+            object.__setattr__(self, "target_id", normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +255,36 @@ class ListDocumentsRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ListMemoriesRequest:
+    library_id: str
+    cursor: str | None = None
+    q: str | None = None
+    memory_type: str | None = None
+    lifecycle: str | None = None
+    limit: int = MEMORY_PAGE_SIZE
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        for name, value, maximum in (
+            ("cursor", self.cursor, 2_048),
+            ("q", self.q, 500),
+            ("memory_type", self.memory_type, 100),
+            ("lifecycle", self.lifecycle, 32),
+        ):
+            if value is None:
+                continue
+            normalized = value.strip()
+            if len(normalized) > maximum:
+                raise ValueError(f"{name} exceeds the {maximum}-character limit")
+            object.__setattr__(self, name, normalized or None)
+        if self.lifecycle is not None and self.lifecycle not in VISIBLE_MEMORY_LIFECYCLES:
+            raise ValueError("lifecycle must be active, superseded, or archived")
+        if self.memory_type is not None and self.memory_type not in FORMAL_MEMORY_TYPES:
+            raise ValueError("memory_type must identify a formal semantic memory type")
+
+
+@dataclass(frozen=True, slots=True)
 class PreviewDocumentUpdateRequest:
     library_id: str
     path: str
@@ -332,7 +382,7 @@ class MemoryKernelPort(Protocol):
 
     async def update(self, request: MemoryUpdateRequest) -> dict[str, object]: ...
 
-    async def delete(self, request: DeleteMemoryRequest) -> dict[str, str]: ...
+    async def delete(self, request: DeleteMemoryRequest) -> dict[str, object]: ...
 
     def audit(self, request: AuditMemoryRequest) -> list[dict[str, str]]: ...
 
@@ -376,6 +426,10 @@ class MemoryKernelPort(Protocol):
 
 
     def list_documents(self, request: ListDocumentsRequest) -> list[dict[str, object]]: ...
+
+    def list_memories(self, request: ListMemoriesRequest) -> dict[str, object]: ...
+
+    def inspect_memory(self, request: DocumentInspectRequest) -> dict[str, object]: ...
 
     def preview_document_update(
         self, request: PreviewDocumentUpdateRequest
@@ -496,7 +550,7 @@ class UnavailableMemoryKernel:
     async def update(self, request: MemoryUpdateRequest) -> dict[str, object]:
         self._raise()
 
-    async def delete(self, request: DeleteMemoryRequest) -> dict[str, str]:
+    async def delete(self, request: DeleteMemoryRequest) -> dict[str, object]:
         self._raise()
 
     def audit(self, request: AuditMemoryRequest) -> list[dict[str, str]]:
@@ -553,6 +607,12 @@ class UnavailableMemoryKernel:
 
 
     def list_documents(self, request: ListDocumentsRequest) -> list[dict[str, object]]:
+        self._raise()
+
+    def list_memories(self, request: ListMemoriesRequest) -> dict[str, object]:
+        self._raise()
+
+    def inspect_memory(self, request: DocumentInspectRequest) -> dict[str, object]:
         self._raise()
 
     def preview_document_update(self, request: PreviewDocumentUpdateRequest) -> dict[str, object]:

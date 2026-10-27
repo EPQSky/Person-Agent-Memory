@@ -3,15 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Personal Agent Memory · mem2</title>
+  <title>Personal Agent Memory · 区域工作区</title>
   <style>
-    :root { color-scheme: light dark; --bg:#f5f7fb; --panel:#fff; --text:#18212f; --muted:#657083; --line:#d9dfeb; --accent:#275fce; --danger:#b42318; }
-    * { box-sizing: border-box; }
+    :root { color-scheme: light dark; --bg:#f5f7fb; --panel:#fff; --text:#18212f; --muted:#657083; --line:#d9dfeb; --accent:#275fce; --accent-soft:#e9effd; --danger:#b42318; --success:#176b3a; }
+    * { box-sizing:border-box; }
     body { margin:0; font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
     header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 28px; background:#12233f; color:#fff; }
     header h1 { margin:0; font-size:20px; }
-    main { max-width:1280px; margin:0 auto; padding:24px; display:grid; gap:18px; }
-    .grid { display:grid; grid-template-columns:minmax(260px,0.8fr) minmax(0,2fr); gap:18px; }
+    main { max-width:1320px; margin:0 auto; padding:24px; display:grid; gap:18px; }
+    .workspace { display:grid; gap:18px; }
+    .workspace-bar { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 20px; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
+    .workspace-bar h2 { margin:0; font-size:22px; }
+    .eyebrow { margin:0 0 2px; color:var(--accent); font-size:12px; font-weight:700; letter-spacing:.12em; }
+    .workspace-tab { border:0; border-bottom:3px solid var(--accent); border-radius:0; background:transparent; color:var(--text); padding:8px 14px; cursor:default; }
+    .grid { display:grid; grid-template-columns:minmax(260px,.78fr) minmax(0,2.2fr); gap:18px; align-items:start; }
+    .stack { display:grid; gap:18px; }
     section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }
     h2 { margin:0 0 12px; font-size:16px; }
     h3 { margin:18px 0 8px; font-size:14px; color:var(--muted); }
@@ -23,20 +29,34 @@
     button.secondary { background:transparent; color:var(--accent); }
     button.danger { border-color:var(--danger); background:var(--danger); }
     button:disabled { opacity:.55; cursor:wait; }
-    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; align-items:center; }
     .row { display:flex; gap:8px; align-items:center; }
     .row > * { flex:1; }
     .muted { color:var(--muted); }
     .notice { min-height:24px; padding:8px 10px; border-radius:8px; background:var(--bg); white-space:pre-wrap; }
     .notice.error { color:var(--danger); }
-    .region-list, .document-list, .history-list { list-style:none; margin:0; padding:0; display:grid; gap:6px; max-height:360px; overflow:auto; }
-    .region-list button, .document-list button, .history-list button { width:100%; text-align:left; background:transparent; color:inherit; border:1px solid var(--line); }
-    .region-list button.active { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 10%,transparent); }
+    .notice.success { color:var(--success); }
+    .region-list, .document-list, .history-list, .source-list, .evidence-list { list-style:none; margin:0; padding:0; display:grid; gap:8px; }
+    .region-list, .history-list, .source-list { max-height:360px; overflow:auto; }
+    .region-list button { width:100%; text-align:left; background:transparent; color:inherit; border:1px solid var(--line); }
+    .region-list button.active { border-color:var(--accent); background:var(--accent-soft); color:var(--text); }
+    .filter-grid { display:grid; grid-template-columns:minmax(180px,2fr) minmax(140px,1fr) minmax(140px,1fr); gap:10px; align-items:end; }
+    .memory-card { width:100%; text-align:left; background:transparent; color:inherit; border:1px solid var(--line); padding:12px; }
+    .memory-card:hover, .memory-card.active { border-color:var(--accent); background:var(--accent-soft); color:var(--text); }
+    .memory-card strong { display:block; margin-bottom:8px; line-height:1.45; }
+    .chips { display:flex; flex-wrap:wrap; gap:6px; }
+    .chip { display:inline-block; padding:2px 8px; border-radius:999px; background:var(--bg); color:var(--muted); font-size:12px; }
+    .detail-meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:18px; }
+    .meta-item { padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); }
+    .meta-item span { display:block; color:var(--muted); font-size:12px; }
+    .meta-item strong { overflow-wrap:anywhere; }
+    .source-list li, .evidence-list li { padding:9px 10px; border:1px solid var(--line); border-radius:8px; overflow-wrap:anywhere; }
+    .evidence-list pre { margin:6px 0 0; }
     .result { border-top:1px solid var(--line); padding:12px 0; }
     .result:first-child { border-top:0; }
     pre { white-space:pre-wrap; overflow-wrap:anywhere; background:var(--bg); padding:12px; border-radius:8px; }
     .hidden { display:none !important; }
-    @media (max-width: 840px) { .grid { grid-template-columns:1fr; } header { padding:16px; } main { padding:14px; } }
+    @media (max-width: 900px) { .grid { grid-template-columns:1fr; } .filter-grid { grid-template-columns:1fr; } header { padding:16px; } main { padding:14px; } }
   </style>
 </head>
 <body>
@@ -56,85 +76,206 @@
     <p id="login-message" class="notice" aria-live="polite"></p>
   </section>
 
-  <div id="workspace" class="grid hidden">
-    <div>
-      <section>
-        <h2>记忆区域</h2>
-        <p class="muted">用户、专题、项目和会话区域共享同一个 mem2.0 存储。</p>
-        <ul id="region-list" class="region-list"></ul>
-        <h3>创建区域</h3>
-        <form id="region-form">
-          <label for="region-kind">类型</label>
-          <select id="region-kind"><option value="topic">专题</option><option value="project">项目</option></select>
-          <label for="region-name">名称</label>
-          <input id="region-name" required maxlength="200">
-          <label for="region-id">区域 ID（可选）</label>
-          <input id="region-id" maxlength="120" placeholder="自动生成">
-          <div class="actions"><button type="submit">创建区域</button></div>
-        </form>
-        <h3>绑定项目</h3>
-        <form id="binding-form">
-          <label for="binding-root">项目根目录</label>
-          <input id="binding-root" required placeholder="/path/to/project">
-          <label for="binding-region">项目区域</label>
-          <select id="binding-region"></select>
-          <div class="actions"><button type="submit">绑定</button></div>
-        </form>
-      </section>
-      <section style="margin-top:18px">
-        <h2>自动晋升</h2>
-        <p class="muted">对选中区域运行多目标晋升。敏感、冲突和证据不足的内容不会晋升。</p>
-        <div class="actions"><button id="promotion-button" type="button">运行晋升</button></div>
-        <p id="promotion-message" class="notice" aria-live="polite"></p>
-      </section>
-    </div>
+  <div id="workspace" class="workspace hidden">
+    <section class="workspace-bar">
+      <div>
+        <p class="eyebrow">区域工作区</p>
+        <h2>记忆</h2>
+      </div>
+      <nav aria-label="区域工作区">
+        <button class="workspace-tab" type="button" aria-current="page">记忆</button>
+      </nav>
+    </section>
 
-    <div>
-      <section>
-        <h2>检索</h2>
-        <form id="search-form">
-          <label for="search-query">查询</label>
-          <input id="search-query" required placeholder="当前项目决策、偏好、领域事实…">
-          <div class="actions"><button type="submit">检索选中区域</button></div>
-        </form>
-        <p id="search-message" class="notice" aria-live="polite"></p>
-        <div id="search-results"></div>
-      </section>
+    <div class="grid">
+      <div class="stack">
+        <section>
+          <h2>记忆区域</h2>
+          <p class="muted">用户、专题、项目和会话区域共享同一个 mem2.0 存储。</p>
+          <ul id="region-list" class="region-list"></ul>
+          <h3>创建区域</h3>
+          <form id="region-form">
+            <label for="region-kind">类型</label>
+            <select id="region-kind"><option value="topic">专题</option><option value="project">项目</option></select>
+            <label for="region-name">名称</label>
+            <input id="region-name" required maxlength="200">
+            <label for="region-id">区域 ID（可选）</label>
+            <input id="region-id" maxlength="120" placeholder="自动生成">
+            <div class="actions"><button type="submit">创建区域</button></div>
+          </form>
+          <h3>绑定项目</h3>
+          <form id="binding-form">
+            <label for="binding-root">项目根目录</label>
+            <input id="binding-root" required placeholder="/path/to/project">
+            <label for="binding-region">项目区域</label>
+            <select id="binding-region"></select>
+            <div class="actions"><button type="submit">绑定</button></div>
+          </form>
+        </section>
+        <section>
+          <h2>自动晋升</h2>
+          <p class="muted">对选中区域运行多目标晋升。敏感、冲突和证据不足的内容不会晋升。</p>
+          <div class="actions"><button id="promotion-button" type="button">运行晋升</button></div>
+          <p id="promotion-message" class="notice" aria-live="polite"></p>
+        </section>
+      </div>
 
-      <section style="margin-top:18px">
-        <h2>记忆单元</h2>
-        <ul id="document-list" class="document-list"></ul>
-        <label for="document-content">内容</label>
-        <textarea id="document-content" spellcheck="false"></textarea>
-        <div class="actions">
-          <button id="save-document" type="button">保存更正</button>
-          <button id="delete-document" class="danger" type="button">遗忘记忆</button>
-          <button id="load-history" class="secondary" type="button">查看审计</button>
-        </div>
-        <p id="document-message" class="notice" aria-live="polite"></p>
-        <ul id="history-list" class="history-list"></ul>
-      </section>
+      <div class="stack">
+        <section>
+          <h2>检索</h2>
+          <form id="search-form">
+            <label for="search-query">查询</label>
+            <input id="search-query" required placeholder="当前项目决策、偏好、领域事实…">
+            <div class="actions"><button type="submit">检索选中区域</button></div>
+          </form>
+          <p id="search-message" class="notice" aria-live="polite"></p>
+          <div id="search-results"></div>
+        </section>
+
+        <section>
+          <h2>正式语义记忆</h2>
+          <p class="muted">按更新时间倒序显示。每页 50 条；原始会话和旧版原样拼接单元不在普通列表显示。</p>
+          <form id="memory-filter-form">
+            <div class="filter-grid">
+              <div>
+                <label for="memory-filter-query">关键词</label>
+                <input id="memory-filter-query" maxlength="500" placeholder="正文关键词">
+              </div>
+              <div>
+                <label for="memory-filter-type">记忆类型</label>
+                <select id="memory-filter-type">
+                  <option value="">全部类型</option>
+                  <option value="domain_fact">领域事实</option>
+                  <option value="decision">决策</option>
+                  <option value="constraint">约束</option>
+                  <option value="preference">偏好</option>
+                  <option value="reusable_experience">可复用经验</option>
+                  <option value="external_reference">外部引用</option>
+                </select>
+              </div>
+              <div>
+                <label for="memory-filter-lifecycle">生命周期</label>
+                <select id="memory-filter-lifecycle">
+                  <option value="">全部生命周期</option>
+                  <option value="active">生效中</option>
+                  <option value="superseded">已被替代</option>
+                  <option value="archived">已归档</option>
+                </select>
+              </div>
+            </div>
+            <div class="actions">
+              <button type="submit">应用筛选</button>
+              <button id="memory-clear-filters" class="secondary" type="button">清除筛选</button>
+            </div>
+          </form>
+          <p id="memory-list-message" class="notice" aria-live="polite"></p>
+          <ul id="document-list" class="document-list"></ul>
+          <div class="actions">
+            <button id="memory-next" class="secondary" type="button" disabled>加载下一页</button>
+            <span id="memory-page-status" class="muted">尚未加载记忆。</span>
+          </div>
+        </section>
+
+        <section id="document-detail" class="hidden" aria-labelledby="detail-heading">
+          <h2 id="detail-heading">记忆详情</h2>
+          <div class="detail-meta">
+            <div class="meta-item"><span>区域</span><strong id="detail-region">—</strong></div>
+            <div class="meta-item"><span>记忆类型</span><strong id="detail-type">—</strong></div>
+            <div class="meta-item"><span>生命周期</span><strong id="detail-lifecycle">—</strong></div>
+            <div class="meta-item"><span>更新时间</span><strong id="detail-updated">—</strong></div>
+            <div class="meta-item"><span>来源数量</span><strong id="detail-source-count">—</strong></div>
+            <div class="meta-item"><span>版本</span><strong id="detail-version">—</strong></div>
+          </div>
+          <label for="document-content">完整正文</label>
+          <textarea id="document-content" spellcheck="false"></textarea>
+          <h3>证据与来源</h3>
+          <ul id="source-list" class="source-list"></ul>
+          <ul id="evidence-list" class="evidence-list"></ul>
+          <div class="actions">
+            <button id="save-document" type="button">保存更正</button>
+            <button id="delete-document" class="danger" type="button">遗忘记忆</button>
+            <button id="load-history" class="secondary" type="button">查看审计</button>
+          </div>
+          <p id="document-message" class="notice" aria-live="polite"></p>
+          <ul id="history-list" class="history-list"></ul>
+        </section>
+      </div>
     </div>
   </div>
 </main>
 <script>
 (() => {
-  const state = { regions: [], selectedRegion: null, selectedPath: null, sourceVersion: null };
+  const TYPE_LABELS = {
+    domain_fact: '领域事实',
+    decision: '决策',
+    constraint: '约束',
+    preference: '偏好',
+    reusable_experience: '可复用经验',
+    external_reference: '外部引用',
+    promoted: '晋升语义记忆',
+    unknown: '未知类型',
+  };
+  const LIFECYCLE_LABELS = {
+    active: '生效中',
+    superseded: '已被替代',
+    archived: '已归档',
+    forgotten: '已遗忘',
+  };
+  const state = {
+    regions: [],
+    selectedRegion: null,
+    selectedMemoryId: null,
+    sourceVersion: null,
+    cursor: null,
+    hasMore: false,
+    page: 0,
+    items: new Map(),
+    listGeneration: 0,
+    listController: null,
+    loadingList: false,
+    detailGeneration: 0,
+    detailReady: false,
+    appliedFilters: null,
+    filtersDirty: false,
+  };
   const $ = (id) => document.getElementById(id);
-  const setMessage = (element, text, error = false) => {
+  const setMessage = (element, text, error = false, success = false) => {
     element.textContent = text;
     element.classList.toggle('error', error);
+    element.classList.toggle('success', success);
+  };
+  const typeLabel = (value) => TYPE_LABELS[value] || value || '未知类型';
+  const memoryTypeLabel = (memory) => (
+    memory.memory_type_resolution === 'legacy_unresolved'
+      ? '类型无法解析（历史晋升）'
+      : typeLabel(memory.memory_type)
+  );
+  const lifecycleLabel = (value) => LIFECYCLE_LABELS[value] || value || '未知生命周期';
+  const formatTime = (value) => {
+    if (!value) return '—';
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString('zh-CN', { hour12: false });
   };
   async function request(url, options = {}) {
     const response = await fetch(url, { credentials: 'same-origin', ...options });
     if (response.status === 401) {
       showLogin();
-      throw new Error('认证已失效，请重新登录。');
+      setMessage($('login-message'), '认证已失效，请重新登录。', true);
+      const error = new Error('认证已失效，请重新登录。');
+      error.status = 401;
+      throw error;
     }
     if (!response.ok) {
       let detail = `${response.status} ${response.statusText}`;
-      try { const body = await response.json(); if (body.detail) detail = body.detail; } catch {}
-      throw new Error(detail);
+      try {
+        const body = await response.json();
+        if (body.detail) detail = body.detail;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      const requestError = new Error(detail);
+      requestError.status = response.status;
+      throw requestError;
     }
     if (response.status === 204) return null;
     const type = response.headers.get('content-type') || '';
@@ -181,41 +322,269 @@
     $('status').textContent = `${status.memory_kernel} · ${status.memory_kernel_status}`;
     showWorkspace();
   }
+  function setGovernanceDisabled(disabled) {
+    $('save-document').disabled = disabled;
+    $('delete-document').disabled = disabled;
+    $('load-history').disabled = disabled;
+  }
+  function setDetailGovernance(lifecycle) {
+    const readOnly = String(lifecycle || '') !== 'active';
+    $('document-content').readOnly = readOnly;
+    $('save-document').disabled = readOnly;
+    $('delete-document').disabled = readOnly;
+    $('load-history').disabled = false;
+  }
+  function clearDetailData() {
+    state.detailReady = false;
+    state.sourceVersion = null;
+    $('detail-region').textContent = '—';
+    $('detail-type').textContent = '—';
+    $('detail-lifecycle').textContent = '—';
+    $('detail-updated').textContent = '—';
+    $('detail-source-count').textContent = '—';
+    $('detail-version').textContent = '—';
+    $('document-content').value = '';
+    $('document-content').readOnly = false;
+    $('source-list').replaceChildren();
+    $('evidence-list').replaceChildren();
+    $('history-list').replaceChildren();
+    setGovernanceDisabled(true);
+  }
+  function invalidateDetail() {
+    state.detailGeneration += 1;
+    state.selectedMemoryId = null;
+    clearDetailData();
+  }
+  function resetDetail() {
+    invalidateDetail();
+    $('document-detail').classList.add('hidden');
+    setMessage($('document-message'), '');
+  }
   async function selectRegion(regionId) {
     state.selectedRegion = regionId;
-    state.selectedPath = null;
-    state.sourceVersion = null;
+    resetDetail();
     renderRegions();
-    await loadDocuments();
+    await loadMemories({ reset: true });
   }
-  async function loadDocuments() {
-    const list = $('document-list');
-    list.replaceChildren();
-    $('document-content').value = '';
-    setMessage($('document-message'), '');
-    if (!state.selectedRegion) return;
-    const documents = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/documents`);
-    for (const document of documents) {
-      const item = document.createElement('li');
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = String(document.path);
-      button.addEventListener('click', () => loadDocument(String(document.path)));
-      item.append(button);
-      list.append(item);
+  function currentFilters() {
+    return {
+      q: $('memory-filter-query').value.trim(),
+      memory_type: $('memory-filter-type').value,
+      lifecycle: $('memory-filter-lifecycle').value,
+    };
+  }
+  function renderMemoryItem(memory) {
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'memory-card';
+    button.dataset.memoryId = memory.id;
+    button.setAttribute('aria-label', `查看记忆：${memory.summary}`);
+    button.classList.toggle('active', state.selectedMemoryId === memory.id);
+    const summary = document.createElement('strong');
+    summary.textContent = memory.summary || '（无摘要）';
+    const chips = document.createElement('div');
+    chips.className = 'chips';
+    for (const text of [
+      memoryTypeLabel(memory),
+      lifecycleLabel(memory.lifecycle),
+      `更新 ${formatTime(memory.updated_at)}`,
+      `来源 ${memory.source_count}`,
+    ]) {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.textContent = text;
+      chips.append(chip);
     }
-    setMessage($('document-message'), documents.length ? '选择一条记忆单元进行检视。' : '当前区域没有记忆单元。');
+    button.append(summary, chips);
+    button.addEventListener('click', () => openMemory(memory.id));
+    item.append(button);
+    return item;
   }
-  async function loadDocument(path) {
-    state.selectedPath = path;
-    const document = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/document?path=${encodeURIComponent(path)}`);
-    state.sourceVersion = String(document.source_version);
-    $('document-content').value = String(document.content);
-    $('history-list').replaceChildren();
-    setMessage($('document-message'), `已加载 ${path}，来源版本 ${state.sourceVersion}。`);
+  function removeMemoryItem(memoryId) {
+    const normalized = String(memoryId || '');
+    if (!normalized) return;
+    state.items.delete(normalized);
+    for (const button of document.querySelectorAll('.memory-card')) {
+      if (button.dataset.memoryId === normalized) {
+        button.closest('li')?.remove();
+        break;
+      }
+    }
+  }
+  function updatePageStatus(text) {
+    $('memory-page-status').textContent = text;
+    $('memory-next').disabled = state.loadingList || !state.hasMore || state.filtersDirty;
+  }
+  async function loadMemories({ reset = false } = {}) {
+    if (!state.selectedRegion) return false;
+    if (state.loadingList && !reset) return false;
+    if (!reset && !state.hasMore) {
+      setMessage($('memory-list-message'), '已经到达分页结束位置。');
+      return true;
+    }
+    if (reset) {
+      state.listGeneration += 1;
+      state.cursor = null;
+      state.hasMore = false;
+      state.page = 0;
+      state.items.clear();
+      $('document-list').replaceChildren();
+      if (state.listController) state.listController.abort();
+    }
+    const generation = state.listGeneration;
+    const filters = reset
+      ? currentFilters()
+      : (state.appliedFilters || currentFilters());
+    if (reset) {
+      state.appliedFilters = { ...filters };
+      state.filtersDirty = false;
+    }
+    const params = new URLSearchParams();
+    if (filters.q) params.set('q', filters.q);
+    if (filters.memory_type) params.set('memory_type', filters.memory_type);
+    if (filters.lifecycle) params.set('lifecycle', filters.lifecycle);
+    params.set('limit', '50');
+    if (!reset && state.cursor) params.set('cursor', state.cursor);
+    const suffix = params.toString() ? `?${params}` : '';
+    state.loadingList = true;
+    const controller = new AbortController();
+    state.listController = controller;
+    updatePageStatus('正在加载记忆…');
+    setMessage($('memory-list-message'), reset ? '正在加载正式语义记忆…' : '正在加载下一页…');
+    try {
+      const page = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/memories${suffix}`, {
+        signal: controller.signal,
+      });
+      if (generation !== state.listGeneration) return false;
+      for (const memory of page.items || []) {
+        if (state.items.has(memory.id)) continue;
+        state.items.set(memory.id, memory);
+        $('document-list').append(renderMemoryItem(memory));
+      }
+      state.cursor = page.next_cursor || null;
+      state.hasMore = page.has_more === true;
+      state.page += (page.items || []).length ? 1 : 0;
+      if (state.items.size === 0) {
+        setMessage($('memory-list-message'), '当前区域或筛选条件下没有正式语义记忆。');
+        updatePageStatus('第 0 页 · 每页 50 条');
+      } else if (state.hasMore) {
+        setMessage($('memory-list-message'), `已加载 ${state.items.size} 条记忆，还有下一页。`);
+        updatePageStatus(`已加载第 ${state.page} 页 · 每页 50 条`);
+      } else {
+        setMessage($('memory-list-message'), `分页结束：共加载 ${state.items.size} 条记忆。`, false, true);
+        updatePageStatus(`已到末页 · 共加载 ${state.items.size} 条`);
+      }
+      return true;
+    } catch (error) {
+      if (error.name === 'AbortError' || generation !== state.listGeneration) return false;
+      setMessage($('memory-list-message'), `加载记忆列表失败：${error.message}`, true);
+      updatePageStatus('加载失败');
+      return false;
+    } finally {
+      if (state.listController === controller) {
+        state.listController = null;
+        state.loadingList = false;
+        if (generation === state.listGeneration) {
+          $('memory-next').disabled = !state.hasMore || state.filtersDirty;
+        }
+      }
+    }
+  }
+  function renderSources(memory) {
+    const sourceList = $('source-list');
+    sourceList.replaceChildren();
+    const references = Array.isArray(memory.source_references) ? memory.source_references : [];
+    if (!references.length) {
+      const item = document.createElement('li');
+      item.className = 'muted';
+      item.textContent = '没有记录来源引用。';
+      sourceList.append(item);
+    } else {
+      for (const reference of references) {
+        const item = document.createElement('li');
+        item.textContent = String(reference);
+        sourceList.append(item);
+      }
+    }
+    const evidenceList = $('evidence-list');
+    evidenceList.replaceChildren();
+    const evidence = Array.isArray(memory.evidence) ? memory.evidence : [];
+    if (!evidence.length) {
+      const item = document.createElement('li');
+      item.className = 'muted';
+      item.textContent = '当前记忆没有可展开的证据单元。';
+      evidenceList.append(item);
+    } else {
+      for (const evidenceItem of evidence) {
+        const item = document.createElement('li');
+        const label = document.createElement('strong');
+        label.textContent = evidenceItem.resolved === false
+          ? `证据 ${evidenceItem.id || ''} · 来源不可用`
+          : `证据 ${evidenceItem.id || ''} · ${lifecycleLabel(evidenceItem.lifecycle)}`;
+        const meta = document.createElement('div');
+        meta.className = 'chips';
+        for (const text of [
+          `区域 ${evidenceItem.region_id || '—'} (${evidenceItem.region_kind || '未知'})`,
+          `会话 ${evidenceItem.session_id || '—'}`,
+          `回合 ${evidenceItem.turn_id || '—'}`,
+          `事件 ${evidenceItem.event_id || '—'}`,
+          `删除 ${evidenceItem.deleted_at ? formatTime(evidenceItem.deleted_at) : '—'}`,
+        ]) {
+          const chip = document.createElement('span');
+          chip.className = 'chip';
+          chip.textContent = text;
+          meta.append(chip);
+        }
+        const content = document.createElement('pre');
+        content.textContent = evidenceItem.redacted
+          ? '（正文已因遗忘隐藏）'
+          : (evidenceItem.content || '（没有可读取的证据正文）');
+        item.append(label, meta, content);
+        evidenceList.append(item);
+      }
+    }
+  }
+  async function openMemory(memoryId) {
+    if (!state.selectedRegion) return;
+    const generation = ++state.detailGeneration;
+    state.selectedMemoryId = memoryId;
+    clearDetailData();
+    for (const button of document.querySelectorAll('.memory-card')) {
+      button.classList.toggle('active', button.dataset.memoryId === memoryId);
+    }
+    $('document-detail').classList.remove('hidden');
+    setMessage($('document-message'), '正在加载记忆详情…');
+    try {
+      const memory = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/memories/${encodeURIComponent(memoryId)}`);
+      if (generation !== state.detailGeneration) return;
+      state.sourceVersion = String(memory.source_version || memory.version);
+      $('detail-region').textContent = memory.region ? `${memory.region.name} · ${memory.region.kind}` : String(memory.region_id || '—');
+      $('detail-type').textContent = memoryTypeLabel(memory);
+      $('detail-lifecycle').textContent = lifecycleLabel(String(memory.lifecycle || ''));
+      $('detail-updated').textContent = formatTime(String(memory.updated_at || ''));
+      $('detail-source-count').textContent = String(memory.source_count ?? 0);
+      $('detail-version').textContent = state.sourceVersion;
+      $('document-content').value = String(memory.content || '');
+      renderSources(memory);
+      state.detailReady = true;
+      const lifecycle = String(memory.lifecycle || '');
+      setDetailGovernance(lifecycle);
+      const readOnlyHint = lifecycle === 'active' ? '' : ' 该版本只读，只能查看信息和审计。';
+      setMessage($('document-message'), `已加载记忆详情，来源版本 ${state.sourceVersion}。${readOnlyHint}`, false, true);
+    } catch (error) {
+      if (generation !== state.detailGeneration) return;
+      clearDetailData();
+      setMessage($('document-message'), `加载记忆详情失败，详情已清空：${error.message}`, true);
+      if (error.status === 404) {
+        setMessage($('memory-list-message'), '该记忆已不在正式记忆列表中，列表已刷新。', true);
+        await loadMemories({ reset: true });
+      }
+    }
   }
   async function saveDocument() {
-    if (!state.selectedRegion || !state.selectedPath) return;
+    if (!state.selectedRegion || !state.selectedMemoryId) return;
+    const submittedMemoryId = state.selectedMemoryId;
     const button = $('save-document');
     button.disabled = true;
     try {
@@ -223,7 +592,7 @@
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          path: state.selectedPath,
+          path: state.selectedMemoryId,
           content: $('document-content').value,
           expected_source_version: state.sourceVersion,
           operation_id: crypto.randomUUID(),
@@ -231,28 +600,81 @@
           source: 'web',
         }),
       });
-      state.sourceVersion = String(updated.source_version);
-      setMessage($('document-message'), '更正已保存并写入持久化审计。');
-      await loadDocuments();
+      if (String(updated.browser_index_sync || '') === 'pending') {
+        removeMemoryItem(submittedMemoryId);
+        invalidateDetail();
+        setMessage(
+          $('document-message'),
+          '更正已提交，索引待同步。旧详情与旧列表项已移除，治理操作保持禁用。',
+          true,
+        );
+        return;
+      }
+      const updatedId = String(updated.id || state.selectedMemoryId);
+      state.selectedMemoryId = updatedId;
+      clearDetailData();
+      setMessage($('document-message'), '更正已保存，正在刷新列表和详情…');
+      const reloaded = await loadMemories({ reset: true });
+      if (!reloaded) {
+        setGovernanceDisabled(true);
+        setMessage(
+          $('document-message'),
+          '更正已保存，但列表刷新失败。旧详情与旧版本已清空，治理操作保持禁用。',
+          true,
+        );
+        return;
+      }
+      if (state.items.has(updatedId)) {
+        await openMemory(updatedId);
+        setMessage($('document-message'), '更正已保存并通过当前列表同步。可在审计记录中核对。', false, true);
+      } else {
+        resetDetail();
+        setMessage($('memory-list-message'), '更正已保存，但当前筛选条件不再匹配这条记忆。', false, true);
+      }
     } catch (error) {
-      setMessage($('document-message'), error.message, true);
-    } finally { button.disabled = false; }
+      if (error.status === 409) {
+        invalidateDetail();
+        setMessage($('document-message'), '版本冲突：该记忆已被其他操作更新。旧详情与旧版本已清空，请重新打开最新版本后再更正。', true);
+        await loadMemories({ reset: true });
+      } else if (error.status === 401) {
+        setMessage($('document-message'), error.message, true);
+      } else if (error.status === 503) {
+        invalidateDetail();
+        setMessage(
+          $('document-message'),
+          '更正提交结果待确认，索引同步失败。旧详情已清空，请稍后刷新列表。',
+          true,
+        );
+        await loadMemories({ reset: true });
+      } else {
+        setMessage($('document-message'), `保存更正失败：${error.message}`, true);
+      }
+    } finally {
+      button.disabled = false;
+      if (!state.detailReady) setGovernanceDisabled(true);
+    }
   }
   async function deleteDocument() {
-    if (!state.selectedRegion || !state.selectedPath) return;
+    if (!state.selectedRegion || !state.selectedMemoryId) return;
+    if (!window.confirm('确认遗忘这条记忆？遗忘后普通列表不再显示。')) return;
     const button = $('delete-document');
+    const forgottenId = state.selectedMemoryId;
     button.disabled = true;
     try {
       const preview = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/document/delete-preview`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path: state.selectedPath, expected_source_version: state.sourceVersion, operation_id: crypto.randomUUID() }),
+        body: JSON.stringify({
+          path: forgottenId,
+          expected_source_version: state.sourceVersion,
+          operation_id: crypto.randomUUID(),
+        }),
       });
-      await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/document`, {
+      const forgotten = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/document`, {
         method: 'DELETE',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          path: state.selectedPath,
+          path: forgottenId,
           expected_source_version: state.sourceVersion,
           preview_token: preview.preview_token,
           operation_id: crypto.randomUUID(),
@@ -261,47 +683,108 @@
           mode: 'forget',
         }),
       });
-      setMessage($('document-message'), '记忆已遗忘，可在审计记录中核对。');
-      await loadDocuments();
+      if (String(forgotten.browser_index_sync || '') === 'pending') {
+        const affectedIds = Array.isArray(forgotten.affected_unit_ids) && forgotten.affected_unit_ids.length
+          ? forgotten.affected_unit_ids
+          : [forgottenId];
+        for (const affectedId of affectedIds) removeMemoryItem(affectedId);
+        invalidateDetail();
+        setMessage(
+          $('document-message'),
+          '遗忘已提交，索引待同步。整条版本链的旧详情与列表项已移除，治理操作保持禁用。',
+          true,
+        );
+        return;
+      }
+      resetDetail();
+      const reloaded = await loadMemories({ reset: true });
+      if (reloaded) {
+        setMessage($('memory-list-message'), `记忆 ${forgottenId} 已遗忘，普通列表已同步隐藏。可在区域审计记录中核对。`, false, true);
+      } else {
+        setMessage($('memory-list-message'), `记忆 ${forgottenId} 已遗忘，但列表刷新失败；请重新加载。`, true);
+      }
     } catch (error) {
-      setMessage($('document-message'), error.message, true);
-    } finally { button.disabled = false; }
+      if (error.status === 409) {
+        invalidateDetail();
+        setMessage($('document-message'), '版本冲突：记忆状态已变化，无法执行遗忘。旧详情与旧版本已清空，请重新打开最新版本后再操作。', true);
+        await loadMemories({ reset: true });
+      } else if (error.status === 401) {
+        setMessage($('document-message'), error.message, true);
+      } else if (error.status === 503) {
+        invalidateDetail();
+        setMessage(
+          $('document-message'),
+          '遗忘提交结果待确认，索引同步失败。旧详情已清空，请稍后刷新列表。',
+          true,
+        );
+        await loadMemories({ reset: true });
+      } else {
+        setMessage($('document-message'), `遗忘失败：${error.message}`, true);
+      }
+    } finally {
+      if (state.detailReady) button.disabled = false;
+    }
   }
   async function loadHistory() {
     if (!state.selectedRegion) return;
-    const history = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/history?limit=50`);
-    const list = $('history-list');
-    list.replaceChildren();
-    for (const entry of history) {
-      const item = document.createElement('li');
-      item.textContent = `${entry.occurred_at || entry.authored_at || ''} · ${entry.action} · ${entry.target_id || entry.subject || ''}`;
-      list.append(item);
+    const generation = state.detailGeneration;
+    const selected = state.selectedMemoryId;
+    const region = state.selectedRegion;
+    try {
+      const target = selected ? `&target_id=${encodeURIComponent(selected)}` : '';
+      const history = await request(`/api/v1/libraries/${encodeURIComponent(region)}/history?limit=50${target}`);
+      if (
+        generation !== state.detailGeneration
+        || selected !== state.selectedMemoryId
+        || region !== state.selectedRegion
+      ) {
+        return;
+      }
+      const list = $('history-list');
+      list.replaceChildren();
+      for (const entry of history) {
+        const item = document.createElement('li');
+        item.textContent = `${formatTime(entry.occurred_at || entry.authored_at || '')} · ${entry.action} · ${entry.status || ''} · ${entry.target_id || entry.subject || ''}`;
+        list.append(item);
+      }
+      setMessage($('document-message'), history.length ? '已加载当前记忆的持久化审计记录。' : '当前记忆没有审计记录。');
+    } catch (error) {
+      if (
+        generation === state.detailGeneration
+        && selected === state.selectedMemoryId
+        && region === state.selectedRegion
+      ) {
+        setMessage($('document-message'), `加载审计记录失败：${error.message}`, true);
+      }
     }
-    setMessage($('document-message'), history.length ? '已加载持久化审计记录。' : '当前区域没有审计记录。');
   }
   async function runSearch(event) {
     event.preventDefault();
     if (!state.selectedRegion) return;
     setMessage($('search-message'), '正在检索…');
-    const packageValue = await request('/api/v1/search', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ region_id: state.selectedRegion, query: $('search-query').value, token_budget: 10000 }),
-    });
-    const container = $('search-results');
-    container.replaceChildren();
-    for (const result of packageValue.results || []) {
-      const article = document.createElement('article');
-      article.className = 'result';
-      const heading = document.createElement('strong');
-      heading.textContent = `${result.path} · ${result.source_type} · ${result.source_version}`;
-      const content = document.createElement('p');
-      content.textContent = result.content;
-      article.append(heading, content);
-      container.append(article);
+    try {
+      const packageValue = await request('/api/v1/search', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ region_id: state.selectedRegion, query: $('search-query').value, token_budget: 10000 }),
+      });
+      const container = $('search-results');
+      container.replaceChildren();
+      for (const result of packageValue.results || []) {
+        const article = document.createElement('article');
+        article.className = 'result';
+        const heading = document.createElement('strong');
+        heading.textContent = `${result.path} · ${result.source_type} · ${result.source_version}`;
+        const content = document.createElement('p');
+        content.textContent = result.content;
+        article.append(heading, content);
+        container.append(article);
+      }
+      const budget = packageValue.budget || {};
+      setMessage($('search-message'), `${(packageValue.results || []).length} 条结果，使用 ${budget.used_tokens ?? 0}/${budget.effective_tokens ?? 10000} token。`);
+    } catch (error) {
+      setMessage($('search-message'), `检索失败：${error.message}`, true);
     }
-    const budget = packageValue.budget || {};
-    setMessage($('search-message'), `${(packageValue.results || []).length} 条结果，使用 ${budget.used_tokens ?? 0}/${budget.effective_tokens ?? 10000} token。`);
   }
   async function createRegion(event) {
     event.preventDefault();
@@ -310,10 +793,11 @@
       if ($('region-id').value.trim()) body.region_id = $('region-id').value.trim();
       const region = await request('/api/v1/regions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       state.selectedRegion = region.region_id;
+      resetDetail();
       $('region-form').reset();
       await loadRegions();
-      await loadDocuments();
-    } catch (error) { setMessage($('status'), error.message, true); }
+      await loadMemories({ reset: true });
+    } catch (error) { setMessage($('status'), `创建区域失败：${error.message}`, true); }
   }
   async function bindProject(event) {
     event.preventDefault();
@@ -323,8 +807,8 @@
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ project_root: $('binding-root').value, region_id: $('binding-region').value }),
       });
-      setMessage($('document-message'), '项目绑定已保存。');
-    } catch (error) { setMessage($('document-message'), error.message, true); }
+      setMessage($('memory-list-message'), '项目绑定已保存。', false, true);
+    } catch (error) { setMessage($('memory-list-message'), `项目绑定失败：${error.message}`, true); }
   }
   async function runPromotion() {
     if (!state.selectedRegion) return;
@@ -337,7 +821,7 @@
         body: JSON.stringify({ source_region_ids: [state.selectedRegion] }),
       });
       setMessage($('promotion-message'), `晋升任务已排队：${job.job_id}`);
-    } catch (error) { setMessage($('promotion-message'), error.message, true); }
+    } catch (error) { setMessage($('promotion-message'), `运行晋升失败：${error.message}`, true); }
     finally { button.disabled = false; }
   }
   $('login-form').addEventListener('submit', async (event) => {
@@ -350,17 +834,35 @@
       $('login-form').reset();
       await loadStatus();
       await loadRegions();
-      await loadDocuments();
-    } catch (error) { setMessage($('login-message'), error.message, true); }
+      if (state.selectedRegion) await loadMemories({ reset: true });
+    } catch (error) { setMessage($('login-message'), `登录失败：${error.message}`, true); }
   });
-  $('search-form').addEventListener('submit', (event) => runSearch(event).catch((error) => setMessage($('search-message'), error.message, true)));
+  $('search-form').addEventListener('submit', (event) => runSearch(event));
+  $('memory-filter-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    resetDetail();
+    loadMemories({ reset: true });
+  });
+  $('memory-filter-query').addEventListener('input', () => {
+    state.filtersDirty = true;
+    updatePageStatus($('memory-page-status').textContent);
+    setMessage($('memory-list-message'), '关键词已更改。请应用筛选后重新开始分页。');
+  });
+  $('memory-filter-type').addEventListener('change', () => { resetDetail(); loadMemories({ reset: true }); });
+  $('memory-filter-lifecycle').addEventListener('change', () => { resetDetail(); loadMemories({ reset: true }); });
+  $('memory-clear-filters').addEventListener('click', () => {
+    $('memory-filter-form').reset();
+    resetDetail();
+    loadMemories({ reset: true });
+  });
+  $('memory-next').addEventListener('click', () => loadMemories());
   $('region-form').addEventListener('submit', createRegion);
   $('binding-form').addEventListener('submit', bindProject);
   $('save-document').addEventListener('click', saveDocument);
   $('delete-document').addEventListener('click', deleteDocument);
-  $('load-history').addEventListener('click', () => loadHistory().catch((error) => setMessage($('document-message'), error.message, true)));
+  $('load-history').addEventListener('click', loadHistory);
   $('promotion-button').addEventListener('click', runPromotion);
-  loadStatus().then(async () => { await loadRegions(); await loadDocuments(); }).catch(() => showLogin());
+  loadStatus().then(async () => { await loadRegions(); await loadMemories({ reset: true }); }).catch(() => showLogin());
 })();
 </script>
 </body>

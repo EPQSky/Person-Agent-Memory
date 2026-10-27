@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import Settings
+from personal_agent_memory.mem2_kernel import Mem2MemoryKernel
 
 
 def _app(state_dir: Path):
@@ -232,7 +233,8 @@ def test_promotion_promotes_user_and_topic_targets_and_keeps_project_fact(
         promoted_user = next(
             item for item in user_results if item["content"] == "I prefer concise answers"
         )
-        assert promoted_user["user_metadata"]["memory_type"] == "promoted"
+        assert promoted_user["user_metadata"]["memory_type"] == "preference"
+        assert promoted_user["user_metadata"]["promotion_marker"] is True
         assert promoted_user["user_metadata"]["source_unit_ids"] == [user_source["id"]]
         assert f"unit:{user_source['id']}" in promoted_user["user_metadata"]["source_references"]
         assert "source:promotion-user" in promoted_user["user_metadata"]["source_references"]
@@ -256,7 +258,8 @@ def test_promotion_promotes_user_and_topic_targets_and_keeps_project_fact(
             for item in topic_results
             if item["content"] == "Rust ownership is a memory-safety principle"
         )
-        assert promoted_topic["user_metadata"]["memory_type"] == "promoted"
+        assert promoted_topic["user_metadata"]["memory_type"] == "domain_fact"
+        assert promoted_topic["user_metadata"]["promotion_marker"] is True
         assert promoted_topic["user_metadata"]["source_unit_ids"] == [topic_source["id"]]
 
         project_results = _search(
@@ -364,12 +367,88 @@ def test_repeated_promotion_runs_are_idempotent_and_audit_once(tmp_path: Path) -
     assert int(records[0][1]) > 0
 
 
-def test_session_capture_evolve_then_promotion_preserves_source(tmp_path: Path) -> None:
+def test_repeated_promotion_does_not_resurrect_forgotten_target(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    content = "I prefer durable archive navigation"
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers, "project", "demo")
+        _write(
+            client,
+            headers,
+            "demo",
+            content,
+            key="promotion-forgotten-target",
+            memory_type="preference",
+        )
+
+        first = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["demo"]},
+        )
+        assert first.status_code == 202, first.text
+        first_status = _wait_promotion(client, headers, str(first.json()["job_id"]))
+        assert first_status["summary"]["promoted"] == 1
+        user_results = _search(client, headers, region_id="user", query="archive")["results"]
+        target = next(item for item in user_results if item["content"] == content)
+        target_id = str(target["document_id"])
+        target_revision = str(
+            _inspect_document(
+                client,
+                headers,
+                region_id="user",
+                path=target_id,
+            )["version"]
+        )
+        _delete_document(
+            client,
+            headers,
+            region_id="user",
+            path=target_id,
+            revision=target_revision,
+            mode="forget",
+            operation_id="promotion-forget-target",
+        )
+        assert client.get(
+            "/api/v1/libraries/user/memories",
+            headers=headers,
+        ).json()["items"] == []
+
+        repeated = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["demo"]},
+        )
+        assert repeated.status_code == 202, repeated.text
+        repeated_status = _wait_promotion(client, headers, str(repeated.json()["job_id"]))
+        assert repeated_status["status"] == "completed", repeated_status
+        assert repeated_status["summary"]["promoted"] == 0
+        assert repeated_status["summary"]["skipped"] == 1
+        assert client.get(
+            "/api/v1/libraries/user/memories",
+            headers=headers,
+        ).json()["items"] == []
+        tombstone = client.get(
+            f"/api/v1/libraries/user/memories/{target_id}",
+            headers=headers,
+        )
+        assert tombstone.status_code == 404, tombstone.text
+
+    with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+        record = connection.execute(
+            "SELECT target_unit_id FROM promotion_records"
+        ).fetchone()
+    assert record == (target_id,)
+
+
+def test_evolved_units_stay_diagnostic_and_do_not_promote(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     other_root = tmp_path / "other"
     other_root.mkdir()
     with TestClient(_app(state_dir)) as client:
         headers = _headers(state_dir)
+        _region(client, headers, "user", "user")
         captured = client.post(
             "/api/v1/capture/events",
             headers=headers,
@@ -417,29 +496,42 @@ def test_session_capture_evolve_then_promotion_preserves_source(tmp_path: Path) 
         assert started.status_code == 202, started.text
         status = _wait_promotion(client, headers, str(started.json()["job_id"]))
         assert status["status"] == "completed", status
-        assert status["summary"]["promoted"] == 1
+        assert status["summary"]["candidates"] == 0
+        assert status["summary"]["promoted"] == 0
 
-        user_results = _search(
-            client,
-            headers,
-            region_id="user",
-            query="detailed",
-        )["results"]
-        promoted = next(item for item in user_results if "detailed explanations" in item["content"])
-        provenance = promoted["user_metadata"]["source_unit_ids"]
-        assert provenance
-        assert any(
-            ref.startswith(f"capture:{source_region_id}:")
-            for ref in promoted["user_metadata"]["source_references"]
+        user_page = client.get(
+            "/api/v1/libraries/user/memories",
+            headers=headers,
+            params={"q": "detailed"},
         )
+        assert user_page.status_code == 200, user_page.text
+        assert user_page.json()["items"] == []
 
-        source_results = _search(
-            client,
-            headers,
-            region_id=source_region_id,
-            query="detailed",
-        )["results"]
-        assert any("detailed explanations" in item["content"] for item in source_results)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            rounds = client.get(
+                "/api/v1/capture/rounds",
+                headers=headers,
+                params={"session_id": "promotion-session"},
+            )
+            assert rounds.status_code == 200, rounds.text
+            if rounds.json() and rounds.json()[0]["status"] == "done":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("capture consolidation did not complete")
+
+        kernel = client.app.state.memory_kernel
+        bundle = kernel._require_bundle()
+        evolved_units = [
+            unit
+            for scope in bundle.kv_store.scopes()
+            for unit in kernel._units_in_scope(bundle, scope)
+            if unit.user_metadata.get("memory_type") == "evolved"
+            and unit.user_metadata.get("region_id") == source_region_id
+        ]
+        assert len(evolved_units) == 1
+        assert "detailed explanations" in evolved_units[0].content
 
 
 def test_promotion_rejects_invalid_sources_and_missing_jobs(tmp_path: Path) -> None:
@@ -514,7 +606,8 @@ def test_injected_classifier_can_route_generalizable_knowledge_to_topic(
         )["results"]
         assert any(
             item["content"] == "Ownership keeps shared state memory safe"
-            and item["user_metadata"]["memory_type"] == "promoted"
+            and item["user_metadata"].get("promotion_marker") is True
+            and item["user_metadata"]["memory_type"] != "promoted"
             for item in results
         )
 
@@ -527,7 +620,7 @@ def test_repeated_promotion_repairs_record_and_audit_after_partial_persistence(
     with TestClient(_app(state_dir)) as client:
         headers = _headers(state_dir)
         _region(client, headers, "project", "demo")
-        _write(
+        source = _write(
             client,
             headers,
             "demo",
@@ -569,6 +662,21 @@ def test_repeated_promotion_repairs_record_and_audit_after_partial_persistence(
         second_status = _wait_promotion(client, headers, str(second.json()["job_id"]))
         assert second_status["summary"]["promoted"] == 0
         assert second_status["summary"]["skipped"] == 1
+
+        user_page = client.get(
+            "/api/v1/libraries/user/memories",
+            headers=headers,
+            params={"q": content},
+        )
+        assert user_page.status_code == 200, user_page.text
+        assert [item["id"] for item in user_page.json()["items"]] == [target_unit_id]
+        detail = client.get(
+            f"/api/v1/libraries/user/memories/{target_unit_id}",
+            headers=headers,
+        )
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["user_metadata"]["source_unit_ids"] == [source["id"]]
+        assert detail.json()["provenance"] == [source["id"]]
 
     with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
         repaired = connection.execute(
@@ -662,6 +770,14 @@ def test_multi_source_evidence_promotes_once_and_merges_provenance(tmp_path: Pat
         second = _write(
             client,
             headers,
+            "alpha",
+            content,
+            key="multi-source-alpha-two",
+            memory_type="preference",
+        )
+        third = _write(
+            client,
+            headers,
             "beta",
             content,
             key="multi-source-beta",
@@ -687,22 +803,60 @@ def test_multi_source_evidence_promotes_once_and_merges_provenance(tmp_path: Pat
         status = _wait_promotion(client, headers, str(started.json()["job_id"]))
         summary = status["summary"]
         assert status["status"] == "completed"
-        assert summary["candidates"] == 2
+        assert summary["candidates"] == 3
         assert summary["promoted"] == 1
         assert summary["skipped"] == 0
         assert summary["failed"] == 0
         assert summary["conflict_groups"] == 0
         assert summary["evidence_groups"] == 1
 
-        user_results = _search(client, headers, region_id="user", query="compact")["results"]
-        promoted = next(item for item in user_results if item["content"] == content)
-        metadata = promoted["user_metadata"]
+        user_page = client.get(
+            "/api/v1/libraries/user/memories",
+            headers=headers,
+            params={"q": "compact", "memory_type": "preference"},
+        )
+        assert user_page.status_code == 200, user_page.text
+        promoted = next(
+            item for item in user_page.json()["items"] if item["summary"] == content
+        )
+        promoted_detail = client.get(
+            f"/api/v1/libraries/user/memories/{promoted['id']}",
+            headers=headers,
+        )
+        assert promoted_detail.status_code == 200, promoted_detail.text
+        metadata = promoted_detail.json()["user_metadata"]
         assert metadata["promotion_evidence_kind"] == "multi_source"
-        assert metadata["promotion_evidence_count"] == 2
-        assert set(metadata["source_unit_ids"]) == {first["id"], second["id"]}
+        assert metadata["promotion_evidence_count"] == 3
+        assert set(metadata["source_unit_ids"]) == {
+            first["id"],
+            second["id"],
+            third["id"],
+        }
         assert set(metadata["source_region_ids"]) == {"alpha", "beta"}
-        assert set(metadata["provenance"]) == {first["id"], second["id"]}
-        for region_id, source in (("alpha", first), ("beta", second)):
+        assert set(metadata["provenance"]) == {
+            first["id"],
+            second["id"],
+            third["id"],
+        }
+        source_unit_regions = json.loads(metadata["source_unit_regions"])
+        assert {
+            (item["unit_id"], item["region_id"]) for item in source_unit_regions
+        } == {
+            (first["id"], "alpha"),
+            (second["id"], "alpha"),
+            (third["id"], "beta"),
+        }
+        detail = client.get(
+            f"/api/v1/libraries/user/memories/{promoted['id']}",
+            headers=headers,
+        )
+        assert detail.status_code == 200, detail.text
+        evidence = {item["id"]: item for item in detail.json()["evidence"]}
+        assert evidence[first["id"]]["region_id"] == "alpha"
+        assert evidence[second["id"]]["region_id"] == "alpha"
+        assert evidence[third["id"]]["region_id"] == "beta"
+        assert all(evidence[source["id"]]["resolved"] is True for source in (first, second, third))
+        for region_id, source in (("alpha", first), ("beta", third)):
             source_results = _search(
                 client,
                 headers,
@@ -730,7 +884,11 @@ def test_multi_source_evidence_promotes_once_and_merges_provenance(tmp_path: Pat
         ).fetchall()
     assert len(records) == 1
     assert records[0][0] == "multi_source"
-    assert set(json.loads(records[0][1])) == {first["id"], second["id"]}
+    assert set(json.loads(records[0][1])) == {
+        first["id"],
+        second["id"],
+        third["id"],
+    }
 
 
 def test_later_source_merges_into_existing_promotion(tmp_path: Path) -> None:
@@ -946,13 +1104,15 @@ def test_complementary_claims_are_not_treated_as_conflict(tmp_path: Path) -> Non
         fast_results = _search(client, headers, region_id="rust", query="fast")["results"]
         assert any(
             item["content"] == "Rust is fast"
-            and item["user_metadata"]["memory_type"] == "promoted"
+            and item["user_metadata"].get("promotion_marker") is True
+            and item["user_metadata"]["memory_type"] != "promoted"
             for item in fast_results
         )
         safe_results = _search(client, headers, region_id="rust", query="memory")["results"]
         assert any(
             item["content"] == "Rust is memory-safe"
-            and item["user_metadata"]["memory_type"] == "promoted"
+            and item["user_metadata"].get("promotion_marker") is True
+            and item["user_metadata"]["memory_type"] != "promoted"
             for item in safe_results
         )
 
@@ -1578,6 +1738,93 @@ def test_promoted_unit_can_be_corrected_downweighted_and_forgotten(tmp_path: Pat
         history = client.get("/api/v1/libraries/user/history", headers=headers).json()
         actions = {item["action"] for item in history}
         assert {"overwrite", "delete:downweight", "delete:forget"}.issubset(actions)
+
+
+def test_promotion_schema_migration_is_bounded_and_batched(tmp_path: Path) -> None:
+    maintenance = tmp_path / "state" / "mem2" / "maintenance.sqlite3"
+    maintenance.parent.mkdir(parents=True)
+    with sqlite3.connect(maintenance) as connection:
+        connection.execute(
+            """CREATE TABLE memory_browser_index (
+               region_id TEXT NOT NULL,
+               unit_id TEXT NOT NULL,
+               PRIMARY KEY (region_id, unit_id)
+               )"""
+        )
+        connection.execute(
+            """CREATE TABLE promotion_records (
+               promotion_key TEXT PRIMARY KEY,
+               job_id TEXT NOT NULL,
+               source_unit_id TEXT NOT NULL,
+               source_region_id TEXT NOT NULL,
+               source_region_kind TEXT NOT NULL,
+               target_region_id TEXT NOT NULL,
+               target_region_kind TEXT NOT NULL,
+               target_unit_id TEXT NOT NULL,
+               classification TEXT NOT NULL,
+               confidence REAL NOT NULL,
+               audit_event_id INTEGER,
+               evidence_kind TEXT NOT NULL DEFAULT 'explicit',
+               source_unit_ids TEXT NOT NULL DEFAULT '[]',
+               source_region_ids TEXT NOT NULL DEFAULT '[]',
+               created_at TEXT NOT NULL
+               )"""
+        )
+        records: list[tuple[object, ...]] = []
+        indexes: list[tuple[str, str]] = []
+        for index in range(250):
+            unit_id = f"source-{index:03d}"
+            region_id = "alpha" if index % 2 == 0 else "beta"
+            records.append(
+                (
+                    f"promotion-{index:03d}",
+                    "job",
+                    unit_id,
+                    region_id,
+                    "topic",
+                    "user",
+                    "user",
+                    f"target-{index:03d}",
+                    "user",
+                    0.95,
+                    None,
+                    "explicit",
+                    json.dumps([unit_id]),
+                    json.dumps([region_id]),
+                    "2026-10-01T00:00:00Z",
+                )
+            )
+            indexes.append((region_id, unit_id))
+        connection.executemany(
+            """INSERT INTO promotion_records
+               (promotion_key, job_id, source_unit_id, source_region_id,
+                source_region_kind, target_region_id, target_region_kind,
+                target_unit_id, classification, confidence, audit_event_id,
+                evidence_kind, source_unit_ids, source_region_ids, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            records,
+        )
+        connection.executemany(
+            "INSERT INTO memory_browser_index (region_id, unit_id) VALUES (?, ?)",
+            indexes,
+        )
+        connection.commit()
+
+        batches = Mem2MemoryKernel._ensure_promotion_schema(
+            connection,
+            batch_size=100,
+        )
+
+        assert batches == [100, 100, 50]
+        assert max(batches) <= 100
+        rows = connection.execute(
+            """SELECT source_unit_id, source_region_id, source_unit_regions
+               FROM promotion_records ORDER BY promotion_key"""
+        ).fetchall()
+    assert len(rows) == 250
+    for unit_id, region_id, raw_mapping in rows:
+        mapping = json.loads(str(raw_mapping))
+        assert mapping == [{"unit_id": unit_id, "region_id": region_id}]
 
 
 def test_promotion_schema_migrates_existing_ticket08_database(tmp_path: Path) -> None:

@@ -56,6 +56,7 @@ from jiuwen_memory.storage.vector import VectorProducer
 from personal_agent_memory.config import MemoryKernelKind
 from personal_agent_memory.memory_kernel import (
     CWD_SCOPE_PREFIX,
+    FORMAL_MEMORY_TYPES,
     LIBRARY_SCOPE_PREFIX,
     AssociateWorktreeRegionRequest,
     AuditMemoryRequest,
@@ -76,6 +77,7 @@ from personal_agent_memory.memory_kernel import (
     KernelHealth,
     ListDocumentsRequest,
     ListForgottenRequest,
+    ListMemoriesRequest,
     MemoryGovernanceError,
     MemoryIdempotencyConflictError,
     MemoryIdempotencyPendingError,
@@ -123,6 +125,12 @@ _AUDIT_TARGET = "personal-agent-memory-sqlite"
 _EMBEDDER_TARGET = "personal-agent-memory-openai"
 _GRAPH_PROJECTION_SCHEMA = 2
 _GRAPH_PROJECTION_MANIFEST_SCHEMA = 1
+_PROMOTION_SCHEMA_VERSION = 2
+_PROMOTION_MIGRATION_BATCH_SIZE = 100
+_PROMOTION_RECOVERY_BATCH_SIZE = 100
+_BROWSER_INDEX_RETRY_BATCH_SIZE = 100
+_BROWSER_INDEX_RETRY_MAX = 1_000
+_LINEAGE_MIGRATION_BATCH_SIZE = 100
 PromotionClassifier = Callable[[str, Mapping[str, object]], Mapping[str, object]]
 
 
@@ -185,6 +193,7 @@ _GOVERNANCE_AUDIT_SCHEMA = """CREATE TABLE IF NOT EXISTS governance_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     region_id TEXT NOT NULL,
     unit_id TEXT NOT NULL,
+    logical_memory_id TEXT NOT NULL DEFAULT '',
     action TEXT NOT NULL,
     actor TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -195,6 +204,53 @@ _GOVERNANCE_AUDIT_SCHEMA = """CREATE TABLE IF NOT EXISTS governance_events (
     status TEXT NOT NULL DEFAULT 'committed',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )"""
+_BROWSER_INDEX_SCHEMA_VERSION = 4
+_BROWSER_INDEX_SCHEMA = """CREATE TABLE IF NOT EXISTS memory_browser_index (
+    region_id TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    logical_memory_id TEXT NOT NULL DEFAULT '',
+    region_name TEXT NOT NULL,
+    region_kind TEXT NOT NULL,
+    scope_org TEXT NOT NULL,
+    scope_space TEXT NOT NULL,
+    scope_user TEXT NOT NULL,
+    scope_agent TEXT NOT NULL,
+    scope_session TEXT NOT NULL,
+    content TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    memory_type TEXT NOT NULL,
+    memory_type_resolution TEXT NOT NULL DEFAULT 'native',
+    lifecycle TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version TEXT NOT NULL,
+    supersedes TEXT NOT NULL DEFAULT '',
+    source_count INTEGER NOT NULL,
+    source_references TEXT NOT NULL DEFAULT '[]',
+    provenance TEXT NOT NULL DEFAULT '[]',
+    user_metadata TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (region_id, unit_id)
+);
+CREATE INDEX IF NOT EXISTS memory_browser_index_page
+ON memory_browser_index (region_id, updated_at DESC, unit_id DESC);
+CREATE INDEX IF NOT EXISTS memory_browser_index_filter
+ON memory_browser_index (region_id, lifecycle, memory_type, updated_at DESC, unit_id DESC);
+CREATE TABLE IF NOT EXISTS memory_browser_index_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_browser_index_pending (
+    token TEXT PRIMARY KEY,
+    region_id TEXT NOT NULL,
+    scope_org TEXT NOT NULL,
+    scope_space TEXT NOT NULL,
+    scope_user TEXT NOT NULL,
+    scope_agent TEXT NOT NULL,
+    scope_session TEXT NOT NULL,
+    unit_ids TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_browser_index_pending_created
+ON memory_browser_index_pending (created_at, token)"""
 _PROMOTION_SCHEMA = """CREATE TABLE IF NOT EXISTS promotion_jobs (
     job_id TEXT PRIMARY KEY,
     status TEXT NOT NULL
@@ -221,7 +277,16 @@ CREATE TABLE IF NOT EXISTS promotion_records (
     evidence_kind TEXT NOT NULL DEFAULT 'explicit',
     source_unit_ids TEXT NOT NULL DEFAULT '[]',
     source_region_ids TEXT NOT NULL DEFAULT '[]',
+    source_unit_regions TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS promotion_outbox (
+    promotion_key TEXT PRIMARY KEY,
+    target_region_id TEXT NOT NULL,
+    target_unit_id TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 )"""
 _MAINTENANCE_SCHEMA = (
     _SESSION_RETENTION_SCHEMA
@@ -365,6 +430,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._scope_graph_lock = threading.Lock()
         self._lock = threading.RLock()
         self._maintenance_lock = threading.RLock()
+        self._browser_index_lock = threading.RLock()
         self._graph_write_lock = threading.RLock()
         self._governance_locks: dict[str, threading.RLock] = {}
         self._governance_locks_guard = threading.Lock()
@@ -374,6 +440,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._promotion_lock = threading.RLock()
         self._promotion_threads: dict[str, threading.Thread] = {}
         self._promotion_threads_lock = threading.Lock()
+        self._promotion_schema_ready = False
+        self._browser_index_active_tokens: set[str] = set()
 
     async def start(self) -> None:
         await asyncio.to_thread(self._start)
@@ -412,7 +480,22 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 (store for store in stores if isinstance(store, MilvusLiteGraphStore)),
                 None,
             )
-            self._bundle = _RuntimeBundle(runtime, kv_store, tuple(stores), graph_store)
+            bundle = _RuntimeBundle(runtime, kv_store, tuple(stores), graph_store)
+            self._bundle = bundle
+            try:
+                self._ensure_browser_index(bundle)
+                self._promotion_schema_ready = True
+                with closing(self._maintenance_db()):
+                    pass
+                self._retry_pending_browser_index(bundle, strict=False)
+                self._recover_promotion_outbox(bundle)
+            except Exception as error:
+                self._promotion_schema_ready = False
+                self._bundle = None
+                _close_quietly(runtime)
+                _close_quietly(kv_store)
+                _close_stores(list(stores))
+                self._startup_error = f"mem2 memory browser startup failed: {error}"
 
     def _prepare_state_dir(self) -> Path | None:
         state_dir = self._state_dir / "mem2"
@@ -1777,8 +1860,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 scope = _scope_for_normalized_library(request.library_id)
                 identity = request.library_id
             request_hash = _write_request_hash(request)
+            indexed_region = self._region_for_scope(scope)
             existing_id = self._reserve_idempotency(identity, request.idempotency_key, request_hash)
             if existing_id is not None:
+                if indexed_region is not None:
+                    self._refresh_browser_index_ids(
+                        bundle,
+                        indexed_region,
+                        scope,
+                        [existing_id],
+                    )
                 return _write_response(request, existing_id, status="existing")
             user_metadata = {
                 "memory_type": request.memory_type,
@@ -1786,6 +1877,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "request_actor": request.actor,
                 "idempotency_key": request.idempotency_key,
                 "region_id": request.region_id,
+                "logical_memory_id": uuid.uuid4().hex,
             }
         elif isinstance(request, CaptureMemoryRequest):
             if request.deadline is not None and time.monotonic() >= request.deadline:
@@ -1826,6 +1918,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             }
         else:
             raise TypeError("unsupported memory write request")
+        index_token: str | None = None
+        if isinstance(request, CreateMemoryRequest) and indexed_region is not None:
+            index_token = self._begin_browser_index_pending(indexed_region, scope)
         security = _security_for(scope)
         if isinstance(request, CaptureMemoryRequest):
             self._mark_scope_graph_pending(bundle, scope)
@@ -1838,6 +1933,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 user_metadata=user_metadata,
             )
         except Exception:
+            if index_token is not None:
+                self._complete_browser_index_pending(index_token)
             if isinstance(request, CreateMemoryRequest):
                 self._release_pending_idempotency(_write_identity(request), request.idempotency_key)
             elif isinstance(request, CaptureMemoryRequest):
@@ -1852,6 +1949,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 self._release_pending_idempotency(identity, request.event_id)
             raise
         if not units:
+            if index_token is not None:
+                self._complete_browser_index_pending(index_token)
             if isinstance(request, CreateMemoryRequest):
                 self._release_pending_idempotency(_write_identity(request), request.idempotency_key)
             elif isinstance(request, CaptureMemoryRequest):
@@ -1878,7 +1977,24 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 raise MemoryKernelUnavailableError(
                     "memory was created but its idempotency completion is pending"
                 ) from error
-            return _write_response(request, unit.id, status="created")
+            if indexed_region is not None:
+                self._record_create_audit(indexed_region, unit, request)
+            browser_index_sync = "ready"
+            if indexed_region is not None and index_token is not None:
+                browser_index_sync = self._sync_browser_index_best_effort(
+                    bundle,
+                    indexed_region,
+                    scope,
+                    index_token,
+                    [unit.id],
+                )
+            response = _write_response(request, unit.id, status="created")
+            response["browser_index_sync"] = browser_index_sync
+            if browser_index_sync == "pending":
+                response["warning"] = (
+                    "authoritative create committed; browser index sync is pending"
+                )
+            return response
         try:
             self._complete_idempotency(
                 identity,
@@ -2583,6 +2699,64 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         }
         return [payloads[key] for key in sorted(payloads)]
 
+    def list_memories(self, request: ListMemoriesRequest) -> dict[str, object]:
+        with self._governance_region_lock(request.library_id):
+            return self._list_memories_locked(request)
+
+    def _list_memories_locked(self, request: ListMemoriesRequest) -> dict[str, object]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        self._retry_pending_browser_index(bundle, region_id=region.region_id)
+        where = ["region_id = ?", "lifecycle IN ('active', 'superseded', 'archived')"]
+        values: list[object] = [region.region_id]
+        if request.memory_type is not None:
+            where.append("memory_type = ?")
+            values.append(request.memory_type)
+        if request.lifecycle is not None:
+            where.append("lifecycle = ?")
+            values.append(request.lifecycle)
+        if request.q is not None:
+            where.append("instr(lower(content), lower(?)) > 0")
+            values.append(request.q)
+        if request.cursor is not None:
+            cursor_updated, cursor_id = _decode_memory_cursor(request.cursor)
+            where.append("(updated_at < ? OR (updated_at = ? AND unit_id < ?))")
+            values.extend(
+                [cursor_updated.isoformat(), cursor_updated.isoformat(), cursor_id]
+            )
+        sql = (
+            "SELECT unit_id, summary, memory_type, memory_type_resolution, lifecycle, "
+            "updated_at, source_count, version "
+            "FROM memory_browser_index WHERE "
+            + " AND ".join(where)
+            + " ORDER BY updated_at DESC, unit_id DESC LIMIT ?"
+        )
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(sql, (*values, request.limit + 1)).fetchall()
+        has_more = len(rows) > request.limit
+        rows = rows[: request.limit]
+        next_cursor = _encode_memory_cursor_rows(rows[-1]) if has_more and rows else None
+        return {
+            "items": [
+                {
+                    "id": str(row[0]),
+                    "path": str(row[0]),
+                    "region_id": region.region_id,
+                    "summary": str(row[1]),
+                    "memory_type": str(row[2]),
+                    "memory_type_resolution": str(row[3]),
+                    "lifecycle": str(row[4]),
+                    "updated_at": str(row[5]),
+                    "source_count": int(row[6]),
+                    "version": str(row[7]),
+                }
+                for row in rows
+            ],
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "page_size": request.limit,
+        }
+
     def inspect(self, request: object) -> dict[str, object]:
         if not isinstance(request, DocumentInspectRequest):
             self._raise()
@@ -2617,6 +2791,60 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         payload["provenance_chain"] = [_unit_payload(item, region) for item in trace]
         return payload
 
+    def inspect_memory(self, request: DocumentInspectRequest) -> dict[str, object]:
+        with self._governance_region_lock(request.library_id):
+            return self._inspect_memory_locked(request)
+
+    def _inspect_memory_locked(self, request: DocumentInspectRequest) -> dict[str, object]:
+        bundle = self._require_bundle()
+        region = self._governance_region(request.library_id)
+        self._retry_pending_browser_index(bundle, region_id=region.region_id)
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                """SELECT scope_org, scope_space, scope_user, scope_agent, scope_session,
+                          memory_type, memory_type_resolution, logical_memory_id, lifecycle
+                   FROM memory_browser_index WHERE region_id = ? AND unit_id = ?""",
+                (region.region_id, request.path.strip()),
+            ).fetchone()
+        if row is None:
+            raise MemoryRecordNotFoundError("memory record not found")
+        scope = Scope(
+            org=str(row[0]),
+            user=str(row[2]),
+            agent=str(row[3]),
+            session=str(row[4]),
+            space=str(row[1]),
+        )
+        units = load_units(bundle.kv_store, scope, [request.path.strip()])
+        if not units:
+            raise MemoryRecordNotFoundError("memory record not found")
+        unit = units[0]
+        logical_memory_id = str(row[7]) or self._resolved_unit_lineage_id(region, unit)
+        terminal_lifecycle = self._lineage_terminal_lifecycle(
+            region.region_id,
+            logical_memory_id,
+        )
+        if unit.lifecycle.value == "forgotten" or terminal_lifecycle == "forgotten":
+            raise MemoryRecordNotFoundError("memory record not found")
+        payload = _unit_payload(unit, region)
+        payload["memory_type"] = str(row[5])
+        payload["memory_type_resolution"] = str(row[6])
+        payload["region"] = {
+            "region_id": region.region_id,
+            "name": region.name,
+            "kind": region.kind,
+        }
+        payload["evidence"] = self._browser_evidence(bundle, region, unit)
+        history_entry = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"history", "versions", "provenance_chain", "evidence"}
+        }
+        payload["history"] = [history_entry]
+        payload["versions"] = [history_entry]
+        payload["provenance_chain"] = payload["evidence"]
+        return payload
+
     async def update(self, request: MemoryUpdateRequest) -> dict[str, object]:
         return await asyncio.to_thread(self._update_document_serialized, request)
 
@@ -2631,21 +2859,30 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             self._raise()
         bundle = self._require_bundle()
         region = self._governance_region(request.library_id)
+        self._retry_pending_browser_index(bundle, region_id=region.region_id)
         scope, unit = self._find_region_unit(bundle, region, request.path)
         _require_revision(unit, request.expected_revision)
         _require_active(unit, request.mode)
         mode = UpdateMode.OVERWRITE if request.mode == "overwrite" else UpdateMode.SUPERSEDE
-        event_id = self._begin_governance_event(
-            region.region_id,
-            unit.id,
-            request.mode,
-            request.actor,
-            request.source,
-            request.operation_id,
-            before_content=unit.content,
-            after_content=request.content,
-            detail={"previous_unit_id": unit.id},
-        )
+        logical_memory_id = self._resolved_unit_lineage_id(region, unit)
+        governance_updated_at = datetime.now(UTC).isoformat()
+        index_token = self._begin_browser_index_pending(region, scope)
+        try:
+            event_id = self._begin_governance_event(
+                region.region_id,
+                unit.id,
+                request.mode,
+                request.actor,
+                request.source,
+                request.operation_id,
+                before_content=unit.content,
+                after_content=request.content,
+                detail={"previous_unit_id": unit.id},
+                logical_memory_id=logical_memory_id,
+            )
+        except Exception:
+            self._complete_browser_index_pending(index_token)
+            raise
         try:
             updated = bundle.runtime.api.update(
                 unit.id,
@@ -2658,11 +2895,14 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "governance_source": request.source,
                         "operation_id": request.operation_id,
                         "previous_revision": request.expected_revision,
+                        "governance_updated_at": governance_updated_at,
+                        "logical_memory_id": logical_memory_id,
                     },
                 ),
                 security=_security_for(scope),
             )
         except Exception:
+            self._complete_browser_index_pending(index_token)
             self._finish_governance_event(
                 event_id,
                 status="failed",
@@ -2671,12 +2911,19 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 detail={"previous_unit_id": unit.id},
             )
             raise
-        if bundle.graph_store is not None:
-            self._reproject_graph_scope(
-                bundle,
-                scope,
-                region_id=region.region_id,
-            )
+        self._persist_unit_logical_memory_id(
+            bundle,
+            scope,
+            unit.id,
+            logical_memory_id,
+        )
+        self._persist_unit_logical_memory_id(
+            bundle,
+            scope,
+            updated.id,
+            logical_memory_id,
+        )
+        updated.user_metadata["logical_memory_id"] = logical_memory_id
         self._finish_governance_event(
             event_id,
             status="committed",
@@ -2684,11 +2931,29 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             after_content=updated.content,
             detail={"previous_unit_id": unit.id, "result_unit_id": updated.id},
         )
-        return _unit_payload(updated, region)
+        browser_index_sync = self._sync_browser_index_best_effort(
+            bundle,
+            region,
+            scope,
+            index_token,
+            [unit.id, updated.id],
+        )
+        if bundle.graph_store is not None:
+            self._reproject_graph_scope(
+                bundle,
+                scope,
+                region_id=region.region_id,
+            )
+        payload = _unit_payload(updated, region)
+        payload["browser_index_sync"] = browser_index_sync
+        if browser_index_sync == "pending":
+            payload["warning"] = "authoritative update committed; browser index sync is pending"
+        return payload
 
     def preview_document_update(self, request: PreviewDocumentUpdateRequest) -> dict[str, object]:
         bundle = self._require_bundle()
         region = self._governance_region(request.library_id)
+        self._retry_pending_browser_index(bundle, region_id=region.region_id)
         _, unit = self._find_region_unit(bundle, region, request.path)
         _require_revision(unit, request.expected_revision)
         _require_active(unit, "update preview")
@@ -2712,9 +2977,15 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     def _preview_document_delete(self, request: PreviewDocumentDeleteRequest) -> dict[str, object]:
         bundle = self._require_bundle()
         region = self._governance_region(request.library_id)
+        self._retry_pending_browser_index(bundle, region_id=region.region_id)
         _, unit = self._find_region_unit(bundle, region, request.path)
         _require_revision(unit, request.expected_revision)
         revision = _unit_revision(unit)
+        logical_memory_id = self._resolved_unit_lineage_id(region, unit)
+        affected_units = max(
+            1,
+            len(self._lineage_versions(region.region_id, logical_memory_id)),
+        )
         return {
             "path": unit.id,
             "id": unit.id,
@@ -2722,59 +2993,102 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "expected_source_version": revision,
             "preview_token": revision,
             "lifecycle": unit.lifecycle.value,
-            "affected_units": 1,
+            "affected_units": affected_units,
             "provenance": list(unit.provenance),
         }
 
-    async def delete(self, request: DeleteMemoryRequest) -> dict[str, str]:
+    async def delete(self, request: DeleteMemoryRequest) -> dict[str, object]:
         return await asyncio.to_thread(self._delete_document_serialized, request)
 
-    def _delete_document_serialized(self, request: DeleteMemoryRequest) -> dict[str, str]:
+    def _delete_document_serialized(self, request: DeleteMemoryRequest) -> dict[str, object]:
         with self._governance_region_lock(request.library_id):
             return self._delete_document(request)
 
-    def _delete_document(self, request: DeleteMemoryRequest) -> dict[str, str]:
+    def _delete_document(self, request: DeleteMemoryRequest) -> dict[str, object]:
         bundle = self._require_bundle()
         region = self._governance_region(request.library_id)
+        self._retry_pending_browser_index(bundle, region_id=region.region_id)
         scope, unit = self._find_region_unit(bundle, region, request.path)
         revision = _unit_revision(unit)
         _require_revision(unit, request.expected_revision)
         if request.preview_token != revision:
             raise MemoryRevisionConflictError("deletion preview is stale or invalid")
         _require_delete_lifecycle(unit, request.mode)
-        event_id = self._begin_governance_event(
-            region.region_id,
-            unit.id,
-            f"delete:{request.mode}",
-            request.actor,
-            request.source,
-            request.operation_id,
-            before_content=unit.content,
-            after_content="",
-            detail={"mode": request.mode},
-        )
+        logical_memory_id = self._resolved_unit_lineage_id(region, unit)
+        versions: list[tuple[str, Scope]] = [(unit.id, scope)]
+        if request.mode == "forget":
+            versions = self._lineage_versions(region.region_id, logical_memory_id)
+            if unit.id not in {unit_id for unit_id, _ in versions}:
+                versions.append((unit.id, scope))
+        grouped: dict[tuple[str, str, str, str, str], tuple[Scope, list[str]]] = {}
+        for unit_id, version_scope in versions:
+            key = (
+                version_scope.org,
+                version_scope.space,
+                version_scope.user,
+                version_scope.agent,
+                version_scope.session,
+            )
+            grouped.setdefault(key, (version_scope, []))[1].append(unit_id)
+        index_tokens = {
+            key: self._begin_browser_index_pending(region, version_scope, unit_ids)
+            for key, (version_scope, unit_ids) in grouped.items()
+        }
+        affected_ids = list(dict.fromkeys(unit_id for unit_id, _ in versions))
         try:
-            deleted = bundle.runtime.api.delete(
-                DeleteSelector(
-                    unit_ids=[unit.id],
-                    scope=scope,
-                    mode=DeleteMode(request.mode),
-                ),
-                security=_security_for(scope),
+            event_id = self._begin_governance_event(
+                region.region_id,
+                unit.id,
+                f"delete:{request.mode}",
+                request.actor,
+                request.source,
+                request.operation_id,
+                before_content=unit.content,
+                after_content="",
+                detail={
+                    "mode": request.mode,
+                    "affected_unit_ids": affected_ids,
+                    "logical_memory_id": logical_memory_id,
+                },
+                logical_memory_id=logical_memory_id,
             )
         except Exception:
+            for token in index_tokens.values():
+                self._complete_browser_index_pending(token)
+            raise
+        deleted_ids: list[str] = []
+        try:
+            for version_scope, unit_ids in grouped.values():
+                deleted = bundle.runtime.api.delete(
+                    DeleteSelector(
+                        unit_ids=unit_ids,
+                        scope=version_scope,
+                        mode=DeleteMode(request.mode),
+                    ),
+                    security=_security_for(version_scope),
+                )
+                if deleted:
+                    deleted_ids.extend(
+                        [str(item) for item in deleted]
+                        if isinstance(deleted, list)
+                        else unit_ids
+                    )
+        except Exception:
+            for token in index_tokens.values():
+                self._complete_browser_index_pending(token)
             self._finish_governance_event(
                 event_id,
                 status="failed",
                 unit_id=unit.id,
                 after_content="",
-                detail={"mode": request.mode},
+                detail={
+                    "mode": request.mode,
+                    "affected_unit_ids": affected_ids,
+                    "logical_memory_id": logical_memory_id,
+                },
             )
             raise
-        if deleted and request.mode != "downweight":
-            deleted_ids = (
-                [str(item) for item in deleted] if isinstance(deleted, list) else [unit.id]
-            )
+        if deleted_ids and request.mode != "downweight":
             self._remove_graph_nodes(
                 bundle,
                 scope,
@@ -2782,16 +3096,25 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 region.region_id,
             )
         detail: dict[str, object] = {
-            "deleted": bool(deleted),
+            "deleted": bool(deleted_ids),
             "mode": request.mode,
+            "affected_unit_ids": affected_ids,
+            "logical_memory_id": logical_memory_id,
         }
-        if request.mode == "forget" and deleted:
+        if request.mode in {"forget", "archive", "downweight"} and deleted_ids:
             try:
-                refreshed = load_units(bundle.kv_store, scope, [unit.id])
-                if refreshed:
-                    forgotten = refreshed[0]
-                    forgotten.temporal.t_invalid = datetime.now(UTC)
-                    bundle.kv_store.update(scope, memory_key(forgotten.id), dumps(forgotten))
+                now = datetime.now(UTC)
+                for version_scope, unit_ids in grouped.values():
+                    refreshed = load_units(bundle.kv_store, version_scope, unit_ids)
+                    for governed in refreshed:
+                        governed.user_metadata["governance_updated_at"] = now.isoformat()
+                        if request.mode == "forget":
+                            governed.temporal.t_invalid = now
+                        bundle.kv_store.update(
+                            version_scope,
+                            memory_key(governed.id),
+                            dumps(governed),
+                        )
             except Exception:
                 # The deletion already succeeded. Keep it successful and leave
                 # a durable audit marker instead of returning a false 500.
@@ -2803,12 +3126,29 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             after_content="",
             detail=detail,
         )
-        return {
+        sync_statuses = [
+            self._sync_browser_index_best_effort(
+                bundle,
+                region,
+                version_scope,
+                index_tokens[key],
+                unit_ids,
+            )
+            for key, (version_scope, unit_ids) in grouped.items()
+        ]
+        browser_index_sync = "pending" if "pending" in sync_statuses else "ready"
+        response = {
             "id": unit.id,
             "path": unit.id,
             "status": request.mode,
-            "deleted": "true" if deleted else "false",
+            "deleted": "true" if deleted_ids else "false",
+            "browser_index_sync": browser_index_sync,
+            "affected_units": str(len(affected_ids)),
+            "affected_unit_ids": affected_ids,
         }
+        if browser_index_sync == "pending":
+            response["warning"] = "authoritative delete committed; browser index sync is pending"
+        return response
 
     def list_forgotten(self, request: ListForgottenRequest) -> list[dict[str, object]]:
         bundle = self._require_bundle()
@@ -2823,9 +3163,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             chain = _version_chain(unit, pairs)
             if any(item.lifecycle.value == "active" for _, item in chain):
                 continue
-            latest_forgotten = [item for _, item in chain if item.lifecycle.value == "forgotten"][
-                -1
-            ]
+            latest_forgotten = _latest_chain_version(
+                [item for _, item in chain if item.lifecycle.value == "forgotten"]
+            )
             if unit.id != latest_forgotten.id:
                 continue
             payload = _unit_payload(unit, region)
@@ -2849,8 +3189,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryGovernanceError("memory is not forgotten")
         chain = _version_chain(unit, pairs)
         chain_ids = {item.id for _, item in chain}
-        forgotten_versions = [item for _, item in chain if item.lifecycle.value == "forgotten"]
-        latest_forgotten = forgotten_versions[-1]
+        latest_forgotten = _latest_chain_version(
+            [item for _, item in chain if item.lifecycle.value == "forgotten"]
+        )
         if unit.id != latest_forgotten.id:
             raise MemoryLifecycleConflictError("restore must use the latest forgotten version")
         old_scope, old = self._find_region_unit(bundle, region, request.commit)
@@ -2869,6 +3210,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         ]
         if active_versions:
             raise MemoryLifecycleConflictError("forgotten memory already has an active version")
+        logical_memory_id = self._resolved_unit_lineage_id(region, latest_forgotten)
         event_id = self._begin_governance_event(
             region.region_id,
             latest_forgotten.id,
@@ -2879,6 +3221,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             before_content=unit.content,
             after_content=old.content,
             detail={"restored_from": old.id, "previous_unit_id": latest_forgotten.id},
+            logical_memory_id=logical_memory_id,
         )
         try:
             restored = bundle.runtime.api.add(
@@ -2894,6 +3237,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "restored_from": old.id,
                     "provenance": [old.id],
                     "restore_pending": True,
+                    "logical_memory_id": logical_memory_id,
                 },
             )
         except Exception:
@@ -2990,6 +3334,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryKernelUnavailableError(
                 "forgotten memory restore could not persist its version link"
             ) from None
+        self._refresh_browser_index_ids(
+            bundle,
+            region,
+            old_scope,
+            [latest_forgotten.id, restored_unit.id],
+        )
         if bundle.graph_store is not None:
             self._reproject_graph_scope(
                 bundle,
@@ -3049,6 +3399,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryRecordNotFoundError("memory version not found in document history")
         _require_revision(current, request.expected_revision)
         _require_active(current, "history restore")
+        logical_memory_id = self._resolved_unit_lineage_id(region, current)
         event_id = self._begin_governance_event(
             region.region_id,
             current.id,
@@ -3059,6 +3410,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             before_content=current.content,
             after_content=old.content,
             detail={"restored_from": old.id, "previous_unit_id": current.id},
+            logical_memory_id=logical_memory_id,
         )
         try:
             restored = bundle.runtime.api.update(
@@ -3072,6 +3424,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "governance_actor": request.actor,
                         "governance_source": request.source,
                         "restored_from": old.id,
+                        "logical_memory_id": logical_memory_id,
                     },
                 ),
                 security=_security_for(scope),
@@ -3085,6 +3438,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 detail={"restored_from": old.id, "previous_unit_id": current.id},
             )
             raise
+        self._refresh_browser_index_ids(bundle, region, scope, [current.id, restored.id])
         if bundle.graph_store is not None:
             self._reproject_graph_scope(
                 bundle,
@@ -3102,7 +3456,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         return {key: str(value) for key, value in payload.items()}
 
     def audit(self, request: AuditMemoryRequest) -> list[dict[str, str]]:
-        bundle = self._require_bundle()
+        self._require_bundle()
         region: MemoryRegion | None
         try:
             region = self._governance_region(request.library_id)
@@ -3115,11 +3469,38 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         else:
             scope = _scope_for_region(region)
             target_space = region.space
-        events = bundle.runtime.api.audit(
-            {"target_space": target_space},
-            security=_security_for(scope),
-            limit=max(1, min(request.limit, 1000)),
-        )
+        logical_memory_id = ""
+        chain_ids: set[str] = set()
+        forgotten_lineages: set[str] = set()
+        forgotten_unit_ids: set[str] = set()
+        if region is not None:
+            (
+                logical_memory_id,
+                chain_ids,
+                forgotten_lineages,
+                forgotten_unit_ids,
+            ) = self._audit_lineage_context(region.region_id, request.target_id)
+        filters = {"target_space": target_space}
+        if region is not None and region.kind == "session":
+            filters["target_session"] = region.session_id or ""
+        audit_logger = SQLiteAuditLogger(self._state_dir / "mem2" / "audit.sqlite3")
+        try:
+            if request.target_id is not None:
+                events_by_id = {}
+                for target_id in sorted(chain_ids or {request.target_id}):
+                    for event in audit_logger.query_latest(
+                        {**filters, "target_id": target_id},
+                        limit=max(1, min(request.limit, 1000)),
+                    ):
+                        events_by_id[event.id] = event
+                events = list(events_by_id.values())
+            else:
+                events = audit_logger.query_latest(
+                    filters,
+                    limit=max(1, min(request.limit, 1000)),
+                )
+        finally:
+            audit_logger.close()
         payloads = [
             {
                 "id": event.id,
@@ -3140,14 +3521,97 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 ),
             }
             for event in events
+            if request.target_id is None
+            or not chain_ids
+            or event.target_id in chain_ids
         ]
         if region is not None:
-            payloads.extend(self._governance_audit_events(region.region_id, request.limit))
+            payloads.extend(
+                self._governance_audit_events(
+                    region.region_id,
+                    request.limit,
+                    request.target_id,
+                    logical_memory_id=logical_memory_id,
+                    chain_ids=chain_ids,
+                )
+            )
         if region is None and not payloads:
             raise MemoryRecordNotFoundError("memory region not found")
+        for payload in payloads:
+            lineage = str(payload.get("logical_memory_id") or "")
+            target = str(payload.get("target_id") or payload.get("commit") or "")
+            if lineage in forgotten_lineages or target in forgotten_unit_ids:
+                payload["before_content"] = ""
+                payload["after_content"] = ""
+                payload["content_redacted"] = "true"
         return sorted(payloads, key=_audit_sort_key, reverse=True)[
             : max(1, min(request.limit, 1000))
         ]
+
+    def _audit_lineage_context(
+        self,
+        region_id: str,
+        target_id: str | None,
+    ) -> tuple[str, set[str], set[str], set[str]]:
+        logical_memory_id = ""
+        chain_ids: set[str] = set()
+        with closing(self._maintenance_db()) as connection:
+            if target_id is not None:
+                row = connection.execute(
+                    """SELECT logical_memory_id FROM memory_browser_index
+                       WHERE region_id = ? AND unit_id = ?""",
+                    (region_id, target_id),
+                ).fetchone()
+                if row is not None:
+                    logical_memory_id = str(row[0])
+                if not logical_memory_id:
+                    row = connection.execute(
+                        """SELECT logical_memory_id FROM governance_events
+                           WHERE region_id = ? AND unit_id = ? AND logical_memory_id != ''
+                           ORDER BY id DESC LIMIT 1""",
+                        (region_id, target_id),
+                    ).fetchone()
+                    if row is not None:
+                        logical_memory_id = str(row[0])
+                if logical_memory_id:
+                    chain_ids = {
+                        str(row[0])
+                        for row in connection.execute(
+                            """SELECT unit_id FROM memory_browser_index
+                               WHERE region_id = ? AND logical_memory_id = ?""",
+                            (region_id, logical_memory_id),
+                        ).fetchall()
+                    }
+                chain_ids.add(target_id)
+            forgotten_lineages = {
+                str(row[0])
+                for row in connection.execute(
+                    """SELECT logical_memory_id FROM memory_browser_index
+                       WHERE region_id = ? AND lifecycle = 'forgotten'
+                         AND logical_memory_id != ''
+                       UNION
+                       SELECT logical_memory_id FROM governance_events
+                       WHERE region_id = ? AND action = 'delete:forget'
+                         AND status = 'committed' AND logical_memory_id != ''""",
+                    (region_id, region_id),
+                ).fetchall()
+            }
+            forgotten_unit_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    """SELECT unit_id FROM memory_browser_index
+                       WHERE region_id = ? AND lifecycle = 'forgotten'
+                       UNION
+                       SELECT unit_id FROM governance_events
+                       WHERE region_id = ? AND action = 'delete:forget'
+                         AND status = 'committed'""",
+                    (region_id, region_id),
+                ).fetchall()
+            }
+        if target_id is not None and logical_memory_id:
+            forgotten_lineages &= {logical_memory_id}
+            forgotten_unit_ids &= chain_ids
+        return logical_memory_id, chain_ids, forgotten_lineages, forgotten_unit_ids
 
     def _begin_governance_event(
         self,
@@ -3161,16 +3625,18 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         before_content: str,
         after_content: str,
         detail: dict[str, object],
+        logical_memory_id: str = "",
     ) -> int:
         with closing(self._maintenance_db()) as connection, connection:
             cursor = connection.execute(
                 """INSERT INTO governance_events
-                   (region_id, unit_id, action, actor, source, operation_id,
+                   (region_id, unit_id, logical_memory_id, action, actor, source, operation_id,
                     before_content, after_content, detail, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
                 (
                     region_id,
                     unit_id,
+                    logical_memory_id,
                     action,
                     actor,
                     source,
@@ -3213,38 +3679,62 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             # failure must not turn a committed mutation into a false 500.
             return
 
-    def _governance_audit_events(self, region_id: str, limit: int) -> list[dict[str, str]]:
+    def _governance_audit_events(
+        self,
+        region_id: str,
+        limit: int,
+        target_id: str | None = None,
+        *,
+        logical_memory_id: str = "",
+        chain_ids: set[str] | None = None,
+    ) -> list[dict[str, str]]:
+        where = ["region_id = ?"]
+        values: list[object] = [region_id]
+        chain = sorted(chain_ids or set())
+        if logical_memory_id:
+            clauses = ["logical_memory_id = ?"]
+            values.append(logical_memory_id)
+            if chain:
+                clauses.append(f"unit_id IN ({', '.join('?' for _ in chain)})")
+                values.extend(chain)
+            where.append(f"({' OR '.join(clauses)})")
+        elif target_id is not None:
+            where.append("unit_id = ?")
+            values.append(target_id)
+        values.append(max(1, min(limit, 1000)))
         with closing(self._maintenance_db()) as connection:
             rows = connection.execute(
-                """SELECT id, unit_id, action, actor, source, operation_id,
+                """SELECT id, unit_id, logical_memory_id, action, actor, source, operation_id,
                           before_content, after_content, detail, status, created_at
                    FROM governance_events
-                   WHERE region_id = ?
-                   ORDER BY id DESC LIMIT ?""",
-                (region_id, max(1, min(limit, 1000))),
+                   WHERE """
+                + " AND ".join(where)
+                + " ORDER BY id DESC LIMIT ?",
+                tuple(values),
             ).fetchall()
         payloads: list[dict[str, str]] = []
         for row in rows:
-            occurred = _parse_timestamp(str(row[10]))
-            occurred_at = occurred.isoformat() if occurred is not None else str(row[10])
+            occurred = _parse_timestamp(str(row[11]))
+            occurred_at = occurred.isoformat() if occurred is not None else str(row[11])
             payloads.append(
                 {
                     "id": f"governance-{row[0]}",
-                    "action": str(row[2]),
+                    "action": str(row[3]),
                     "decision": "allow",
-                    "actor": str(row[3]),
+                    "actor": str(row[4]),
                     "target": region_id,
                     "target_id": str(row[1]),
-                    "source": str(row[4]),
-                    "operation_id": str(row[5]),
-                    "before_content": str(row[6]),
-                    "after_content": str(row[7]),
-                    "detail": str(row[8]),
-                    "status": str(row[9]),
+                    "logical_memory_id": str(row[2]),
+                    "source": str(row[5]),
+                    "operation_id": str(row[6]),
+                    "before_content": str(row[7]),
+                    "after_content": str(row[8]),
+                    "detail": str(row[9]),
+                    "status": str(row[10]),
                     "commit": str(row[1]),
-                    "subject": str(row[2]),
+                    "subject": str(row[3]),
                     "authored_at": occurred_at,
-                    "actor_type": str(row[3]),
+                    "actor_type": str(row[4]),
                     "occurred_at": occurred_at,
                 }
             )
@@ -3275,10 +3765,845 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         normalized = unit_id.strip()
         if not normalized:
             raise MemoryRecordNotFoundError("memory record not found")
+        indexed = self._load_browser_index_unit(bundle, region, normalized)
+        if indexed is not None:
+            return indexed
         for scope, unit in self._region_unit_pairs(bundle, region):
             if unit.id == normalized:
                 return scope, unit
         raise MemoryRecordNotFoundError("memory record not found")
+
+    def _load_browser_index_unit(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        unit_id: str,
+    ) -> tuple[Scope, MemoryUnit] | None:
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                """SELECT scope_org, scope_space, scope_user, scope_agent, scope_session
+                   FROM memory_browser_index
+                   WHERE region_id = ? AND unit_id = ?""",
+                (region.region_id, unit_id),
+            ).fetchone()
+        if row is None:
+            return None
+        scope = Scope(
+            org=str(row[0]),
+            space=str(row[1]),
+            user=str(row[2]),
+            agent=str(row[3]),
+            session=str(row[4]),
+        )
+        units = list(load_units(bundle.kv_store, scope, [unit_id]))
+        if not units:
+            return None
+        return scope, units[0]
+
+    def _lineage_versions(
+        self,
+        region_id: str,
+        logical_memory_id: str,
+    ) -> list[tuple[str, Scope]]:
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                """SELECT unit_id, scope_org, scope_space, scope_user,
+                          scope_agent, scope_session
+                   FROM memory_browser_index
+                   WHERE region_id = ? AND logical_memory_id = ?
+                   ORDER BY updated_at, unit_id""",
+                (region_id, logical_memory_id),
+            ).fetchall()
+        return [
+            (
+                str(row[0]),
+                Scope(
+                    org=str(row[1]),
+                    space=str(row[2]),
+                    user=str(row[3]),
+                    agent=str(row[4]),
+                    session=str(row[5]),
+                ),
+            )
+            for row in rows
+        ]
+
+    def _resolved_unit_lineage_id(
+        self,
+        region: MemoryRegion,
+        unit: MemoryUnit,
+    ) -> str:
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                """SELECT logical_memory_id FROM memory_browser_index
+                   WHERE region_id = ? AND unit_id = ?""",
+                (region.region_id, unit.id),
+            ).fetchone()
+        if row is not None and str(row[0]):
+            return str(row[0])
+        return _unit_logical_memory_id(unit)
+
+    def _lineage_terminal_lifecycle(
+        self,
+        region_id: str,
+        logical_memory_id: str,
+    ) -> str:
+        if not logical_memory_id:
+            return ""
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                """SELECT lifecycle FROM memory_browser_index
+                   WHERE region_id = ? AND logical_memory_id = ?
+                     AND unit_id NOT IN (
+                         SELECT supersedes FROM memory_browser_index
+                         WHERE region_id = ? AND logical_memory_id = ?
+                           AND supersedes != ''
+                     )
+                   ORDER BY updated_at DESC, unit_id DESC LIMIT 1""",
+                (region_id, logical_memory_id, region_id, logical_memory_id),
+            ).fetchone()
+        return str(row[0]) if row is not None else ""
+
+    def _load_units_from_regions(
+        self,
+        bundle: _RuntimeBundle,
+        unit_ids: list[str],
+        region_ids: list[str],
+    ) -> dict[str, tuple[MemoryUnit, MemoryRegion]]:
+        wanted = set(unit_ids)
+        found: dict[str, tuple[MemoryUnit, MemoryRegion]] = {}
+        for region_id in dict.fromkeys(region_ids):
+            try:
+                region = self._regions.require_region(region_id)
+            except RegionError:
+                continue
+            remaining = list(wanted - set(found))
+            if not remaining:
+                break
+            for scope in self._region_scopes(bundle, region):
+                units = load_units(bundle.kv_store, scope, remaining)
+                for unit in units:
+                    found.setdefault(unit.id, (unit, region))
+                remaining = list(wanted - set(found))
+                if not remaining:
+                    break
+        return found
+
+    def _browser_region_map_for_ids(self, unit_ids: list[str]) -> dict[str, str]:
+        ids = list(dict.fromkeys(unit_ids))
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                f"""SELECT unit_id, region_id FROM memory_browser_index
+                    WHERE unit_id IN ({placeholders})""",
+                ids,
+            ).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows}
+
+    def _browser_evidence(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        unit: MemoryUnit,
+    ) -> list[dict[str, object]]:
+        source_ids = _metadata_strings(unit, "source_unit_ids")
+        if not source_ids:
+            source_ids = _metadata_strings(unit, "provenance")
+        source_region_ids = _metadata_strings(unit, "source_region_ids")
+        single_region = _metadata_text(unit, "source_region_id")
+        if single_region and single_region not in source_region_ids:
+            source_region_ids.insert(0, single_region)
+        region_by_id = _metadata_unit_region_map(unit)
+        if any(source_id not in region_by_id for source_id in source_ids):
+            region_by_id.update(self._browser_region_map_for_ids(source_ids))
+        ordered_ids = list(dict.fromkeys(source_ids))
+        search_region_ids = list(
+            dict.fromkeys(
+                [
+                    *region_by_id.values(),
+                    *source_region_ids,
+                    region.region_id,
+                ]
+            )
+        )
+        found: dict[str, tuple[MemoryUnit, MemoryRegion]] = {}
+        while True:
+            remaining = [unit_id for unit_id in ordered_ids if unit_id not in found]
+            if not remaining:
+                break
+            loaded = self._load_units_from_regions(
+                bundle,
+                remaining,
+                list(
+                    dict.fromkeys(
+                        [
+                            *[region_by_id.get(unit_id, "") for unit_id in remaining],
+                            *search_region_ids,
+                        ]
+                    )
+                ),
+            )
+            if not loaded:
+                break
+            added = False
+            for source_id, hit in loaded.items():
+                if source_id in found:
+                    continue
+                added = True
+                found[source_id] = hit
+                region_by_id.setdefault(source_id, hit[1].region_id)
+                search_region_ids = list(
+                    dict.fromkeys([*search_region_ids, hit[1].region_id])
+                )
+                child_ids = _metadata_strings(hit[0], "source_unit_ids")
+                if not child_ids:
+                    child_ids = _metadata_strings(hit[0], "provenance")
+                for child_id in child_ids:
+                    if child_id not in ordered_ids:
+                        ordered_ids.append(child_id)
+            if not added:
+                break
+
+        payloads: list[dict[str, object]] = []
+        for source_id in ordered_ids:
+            resolved_hit = found.get(source_id)
+            if resolved_hit is None:
+                payloads.append(
+                    {
+                        "id": source_id,
+                        "content": "",
+                        "lifecycle": "",
+                        "created_at": "",
+                        "source_references": [],
+                        "region_id": region_by_id.get(source_id, ""),
+                        "region_kind": "",
+                        "session_id": "",
+                        "turn_id": "",
+                        "event_id": "",
+                        "deleted_at": "",
+                        "redacted": False,
+                        "resolved": False,
+                    }
+                )
+                continue
+            source, source_region = resolved_hit
+            source_payload = _unit_payload(source, source_region)
+            source_references = source.user_metadata.get("source_references")
+            redacted = source.lifecycle.value == "forgotten"
+            payloads.append(
+                {
+                    "id": source.id,
+                    "content": "" if redacted else source.content,
+                    "lifecycle": source.lifecycle.value,
+                    "created_at": source_payload.get("created_at", ""),
+                    "deleted_at": source_payload.get("deleted_at", ""),
+                    "redacted": redacted,
+                    "source_references": (
+                        []
+                        if redacted
+                        else _json_metadata(
+                            list(source_references)
+                            if isinstance(source_references, list)
+                            else list(source.provenance)
+                        )
+                    ),
+                    "region_id": source_region.region_id,
+                    "region_kind": source_region.kind,
+                    "session_id": _metadata_text(source, "session_id"),
+                    "turn_id": _metadata_text(source, "turn_id"),
+                    "event_id": (
+                        _metadata_text(source, "capture_event_id")
+                        or _metadata_text(source, "event_id")
+                    ),
+                    "resolved": True,
+                }
+            )
+        return payloads
+
+    def _browser_semantic_type(
+        self,
+        bundle: _RuntimeBundle,
+        unit: MemoryUnit,
+    ) -> tuple[str, str] | None:
+        memory_type = _metadata_text(unit, "memory_type")
+        if memory_type in FORMAL_MEMORY_TYPES:
+            resolution = (
+                "promotion_source"
+                if unit.user_metadata.get("promotion_marker") is True
+                else "native"
+            )
+            return memory_type, resolution
+        if memory_type != "promoted" and not _metadata_text(unit, "promotion_key"):
+            return None
+        source_ids = _metadata_strings(unit, "source_unit_ids")
+        if not source_ids:
+            source_ids = _metadata_strings(unit, "provenance")
+        source_region_ids = _metadata_strings(unit, "source_region_ids")
+        single_region = _metadata_text(unit, "source_region_id")
+        if single_region and single_region not in source_region_ids:
+            source_region_ids.insert(0, single_region)
+        region_by_id = _metadata_unit_region_map(unit)
+        if any(source_id not in region_by_id for source_id in source_ids):
+            region_by_id.update(self._browser_region_map_for_ids(source_ids))
+        search_region_ids = list(
+            dict.fromkeys([*region_by_id.values(), *source_region_ids])
+        )
+        if source_ids and search_region_ids:
+            found = self._load_units_from_regions(
+                bundle,
+                source_ids,
+                search_region_ids,
+            )
+            for source_id in source_ids:
+                hit = found.get(source_id)
+                if hit is None:
+                    continue
+                source_type = _metadata_text(hit[0], "memory_type")
+                if source_type in FORMAL_MEMORY_TYPES:
+                    return source_type, "legacy_source"
+        return None
+
+    def _browser_index_row(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        scope: Scope,
+        unit: MemoryUnit,
+        *,
+        logical_memory_id: str | None = None,
+    ) -> tuple[object, ...] | None:
+        lifecycle = unit.lifecycle.value
+        if lifecycle not in {"active", "superseded", "archived", "forgotten"}:
+            return None
+        if _is_capture_unit(unit) or _metadata_text(unit, "memory_type") == "evolved":
+            return None
+        lineage_id = logical_memory_id or _unit_logical_memory_id(unit)
+        if lifecycle == "forgotten":
+            with closing(self._maintenance_db()) as connection:
+                row = connection.execute(
+                    """SELECT memory_type, memory_type_resolution, updated_at, version,
+                              supersedes
+                       FROM memory_browser_index
+                       WHERE region_id = ? AND unit_id = ?""",
+                    (region.region_id, unit.id),
+                ).fetchone()
+            return (
+                region.region_id,
+                unit.id,
+                lineage_id,
+                region.name,
+                region.kind,
+                scope.org,
+                scope.space,
+                scope.user,
+                scope.agent,
+                scope.session,
+                "",
+                "",
+                str(row[0]) if row is not None else "unknown",
+                str(row[1]) if row is not None else "redacted",
+                lifecycle,
+                str(row[2]) if row is not None else "",
+                str(row[3]) if row is not None else "",
+                str(row[4]) if row is not None else unit.supersedes,
+                0,
+                "[]",
+                "[]",
+                "{}",
+            )
+        semantic_type = self._browser_semantic_type(bundle, unit)
+        if semantic_type is None:
+            return None
+        memory_type, resolution = semantic_type
+        payload = _unit_payload(unit, region)
+        return (
+            region.region_id,
+            unit.id,
+            lineage_id,
+            region.name,
+            region.kind,
+            scope.org,
+            scope.space,
+            scope.user,
+            scope.agent,
+            scope.session,
+            unit.content,
+            str(payload.get("summary", "")),
+            memory_type,
+            resolution,
+            unit.lifecycle.value,
+            str(payload.get("updated_at", "")),
+            str(payload.get("version", "")),
+            unit.supersedes,
+            int(str(payload.get("source_count", 0))),
+            json.dumps(payload.get("source_references", []), ensure_ascii=False),
+            json.dumps(payload.get("provenance", []), ensure_ascii=False),
+            json.dumps(_json_metadata(dict(unit.user_metadata)), ensure_ascii=False),
+        )
+
+    def _index_browser_units(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        scope: Scope,
+        units: list[MemoryUnit],
+    ) -> None:
+        lineage_ids = _logical_memory_id_map(units)
+        rows = [
+            row
+            for unit in units
+            if (
+                row := self._browser_index_row(
+                    bundle,
+                    region,
+                    scope,
+                    unit,
+                    logical_memory_id=lineage_ids[unit.id],
+                )
+            )
+            is not None
+        ]
+        missing = [unit.id for unit in units if unit.id not in {str(row[1]) for row in rows}]
+        self._write_browser_index_rows(region.region_id, rows, missing)
+
+    def _refresh_browser_index_ids(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        scope: Scope,
+        unit_ids: list[str],
+    ) -> None:
+        ids = list(dict.fromkeys(unit_ids))
+        units = list(load_units(bundle.kv_store, scope, ids))
+        present = {unit.id for unit in units}
+        self._index_browser_units(bundle, region, scope, units)
+        self._write_browser_index_rows(
+            region.region_id,
+            [],
+            [unit_id for unit_id in ids if unit_id not in present],
+        )
+
+    def _sync_browser_index_best_effort(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        scope: Scope,
+        token: str,
+        unit_ids: list[str],
+    ) -> str:
+        try:
+            self._refresh_browser_index_pending(
+                bundle,
+                region,
+                scope,
+                token,
+                unit_ids,
+            )
+        except Exception:
+            return "pending"
+        return "ready"
+
+    def _persist_unit_logical_memory_id(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        unit_id: str,
+        logical_memory_id: str,
+    ) -> None:
+        units = list(load_units(bundle.kv_store, scope, [unit_id]))
+        if not units:
+            return
+        unit = units[0]
+        if _metadata_text(unit, "logical_memory_id") == logical_memory_id:
+            return
+        unit.user_metadata["logical_memory_id"] = logical_memory_id
+        bundle.kv_store.update(scope, memory_key(unit.id), dumps(unit))
+
+    def _record_create_audit(
+        self,
+        region: MemoryRegion,
+        unit: MemoryUnit,
+        request: CreateMemoryRequest,
+    ) -> None:
+        event_id = self._begin_governance_event(
+            region.region_id,
+            unit.id,
+            "add",
+            request.actor,
+            "memory-create",
+            f"create:{request.idempotency_key}",
+            before_content="",
+            after_content=unit.content,
+            detail={
+                "memory_type": request.memory_type,
+                "source_references": list(request.source_references),
+            },
+            logical_memory_id=_unit_logical_memory_id(unit),
+        )
+        self._finish_governance_event(
+            event_id,
+            status="committed",
+            unit_id=unit.id,
+            after_content=unit.content,
+            detail={
+                "memory_type": request.memory_type,
+                "source_references": list(request.source_references),
+            },
+        )
+
+    def _begin_browser_index_pending(
+        self,
+        region: MemoryRegion,
+        scope: Scope,
+        unit_ids: list[str] | None = None,
+    ) -> str:
+        token = uuid.uuid4().hex
+        with (
+            self._browser_index_lock,
+            closing(self._maintenance_db()) as connection,
+            connection,
+        ):
+            connection.execute(
+                """INSERT INTO memory_browser_index_pending
+                       (token, region_id, scope_org, scope_space, scope_user,
+                        scope_agent, scope_session, unit_ids, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    token,
+                    region.region_id,
+                    scope.org,
+                    scope.space,
+                    scope.user,
+                    scope.agent,
+                    scope.session,
+                    json.dumps(unit_ids or [], ensure_ascii=False),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            self._browser_index_active_tokens.add(token)
+        return token
+
+    def _update_browser_index_pending(self, token: str, unit_ids: list[str]) -> None:
+        with (
+            self._browser_index_lock,
+            closing(self._maintenance_db()) as connection,
+            connection,
+        ):
+            connection.execute(
+                "UPDATE memory_browser_index_pending SET unit_ids = ? WHERE token = ?",
+                (json.dumps(list(dict.fromkeys(unit_ids)), ensure_ascii=False), token),
+            )
+
+    def _complete_browser_index_pending(self, token: str) -> None:
+        with (
+            self._browser_index_lock,
+            closing(self._maintenance_db()) as connection,
+            connection,
+        ):
+            connection.execute(
+                "DELETE FROM memory_browser_index_pending WHERE token = ?",
+                (token,),
+            )
+            self._browser_index_active_tokens.discard(token)
+
+    def _refresh_browser_index_pending(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        scope: Scope,
+        token: str,
+        unit_ids: list[str],
+    ) -> None:
+        ids = list(dict.fromkeys(unit_ids))
+        try:
+            self._update_browser_index_pending(token, ids)
+            self._refresh_browser_index_ids(bundle, region, scope, ids)
+        except Exception:
+            with self._browser_index_lock:
+                self._browser_index_active_tokens.discard(token)
+            raise
+        self._complete_browser_index_pending(token)
+
+    def _retry_pending_browser_index(
+        self,
+        bundle: _RuntimeBundle,
+        *,
+        region_id: str | None = None,
+        batch_size: int = _BROWSER_INDEX_RETRY_BATCH_SIZE,
+        total_limit: int = _BROWSER_INDEX_RETRY_MAX,
+        strict: bool = True,
+    ) -> None:
+        where = "WHERE region_id = ?" if region_id is not None else ""
+        batch = max(1, batch_size)
+        maximum = max(batch, total_limit)
+        scanned = 0
+        with self._browser_index_lock:
+            while scanned < maximum:
+                remaining = min(batch, maximum - scanned)
+                params: tuple[object, ...] = (
+                    (region_id, remaining)
+                    if region_id is not None
+                    else (remaining,)
+                )
+                with closing(self._maintenance_db()) as connection:
+                    rows = connection.execute(
+                        f"""SELECT token, region_id, scope_org, scope_space, scope_user,
+                                   scope_agent, scope_session, unit_ids
+                            FROM memory_browser_index_pending
+                            {where}
+                            ORDER BY created_at, token
+                            LIMIT ?""",
+                        params,
+                    ).fetchall()
+                if not rows:
+                    return
+                scanned += len(rows)
+                for row in rows:
+                    token = str(row[0])
+                    if token in self._browser_index_active_tokens:
+                        continue
+                    try:
+                        region = self._regions.require_region(str(row[1]))
+                        scope = Scope(
+                            org=str(row[2]),
+                            space=str(row[3]),
+                            user=str(row[4]),
+                            agent=str(row[5]),
+                            session=str(row[6]),
+                        )
+                        try:
+                            raw_ids = json.loads(str(row[7]))
+                        except json.JSONDecodeError:
+                            raw_ids = []
+                        unit_ids = (
+                            [str(value) for value in raw_ids]
+                            if isinstance(raw_ids, list)
+                            else []
+                        )
+                        if unit_ids:
+                            self._refresh_browser_index_ids(
+                                bundle,
+                                region,
+                                scope,
+                                unit_ids,
+                            )
+                        else:
+                            self._rebuild_browser_scope_index(bundle, region, scope)
+                    except Exception as error:
+                        if strict:
+                            raise MemoryKernelUnavailableError(
+                                "memory browser index synchronization is pending"
+                            ) from error
+                        return
+                    self._complete_browser_index_pending(token)
+            with closing(self._maintenance_db()) as connection:
+                pending = connection.execute(
+                    f"SELECT 1 FROM memory_browser_index_pending {where} LIMIT 1",
+                    (region_id,) if region_id is not None else (),
+                ).fetchone()
+            if pending is not None and strict:
+                raise MemoryKernelUnavailableError(
+                    "memory browser index synchronization exceeds the retry limit"
+                )
+
+    def _rebuild_browser_scope_index(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        scope: Scope,
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """DELETE FROM memory_browser_index
+                   WHERE region_id = ? AND scope_org = ? AND scope_space = ?
+                     AND scope_user = ? AND scope_agent = ? AND scope_session = ?""",
+                (
+                    region.region_id,
+                    scope.org,
+                    scope.space,
+                    scope.user,
+                    scope.agent,
+                    scope.session,
+                ),
+            )
+        self._index_browser_units(
+            bundle,
+            region,
+            scope,
+            self._units_in_scope(bundle, scope),
+        )
+
+    def _region_for_scope(self, scope: Scope) -> MemoryRegion | None:
+        for region in self._regions.list_regions():
+            if region.space != scope.space:
+                continue
+            if region.kind == "session" and scope.session != (region.session_id or ""):
+                continue
+            return region
+        return None
+
+    def _write_browser_index_rows(
+        self,
+        region_id: str,
+        rows: list[tuple[object, ...]],
+        missing_ids: list[str],
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            if rows:
+                connection.executemany(
+                    """INSERT INTO memory_browser_index
+                       (region_id, unit_id, logical_memory_id, region_name, region_kind,
+                        scope_org, scope_space, scope_user, scope_agent, scope_session,
+                        content, summary, memory_type, memory_type_resolution, lifecycle,
+                        updated_at, version, supersedes, source_count, source_references,
+                        provenance, user_metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(region_id, unit_id) DO UPDATE SET
+                         logical_memory_id=excluded.logical_memory_id,
+                         region_name=excluded.region_name,
+                         region_kind=excluded.region_kind,
+                         scope_org=excluded.scope_org,
+                         scope_space=excluded.scope_space,
+                         scope_user=excluded.scope_user,
+                         scope_agent=excluded.scope_agent,
+                         scope_session=excluded.scope_session,
+                         content=excluded.content,
+                         summary=excluded.summary,
+                         memory_type=excluded.memory_type,
+                         memory_type_resolution=excluded.memory_type_resolution,
+                         lifecycle=excluded.lifecycle,
+                         updated_at=excluded.updated_at,
+                         version=excluded.version,
+                         supersedes=excluded.supersedes,
+                         source_count=excluded.source_count,
+                         source_references=excluded.source_references,
+                         provenance=excluded.provenance,
+                         user_metadata=excluded.user_metadata""",
+                    rows,
+                )
+            if missing_ids:
+                connection.executemany(
+                    "DELETE FROM memory_browser_index WHERE region_id = ? AND unit_id = ?",
+                    [(region_id, unit_id) for unit_id in missing_ids],
+                )
+
+    def _ensure_browser_index(self, bundle: _RuntimeBundle) -> None:
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                "SELECT value FROM memory_browser_index_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        if row is None or str(row[0]) != str(_BROWSER_INDEX_SCHEMA_VERSION):
+            self._rebuild_browser_index(bundle)
+            with closing(self._maintenance_db()) as connection, connection:
+                connection.execute(
+                    """INSERT INTO memory_browser_index_meta (key, value)
+                       VALUES ('schema_version', ?)
+                       ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                    (str(_BROWSER_INDEX_SCHEMA_VERSION),),
+                )
+        self._backfill_governance_lineage()
+
+    def _backfill_governance_lineage(
+        self,
+        batch_size: int = _LINEAGE_MIGRATION_BATCH_SIZE,
+    ) -> list[int]:
+        if batch_size <= 0:
+            raise ValueError("lineage migration batch size must be positive")
+        batches: list[int] = []
+        cursor = 0
+        while True:
+            with closing(self._maintenance_db()) as connection, connection:
+                rows = connection.execute(
+                    """SELECT id, unit_id FROM governance_events
+                       WHERE logical_memory_id = '' AND id > ?
+                       ORDER BY id LIMIT ?""",
+                    (cursor, batch_size),
+                ).fetchall()
+                if not rows:
+                    return batches
+                unit_ids = [str(row[1]) for row in rows]
+                placeholders = ", ".join("?" for _ in unit_ids)
+                lineages = {
+                    str(row[0]): str(row[1]) or str(row[0])
+                    for row in connection.execute(
+                        f"""SELECT unit_id, logical_memory_id FROM memory_browser_index
+                            WHERE unit_id IN ({placeholders})""",
+                        unit_ids,
+                    ).fetchall()
+                }
+                connection.executemany(
+                    """UPDATE governance_events SET logical_memory_id = ?
+                       WHERE id = ?""",
+                    [
+                        (lineages.get(str(row[1]), str(row[1])), int(row[0]))
+                        for row in rows
+                    ],
+                )
+            cursor = int(rows[-1][0])
+            batches.append(len(rows))
+
+    def _rebuild_browser_index(self, bundle: _RuntimeBundle) -> None:
+        regions_by_key = {
+            (region.space, region.session_id or ""): region
+            for region in self._regions.list_regions()
+        }
+        regions_by_space = {
+            region.space: region
+            for region in self._regions.list_regions()
+            if region.kind != "session"
+        }
+        with closing(self._maintenance_db()) as connection:
+            connection.execute("DELETE FROM memory_browser_index")
+            connection.commit()
+            batch: list[tuple[object, ...]] = []
+            for scope in bundle.kv_store.scopes():
+                region = regions_by_key.get((scope.space, scope.session))
+                if region is None:
+                    region = regions_by_space.get(scope.space)
+                if region is None:
+                    continue
+                units = self._units_in_scope(bundle, scope)
+                lineage_ids = _logical_memory_id_map(units)
+                for unit in units:
+                    row = self._browser_index_row(
+                        bundle,
+                        region,
+                        scope,
+                        unit,
+                        logical_memory_id=lineage_ids[unit.id],
+                    )
+                    if row is None:
+                        continue
+                    batch.append(row)
+                    if len(batch) >= 500:
+                        connection.executemany(
+                            """INSERT INTO memory_browser_index
+                               (region_id, unit_id, logical_memory_id, region_name, region_kind,
+                                scope_org, scope_space, scope_user, scope_agent, scope_session,
+                                content, summary, memory_type, memory_type_resolution, lifecycle,
+                                updated_at, version, supersedes, source_count, source_references,
+                                provenance, user_metadata)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            batch,
+                        )
+                        connection.commit()
+                        batch.clear()
+            if batch:
+                connection.executemany(
+                    """INSERT INTO memory_browser_index
+                       (region_id, unit_id, logical_memory_id, region_name, region_kind,
+                        scope_org, scope_space, scope_user, scope_agent, scope_session,
+                        content, summary, memory_type, memory_type_resolution, lifecycle,
+                        updated_at, version, supersedes, source_count, source_references,
+                        provenance, user_metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    batch,
+                )
+                connection.commit()
 
     async def evolve(self, request: EvolveMemoryRequest) -> dict[str, int]:
         return await asyncio.to_thread(self._evolve, request)
@@ -4019,6 +5344,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     ) -> None:
         serialized_detail = json.dumps(detail, ensure_ascii=False, sort_keys=True)
         with closing(self._maintenance_db()) as connection, connection:
+            lineage_row = connection.execute(
+                """SELECT logical_memory_id FROM memory_browser_index
+                   WHERE region_id = ? AND unit_id = ?""",
+                (region_id, unit_id),
+            ).fetchone()
+            logical_memory_id = str(lineage_row[0]) if lineage_row is not None else ""
             row = connection.execute(
                 """SELECT id FROM governance_events
                    WHERE operation_id = ? AND action = ?
@@ -4028,13 +5359,14 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             if row is None:
                 connection.execute(
                     """INSERT INTO governance_events
-                       (region_id, unit_id, action, actor, source, operation_id,
+                       (region_id, unit_id, logical_memory_id, action, actor, source, operation_id,
                         before_content, after_content, detail, status, created_at)
-                       VALUES (?, ?, ?, 'platform:auto-promotion', ?,
+                       VALUES (?, ?, ?, ?, 'platform:auto-promotion', ?,
                                ?, '', '', ?, 'committed', ?)""",
                     (
                         region_id,
                         unit_id,
+                        logical_memory_id,
                         action,
                         f"promotion:{job_id}",
                         operation_id,
@@ -4045,10 +5377,17 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 return
             connection.execute(
                 """UPDATE governance_events
-                   SET region_id = ?, unit_id = ?, source = ?, detail = ?,
+                   SET region_id = ?, unit_id = ?, logical_memory_id = ?, source = ?, detail = ?,
                        status = 'committed'
                    WHERE id = ?""",
-                (region_id, unit_id, f"promotion:{job_id}", serialized_detail, int(row[0])),
+                (
+                    region_id,
+                    unit_id,
+                    logical_memory_id,
+                    f"promotion:{job_id}",
+                    serialized_detail,
+                    int(row[0]),
+                ),
             )
 
     def _promotion_candidates(
@@ -4057,7 +5396,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         source_regions: tuple[MemoryRegion, ...],
     ) -> list[_PromotionCandidate]:
         allowed_types = {
-            "evolved",
             "preference",
             "constraint",
             "decision",
@@ -4119,15 +5457,20 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         list[str],
         list[dict[str, str]],
         list[str],
+        list[dict[str, str]],
     ]:
         source_units: list[MemoryUnit] = []
         seen_units: set[str] = set()
         source_references: list[str] = []
         source_regions: list[dict[str, str]] = []
         source_region_ids: list[str] = []
+        source_unit_regions: list[dict[str, str]] = []
         for candidate in candidates:
             units = candidate["source_units"] or (candidate["unit"],)
             for source in units:
+                source_unit_regions.append(
+                    {"unit_id": source.id, "region_id": candidate["region"].region_id}
+                )
                 if source.id in seen_units:
                     continue
                 seen_units.add(str(source.id))
@@ -4160,6 +5503,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             list(dict.fromkeys(source_references)),
             source_regions,
             source_region_ids,
+            source_unit_regions,
         )
 
     @staticmethod
@@ -4260,7 +5604,75 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             source_references,
             source_regions,
             source_region_ids,
+            source_unit_regions,
         ) = self._promotion_group_sources(ordered)
+        promotion_memory_type = _metadata_text(unit, "memory_type")
+        if promotion_memory_type not in FORMAL_MEMORY_TYPES:
+            promotion_memory_type = next(
+                (
+                    memory_type
+                    for source in source_units
+                    if (memory_type := _metadata_text(source, "memory_type"))
+                    in FORMAL_MEMORY_TYPES
+                ),
+                "unknown",
+            )
+        target_metadata: dict[str, object] = {
+            "memory_type": promotion_memory_type,
+            "promotion_marker": True,
+            "promotion_source_type": _metadata_text(unit, "memory_type"),
+            "promotion_key": promotion_key,
+            "promotion_job_id": job_id,
+            "promotion_classification": str(decision["category"]),
+            "promotion_confidence": float(decision["confidence"]),
+            "promotion_claim_subject": decision["claim_subject"],
+            "promotion_claim_value": decision["claim_value"],
+            "promotion_claim_content_hash": hashlib.sha256(
+                unit.content.encode("utf-8")
+            ).hexdigest(),
+            "promotion_evidence_kind": evidence_kind,
+            "promotion_evidence_count": len(source_ids),
+            "source_unit_ids": source_ids,
+            "source_event_ids": source_event_ids,
+            "source_region_id": source_region.region_id,
+            "source_region_kind": source_region.kind,
+            "source_region_ids": source_region_ids,
+            "source_unit_regions": json.dumps(
+                source_unit_regions,
+                ensure_ascii=False,
+            ),
+            "source_region_kinds": [
+                region["region_kind"] for region in source_regions
+            ],
+            "source_references": source_references,
+            "provenance": source_ids,
+            "region_id": target.region_id,
+            "region_kind": target.kind,
+            "promoted_at": datetime.now(UTC).isoformat(),
+        }
+        outbox_payload: dict[str, object] = {
+            "job_id": job_id,
+            "target": {
+                "content": unit.content,
+                "memory_type": promotion_memory_type,
+                "user_metadata": dict(target_metadata),
+            },
+            "promotion": {
+                "source_unit_id": unit.id,
+                "source_region_id": source_region.region_id,
+                "source_region_kind": source_region.kind,
+                "job_id": job_id,
+                "classification": str(decision["category"]),
+                "confidence": float(decision["confidence"]),
+                "evidence_kind": evidence_kind,
+                "source_unit_ids": source_ids,
+                "source_event_ids": source_event_ids,
+                "source_region_ids": source_region_ids,
+                "source_unit_regions": source_unit_regions,
+                "source_regions": source_regions,
+                "source_references": source_references,
+            },
+        }
         with (
             self._maintenance_lock,
             self._promotion_lock,
@@ -4300,98 +5712,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 }
             record = self._promotion_record(promotion_key)
             if record is not None:
-                target_unit = next(
-                    (
-                        candidate_unit
-                        for candidate_unit in self._units_in_scope(bundle, target_scope)
-                        if candidate_unit.id == record["target_unit_id"]
-                        and candidate_unit.lifecycle.value == "active"
-                    ),
-                    None,
+                recorded_units = load_units(
+                    bundle.kv_store,
+                    target_scope,
+                    [str(record["target_unit_id"])],
                 )
-                if target_unit is None:
-                    return {
-                        "created": False,
-                        "decision": {
-                            "source_unit_id": unit.id,
-                            "source_region_id": source_region.region_id,
-                            "source_unit_ids": source_ids,
-                            "source_region_ids": source_region_ids,
-                            "classification": str(decision["category"]),
-                            "confidence": decision["confidence"],
-                            "evidence_kind": evidence_kind,
-                            "status": "skipped",
-                            "target_region_id": target.region_id,
-                            "reason": "promotion target is no longer active",
-                        },
-                    }
-                expected_hash = _metadata_text(
-                    target_unit,
-                    "promotion_claim_content_hash",
-                )
-                current_hash = hashlib.sha256(
-                    target_unit.content.encode("utf-8")
-                ).hexdigest()
-                target_changed = (
-                    _normalize_promotion_text(target_unit.content)
-                    != _normalize_promotion_text(unit.content)
-                    or (bool(expected_hash) and expected_hash != current_hash)
-                )
-                if target_changed:
-                    existing_subject, existing_value = _promotion_claim_signature(
-                        target_unit.content
-                    )
-                    existing_subject = _normalize_promotion_text(existing_subject)
-                    existing_value = _normalize_promotion_claim_value(existing_value)
-                    if not existing_subject or not existing_value:
-                        existing_subject = _normalize_promotion_text(
-                            _metadata_text(target_unit, "promotion_claim_subject")
-                        )
-                        existing_value = _normalize_promotion_claim_value(
-                            _metadata_text(target_unit, "promotion_claim_value")
-                        )
-                    if (
-                        existing_subject
-                        and existing_value
-                        and _promotion_subjects_compatible(
-                            existing_subject,
-                            _normalize_promotion_text(decision["claim_subject"]),
-                        )
-                        and _promotion_values_conflict(
-                            existing_subject,
-                            (existing_value, decision["claim_value"]),
-                        )
-                    ):
-                        self._record_promotion_conflict(
-                            job_id,
-                            decision["claim_subject"],
-                            target,
-                            (existing_value, decision["claim_value"]),
-                            [(item, decision, target) for item in ordered],
-                        )
-                        return {
-                            "created": False,
-                            "decision": {
-                                "source_unit_id": unit.id,
-                                "source_region_id": source_region.region_id,
-                                "source_unit_ids": source_ids,
-                                "source_region_ids": source_region_ids,
-                                "classification": str(decision["category"]),
-                                "confidence": decision["confidence"],
-                                "evidence_kind": evidence_kind,
-                                "status": "conflict",
-                                "target_region_id": target.region_id,
-                                "conflict_unit_id": target_unit.id,
-                                "reason": "corrected target conflicts with late source",
-                            },
-                        }
-                    self._record_promotion_skip(
-                        job_id,
-                        candidate,
-                        decision,
-                        action="promotion_skip",
-                        reason="promotion target was corrected after promotion",
-                    )
+                target_unit = recorded_units[0] if recorded_units else None
+                if target_unit is not None and target_unit.lifecycle.value == "forgotten":
                     return {
                         "created": False,
                         "decision": {
@@ -4405,50 +5732,157 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                             "status": "skipped",
                             "target_region_id": target.region_id,
                             "target_unit_id": target_unit.id,
-                            "reason": "promotion target was corrected after promotion",
+                            "reason": "promotion target remains forgotten",
                         },
                     }
-                merged_unit_ids, merged_region_ids = self._merge_promotion_sources(
-                    bundle,
-                    target_scope,
-                    target_unit,
-                    record,
-                    source_ids,
-                    source_event_ids,
-                    source_references,
-                    source_regions,
-                    source_region_ids,
-                    evidence_kind,
-                )
-                return {
-                    "created": False,
-                    "decision": {
-                        "source_unit_id": unit.id,
-                        "source_region_id": source_region.region_id,
-                        "source_unit_ids": merged_unit_ids,
-                        "source_region_ids": merged_region_ids,
-                        "classification": str(decision["category"]),
-                        "confidence": decision["confidence"],
-                        "evidence_kind": evidence_kind,
-                        "status": "skipped",
-                        "target_region_id": target.region_id,
-                        "target_unit_id": target_unit.id,
-                        "reason": "promotion already persisted; merged new sources",
-                    },
-                }
+                if target_unit is None:
+                    self._delete_promotion_record(promotion_key)
+                    record = None
+                if record is not None:
+                    assert target_unit is not None
+                    expected_hash = _metadata_text(
+                        target_unit,
+                        "promotion_claim_content_hash",
+                    )
+                    current_hash = hashlib.sha256(
+                        target_unit.content.encode("utf-8")
+                    ).hexdigest()
+                    target_changed = (
+                        _normalize_promotion_text(target_unit.content)
+                        != _normalize_promotion_text(unit.content)
+                        or (bool(expected_hash) and expected_hash != current_hash)
+                    )
+                    if target_changed:
+                        existing_subject, existing_value = _promotion_claim_signature(
+                            target_unit.content
+                        )
+                        existing_subject = _normalize_promotion_text(existing_subject)
+                        existing_value = _normalize_promotion_claim_value(existing_value)
+                        if not existing_subject or not existing_value:
+                            existing_subject = _normalize_promotion_text(
+                                _metadata_text(target_unit, "promotion_claim_subject")
+                            )
+                            existing_value = _normalize_promotion_claim_value(
+                                _metadata_text(target_unit, "promotion_claim_value")
+                            )
+                        if (
+                            existing_subject
+                            and existing_value
+                            and _promotion_subjects_compatible(
+                                existing_subject,
+                                _normalize_promotion_text(decision["claim_subject"]),
+                            )
+                            and _promotion_values_conflict(
+                                existing_subject,
+                                (existing_value, decision["claim_value"]),
+                            )
+                        ):
+                            self._record_promotion_conflict(
+                                job_id,
+                                decision["claim_subject"],
+                                target,
+                                (existing_value, decision["claim_value"]),
+                                [(item, decision, target) for item in ordered],
+                            )
+                            return {
+                                "created": False,
+                                "decision": {
+                                    "source_unit_id": unit.id,
+                                    "source_region_id": source_region.region_id,
+                                    "source_unit_ids": source_ids,
+                                    "source_region_ids": source_region_ids,
+                                    "classification": str(decision["category"]),
+                                    "confidence": decision["confidence"],
+                                    "evidence_kind": evidence_kind,
+                                    "status": "conflict",
+                                    "target_region_id": target.region_id,
+                                    "conflict_unit_id": target_unit.id,
+                                    "reason": "corrected target conflicts with late source",
+                                },
+                            }
+                        self._record_promotion_skip(
+                            job_id,
+                            candidate,
+                            decision,
+                            action="promotion_skip",
+                            reason="promotion target was corrected after promotion",
+                        )
+                        return {
+                            "created": False,
+                            "decision": {
+                                "source_unit_id": unit.id,
+                                "source_region_id": source_region.region_id,
+                                "source_unit_ids": source_ids,
+                                "source_region_ids": source_region_ids,
+                                "classification": str(decision["category"]),
+                                "confidence": decision["confidence"],
+                                "evidence_kind": evidence_kind,
+                                "status": "skipped",
+                                "target_region_id": target.region_id,
+                                "target_unit_id": target_unit.id,
+                                "reason": "promotion target was corrected after promotion",
+                            },
+                        }
+                    self._begin_promotion_outbox(
+                        promotion_key,
+                        target,
+                        target_unit.id,
+                        outbox_payload,
+                    )
+                    merged_unit_ids, merged_region_ids = self._merge_promotion_sources(
+                        bundle,
+                        target_scope,
+                        target,
+                        target_unit,
+                        record,
+                        source_ids,
+                        source_event_ids,
+                        source_references,
+                        source_regions,
+                        source_region_ids,
+                        source_unit_regions,
+                        evidence_kind,
+                    )
+                    self._complete_promotion_outbox(promotion_key)
+                    return {
+                        "created": False,
+                        "decision": {
+                            "source_unit_id": unit.id,
+                            "source_region_id": source_region.region_id,
+                            "source_unit_ids": merged_unit_ids,
+                            "source_region_ids": merged_region_ids,
+                            "classification": str(decision["category"]),
+                            "confidence": decision["confidence"],
+                            "evidence_kind": evidence_kind,
+                            "status": "skipped",
+                            "target_region_id": target.region_id,
+                            "target_unit_id": target_unit.id,
+                            "reason": "promotion already persisted; merged new sources",
+                        },
+                    }
             existing = self._promoted_target(bundle, target_scope, promotion_key)
             if existing is not None:
+                pending_recovery = not self._promotion_audit_exists(promotion_key)
+                self._begin_promotion_outbox(
+                    promotion_key,
+                    target,
+                    existing.id,
+                    outbox_payload,
+                )
+                self._index_browser_units(bundle, target, target_scope, [existing])
                 self._persist_promotion(
                     existing,
                     target,
                     ordered,
                     source_units,
                     source_references,
+                    source_unit_regions,
                     job_id,
                     promotion_key,
                     decision,
                     evidence_kind,
                 )
+                self._complete_promotion_outbox(promotion_key)
                 if bundle.graph_store is not None:
                     self._associate_graph_scope(
                         bundle,
@@ -4456,7 +5890,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         region_id=target.region_id,
                     )
                 return {
-                    "created": False,
+                    "created": pending_recovery,
                     "decision": {
                         "source_unit_id": unit.id,
                         "source_region_id": source_region.region_id,
@@ -4465,86 +5899,60 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "classification": str(decision["category"]),
                         "confidence": decision["confidence"],
                         "evidence_kind": evidence_kind,
-                        "status": "skipped",
+                        "status": "promoted" if pending_recovery else "skipped",
                         "target_region_id": target.region_id,
                         "target_unit_id": existing.id,
-                        "reason": "promotion already persisted",
+                        "reason": (
+                            "pending promotion target was recovered and indexed"
+                            if pending_recovery
+                            else "existing promotion target was repaired without a duplicate"
+                        ),
                     },
                 }
 
-            added: MemoryUnit | None = None
-            try:
-                units = bundle.runtime.api.add(
-                    unit.content,
+            self._begin_promotion_outbox(
+                promotion_key,
+                target,
+                "",
+                outbox_payload,
+            )
+            units = bundle.runtime.api.add(
+                unit.content,
+                target_scope,
+                Modality.TEXT,
+                security=_security_for(target_scope),
+                user_metadata=target_metadata,
+            )
+            if not units:
+                raise MemoryKernelUnavailableError("promotion did not create a memory unit")
+            added = units[0]
+            added.provenance = source_ids
+            bundle.kv_store.update(
+                target_scope,
+                memory_key(added.id),
+                dumps(added),
+            )
+            self._set_promotion_outbox_target(promotion_key, added.id)
+            self._index_browser_units(bundle, target, target_scope, [added])
+            self._persist_promotion(
+                added,
+                target,
+                ordered,
+                source_units,
+                source_references,
+                source_unit_regions,
+                job_id,
+                promotion_key,
+                decision,
+                evidence_kind,
+            )
+            self._complete_promotion_outbox(promotion_key)
+            if bundle.graph_store is not None:
+                self._associate_graph_scope(
+                    bundle,
                     target_scope,
-                    Modality.TEXT,
-                    security=_security_for(target_scope),
-                    user_metadata={
-                        "memory_type": "promoted",
-                        "promotion_key": promotion_key,
-                        "promotion_job_id": job_id,
-                        "promotion_classification": str(decision["category"]),
-                        "promotion_confidence": float(decision["confidence"]),
-                        "promotion_claim_subject": decision["claim_subject"],
-                        "promotion_claim_value": decision["claim_value"],
-                        "promotion_claim_content_hash": hashlib.sha256(
-                            unit.content.encode("utf-8")
-                        ).hexdigest(),
-                        "promotion_evidence_kind": evidence_kind,
-                        "promotion_evidence_count": len(source_ids),
-                        "source_unit_ids": source_ids,
-                        "source_event_ids": source_event_ids,
-                        "source_region_id": source_region.region_id,
-                        "source_region_kind": source_region.kind,
-                        "source_region_ids": source_region_ids,
-                        "source_region_kinds": [
-                            region["region_kind"] for region in source_regions
-                        ],
-                        "source_references": source_references,
-                        "provenance": source_ids,
-                        "region_id": target.region_id,
-                        "region_kind": target.kind,
-                        "promoted_at": datetime.now(UTC).isoformat(),
-                    },
+                    region_id=target.region_id,
                 )
-                if not units:
-                    raise MemoryKernelUnavailableError("promotion did not create a memory unit")
-                added = units[0]
-                added.provenance = source_ids
-                bundle.kv_store.update(
-                    target_scope,
-                    memory_key(added.id),
-                    dumps(added),
-                )
-                self._persist_promotion(
-                    added,
-                    target,
-                    ordered,
-                    source_units,
-                    source_references,
-                    job_id,
-                    promotion_key,
-                    decision,
-                    evidence_kind,
-                )
-                if bundle.graph_store is not None:
-                    self._associate_graph_scope(
-                        bundle,
-                        target_scope,
-                        region_id=target.region_id,
-                    )
-            except Exception:
-                if added is not None:
-                    with suppress(Exception):
-                        bundle.runtime.api.delete(
-                            DeleteSelector(
-                                unit_ids=[added.id],
-                                scope=target_scope,
-                                mode=DeleteMode.PURGE,
-                            ),
-                            security=_security_for(target_scope),
-                        )
-                raise
             return {
                 "created": True,
                 "decision": {
@@ -4562,11 +5970,462 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 },
             }
 
+    def _promotion_audit_exists(self, promotion_key: str) -> bool:
+        with closing(self._maintenance_db()) as connection:
+            return (
+                connection.execute(
+                    """SELECT 1 FROM governance_events
+                       WHERE operation_id = ? AND action = 'promote'
+                         AND status = 'committed'""",
+                    (promotion_key,),
+                ).fetchone()
+                is not None
+            )
+
+    def _begin_promotion_outbox(
+        self,
+        promotion_key: str,
+        target: MemoryRegion,
+        target_unit_id: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """INSERT INTO promotion_outbox
+                   (promotion_key, target_region_id, target_unit_id, payload,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(promotion_key) DO UPDATE SET
+                     target_region_id = excluded.target_region_id,
+                     target_unit_id = excluded.target_unit_id,
+                     payload = excluded.payload,
+                     updated_at = excluded.updated_at""",
+                (
+                    promotion_key,
+                    target.region_id,
+                    target_unit_id,
+                    serialized,
+                    now,
+                    now,
+                ),
+            )
+
+    def _set_promotion_outbox_target(self, promotion_key: str, target_unit_id: str) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """UPDATE promotion_outbox SET target_unit_id = ?, updated_at = ?
+                   WHERE promotion_key = ?""",
+                (target_unit_id, datetime.now(UTC).isoformat(), promotion_key),
+            )
+
+    def _complete_promotion_outbox(self, promotion_key: str) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                "DELETE FROM promotion_outbox WHERE promotion_key = ?",
+                (promotion_key,),
+            )
+
+    def _recover_promotion_outbox(self, bundle: _RuntimeBundle) -> None:
+        while True:
+            with closing(self._maintenance_db()) as connection:
+                rows = connection.execute(
+                    """SELECT promotion_key, target_region_id, target_unit_id, payload
+                       FROM promotion_outbox
+                       ORDER BY promotion_key
+                       LIMIT ?""",
+                    (_PROMOTION_RECOVERY_BATCH_SIZE,),
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                self._recover_promotion_outbox_row(bundle, row)
+
+    def _recover_promotion_outbox_row(
+        self,
+        bundle: _RuntimeBundle,
+        row: tuple[object, ...],
+    ) -> None:
+        promotion_key = str(row[0])
+        target_region_id = str(row[1])
+        target_unit_id = str(row[2] or "")
+        try:
+            payload = json.loads(str(row[3]))
+        except json.JSONDecodeError as error:
+            raise MemoryKernelUnavailableError(
+                f"promotion outbox payload is invalid: {promotion_key}"
+            ) from error
+        if not isinstance(payload, dict):
+            raise MemoryKernelUnavailableError(
+                f"promotion outbox payload is invalid: {promotion_key}"
+            )
+        target = self._regions.require_region(target_region_id)
+        target_scope = _scope_for_region(target)
+        target_unit: MemoryUnit | None = None
+        if target_unit_id:
+            units = load_units(bundle.kv_store, target_scope, [target_unit_id])
+            if units and _metadata_text(units[0], "promotion_key") == promotion_key:
+                target_unit = units[0]
+        if target_unit is None:
+            target_unit = self._recovery_promotion_target(
+                bundle,
+                target_scope,
+                promotion_key,
+            )
+        if target_unit is not None and target_unit.lifecycle.value == "forgotten":
+            promotion = payload.get("promotion")
+            if not isinstance(promotion, dict):
+                raise MemoryKernelUnavailableError(
+                    f"promotion outbox record is invalid: {promotion_key}"
+                )
+            target_unit = self._merge_recovered_promotion_sources(
+                bundle,
+                target,
+                target_scope,
+                target_unit,
+                promotion,
+            )
+            self._write_browser_index_rows(target.region_id, [], [target_unit.id])
+            self._persist_recovered_promotion(
+                target_unit,
+                target,
+                promotion_key,
+                payload,
+            )
+            self._complete_promotion_outbox(promotion_key)
+            return
+        if target_unit is None:
+            target_payload = payload.get("target")
+            if not isinstance(target_payload, dict):
+                raise MemoryKernelUnavailableError(
+                    f"promotion outbox target is invalid: {promotion_key}"
+                )
+            content = str(target_payload.get("content") or "")
+            metadata = target_payload.get("user_metadata")
+            if not content or not isinstance(metadata, dict):
+                raise MemoryKernelUnavailableError(
+                    f"promotion outbox target is invalid: {promotion_key}"
+                )
+            units = bundle.runtime.api.add(
+                content,
+                target_scope,
+                Modality.TEXT,
+                security=_security_for(target_scope),
+                user_metadata=dict(metadata),
+            )
+            if not units:
+                raise MemoryKernelUnavailableError(
+                    "promotion recovery did not create a memory unit"
+                )
+            target_unit = units[0]
+            source_ids = _metadata_strings(target_unit, "source_unit_ids")
+            if not source_ids:
+                source_ids = _metadata_strings(target_unit, "provenance")
+            target_unit.provenance = source_ids
+            bundle.kv_store.update(
+                target_scope,
+                memory_key(target_unit.id),
+                dumps(target_unit),
+            )
+            target_unit_id = target_unit.id
+            self._set_promotion_outbox_target(promotion_key, target_unit_id)
+        promotion = payload.get("promotion")
+        if not isinstance(promotion, dict):
+            raise MemoryKernelUnavailableError(
+                f"promotion outbox record is invalid: {promotion_key}"
+            )
+        target_unit = self._merge_recovered_promotion_sources(
+            bundle,
+            target,
+            target_scope,
+            target_unit,
+            promotion,
+        )
+        self._index_browser_units(bundle, target, target_scope, [target_unit])
+        self._persist_recovered_promotion(
+            target_unit,
+            target,
+            promotion_key,
+            payload,
+        )
+        self._complete_promotion_outbox(promotion_key)
+
+    def _recovery_promotion_target(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        promotion_key: str,
+    ) -> MemoryUnit | None:
+        matches = [
+            unit
+            for unit in self._units_in_scope(bundle, scope)
+            if _metadata_text(unit, "promotion_key") == promotion_key
+        ]
+        return next(
+            (unit for unit in matches if unit.lifecycle.value == "active"),
+            None,
+        ) or next(
+            (unit for unit in matches if unit.lifecycle.value == "forgotten"),
+            None,
+        ) or (matches[0] if matches else None)
+
+    def _merge_recovered_promotion_sources(
+        self,
+        bundle: _RuntimeBundle,
+        target: MemoryRegion,
+        target_scope: Scope,
+        target_unit: MemoryUnit,
+        promotion: Mapping[str, object],
+    ) -> MemoryUnit:
+        existing_ids = _metadata_strings(target_unit, "source_unit_ids")
+        if not existing_ids:
+            existing_ids = _metadata_strings(target_unit, "provenance")
+        raw_ids = promotion.get("source_unit_ids")
+        recovered_ids = (
+            [str(value) for value in raw_ids if str(value)]
+            if isinstance(raw_ids, list)
+            else []
+        )
+        source_ids = list(dict.fromkeys([*existing_ids, *recovered_ids]))
+
+        existing_region_ids = _metadata_strings(target_unit, "source_region_ids")
+        single_region = _metadata_text(target_unit, "source_region_id")
+        if single_region and single_region not in existing_region_ids:
+            existing_region_ids.insert(0, single_region)
+        raw_region_ids = promotion.get("source_region_ids")
+        recovered_region_ids = (
+            [str(value) for value in raw_region_ids if str(value)]
+            if isinstance(raw_region_ids, list)
+            else []
+        )
+        source_region_ids = list(
+            dict.fromkeys([*existing_region_ids, *recovered_region_ids])
+        )
+
+        unit_region_map = _metadata_unit_region_map(target_unit)
+        raw_unit_regions = promotion.get("source_unit_regions")
+        if isinstance(raw_unit_regions, list):
+            for item in raw_unit_regions:
+                if not isinstance(item, dict):
+                    continue
+                unit_id = str(item.get("unit_id") or "").strip()
+                region_id = str(item.get("region_id") or "").strip()
+                if unit_id and region_id:
+                    unit_region_map[unit_id] = region_id
+
+        kind_by_region = dict(
+            zip(
+                _metadata_strings(target_unit, "source_region_ids"),
+                _metadata_strings(target_unit, "source_region_kinds"),
+                strict=False,
+            )
+        )
+        raw_regions = promotion.get("source_regions")
+        if isinstance(raw_regions, list):
+            for item in raw_regions:
+                if not isinstance(item, dict):
+                    continue
+                region_id = str(item.get("region_id") or "").strip()
+                region_kind = str(item.get("region_kind") or "").strip()
+                if region_id and region_kind:
+                    kind_by_region[region_id] = region_kind
+        regions_by_id = {region.region_id: region for region in self._regions.list_regions()}
+        for region_id in source_region_ids:
+            kind_by_region.setdefault(
+                region_id,
+                regions_by_id[region_id].kind if region_id in regions_by_id else target.kind,
+            )
+
+        raw_event_ids = promotion.get("source_event_ids")
+        recovered_event_ids = (
+            [str(value) for value in raw_event_ids if str(value)]
+            if isinstance(raw_event_ids, list)
+            else []
+        )
+        source_event_ids = list(
+            dict.fromkeys(
+                [
+                    *_metadata_strings(target_unit, "source_event_ids"),
+                    *recovered_event_ids,
+                ]
+            )
+        )
+        raw_references = promotion.get("source_references")
+        recovered_references = (
+            [str(value) for value in raw_references if str(value)]
+            if isinstance(raw_references, list)
+            else []
+        )
+        source_references = list(
+            dict.fromkeys(
+                [
+                    *_metadata_strings(target_unit, "source_references"),
+                    *recovered_references,
+                ]
+            )
+        )
+        recovered_evidence_kind = str(promotion.get("evidence_kind") or "")
+        evidence_kind = (
+            "multi_source"
+            if (
+                recovered_evidence_kind == "multi_source"
+                or _metadata_text(target_unit, "promotion_evidence_kind") == "multi_source"
+                or len(source_ids) > 1
+            )
+            else "explicit"
+        )
+        target_unit.user_metadata.update(
+            {
+                "source_unit_ids": source_ids,
+                "source_event_ids": source_event_ids,
+                "source_region_ids": source_region_ids,
+                "source_region_kinds": [
+                    kind_by_region[region_id] for region_id in source_region_ids
+                ],
+                "source_unit_regions": json.dumps(
+                    [
+                        {"unit_id": unit_id, "region_id": region_id}
+                        for unit_id, region_id in unit_region_map.items()
+                    ],
+                    ensure_ascii=False,
+                ),
+                "source_references": source_references,
+                "provenance": source_ids,
+                "promotion_evidence_kind": evidence_kind,
+                "promotion_evidence_count": len(source_ids),
+            }
+        )
+        target_unit.provenance = source_ids
+        bundle.kv_store.update(
+            target_scope,
+            memory_key(target_unit.id),
+            dumps(target_unit),
+        )
+        return target_unit
+
+    def _persist_recovered_promotion(
+        self,
+        target_unit: MemoryUnit,
+        target: MemoryRegion,
+        promotion_key: str,
+        payload: Mapping[str, object],
+    ) -> int:
+        promotion = payload.get("promotion")
+        if not isinstance(promotion, dict):
+            raise MemoryKernelUnavailableError(
+                f"promotion outbox record is invalid: {promotion_key}"
+            )
+        source_ids = _metadata_strings(target_unit, "source_unit_ids")
+        if not source_ids:
+            source_ids = _metadata_strings(target_unit, "provenance")
+        if not source_ids:
+            raw_source_ids = promotion.get("source_unit_ids")
+            if isinstance(raw_source_ids, list):
+                source_ids = [str(value) for value in raw_source_ids if str(value)]
+        source_region_ids = _metadata_strings(target_unit, "source_region_ids")
+        if not source_region_ids:
+            raw_region_ids = promotion.get("source_region_ids")
+            if isinstance(raw_region_ids, list):
+                source_region_ids = [str(value) for value in raw_region_ids if str(value)]
+        source_unit_regions = [
+            {"unit_id": unit_id, "region_id": region_id}
+            for unit_id, region_id in _metadata_unit_region_map(target_unit).items()
+        ]
+        if not source_unit_regions:
+            raw_unit_regions = promotion.get("source_unit_regions")
+            if isinstance(raw_unit_regions, list):
+                source_unit_regions = [
+                    {
+                        "unit_id": str(item["unit_id"]),
+                        "region_id": str(item["region_id"]),
+                    }
+                    for item in raw_unit_regions
+                    if isinstance(item, dict)
+                    and item.get("unit_id")
+                    and item.get("region_id")
+                ]
+        source_event_ids = _metadata_strings(target_unit, "source_event_ids")
+        if not source_event_ids:
+            raw_event_ids = promotion.get("source_event_ids")
+            if isinstance(raw_event_ids, list):
+                source_event_ids = [str(value) for value in raw_event_ids if str(value)]
+        source_references = _metadata_strings(target_unit, "source_references")
+        if not source_references:
+            raw_references = promotion.get("source_references")
+            if isinstance(raw_references, list):
+                source_references = [str(value) for value in raw_references if str(value)]
+        source_region_kinds = _metadata_strings(target_unit, "source_region_kinds")
+        kind_by_region = dict(zip(source_region_ids, source_region_kinds, strict=False))
+        regions_by_id = {region.region_id: region for region in self._regions.list_regions()}
+        source_regions = [
+            {
+                "region_id": region_id,
+                "region_kind": (
+                    kind_by_region.get(region_id)
+                    or (
+                        regions_by_id[region_id].kind
+                        if region_id in regions_by_id
+                        else target.kind
+                    )
+                ),
+            }
+            for region_id in source_region_ids
+        ]
+        source_unit_id = str(promotion.get("source_unit_id") or "")
+        if not source_unit_id:
+            source_unit_id = source_ids[0] if source_ids else target_unit.id
+        source_region_id = str(promotion.get("source_region_id") or "")
+        if not source_region_id:
+            source_region_id = source_region_ids[0] if source_region_ids else target.region_id
+        source_region_kind = next(
+            (
+                item["region_kind"]
+                for item in source_regions
+                if item["region_id"] == source_region_id
+            ),
+            target.kind,
+        )
+        evidence_kind = _metadata_text(target_unit, "promotion_evidence_kind")
+        if not evidence_kind:
+            evidence_kind = str(promotion.get("evidence_kind") or "explicit")
+        confidence = promotion.get("confidence")
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            confidence = 0.0
+        job_id = str(promotion.get("job_id") or "")
+        if not job_id:
+            job_id = _metadata_text(target_unit, "promotion_job_id")
+        return self._persist_promotion_values(
+            target_unit=target_unit,
+            target=target,
+            source_unit_id=source_unit_id,
+            source_region_id=source_region_id,
+            source_region_kind=source_region_kind,
+            job_id=job_id,
+            promotion_key=promotion_key,
+            classification=str(promotion.get("classification") or "user"),
+            confidence=float(confidence),
+            evidence_kind=evidence_kind,
+            source_ids=source_ids,
+            source_event_ids=source_event_ids,
+            source_region_ids=source_region_ids,
+            source_unit_regions=source_unit_regions,
+            source_regions=source_regions,
+            source_references=source_references,
+        )
+
+    def _delete_promotion_record(self, promotion_key: str) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                "DELETE FROM promotion_records WHERE promotion_key = ?",
+                (promotion_key,),
+            )
+
     def _promotion_record(self, promotion_key: str) -> dict[str, object] | None:
         with closing(self._maintenance_db()) as connection:
             row = connection.execute(
                 """SELECT target_unit_id, source_unit_ids, source_region_ids,
-                          audit_event_id, evidence_kind
+                          audit_event_id, evidence_kind, source_unit_regions
                    FROM promotion_records WHERE promotion_key = ?""",
                 (promotion_key,),
             ).fetchone()
@@ -4580,6 +6439,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             source_region_ids = json.loads(str(row[2]))
         except json.JSONDecodeError:
             source_region_ids = []
+        try:
+            source_unit_regions = json.loads(str(row[5]))
+        except json.JSONDecodeError:
+            source_unit_regions = []
         return {
             "target_unit_id": str(row[0]),
             "source_unit_ids": source_unit_ids if isinstance(source_unit_ids, list) else [],
@@ -4588,6 +6451,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             ),
             "audit_event_id": int(row[3]) if row[3] is not None else None,
             "evidence_kind": str(row[4]),
+            "source_unit_regions": (
+                source_unit_regions if isinstance(source_unit_regions, list) else []
+            ),
         }
 
     def _promotion_existing_conflict(
@@ -4637,6 +6503,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self,
         bundle: _RuntimeBundle,
         target_scope: Scope,
+        target: MemoryRegion,
         target_unit: MemoryUnit,
         record: Mapping[str, object],
         source_ids: list[str],
@@ -4644,6 +6511,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         source_references: list[str],
         source_regions: list[dict[str, str]],
         source_region_ids: list[str],
+        source_unit_regions: list[dict[str, str]],
         evidence_kind: str,
     ) -> tuple[list[str], list[str]]:
         existing_unit_ids = _metadata_strings(target_unit, "source_unit_ids")
@@ -4664,8 +6532,25 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             record_regions = record.get("source_region_ids")
             if isinstance(record_regions, list):
                 existing_region_ids = [str(value) for value in record_regions]
+        existing_unit_regions = _metadata_unit_region_map(target_unit)
+        if not existing_unit_regions:
+            record_unit_regions = record.get("source_unit_regions")
+            if isinstance(record_unit_regions, list):
+                existing_unit_regions = {
+                    str(item["unit_id"]): str(item["region_id"])
+                    for item in record_unit_regions
+                    if isinstance(item, dict)
+                    and item.get("unit_id")
+                    and item.get("region_id")
+                }
 
         merged_unit_ids = list(dict.fromkeys([*existing_unit_ids, *source_ids]))
+        merged_unit_regions = dict(existing_unit_regions)
+        for item in source_unit_regions:
+            unit_id = str(item.get("unit_id") or "").strip()
+            region_id = str(item.get("region_id") or "").strip()
+            if unit_id and region_id:
+                merged_unit_regions[unit_id] = region_id
         merged_region_ids = list(dict.fromkeys([*existing_region_ids, *source_region_ids]))
         kind_by_region = dict(zip(existing_region_ids, existing_region_kinds, strict=False))
         for region in source_regions:
@@ -4696,10 +6581,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 ]
             )
         )
-        new_unit_ids = set(merged_unit_ids) - set(existing_unit_ids)
-        new_region_ids = set(merged_region_ids) - set(existing_region_ids)
-        if not new_unit_ids and not new_region_ids:
-            return merged_unit_ids, merged_region_ids
         merged_evidence_kind = (
             "multi_source"
             if (
@@ -4714,6 +6595,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "source_event_ids": merged_event_ids,
             "source_region_ids": merged_region_ids,
             "source_region_kinds": merged_region_kinds,
+            "source_unit_regions": json.dumps(
+                [
+                    {"unit_id": unit_id, "region_id": region_id}
+                    for unit_id, region_id in merged_unit_regions.items()
+                ],
+                ensure_ascii=False,
+            ),
             "source_references": merged_references,
             "provenance": merged_unit_ids,
             "promotion_evidence_kind": merged_evidence_kind,
@@ -4726,15 +6614,24 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             memory_key(target_unit.id),
             dumps(target_unit),
         )
+        self._index_browser_units(bundle, target, target_scope, [target_unit])
         audit_id = record.get("audit_event_id")
         with closing(self._maintenance_db()) as connection, connection:
             connection.execute(
                 """UPDATE promotion_records
-                   SET source_unit_ids = ?, source_region_ids = ?, evidence_kind = ?
+                   SET source_unit_ids = ?, source_region_ids = ?,
+                       source_unit_regions = ?, evidence_kind = ?
                    WHERE promotion_key = ?""",
                 (
                     json.dumps(merged_unit_ids, ensure_ascii=False),
                     json.dumps(merged_region_ids, ensure_ascii=False),
+                    json.dumps(
+                        [
+                            {"unit_id": unit_id, "region_id": region_id}
+                            for unit_id, region_id in merged_unit_regions.items()
+                        ],
+                        ensure_ascii=False,
+                    ),
                     merged_evidence_kind,
                     _metadata_text(target_unit, "promotion_key"),
                 ),
@@ -4756,6 +6653,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     {
                         "source_unit_ids": merged_unit_ids,
                         "source_region_ids": merged_region_ids,
+                        "source_unit_regions": [
+                            {"unit_id": unit_id, "region_id": region_id}
+                            for unit_id, region_id in merged_unit_regions.items()
+                        ],
                         "source_regions": merged_source_regions,
                         "source_references": merged_references,
                         "evidence_kind": merged_evidence_kind,
@@ -4793,6 +6694,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         candidates: list[_PromotionCandidate],
         source_units: tuple[MemoryUnit, ...],
         source_references: list[str],
+        source_unit_regions: list[dict[str, str]],
         job_id: str,
         promotion_key: str,
         decision: _PromotionDecision,
@@ -4805,27 +6707,78 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         source_unit = ordered[0]["unit"]
         source_region = ordered[0]["region"]
         source_ids = [str(unit.id) for unit in source_units] or [str(source_unit.id)]
+        source_event_ids = list(
+            dict.fromkeys(
+                event_id
+                for unit in source_units
+                if (event_id := _metadata_text(unit, "event_id"))
+            )
+        )
         source_region_ids = list(
             dict.fromkeys(candidate["region"].region_id for candidate in ordered)
         )
         source_regions = [
-            {"region_id": region_id, "region_kind": next(
-                candidate["region"].kind
-                for candidate in ordered
-                if candidate["region"].region_id == region_id
-            )}
+            {
+                "region_id": region_id,
+                "region_kind": next(
+                    candidate["region"].kind
+                    for candidate in ordered
+                    if candidate["region"].region_id == region_id
+                ),
+            }
             for region_id in source_region_ids
         ]
+        return self._persist_promotion_values(
+            target_unit=target_unit,
+            target=target,
+            source_unit_id=source_unit.id,
+            source_region_id=source_region.region_id,
+            source_region_kind=source_region.kind,
+            job_id=job_id,
+            promotion_key=promotion_key,
+            classification=str(decision["category"]),
+            confidence=float(decision["confidence"]),
+            evidence_kind=evidence_kind,
+            source_ids=source_ids,
+            source_event_ids=source_event_ids,
+            source_region_ids=source_region_ids,
+            source_unit_regions=source_unit_regions,
+            source_regions=source_regions,
+            source_references=source_references,
+        )
+
+    def _persist_promotion_values(
+        self,
+        *,
+        target_unit: MemoryUnit,
+        target: MemoryRegion,
+        source_unit_id: str,
+        source_region_id: str,
+        source_region_kind: str,
+        job_id: str,
+        promotion_key: str,
+        classification: str,
+        confidence: float,
+        evidence_kind: str,
+        source_ids: list[str],
+        source_event_ids: list[str],
+        source_region_ids: list[str],
+        source_unit_regions: list[dict[str, str]],
+        source_regions: list[dict[str, str]],
+        source_references: list[str],
+    ) -> int:
         detail = {
-            "source_unit_id": source_unit.id,
+            "source_unit_id": source_unit_id,
             "source_unit_ids": source_ids,
-            "source_region_id": source_region.region_id,
-            "source_region_kind": source_region.kind,
+            "source_event_ids": source_event_ids,
+            "source_region_id": source_region_id,
+            "source_region_kind": source_region_kind,
             "source_region_ids": source_region_ids,
+            "source_unit_regions": source_unit_regions,
             "source_regions": source_regions,
             "source_references": source_references,
-            "classification": decision["category"],
-            "confidence": decision["confidence"],
+            "classification": classification,
+            "confidence": confidence,
             "evidence_kind": evidence_kind,
             "job_id": job_id,
         }
@@ -4840,13 +6793,14 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             if row is None:
                 cursor = connection.execute(
                     """INSERT INTO governance_events
-                       (region_id, unit_id, action, actor, source, operation_id,
+                       (region_id, unit_id, logical_memory_id, action, actor, source, operation_id,
                         before_content, after_content, detail, status, created_at)
-                       VALUES (?, ?, 'promote', 'platform:auto-promotion', ?, ?,
+                       VALUES (?, ?, ?, 'promote', 'platform:auto-promotion', ?, ?,
                                '', ?, ?, 'committed', ?)""",
                     (
                         target.region_id,
                         target_unit.id,
+                        _unit_logical_memory_id(target_unit),
                         f"promotion:{job_id}",
                         promotion_key,
                         target_unit.content,
@@ -4863,13 +6817,15 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 audit_id = int(row[0])
                 connection.execute(
                     """UPDATE governance_events
-                       SET region_id = ?, unit_id = ?, actor = 'platform:auto-promotion',
+                       SET region_id = ?, unit_id = ?, logical_memory_id = ?,
+                           actor = 'platform:auto-promotion',
                            source = ?, before_content = '', after_content = ?,
                            detail = ?, status = 'committed'
                        WHERE id = ?""",
                     (
                         target.region_id,
                         target_unit.id,
+                        _unit_logical_memory_id(target_unit),
                         f"promotion:{job_id}",
                         target_unit.content,
                         serialized_detail,
@@ -4881,23 +6837,40 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                    (promotion_key, job_id, source_unit_id, source_region_id,
                     source_region_kind, target_region_id, target_region_kind,
                     target_unit_id, classification, confidence, audit_event_id,
-                    evidence_kind, source_unit_ids, source_region_ids, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    evidence_kind, source_unit_ids, source_region_ids,
+                    source_unit_regions, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(promotion_key) DO UPDATE SET
+                     job_id = excluded.job_id,
+                     source_unit_id = excluded.source_unit_id,
+                     source_region_id = excluded.source_region_id,
+                     source_region_kind = excluded.source_region_kind,
+                     target_region_id = excluded.target_region_id,
+                     target_region_kind = excluded.target_region_kind,
+                     target_unit_id = excluded.target_unit_id,
+                     classification = excluded.classification,
+                     confidence = excluded.confidence,
+                     audit_event_id = excluded.audit_event_id,
+                     evidence_kind = excluded.evidence_kind,
+                     source_unit_ids = excluded.source_unit_ids,
+                     source_region_ids = excluded.source_region_ids,
+                     source_unit_regions = excluded.source_unit_regions""",
                 (
                     promotion_key,
                     job_id,
-                    source_unit.id,
-                    source_region.region_id,
-                    source_region.kind,
+                    source_unit_id,
+                    source_region_id,
+                    source_region_kind,
                     target.region_id,
                     target.kind,
                     target_unit.id,
-                    str(decision["category"]),
-                    float(decision["confidence"]),
+                    classification,
+                    confidence,
                     audit_id,
                     evidence_kind,
                     json.dumps(source_ids, ensure_ascii=False),
                     json.dumps(source_region_ids, ensure_ascii=False),
+                    json.dumps(source_unit_regions, ensure_ascii=False),
                     datetime.now(UTC).isoformat(),
                 ),
             )
@@ -5119,13 +7092,36 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path, timeout=5.0)
         with self._idempotency_schema_lock:
-            self._ensure_maintenance_schema(connection)
+            self._ensure_maintenance_schema(
+                connection,
+                migrate_promotions=self._promotion_schema_ready,
+            )
         return connection
 
     @staticmethod
-    def _ensure_maintenance_schema(connection: sqlite3.Connection) -> None:
+    def _ensure_maintenance_schema(
+        connection: sqlite3.Connection,
+        *,
+        migrate_promotions: bool = True,
+    ) -> None:
+        connection.executescript(_BROWSER_INDEX_SCHEMA)
+        browser_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(memory_browser_index)").fetchall()
+        }
+        if "logical_memory_id" not in browser_columns:
+            with connection:
+                connection.execute(
+                    "ALTER TABLE memory_browser_index "
+                    "ADD COLUMN logical_memory_id TEXT NOT NULL DEFAULT ''"
+                )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS memory_browser_index_lineage
+               ON memory_browser_index (region_id, logical_memory_id, unit_id)"""
+        )
         connection.executescript(_PROMOTION_SCHEMA)
-        Mem2MemoryKernel._ensure_promotion_schema(connection)
+        if migrate_promotions:
+            Mem2MemoryKernel._ensure_promotion_schema(connection)
         columns = {
             str(row[1]): row
             for row in connection.execute("PRAGMA table_info(capture_evolutions)").fetchall()
@@ -5167,7 +7163,19 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             connection.execute("DROP TABLE capture_evolutions_v1")
 
     @staticmethod
-    def _ensure_promotion_schema(connection: sqlite3.Connection) -> None:
+    def _ensure_promotion_schema(
+        connection: sqlite3.Connection,
+        *,
+        batch_size: int = _PROMOTION_MIGRATION_BATCH_SIZE,
+    ) -> list[int]:
+        if batch_size <= 0:
+            raise ValueError("promotion migration batch size must be positive")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS memory_browser_index_meta (
+                   key TEXT PRIMARY KEY,
+                   value TEXT NOT NULL
+               )"""
+        )
         columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(promotion_records)").fetchall()
@@ -5176,48 +7184,144 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "evidence_kind": "TEXT NOT NULL DEFAULT 'explicit'",
             "source_unit_ids": "TEXT NOT NULL DEFAULT '[]'",
             "source_region_ids": "TEXT NOT NULL DEFAULT '[]'",
+            "source_unit_regions": "TEXT NOT NULL DEFAULT '[]'",
         }
         missing = [name for name in additions if name not in columns]
-        if not missing:
-            return
         with connection:
             for name in missing:
                 connection.execute(
                     f"ALTER TABLE promotion_records ADD COLUMN {name} {additions[name]}"
                 )
-            rows = connection.execute(
-                """SELECT promotion_key, source_unit_id, source_region_id,
-                          source_unit_ids, source_region_ids
-                   FROM promotion_records"""
-            ).fetchall()
-            for row in rows:
-                promotion_key = str(row[0])
-                source_unit_ids = str(row[3])
-                source_region_ids = str(row[4])
-                assignments: list[str] = []
-                values: list[str] = []
-                if source_unit_ids in {"", "[]"}:
-                    assignments.append("source_unit_ids = ?")
-                    values.append(
-                        json.dumps([str(row[1])], ensure_ascii=False)
-                        if row[1]
-                        else "[]"
+        marker = connection.execute(
+            """SELECT value FROM memory_browser_index_meta
+               WHERE key = 'promotion_schema_version'"""
+        ).fetchone()
+        if not missing and marker is not None and str(marker[0]) == str(
+            _PROMOTION_SCHEMA_VERSION
+        ):
+            return []
+
+        batch_sizes: list[int] = []
+        cursor = ""
+        while True:
+            with connection:
+                rows = connection.execute(
+                    """SELECT promotion_key, source_unit_id, source_region_id,
+                              source_unit_ids, source_region_ids, source_unit_regions
+                       FROM promotion_records
+                       WHERE promotion_key > ?
+                       ORDER BY promotion_key
+                       LIMIT ?""",
+                    (cursor, batch_size),
+                ).fetchall()
+                if not rows:
+                    break
+                parsed: list[tuple[str, str, str, list[str], list[str], dict[str, str]]] = []
+                source_ids: set[str] = set()
+                for row in rows:
+                    promotion_key = str(row[0])
+                    primary_unit_id = str(row[1] or "")
+                    primary_region_id = str(row[2] or "")
+                    try:
+                        record_unit_ids = json.loads(str(row[3]))
+                    except json.JSONDecodeError:
+                        record_unit_ids = []
+                    try:
+                        record_region_ids = json.loads(str(row[4]))
+                    except json.JSONDecodeError:
+                        record_region_ids = []
+                    try:
+                        raw_region_map = json.loads(str(row[5]))
+                    except json.JSONDecodeError:
+                        raw_region_map = []
+                    unit_ids = (
+                        [str(value) for value in record_unit_ids if str(value)]
+                        if isinstance(record_unit_ids, list) and record_unit_ids
+                        else ([primary_unit_id] if primary_unit_id else [])
                     )
-                if source_region_ids in {"", "[]"}:
-                    assignments.append("source_region_ids = ?")
-                    values.append(
-                        json.dumps([str(row[2])], ensure_ascii=False)
-                        if row[2]
-                        else "[]"
+                    region_ids = (
+                        [str(value) for value in record_region_ids if str(value)]
+                        if isinstance(record_region_ids, list) and record_region_ids
+                        else ([primary_region_id] if primary_region_id else [])
                     )
-                if not assignments:
-                    continue
-                values.append(promotion_key)
-                connection.execute(
-                    f"UPDATE promotion_records SET {', '.join(assignments)} "
-                    "WHERE promotion_key = ?",
-                    tuple(values),
-                )
+                    unit_region_map: dict[str, str] = {}
+                    if isinstance(raw_region_map, list):
+                        for item in raw_region_map:
+                            if not isinstance(item, dict):
+                                continue
+                            unit_id = str(item.get("unit_id") or "").strip()
+                            region_id = str(item.get("region_id") or "").strip()
+                            if unit_id and region_id:
+                                unit_region_map[unit_id] = region_id
+                    source_ids.update(unit_ids)
+                    parsed.append(
+                        (
+                            promotion_key,
+                            primary_unit_id,
+                            primary_region_id,
+                            unit_ids,
+                            region_ids,
+                            unit_region_map,
+                        )
+                    )
+                indexed_regions: dict[str, str] = {}
+                ordered_source_ids = sorted(source_ids)
+                for offset in range(0, len(ordered_source_ids), 500):
+                    chunk = ordered_source_ids[offset : offset + 500]
+                    if not chunk:
+                        continue
+                    placeholders = ", ".join("?" for _ in chunk)
+                    index_rows = connection.execute(
+                        f"""SELECT unit_id, region_id FROM memory_browser_index
+                            WHERE unit_id IN ({placeholders})
+                            ORDER BY unit_id, region_id""",
+                        chunk,
+                    ).fetchall()
+                    for index_row in index_rows:
+                        indexed_regions.setdefault(str(index_row[0]), str(index_row[1]))
+                for (
+                    promotion_key,
+                    primary_unit_id,
+                    primary_region_id,
+                    unit_ids,
+                    region_ids,
+                    unit_region_map,
+                ) in parsed:
+                    if primary_unit_id and primary_region_id:
+                        unit_region_map.setdefault(primary_unit_id, primary_region_id)
+                    for unit_id in unit_ids:
+                        indexed = indexed_regions.get(unit_id)
+                        if indexed:
+                            unit_region_map.setdefault(unit_id, indexed)
+                    connection.execute(
+                        """UPDATE promotion_records
+                           SET source_unit_ids = ?, source_region_ids = ?,
+                               source_unit_regions = ?
+                           WHERE promotion_key = ?""",
+                        (
+                            json.dumps(unit_ids, ensure_ascii=False),
+                            json.dumps(region_ids, ensure_ascii=False),
+                            json.dumps(
+                                [
+                                    {"unit_id": unit_id, "region_id": region_id}
+                                    for unit_id, region_id in unit_region_map.items()
+                                ],
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            promotion_key,
+                        ),
+                    )
+            cursor = str(rows[-1][0])
+            batch_sizes.append(len(rows))
+        with connection:
+            connection.execute(
+                """INSERT INTO memory_browser_index_meta (key, value)
+                   VALUES ('promotion_schema_version', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (str(_PROMOTION_SCHEMA_VERSION),),
+            )
+        return batch_sizes
 
     @staticmethod
     def _ensure_governance_schema(connection: sqlite3.Connection) -> None:
@@ -5231,6 +7335,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "ALTER TABLE governance_events "
                     "ADD COLUMN status TEXT NOT NULL DEFAULT 'committed'"
                 )
+        if "logical_memory_id" not in columns:
+            with connection:
+                connection.execute(
+                    "ALTER TABLE governance_events "
+                    "ADD COLUMN logical_memory_id TEXT NOT NULL DEFAULT ''"
+                )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS governance_events_lineage
+               ON governance_events (region_id, logical_memory_id, unit_id)"""
+        )
 
     def _reserve_evolution(
         self,
@@ -5930,6 +8044,26 @@ def _metadata_text(unit: MemoryUnit, key: str) -> str:
     return "" if value is None else str(value)
 
 
+def _metadata_unit_region_map(unit: MemoryUnit) -> dict[str, str]:
+    raw = unit.user_metadata.get("source_unit_regions")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(raw, list):
+        return {}
+    mapping: dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        unit_id = str(item.get("unit_id") or "").strip()
+        region_id = str(item.get("region_id") or "").strip()
+        if unit_id and region_id:
+            mapping[unit_id] = region_id
+    return mapping
+
+
 def _metadata_int(unit: MemoryUnit, key: str) -> int:
     value = unit.user_metadata.get(key)
     try:
@@ -6215,17 +8349,33 @@ def _unit_payload(unit: MemoryUnit, region: MemoryRegion) -> dict[str, object]:
             provenance = [str(value) for value in metadata_provenance]
     if not isinstance(source_references, list):
         source_references = provenance
+    normalized_source_references = [str(value) for value in source_references]
+    memory_type = _metadata_text(unit, "memory_type") or "unknown"
     revision = _unit_revision(unit)
     ingested = unit.temporal.t_ingest or unit.temporal.t_valid or unit.temporal.t_message
-    updated = unit.temporal.t_ingest
-    if unit.lifecycle.value in {"superseded", "forgotten"}:
-        updated = unit.temporal.t_invalid or updated
+    updated_candidates = [
+        value
+        for value in (
+            unit.temporal.t_ingest,
+            _parse_timestamp(str(user_metadata.get("governance_updated_at", ""))),
+            (
+                unit.temporal.t_invalid
+                if unit.lifecycle.value in {"superseded", "forgotten", "archived"}
+                else None
+            ),
+        )
+        if value is not None
+    ]
+    updated = max(updated_candidates) if updated_candidates else None
     deleted = unit.temporal.t_invalid if unit.lifecycle.value == "forgotten" else None
     return {
         "id": unit.id,
         "path": unit.id,
         "document_id": unit.id,
         "content": unit.content,
+        "summary": _memory_summary(unit.content),
+        "memory_type": memory_type,
+        "source_count": len(set(normalized_source_references)),
         "metadata": {
             "system": _json_metadata(dict(unit.system_metadata)),
             "user": _json_metadata(user_metadata),
@@ -6238,7 +8388,7 @@ def _unit_payload(unit: MemoryUnit, region: MemoryRegion) -> dict[str, object]:
         "revision": revision,
         "source_version": revision,
         "source": unit.source_ref or "mem2",
-        "source_references": _json_metadata(source_references),
+        "source_references": _json_metadata(normalized_source_references),
         "provenance": provenance,
         "supersedes": unit.supersedes,
         "region_id": region.region_id,
@@ -6260,6 +8410,86 @@ def _unit_payload(unit: MemoryUnit, region: MemoryRegion) -> dict[str, object]:
     }
 
 
+def _memory_summary(content: str, limit: int = 160) -> str:
+    normalized = " ".join(content.split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit].rstrip()}…"
+
+
+def _is_formal_semantic_unit(unit: MemoryUnit) -> bool:
+    if _is_capture_unit(unit):
+        return False
+    memory_type = _metadata_text(unit, "memory_type")
+    return (
+        memory_type in FORMAL_MEMORY_TYPES
+        and unit.lifecycle.value in {"active", "superseded", "archived"}
+    )
+
+
+def _memory_sort_key(payload: Mapping[str, object]) -> tuple[datetime, str]:
+    updated = _parse_timestamp(str(payload.get("updated_at", "")))
+    return (
+        updated if updated is not None else datetime.min.replace(tzinfo=UTC),
+        str(payload.get("id", "")),
+    )
+
+
+def _memory_list_item(payload: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "id": str(payload.get("id", "")),
+        "path": str(payload.get("path", "")),
+        "region_id": str(payload.get("region_id", "")),
+        "summary": str(payload.get("summary", "")),
+        "memory_type": str(payload.get("memory_type", "")),
+        "lifecycle": str(payload.get("lifecycle", "")),
+        "updated_at": str(payload.get("updated_at", "")),
+        "source_count": int(str(payload.get("source_count", 0))),
+        "version": str(payload.get("version", "")),
+    }
+
+
+def _encode_memory_cursor_rows(row: tuple[object, ...]) -> str:
+    updated = _parse_timestamp(str(row[5]))
+    value = {
+        "v": 1,
+        "updated_at": updated.isoformat() if updated is not None else "",
+        "id": str(row[0]),
+    }
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return base64.urlsafe_b64encode(encoded.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _encode_memory_cursor(payload: Mapping[str, object]) -> str:
+    updated = _parse_timestamp(str(payload.get("updated_at", "")))
+    value = {
+        "v": 1,
+        "updated_at": updated.isoformat() if updated is not None else "",
+        "id": str(payload.get("id", "")),
+    }
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return base64.urlsafe_b64encode(encoded.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_memory_cursor(cursor: str) -> tuple[datetime, str]:
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        decoded = base64.urlsafe_b64decode(f"{cursor}{padding}".encode("ascii"))
+        value = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MemoryGovernanceError("invalid memory cursor") from error
+    if not isinstance(value, dict) or value.get("v") != 1:
+        raise MemoryGovernanceError("invalid memory cursor")
+    unit_id = value.get("id")
+    updated_at = value.get("updated_at")
+    if not isinstance(unit_id, str) or not unit_id or not isinstance(updated_at, str):
+        raise MemoryGovernanceError("invalid memory cursor")
+    updated = _parse_timestamp(updated_at)
+    if updated is None:
+        raise MemoryGovernanceError("invalid memory cursor")
+    return updated, unit_id
+
+
 def _unit_sort_key(pair: tuple[Scope, MemoryUnit]) -> tuple[str, str]:
     _, unit = pair
     timestamp = (
@@ -6269,6 +8499,54 @@ def _unit_sort_key(pair: tuple[Scope, MemoryUnit]) -> tuple[str, str]:
         or unit.temporal.t_event
     )
     return (timestamp.isoformat() if timestamp is not None else "", unit.id)
+
+
+def _unit_logical_memory_id(unit: MemoryUnit) -> str:
+    return _metadata_text(unit, "logical_memory_id") or unit.id
+
+
+def _logical_memory_id_map(units: list[MemoryUnit]) -> dict[str, str]:
+    """Resolve stable lineage IDs for a bounded set of versions."""
+    ids = {unit.id for unit in units}
+    parents = {unit_id: unit_id for unit_id in ids}
+
+    def find(unit_id: str) -> str:
+        root = unit_id
+        while parents[root] != root:
+            root = parents[root]
+        while parents[unit_id] != unit_id:
+            parent = parents[unit_id]
+            parents[unit_id] = root
+            unit_id = parent
+        return root
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for unit in units:
+        if unit.supersedes and unit.supersedes in ids:
+            union(unit.id, unit.supersedes)
+
+    components: dict[str, list[MemoryUnit]] = {}
+    for unit in units:
+        components.setdefault(find(unit.id), []).append(unit)
+
+    result: dict[str, str] = {}
+    for members in components.values():
+        explicit = sorted(
+            {
+                lineage
+                for unit in members
+                if (lineage := _metadata_text(unit, "logical_memory_id"))
+            }
+        )
+        lineage_id = explicit[0] if explicit else min(unit.id for unit in members)
+        for unit in members:
+            result[unit.id] = lineage_id
+    return result
 
 
 def _version_chain(
@@ -6289,6 +8567,12 @@ def _version_chain(
                 ids.update(new_ids)
                 changed = True
     return sorted((pair for pair in pairs if pair[1].id in ids), key=_unit_sort_key)
+
+
+def _latest_chain_version(units: list[MemoryUnit]) -> MemoryUnit:
+    superseded_ids = {unit.supersedes for unit in units if unit.supersedes}
+    terminals = [unit for unit in units if unit.id not in superseded_ids]
+    return (terminals or units)[-1]
 
 
 def _require_revision(unit: MemoryUnit, expected: str) -> None:
