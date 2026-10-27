@@ -8,10 +8,12 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from jiuwen_memory.api import Modality, legacy_request_context
 from jiuwen_memory.common.errors import ConflictError, NotFoundError
 from jiuwen_memory.common.type_def import Scope
 from jiuwen_memory.storage.types import Edge, GraphQuery, Node
 
+import personal_agent_memory.mem2_kernel as mem2_module
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import Settings
 from personal_agent_memory.memory_kernel import (
@@ -690,6 +692,7 @@ def test_multi_scope_search_keeps_graph_expansion_after_merge(
             [(first_scope, region), (second_scope, region)],
             scope_kind="explicit_regions",
             region_ids=["graph-region"],
+            regions_by_id={"graph-region": region},
         )
         results = payload["results"]
         assert len(results) == 10
@@ -2213,6 +2216,217 @@ def test_consolidation_keeps_graph_error_from_capture_scope(
         assert all(item["classification"] == "direct" for item in payload["results"])
 
 
+def test_capture_updates_graph_and_keeps_search_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        region = client.post(
+            "/api/v1/regions",
+            headers=headers,
+            json={"kind": "project", "name": "capture graph", "region_id": "capture-graph"},
+        )
+        assert region.status_code == 201, region.text
+        binding = client.post(
+            "/api/v1/project-bindings",
+            headers=headers,
+            json={"project_root": str(project_root), "region_id": "capture-graph"},
+        )
+        assert binding.status_code == 201, binding.text
+        warmup = client.post(
+            "/api/v1/memories",
+            headers=headers,
+            json={
+                "region_id": "capture-graph",
+                "content": "CAPTUREGRAPH durable project baseline",
+                "memory_type": "domain_fact",
+                "source_references": ["source:capture-graph-baseline"],
+                "actor": "test",
+                "idempotency_key": "capture-graph-baseline",
+            },
+        )
+        assert warmup.status_code == 201, warmup.text
+        rebuilt = client.post(
+            "/api/v1/libraries/capture-graph/graph-index/rebuild",
+            headers=headers,
+        )
+        assert rebuilt.status_code == 202, rebuilt.text
+        assert rebuilt.json()["status"] == "ready", rebuilt.text
+
+        kernel = client.app.state.memory_kernel
+        bundle = kernel._require_bundle()
+        update_started = threading.Event()
+        release_update = threading.Event()
+        original_associate = kernel._associate_graph_scope
+        original_add = bundle.runtime.api.add
+        statuses_during_add: list[dict[str, object]] = []
+
+        def add_with_pending_check(*args: object, **kwargs: object) -> list[object]:
+            units = original_add(*args, **kwargs)
+            scope = args[1]
+            if getattr(scope, "session", "") == "capture-graph-session":
+                statuses_during_add.append(kernel.graph_status("capture-graph"))
+            return units
+
+        def controlled_associate(
+            bundle: object,
+            scope: Scope,
+            *,
+            region_id: str | None = None,
+        ) -> str | None:
+            if scope.session == "capture-graph-session":
+                update_started.set()
+                assert release_update.wait(timeout=5)
+            return original_associate(bundle, scope, region_id=region_id)
+
+        monkeypatch.setattr(bundle.runtime.api, "add", add_with_pending_check)
+        monkeypatch.setattr(kernel, "_associate_graph_scope", controlled_associate)
+        captured = client.post(
+            "/api/v1/capture/events",
+            headers=headers,
+            json={
+                "event_id": "capture-graph-user",
+                "session_id": "capture-graph-session",
+                "turn_id": "capture-graph-turn",
+                "event_kind": "user",
+                "content": "CAPTUREGRAPH alpha beta source",
+                "occurred_at": "2026-10-25T00:00:00Z",
+                "cwd": str(project_root),
+            },
+        )
+        assert captured.status_code == 202, captured.text
+        assert update_started.wait(timeout=5)
+        assert len(statuses_during_add) == 1
+        assert statuses_during_add[0]["status"] == "ready"
+        assert statuses_during_add[0]["detail"] == "graph projection update pending"
+
+        pending_status = client.get(
+            "/api/v1/libraries/capture-graph/graph-status",
+            headers=headers,
+        )
+        assert pending_status.status_code == 200, pending_status.text
+        assert pending_status.json()["status"] == "ready", pending_status.text
+        assert pending_status.json()["detail"] == "graph projection update pending"
+
+        pending_search = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "cwd": str(project_root),
+                "session_id": "capture-graph-session",
+                "query": "CAPTUREGRAPH",
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert pending_search.status_code == 200, pending_search.text
+        pending_payload = pending_search.json()
+        assert pending_payload["graph_index_status"] == "ready"
+        assert "graph_unavailable" not in pending_payload["degradation"]
+
+        release_update.set()
+        kernel._wait_for_scope_graph_updates()
+        status = client.get(
+            "/api/v1/libraries/capture-graph/graph-status",
+            headers=headers,
+        )
+        assert status.status_code == 200, status.text
+        assert status.json()["status"] == "ready", status.text
+        assert status.json()["total_documents"] == 2
+        assert status.json()["projected_documents"] == 2
+
+        search = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "cwd": str(project_root),
+                "session_id": "capture-graph-session",
+                "query": "CAPTUREGRAPH",
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert search.status_code == 200, search.text
+        payload = search.json()
+        assert payload["graph_index_status"] == "ready"
+        assert "graph_unavailable" not in payload["degradation"]
+        assert payload["results"]
+
+
+def test_consolidation_deadline_queues_remaining_graph_updates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        region = client.post(
+            "/api/v1/regions",
+            headers=headers,
+            json={"kind": "project", "name": "deadline graph", "region_id": "deadline-graph"},
+        )
+        assert region.status_code == 201, region.text
+        binding = client.post(
+            "/api/v1/project-bindings",
+            headers=headers,
+            json={"project_root": str(project_root), "region_id": "deadline-graph"},
+        )
+        assert binding.status_code == 201, binding.text
+        for event_id, event_kind, content in (
+            ("deadline-user", "user", "DEADLINEGRAPH alpha beta source"),
+            ("deadline-assistant", "assistant", "DEADLINEGRAPH alpha beta target"),
+        ):
+            captured = client.post(
+                "/api/v1/capture/events",
+                headers=headers,
+                json={
+                    "event_id": event_id,
+                    "session_id": "deadline-session",
+                    "turn_id": "deadline-turn",
+                    "event_kind": event_kind,
+                    "content": content,
+                    "occurred_at": "2026-10-25T00:00:00Z",
+                    "cwd": str(project_root),
+                },
+            )
+            assert captured.status_code == 202, captured.text
+
+        kernel = client.app.state.memory_kernel
+        kernel._wait_for_scope_graph_updates()
+        clock = [1000.0]
+        monkeypatch.setattr(mem2_module.time, "monotonic", lambda: clock[0])
+        original_complete = kernel._complete_evolution
+
+        def complete_then_expire(evolve_key: str, memory_id: str) -> None:
+            original_complete(evolve_key, memory_id)
+            clock[0] = 2000.0
+
+        monkeypatch.setattr(kernel, "_complete_evolution", complete_then_expire)
+        evolved = kernel._evolve(
+            EvolveMemoryRequest(
+                session_id="deadline-session",
+                deadline=1500.0,
+            )
+        )
+        assert evolved["queued"] == 1
+        kernel._wait_for_scope_graph_updates()
+
+        status = client.get(
+            "/api/v1/libraries/deadline-graph/graph-status",
+            headers=headers,
+        )
+        assert status.status_code == 200, status.text
+        assert status.json()["status"] == "ready", status.text
+        assert status.json()["total_documents"] == 3
+        assert status.json()["projected_documents"] == 3
+
+
 def test_rebuild_scope_enumeration_failure_is_degraded_and_persisted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2600,6 +2814,14 @@ def test_rebuild_failure_keeps_errors_for_unprocessed_scopes(
             agent="codex",
             session="session-b",
         )
+        bundle = kernel._require_bundle()
+        added = bundle.runtime.api.add(
+            "anything in unprocessed scope",
+            unprocessed_scope,
+            Modality.TEXT,
+            security=legacy_request_context(unprocessed_scope),
+        )
+        assert added
         kernel._set_graph_projection_error(
             "pre-existing missing edges",
             scope=unprocessed_scope,

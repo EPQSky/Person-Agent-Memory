@@ -26,7 +26,7 @@ from jiuwen_memory.common.type_def import (
     Scope,
     filter_field_metadata_key,
 )
-from jiuwen_memory.storage._support import scope_dims, wrap_backend
+from jiuwen_memory.storage._support import wrap_backend
 from jiuwen_memory.storage.base import StoreType
 from jiuwen_memory.storage.fulltext import FulltextStore
 from jiuwen_memory.storage.graph import GraphStore
@@ -113,7 +113,9 @@ def _compile_metadata_filter(expr: FilterExpr | None) -> str:
 
 def _scope_expression(scope: Scope) -> str:
     return " && ".join(
-        f"scope_{dimension} == {_literal(value)}" for dimension, value in scope_dims(scope)
+        f"scope_{field_name.removeprefix('scope_')} == "
+        f"{_literal(str(getattr(scope, field_name.removeprefix('scope_'))))}"
+        for field_name in _SCOPE_FIELDS
     )
 
 
@@ -288,6 +290,10 @@ class MilvusLiteVectorStore(_JiuwenMilvusVectorStore):  # type: ignore[misc]
     @staticmethod
     def _filter_clause(clause: FilterClause) -> str:
         return _compile_metadata_filter(clause)
+
+    def _scope_expr(self, scope: Scope) -> str:
+        """Match every scope dimension exactly, including empty session values."""
+        return _scope_expression(scope)
 
     def insert(self, scope: Scope, records: list[VectorRecord]) -> None:
         with wrap_backend("milvus vector insert"):

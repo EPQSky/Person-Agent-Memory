@@ -360,6 +360,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._graph_projection_lock = threading.RLock()
         self._graph_projection_errors: dict[str, str] = {}
         self._graph_projection_manifests: dict[str, dict[str, str]] = {}
+        self._scope_graph_threads: dict[str, threading.Thread] = {}
+        self._scope_graph_requested: set[str] = set()
+        self._scope_graph_lock = threading.Lock()
         self._lock = threading.RLock()
         self._maintenance_lock = threading.RLock()
         self._graph_write_lock = threading.RLock()
@@ -488,6 +491,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     def _close(self) -> None:
         self._wait_for_promotion_threads()
+        self._wait_for_scope_graph_updates()
         with self._lock:
             bundle = self._bundle
             self._bundle = None
@@ -558,6 +562,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             transient_errors: list[str] = []
             active_documents = 0
             projected_documents = 0
+            graph_updates_pending = False
             if identifier is None:
                 scopes = self._graph_status_scopes(bundle)
             elif region is None:
@@ -566,6 +571,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 scopes = self._region_scopes(bundle, region)
             with self._graph_write_lock:
                 for scope in scopes:
+                    graph_updates_pending = (
+                        graph_updates_pending or self._scope_graph_update_pending(scope)
+                    )
                     scope_counts = bundle.graph_store.counts(scope)
                     counts["nodes"] += int(scope_counts.get("nodes", 0))
                     counts["edges"] += int(scope_counts.get("edges", 0))
@@ -630,7 +638,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             or (projection_issues[0] if projection_issues else None)
             or (store_errors[0] if store_errors else None)
             or transient_error
-            or "one-hop graph expansion available"
+            or (
+                "graph projection update pending"
+                if graph_updates_pending
+                else "one-hop graph expansion available"
+            )
         )
         degraded = bool(projection_error or projection_issues or store_errors or transient_error)
         return {
@@ -823,6 +835,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         bundle: _RuntimeBundle,
         scope: Scope,
     ) -> tuple[int, int, str | None]:
+        update_pending = self._scope_graph_update_pending(scope)
         units = self._active_graph_units(bundle, scope)
         expected_count, actual_count, mismatch = self._graph_projection_contents(
             bundle,
@@ -830,11 +843,15 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             units,
         )
         if mismatch is not None:
+            if update_pending:
+                return expected_count, actual_count, None
             return expected_count, actual_count, mismatch
         if not units and actual_count == 0:
             return expected_count, actual_count, None
         manifest = self._graph_projection_manifest(scope)
         if manifest is None:
+            if update_pending:
+                return expected_count, actual_count, None
             return (
                 expected_count,
                 actual_count,
@@ -853,6 +870,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             manifest["kv_fingerprint"] == kv_fingerprint
             and manifest["graph_fingerprint"] == graph_fingerprint
         ):
+            return expected_count, actual_count, None
+        if update_pending:
             return expected_count, actual_count, None
         edge_mismatch = self._graph_edge_mismatch(bundle, scope, units)
         return (
@@ -1561,6 +1580,93 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 return region.region_id
         return None
 
+    def _queue_scope_graph_update(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+    ) -> None:
+        if bundle.graph_store is None:
+            return
+        key = self._graph_projection_key(None, scope)
+        with self._scope_graph_lock:
+            self._scope_graph_requested.add(key)
+            if key in self._scope_graph_threads:
+                return
+            thread = threading.Thread(
+                target=self._run_scope_graph_update,
+                args=(
+                    bundle,
+                    scope,
+                    key,
+                    self._region_id_for_scope(scope),
+                ),
+                name="memory-scope-graph-update",
+                daemon=True,
+            )
+            self._scope_graph_threads[key] = thread
+        thread.start()
+
+    def _mark_scope_graph_pending(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+    ) -> None:
+        if bundle.graph_store is None:
+            return
+        key = self._graph_projection_key(None, scope)
+        with self._scope_graph_lock:
+            self._scope_graph_requested.add(key)
+
+    def _clear_scope_graph_pending(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+    ) -> None:
+        if bundle.graph_store is None:
+            return
+        key = self._graph_projection_key(None, scope)
+        with self._scope_graph_lock:
+            if key not in self._scope_graph_threads:
+                self._scope_graph_requested.discard(key)
+
+    def _run_scope_graph_update(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        key: str,
+        region_id: str | None,
+    ) -> None:
+        try:
+            while True:
+                with self._scope_graph_lock:
+                    if key not in self._scope_graph_requested:
+                        self._scope_graph_threads.pop(key, None)
+                        return
+                    self._scope_graph_requested.discard(key)
+                self._associate_graph_scope(
+                    bundle,
+                    scope,
+                    region_id=region_id,
+                )
+        except Exception as error:
+            with self._scope_graph_lock:
+                self._scope_graph_requested.discard(key)
+                self._scope_graph_threads.pop(key, None)
+            failure = f"graph projection update failed: {error}"
+            self._set_graph_error(failure, region_id=region_id, scope=scope)
+            self._set_graph_projection_error(failure, scope=scope)
+
+    def _scope_graph_update_pending(self, scope: Scope) -> bool:
+        key = self._graph_projection_key(None, scope)
+        with self._scope_graph_lock:
+            return key in self._scope_graph_requested or key in self._scope_graph_threads
+
+    def _wait_for_scope_graph_updates(self) -> None:
+        with self._scope_graph_lock:
+            threads = tuple(self._scope_graph_threads.values())
+        for thread in threads:
+            thread.join(timeout=30.0)
+
     def _graph_region_or_none(self, library_id: str) -> MemoryRegion | None:
         try:
             return self._regions.require_region(library_id)
@@ -1695,6 +1801,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 request_hash,
             )
             if existing_id is not None:
+                self._queue_scope_graph_update(bundle, scope)
                 return _capture_response(
                     request,
                     existing_id,
@@ -1720,6 +1827,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         else:
             raise TypeError("unsupported memory write request")
         security = _security_for(scope)
+        if isinstance(request, CaptureMemoryRequest):
+            self._mark_scope_graph_pending(bundle, scope)
         try:
             units = bundle.runtime.api.add(
                 request.content,
@@ -1735,9 +1844,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 try:
                     self._purge_capture_units(bundle, scope, request.event_id)
                 except Exception as cleanup_error:
+                    self._clear_scope_graph_pending(bundle, scope)
                     raise MemoryKernelUnavailableError(
                         "capture cleanup is pending after partial persistence"
                     ) from cleanup_error
+                self._clear_scope_graph_pending(bundle, scope)
                 self._release_pending_idempotency(identity, request.event_id)
             raise
         if not units:
@@ -1747,9 +1858,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 try:
                     self._purge_capture_units(bundle, scope, request.event_id)
                 except Exception as cleanup_error:
+                    self._clear_scope_graph_pending(bundle, scope)
                     raise MemoryKernelUnavailableError(
                         "capture cleanup is pending after partial persistence"
                     ) from cleanup_error
+                self._clear_scope_graph_pending(bundle, scope)
                 self._release_pending_idempotency(identity, request.event_id)
             raise MemoryKernelUnavailableError("mem2 runtime did not create a memory unit")
         unit = units[0]
@@ -1774,9 +1887,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 unit.id,
             )
         except Exception as error:
+            self._queue_scope_graph_update(bundle, scope)
             raise MemoryKernelUnavailableError(
                 "capture was stored but its idempotency completion is pending"
             ) from error
+        self._queue_scope_graph_update(bundle, scope)
         return _capture_response(request, unit.id, region, scope, status="accepted")
 
     async def search(self, request: SearchMemoryRequest) -> dict[str, object]:
@@ -3355,8 +3470,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 for scope in target_scopes:
                     if scope not in graph_scopes:
                         graph_scopes.append(scope)
-                for scope in graph_scopes:
+                for index, scope in enumerate(graph_scopes):
                     if request.deadline is not None and time.monotonic() >= request.deadline:
+                        for pending_scope in graph_scopes[index:]:
+                            self._queue_scope_graph_update(bundle, pending_scope)
                         break
                     self._associate_graph_scope(
                         bundle,

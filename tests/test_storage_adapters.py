@@ -439,6 +439,121 @@ def test_scope_keys_are_unambiguous_for_vector_and_fulltext(tmp_path: Path) -> N
         fulltext.close()
 
 
+def test_vector_and_fulltext_empty_session_scope_is_exact(tmp_path: Path) -> None:
+    data_dir = tmp_path / "empty-session-scope.db"
+    base_scope = Scope(
+        org="local",
+        space="project:session-isolation",
+        user="u",
+        agent="a",
+        session="",
+    )
+    session_scope = Scope(
+        org="local",
+        space="project:session-isolation",
+        user="u",
+        agent="a",
+        session="session-a",
+    )
+    vectors = MilvusLiteVectorStore(uri=data_dir, dim=2)
+    fulltext = MilvusLiteFulltextStore(uri=data_dir)
+    try:
+        vectors.insert(
+            base_scope,
+            [
+                VectorRecord(
+                    id="shared",
+                    vector=[1.0, 0.0],
+                    metadata={"owner": "base"},
+                ),
+                VectorRecord(
+                    id="base-only",
+                    vector=[1.0, 0.0],
+                    metadata={"owner": "base"},
+                ),
+            ],
+        )
+        vectors.insert(
+            session_scope,
+            [
+                VectorRecord(
+                    id="shared",
+                    vector=[0.0, 1.0],
+                    metadata={"owner": "session"},
+                ),
+                VectorRecord(
+                    id="session-only",
+                    vector=[0.0, 1.0],
+                    metadata={"owner": "session"},
+                ),
+            ],
+        )
+        fulltext.insert(
+            base_scope,
+            [
+                Document(id="shared", text="scope marker base shared"),
+                Document(id="base-only", text="scope marker base only"),
+            ],
+        )
+        fulltext.insert(
+            session_scope,
+            [
+                Document(id="shared", text="scope marker session shared"),
+                Document(id="session-only", text="scope marker session only"),
+            ],
+        )
+
+        assert vectors.get(base_scope, ["shared"])[0].metadata == {"owner": "base"}
+        assert vectors.get(session_scope, ["shared"])[0].metadata == {"owner": "session"}
+        assert {
+            hit.id
+            for hit in vectors.search(
+                base_scope,
+                VectorQuery(vector=[1.0, 0.0], top_k=10),
+            )
+        } == {"shared", "base-only"}
+        assert {
+            hit.id
+            for hit in vectors.search(
+                session_scope,
+                VectorQuery(vector=[0.0, 1.0], top_k=10),
+            )
+        } == {"shared", "session-only"}
+
+        assert fulltext.get(base_scope, ["shared"])[0].text == "scope marker base shared"
+        assert (
+            fulltext.get(session_scope, ["shared"])[0].text
+            == "scope marker session shared"
+        )
+        assert {
+            hit.id
+            for hit in fulltext.search(
+                base_scope,
+                TextQuery(text="scope marker", top_k=10),
+            )
+        } == {"shared", "base-only"}
+        assert {
+            hit.id
+            for hit in fulltext.search(
+                session_scope,
+                TextQuery(text="scope marker", top_k=10),
+            )
+        } == {"shared", "session-only"}
+
+        vectors.delete(base_scope, ["shared"])
+        fulltext.delete(base_scope, ["shared"])
+        assert vectors.get(base_scope, ["shared"]) == []
+        assert fulltext.get(base_scope, ["shared"]) == []
+        assert vectors.get(session_scope, ["shared"])[0].metadata == {"owner": "session"}
+        assert (
+            fulltext.get(session_scope, ["shared"])[0].text
+            == "scope marker session shared"
+        )
+    finally:
+        vectors.close()
+        fulltext.close()
+
+
 @pytest.mark.parametrize("operation", ["search", "recall"])
 def test_vector_search_recall_wrap_first_connection_failure(
     tmp_path: Path,
