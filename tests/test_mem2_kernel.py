@@ -531,6 +531,11 @@ def test_mem2_vector_failure_returns_keyword_result_and_degradation(
             assert result["results"][0]["document_id"] == memory_id
             assert result["degraded"] is True
             assert "vector_unavailable" in result["degradation"]
+            assert result["vector_index_status"] == "degraded"
+            assert any(
+                item["channel"] == "vector"
+                for item in result["retrieval_errors"]
+            )
 
 
 def test_mem2_accepts_configured_1024_dimension(tmp_path: Path) -> None:

@@ -36,7 +36,14 @@ from jiuwen_memory.api import (
 from jiuwen_memory.common.audit.base import AuditLogger, AuditProducer
 from jiuwen_memory.common.embedder.base import Embedder, EmbedderProducer
 from jiuwen_memory.common.embedder.embedder_impl.openai_embedder import OpenAIEmbedder
-from jiuwen_memory.common.type_def import memory_key
+from jiuwen_memory.common.type_def import (
+    FilterClause,
+    FilterExpr,
+    FilterGroup,
+    FilterLogic,
+    FilterOp,
+    memory_key,
+)
 from jiuwen_memory.common.type_def.memory_codec import dumps
 from jiuwen_memory.construction import EvolveMode
 from jiuwen_memory.control import (
@@ -172,6 +179,7 @@ _FULLTEXT_CONTENT_LIMIT = 65_535
 _EVOLVE_CHUNK_LIMIT = 60_000
 _STATE_VERSION = "jiuwen-memory-0.2.0"
 _DEFAULT_SESSION_RETENTION_DAYS = 30
+_MAX_RECALL_CANDIDATE_POOL = 500
 _SESSION_RETENTION_SCHEMA = """CREATE TABLE IF NOT EXISTS session_retention_policy (
     region_id TEXT PRIMARY KEY,
     retention_days INTEGER NOT NULL,
@@ -183,9 +191,14 @@ _CAPTURE_EVOLUTIONS_SCHEMA = """CREATE TABLE IF NOT EXISTS capture_evolutions (
     turn_id TEXT NOT NULL,
     region_id TEXT NOT NULL,
     source_fingerprint TEXT NOT NULL DEFAULT '',
+    source_unit_ids TEXT NOT NULL DEFAULT '[]',
     memory_id TEXT,
     status TEXT NOT NULL DEFAULT 'completed'
         CHECK (status IN ('pending', 'completed')),
+    last_error TEXT NOT NULL DEFAULT '',
+    round_started_at TEXT NOT NULL DEFAULT '',
+    round_received_earliest TEXT NOT NULL DEFAULT '',
+    round_received_latest TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT
 )"""
@@ -2193,6 +2206,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         scope_attempts: dict[str, int] = {}
         scope_failures: dict[str, int] = {}
         source_references: dict[str, list[str]] = {}
+        retrieval_errors: list[dict[str, object]] = []
         for region_id in region_ids:
             region = regions_by_id[region_id]
             groups[region_id] = {
@@ -2249,6 +2263,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     if reason_text not in degradation:
                         degradation.append(reason_text)
                     if reason_text not in {
+                        "default_recall_candidate_truncated",
                         "fulltext_unavailable",
                         "graph_unavailable",
                         "model_unavailable",
@@ -2259,6 +2274,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     if reason_text not in group_degradation:
                         group_degradation.append(reason_text)
                     group["degraded"] = True
+            raw_errors = response.get("retrieval_errors", [])
+            if isinstance(raw_errors, list):
+                for raw_error in raw_errors:
+                    if isinstance(raw_error, dict) and raw_error not in retrieval_errors:
+                        retrieval_errors.append(raw_error)
             vector_status = str(response.get("vector_index_status", "degraded"))
             graph_status = str(response.get("graph_index_status", "degraded"))
             vector_statuses.add(vector_status)
@@ -2360,6 +2380,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "graph_index_status": graph_status,
             "results": results,
         }
+        if retrieval_errors:
+            result["retrieval_errors"] = retrieval_errors
         if scope_kind == "explicit_regions":
             result["region_groups"] = [groups[region_id] for region_id in region_ids]
         return result
@@ -2377,9 +2399,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         embedding_configured = self._vector_enabled
         if not embedding_configured:
             degradation.append(self._vector_degradation)
-            items, failed = self._keyword_fallback(bundle, scope, request)
+            items, failed, truncated = self._keyword_fallback(bundle, scope, request)
             if failed:
                 degradation.append("fulltext_unavailable")
+            if truncated:
+                degradation.append("default_recall_candidate_truncated")
             items = self._append_graph_expansions(
                 bundle, scope, items, request, degradation, region
             )
@@ -2395,12 +2419,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 region=region,
             )
         try:
-            result = bundle.runtime.api.search(
-                request.query,
-                Context(scope=scope),
-                security=security,
-                top_k=max(1, min(request.limit, 100)),
-                disclosure=DisclosureLevel.ADAPTIVE,
+            items, reported_errors, truncated = self._search_scope_candidates(
+                bundle.runtime.api,
+                scope,
+                request,
+                security,
             )
         except Exception as retrieval_error:
             classification = _classify_failure(
@@ -2408,9 +2431,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
             if classification not in degradation:
                 degradation.append(classification)
-            units, failed = self._keyword_fallback(bundle, scope, request)
+            units, failed, truncated = self._keyword_fallback(bundle, scope, request)
             if failed and "fulltext_unavailable" not in degradation:
                 degradation.append("fulltext_unavailable")
+            if truncated:
+                degradation.append("default_recall_candidate_truncated")
             units = self._append_graph_expansions(
                 bundle, scope, units, request, degradation, region
             )
@@ -2426,15 +2451,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 region=region,
             )
 
-        reported_errors = list(result.errors)
-        items = result.items
-        if not items and result.errors:
-            recovered, failed = self._keyword_fallback(bundle, scope, request)
+        if not items and reported_errors:
+            recovered, failed, truncated = self._keyword_fallback(bundle, scope, request)
             if recovered:
                 items = recovered
-                reported_errors = []
             elif failed and "fulltext_unavailable" not in degradation:
                 degradation.append("fulltext_unavailable")
+            if truncated:
+                degradation.append("default_recall_candidate_truncated")
+        elif truncated:
+            degradation.append("default_recall_candidate_truncated")
         for channel_error in reported_errors:
             channel = getattr(channel_error.channel, "value", str(channel_error.channel))
             failure = _channel_failure(channel, channel_error)
@@ -2442,7 +2468,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 degradation.append(failure)
         vector_failed = any(
             getattr(channel_error.channel, "value", str(channel_error.channel)) == "vector"
-            for channel_error in result.errors
+            for channel_error in reported_errors
         )
         vector_status = (
             "not_configured"
@@ -2463,6 +2489,49 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             graph_status=graph_status,
             region=region,
         )
+
+    @staticmethod
+    def _search_scope_candidates(
+        api: Any,
+        scope: Scope,
+        request: SearchMemoryRequest,
+        security: RequestSecurityContext,
+    ) -> tuple[list[Any], list[Any], bool]:
+        limit = max(1, min(request.limit, 100))
+        candidate_top_k = min(
+            max(limit * 4, 20),
+            _MAX_RECALL_CANDIDATE_POOL,
+        )
+        while True:
+            result = api.search(
+                request.query,
+                Context(scope=scope),
+                security=security,
+                filters=_default_recall_filter(),
+                top_k=candidate_top_k,
+                disclosure=DisclosureLevel.ADAPTIVE,
+            )
+            items = [
+                item for item in result.items if _is_default_recall_candidate(item)
+            ]
+            if (
+                len(items) >= limit
+                or len(result.items) < candidate_top_k
+                or candidate_top_k >= _MAX_RECALL_CANDIDATE_POOL
+            ):
+                return (
+                    items,
+                    list(result.errors),
+                    (
+                        candidate_top_k >= _MAX_RECALL_CANDIDATE_POOL
+                        and len(result.items) >= candidate_top_k
+                        and len(items) < limit
+                    ),
+                )
+            candidate_top_k = min(
+                candidate_top_k * 2,
+                _MAX_RECALL_CANDIDATE_POOL,
+            )
 
     def _graph_ready_status(
         self,
@@ -2594,6 +2663,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 str(item.id if isinstance(item, MemoryUnit) else item.unit_id)
                 for item in items
                 if isinstance(item, MemoryUnit) or hasattr(item, "unit_id")
+                if _is_default_recall_item(item)
             }
             if not direct_ids:
                 return list(items)
@@ -2624,6 +2694,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 if unit.lifecycle.value != "active":
                     continue
                 if unit.user_metadata.get("restore_pending") is True:
+                    continue
+                if not _is_default_recall_item(unit):
                     continue
                 payload = _result_item(unit, request)
                 payload["classification"] = "graph_expansion"
@@ -2667,7 +2739,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         bundle: _RuntimeBundle,
         scope: Scope,
         request: SearchMemoryRequest,
-    ) -> tuple[list[Any], bool]:
+    ) -> tuple[list[Any], bool, bool]:
         fulltext = next(
             (
                 store
@@ -2678,17 +2750,48 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             None,
         )
         if fulltext is None:
-            return [], True
+            return [], True, False
         try:
-            hits: list[ScoredID] = fulltext.search(
-                scope,
-                TextQuery(text=request.query, top_k=max(1, min(request.limit, 100))),
+            limit = max(1, min(request.limit, 100))
+            candidate_top_k = min(
+                max(limit * 4, 20),
+                _MAX_RECALL_CANDIDATE_POOL,
             )
+            while True:
+                hits: list[ScoredID] = fulltext.search(
+                    scope,
+                    TextQuery(
+                        text=request.query,
+                        top_k=candidate_top_k,
+                        filters=_default_recall_filter(),
+                    ),
+                )
+                units = list(
+                    load_units(bundle.kv_store, scope, [hit.id for hit in hits])
+                )
+                visible = [
+                    unit for unit in units if _is_default_recall_candidate(unit)
+                ]
+                if (
+                    len(visible) >= limit
+                    or len(hits) < candidate_top_k
+                    or candidate_top_k >= _MAX_RECALL_CANDIDATE_POOL
+                ):
+                    break
+                candidate_top_k = min(
+                    candidate_top_k * 2,
+                    _MAX_RECALL_CANDIDATE_POOL,
+                )
             if not hits:
-                return [], False
-            return list(load_units(bundle.kv_store, scope, [hit.id for hit in hits])), False
+                return [], False, False
+            truncated = (
+                candidate_top_k >= _MAX_RECALL_CANDIDATE_POOL
+                and len(hits) >= candidate_top_k
+                and len(visible) < limit
+            )
+            return visible, False, truncated
         except Exception:
-            return [], True
+            return [], True, False
 
     def list_documents(self, request: ListDocumentsRequest) -> list[dict[str, object]]:
         bundle = self._require_bundle()
@@ -4656,6 +4759,82 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         with self._maintenance_lock:
             return self._evolve_locked(request)
 
+    def _evolve_reserved_turn(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        region: MemoryRegion,
+        target_scope: Scope,
+        evolve_key: str,
+        source_fingerprint: str,
+        source_ids: list[str],
+        ordered: list[MemoryUnit],
+        turn_id: str,
+        status: str,
+    ) -> int:
+        content = "\n\n".join(
+            f"{_event_label(_metadata_text(unit, 'event_kind'))}: {unit.content}"
+            for unit in ordered
+        )
+        chunks = _chunk_evolved_content(content)
+        residual = self._evolution_units(bundle, target_scope, evolve_key)
+        if status == "pending" and self._evolution_visible(
+            bundle,
+            target_scope,
+            residual,
+            len(chunks),
+            source_fingerprint,
+        ):
+            self._complete_evolution(evolve_key, residual[0].id)
+            return 0
+        if residual:
+            self._purge_evolution_units(bundle, target_scope, residual)
+        added_units: list[MemoryUnit] = []
+        try:
+            for part, chunk in enumerate(chunks):
+                units_added = bundle.runtime.api.add(
+                    chunk,
+                    target_scope,
+                    Modality.TEXT,
+                    security=_security_for(target_scope),
+                    user_metadata={
+                        "memory_type": "evolved",
+                        "evolve_key": evolve_key,
+                        "source_fingerprint": source_fingerprint,
+                        "evolve_part": part,
+                        "evolve_parts": len(chunks),
+                        "region_id": region.region_id,
+                        "region_kind": region.kind,
+                        "session_id": scope.session,
+                        "turn_id": turn_id,
+                        "source_unit_ids": source_ids,
+                        "source_event_ids": [
+                            _metadata_text(unit, "event_id") for unit in ordered
+                        ],
+                        "provenance": source_ids,
+                    },
+                )
+                if not units_added:
+                    raise MemoryKernelUnavailableError("evolve did not create a memory unit")
+                added_units.append(units_added[0])
+            if not self._evolution_visible(
+                bundle,
+                target_scope,
+                added_units,
+                len(chunks),
+                source_fingerprint,
+            ):
+                self._purge_evolution_units(bundle, target_scope, added_units)
+                raise MemoryKernelUnavailableError(
+                    "evolved memory is not visible in the fulltext index"
+                )
+        except Exception:
+            residual = self._evolution_units(bundle, target_scope, evolve_key)
+            self._purge_evolution_units(bundle, target_scope, residual)
+            raise
+        self._complete_evolution(evolve_key, added_units[0].id)
+        return 1
+
     def _evolve_locked(self, request: EvolveMemoryRequest) -> dict[str, int]:
         bundle = self._require_bundle()
         session_id = (
@@ -4692,7 +4871,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         unit.id,
                     ),
                 )
+                if not _capture_turn_is_complete(ordered):
+                    continue
                 source_ids = [unit.id for unit in ordered]
+                started_at, received_earliest, received_latest = _capture_units_timeline(
+                    ordered
+                )
                 region_id = _metadata_text(ordered[0], "region_id")
                 if not region_id:
                     continue
@@ -4717,73 +4901,29 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     turn_id,
                     region.region_id,
                     source_fingerprint,
+                    source_ids,
+                    started_at,
+                    received_earliest,
+                    received_latest,
                 )
                 if status == "completed" and memory_id is not None:
                     continue
-                content = "\n\n".join(
-                    f"{_event_label(_metadata_text(unit, 'event_kind'))}: {unit.content}"
-                    for unit in ordered
-                )
-                chunks = _chunk_evolved_content(content)
-                residual = self._evolution_units(bundle, target_scope, evolve_key)
-                if status == "pending" and self._evolution_visible(
-                    bundle,
-                    target_scope,
-                    residual,
-                    len(chunks),
-                    source_fingerprint,
-                ):
-                    self._complete_evolution(evolve_key, residual[0].id)
-                    continue
-                if residual:
-                    self._purge_evolution_units(bundle, target_scope, residual)
-                added_units: list[MemoryUnit] = []
                 try:
-                    for part, chunk in enumerate(chunks):
-                        units_added = bundle.runtime.api.add(
-                            chunk,
-                            target_scope,
-                            Modality.TEXT,
-                            security=_security_for(target_scope),
-                            user_metadata={
-                                "memory_type": "evolved",
-                                "evolve_key": evolve_key,
-                                "source_fingerprint": source_fingerprint,
-                                "evolve_part": part,
-                                "evolve_parts": len(chunks),
-                                "region_id": region.region_id,
-                                "region_kind": region.kind,
-                                "session_id": scope.session,
-                                "turn_id": turn_id,
-                                "source_unit_ids": source_ids,
-                                "source_event_ids": [
-                                    _metadata_text(unit, "event_id") for unit in ordered
-                                ],
-                                "provenance": source_ids,
-                            },
-                        )
-                        if not units_added:
-                            raise MemoryKernelUnavailableError(
-                                "evolve did not create a memory unit"
-                            )
-                        added_units.append(units_added[0])
-                    if not self._evolution_visible(
+                    created += self._evolve_reserved_turn(
                         bundle,
+                        scope,
+                        region,
                         target_scope,
-                        added_units,
-                        len(chunks),
+                        evolve_key,
                         source_fingerprint,
-                    ):
-                        self._purge_evolution_units(bundle, target_scope, added_units)
-                        raise MemoryKernelUnavailableError(
-                            "evolved memory is not visible in the fulltext index"
-                        )
-                except Exception:
-                    residual = self._evolution_units(bundle, target_scope, evolve_key)
-                    self._purge_evolution_units(bundle, target_scope, residual)
+                        source_ids,
+                        ordered,
+                        turn_id,
+                        status,
+                    )
+                except Exception as error:
+                    self._fail_evolution(evolve_key, _evolution_failure_text(error))
                     raise
-                self._complete_evolution(evolve_key, added_units[0].id)
-                created += 1
         if bundle.graph_store is not None:
             with self._graph_write_lock:
                 graph_scopes = list(all_scopes)
@@ -6937,6 +7077,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         bundle = self._require_bundle()
         region = self._session_region(request.library_id)
         plan = self._retention_plan(region)
+        self._record_archived_incomplete_turns(bundle, plan)
         for scope, units in _group_units_by_scope(plan):
             bundle.runtime.api.delete(
                 DeleteSelector(
@@ -6966,36 +7107,98 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     def list_capture_events(self, request: CaptureEventsRequest) -> list[dict[str, object]]:
         bundle = self._require_bundle()
-        session_id = request.session_id.strip() if request.session_id is not None else None
+        session_id = (
+            _normalize_session_id(request.session_id)
+            if request.session_id is not None
+            else None
+        )
+        turn_id = _normalize_optional_identifier(request.turn_id, "turn_id")
+        region: MemoryRegion | None = None
+        if request.region_id is not None:
+            region_id = _normalize_optional_identifier(request.region_id, "region_id")
+            assert region_id is not None
+            region = self._regions.require_region(region_id)
         events: list[dict[str, object]] = []
         for scope in bundle.kv_store.scopes():
-            if session_id is not None and scope.session != session_id:
+            if region is not None and scope.space != region.space:
+                continue
+            if (
+                region is not None
+                and region.kind == "session"
+                and scope.session != (region.session_id or "")
+            ):
                 continue
             for unit in self._units_in_scope(bundle, scope):
-                if unit.lifecycle.value != "active" or not _is_capture_unit(unit):
+                if unit.lifecycle.value != "active":
+                    continue
+                capture_record = _is_capture_record(unit)
+                evolved_diagnostic = _is_evolved_unit(unit)
+                if not capture_record and not evolved_diagnostic:
+                    continue
+                event_region_id = _metadata_text(unit, "region_id") or (
+                    region.region_id if region is not None else ""
+                )
+                if region is not None and event_region_id != region.region_id:
+                    continue
+                event_session_id = _metadata_text(unit, "session_id") or scope.session
+                event_turn_id = _metadata_text(unit, "turn_id")
+                if session_id is not None and event_session_id != session_id:
+                    continue
+                if turn_id is not None and event_turn_id != turn_id:
                     continue
                 received = unit.temporal.t_ingest
-                events.append(
-                    {
-                        "event_id": _metadata_text(unit, "event_id"),
-                        "session_id": _metadata_text(unit, "session_id"),
-                        "project_id": _metadata_text(unit, "project_id"),
-                        "library_id": _metadata_text(unit, "region_id"),
-                        "region_id": _metadata_text(unit, "region_id"),
-                        "turn_id": _metadata_text(unit, "turn_id"),
-                        "event_kind": _metadata_text(unit, "event_kind"),
-                        "content": unit.content,
-                        "occurred_at": _metadata_text(unit, "occurred_at"),
-                        "received_at": (received.isoformat() if received is not None else ""),
-                        "consolidated_at": None,
-                    }
-                )
-        events.sort(key=lambda item: (str(item["received_at"]), str(item["event_id"])))
+                payload: dict[str, object] = {
+                    "record_type": (
+                        "capture_event" if capture_record else "evolved_diagnostic"
+                    ),
+                    "diagnostic_kind": "" if capture_record else "legacy_evolved",
+                    "legacy": (
+                        not _is_capture_unit(unit) if capture_record else True
+                    ),
+                    "event_id": _metadata_text(unit, "event_id"),
+                    "session_id": event_session_id,
+                    "project_id": _metadata_text(unit, "project_id"),
+                    "library_id": event_region_id,
+                    "region_id": event_region_id,
+                    "space": scope.space,
+                    "agent": scope.agent,
+                    "turn_id": event_turn_id,
+                    "event_kind": _metadata_text(unit, "event_kind"),
+                    "content": unit.content,
+                    "unit_id": unit.id,
+                    "occurred_at": _metadata_text(unit, "occurred_at"),
+                    "received_at": (received.isoformat() if received is not None else ""),
+                    "consolidated_at": None,
+                }
+                events.append(payload)
+        events.sort(key=_capture_event_sort_key)
         return events
 
     def list_capture_rounds(self, request: CaptureRoundsRequest) -> list[dict[str, object]]:
-        events = self.list_capture_events(CaptureEventsRequest(session_id=request.session_id))
-        consolidated = {(session_id, turn_id) for session_id, turn_id in self._evolution_turns()}
+        bundle = self._require_bundle()
+        events = self.list_capture_events(
+            CaptureEventsRequest(
+                session_id=request.session_id,
+                region_id=request.region_id,
+                turn_id=request.turn_id,
+            )
+        )
+        session_filter = (
+            _normalize_session_id(request.session_id)
+            if request.session_id is not None
+            else None
+        )
+        turn_filter = _normalize_optional_identifier(request.turn_id, "turn_id")
+        region_filter: MemoryRegion | None = None
+        if request.region_id is not None:
+            region_id = _normalize_optional_identifier(request.region_id, "region_id")
+            assert region_id is not None
+            region_filter = self._regions.require_region(region_id)
+        evolution_records = self._capture_evolution_records()
+        record_source_ids = self._evolution_record_source_ids(
+            bundle,
+            evolution_records,
+        )
         rounds: dict[tuple[str, str, str], dict[str, object]] = {}
         for event in events:
             key = (
@@ -7009,21 +7212,273 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "session_id": event["session_id"],
                     "turn_id": event["turn_id"],
                     "library_id": event["region_id"],
-                    "status": (
-                        "done"
-                        if (event["session_id"], event["turn_id"]) in consolidated
-                        else "pending"
-                    ),
+                    "region_id": event["region_id"],
+                    "space": event["space"],
+                    "status": "pending",
+                    "distillation_status": "pending_completion",
                     "candidate_id": None,
+                    "memory_id": None,
                     "last_error": "",
-                    "updated_at": event["received_at"],
+                    "failure_reason": "",
+                    "started_at": (
+                        _normalize_timeline_timestamp(event.get("occurred_at"))
+                        or _normalize_timeline_timestamp(event.get("received_at"))
+                    ),
+                    "updated_at": _normalize_timeline_timestamp(
+                        event.get("received_at")
+                    ),
+                    "received_at": _normalize_timeline_timestamp(
+                        event.get("received_at")
+                    ),
+                    "completed_at": None,
+                    "created_at": None,
+                    "events": [event],
                 }
             else:
-                current["updated_at"] = max(str(current["updated_at"]), str(event["received_at"]))
+                received_at = _normalize_timeline_timestamp(event.get("received_at"))
+                current["updated_at"] = max(str(current["updated_at"]), received_at)
+                current["received_at"] = current["updated_at"]
+                cast(list[dict[str, object]], current["events"]).append(event)
+        for record_key, evolution_record in evolution_records.items():
+            record_session, record_turn, record_region = record_key
+            if session_filter is not None and record_session != session_filter:
+                continue
+            if turn_filter is not None and record_turn != turn_filter:
+                continue
+            if region_filter is not None and record_region != region_filter.region_id:
+                continue
+            if record_key in rounds:
+                continue
+            try:
+                record_memory_region = self._regions.require_region(record_region)
+            except RegionError:
+                continue
+            created_at = _normalize_timeline_timestamp(
+                evolution_record.get("created_at")
+            )
+            completed_at = _normalize_timeline_timestamp(
+                evolution_record.get("completed_at")
+            )
+            started_at, received_at, updated_at = self._evolution_record_timeline(
+                evolution_record
+            )
+            rounds[record_key] = {
+                "session_id": record_session,
+                "turn_id": record_turn,
+                "library_id": record_region,
+                "region_id": record_region,
+                "space": record_memory_region.space,
+                "status": "pending",
+                "distillation_status": "pending_completion",
+                "candidate_id": None,
+                "memory_id": evolution_record["memory_id"],
+                "last_error": evolution_record["last_error"],
+                "failure_reason": evolution_record["last_error"],
+                "started_at": started_at,
+                "updated_at": updated_at,
+                "received_at": received_at,
+                "completed_at": completed_at or None,
+                "created_at": created_at or completed_at,
+                "events": [],
+                "diagnostics": [],
+                "user_message": None,
+                "assistant_final": None,
+            }
+        for key, round_payload in rounds.items():
+            round_events = cast(list[dict[str, object]], round_payload["events"])
+            capture_events = [
+                event for event in round_events if event["record_type"] == "capture_event"
+            ]
+            diagnostics = [
+                event for event in round_events if event["record_type"] == "evolved_diagnostic"
+            ]
+            users = [event for event in capture_events if event["event_kind"] == "user"]
+            assistants = [
+                event for event in capture_events if event["event_kind"] == "assistant"
+            ]
+            round_payload["user_message"] = users[0] if users else None
+            round_payload["assistant_final"] = assistants[-1] if assistants else None
+            round_payload["diagnostics"] = diagnostics
+            complete = bool(users and assistants)
+            record = evolution_records.get(key)
+            last_error = "" if record is None else str(record["last_error"])
+            round_fingerprint = _capture_round_fingerprint(capture_events)
+            current_unit_ids = [str(event["unit_id"]) for event in capture_events]
+            current_unit_id_set = set(current_unit_ids)
+            source_unit_ids = [] if record is None else record_source_ids.get(key, [])
+            source_unit_id_set = set(source_unit_ids)
+            source_known = bool(source_unit_id_set)
+            current_subset = source_known and current_unit_id_set <= source_unit_id_set
+            source_exact = source_known and current_unit_id_set == source_unit_id_set
+            source_matches = bool(
+                record is not None
+                and (
+                    record["source_fingerprint"] == round_fingerprint
+                    or source_exact
+                )
+            )
+            if (
+                complete
+                and record is not None
+                and record["status"] == "completed"
+                and not record["source_fingerprint"]
+                and source_exact
+            ):
+                evolve_key = str(record["evolve_key"])
+                started_at, received_earliest, received_latest = _capture_events_timeline(
+                    capture_events
+                )
+                self._backfill_evolution_source_fingerprint(
+                    evolve_key,
+                    round_fingerprint,
+                    source_unit_ids,
+                    started_at,
+                    received_earliest,
+                    received_latest,
+                )
+                record["source_fingerprint"] = round_fingerprint
+                record["source_unit_ids"] = source_unit_ids
+                record["round_started_at"] = started_at
+                record["round_received_earliest"] = received_earliest
+                record["round_received_latest"] = received_latest
+                source_matches = True
+            record_completed = bool(
+                record is not None
+                and record["status"] == "completed"
+                and not last_error
+            )
+            record_failed = bool(record is not None and last_error)
+            terminal_matches = bool(
+                record is not None
+                and (record_completed or record_failed)
+                and (source_matches or current_subset)
+            )
+            if not capture_events:
+                if record_completed:
+                    distillation_status = "completed"
+                    legacy_status = "done"
+                elif record_failed:
+                    distillation_status = "failed"
+                    legacy_status = "failed"
+                else:
+                    distillation_status = "pending_completion"
+                    legacy_status = "pending"
+            elif record_completed and terminal_matches:
+                distillation_status = "completed"
+                legacy_status = "done"
+            elif record_failed and terminal_matches:
+                distillation_status = "failed"
+                legacy_status = "failed"
+            elif not complete:
+                distillation_status = "pending_completion"
+                legacy_status = "pending"
+            else:
+                distillation_status = "pending_distillation"
+                legacy_status = "pending"
+            round_payload["status"] = legacy_status
+            round_payload["distillation_status"] = distillation_status
+            round_payload["last_error"] = last_error
+            round_payload["failure_reason"] = last_error
+            if record is not None:
+                round_payload["candidate_id"] = None
+                round_payload["memory_id"] = record["memory_id"]
+                record_created_at = _normalize_timeline_timestamp(
+                    record["created_at"]
+                )
+                record_completed_at = _normalize_timeline_timestamp(
+                    record["completed_at"]
+                )
+                round_payload["completed_at"] = record_completed_at or None
+                round_payload["created_at"] = record_created_at
+                if not capture_events or terminal_matches:
+                    started_at, received_at, updated_at = (
+                        self._evolution_record_timeline(record)
+                    )
+                    round_payload["started_at"] = started_at
+                    round_payload["received_at"] = received_at
+                    round_payload["updated_at"] = updated_at
         return sorted(
             rounds.values(),
-            key=lambda item: (str(item["updated_at"]), str(item["turn_id"])),
+            key=_capture_round_sort_key,
         )
+
+    def _capture_evolution_records(self) -> dict[tuple[str, str, str], dict[str, object]]:
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                """SELECT session_id, turn_id, region_id, status, memory_id,
+                          source_fingerprint, last_error, created_at, completed_at,
+                          evolve_key, source_unit_ids, round_started_at,
+                          round_received_earliest, round_received_latest
+                   FROM capture_evolutions"""
+            ).fetchall()
+        return {
+            (str(row[0]), str(row[1]), str(row[2])): {
+                "status": str(row[3]),
+                "memory_id": None if row[4] is None else str(row[4]),
+                "source_fingerprint": str(row[5]),
+                "last_error": str(row[6]),
+                "created_at": None if row[7] is None else str(row[7]),
+                "completed_at": None if row[8] is None else str(row[8]),
+                "evolve_key": str(row[9]),
+                "source_unit_ids": _json_string_list(row[10]),
+                "round_started_at": str(row[11]),
+                "round_received_earliest": str(row[12]),
+                "round_received_latest": str(row[13]),
+            }
+            for row in rows
+        }
+
+    def _evolution_record_source_ids(
+        self,
+        bundle: _RuntimeBundle,
+        records: Mapping[tuple[str, str, str], dict[str, object]],
+    ) -> dict[tuple[str, str, str], list[str]]:
+        resolved = {
+            key: _json_string_list(record.get("source_unit_ids"))
+            for key, record in records.items()
+        }
+        missing_memory_ids = {
+            str(record["memory_id"])
+            for key, record in records.items()
+            if not resolved[key] and record.get("memory_id")
+        }
+        if not missing_memory_ids:
+            return resolved
+        found: dict[str, list[str]] = {}
+        for scope in bundle.kv_store.scopes():
+            for unit in self._units_in_scope(bundle, scope):
+                if unit.id not in missing_memory_ids:
+                    continue
+                source_ids = _metadata_strings(unit, "source_unit_ids")
+                if not source_ids:
+                    source_ids = [str(item) for item in unit.provenance]
+                if source_ids:
+                    found[unit.id] = source_ids
+        for key, record in records.items():
+            memory_id = record.get("memory_id")
+            if not resolved[key] and memory_id:
+                resolved[key] = found.get(str(memory_id), [])
+        return resolved
+
+    @staticmethod
+    def _evolution_record_timeline(
+        record: Mapping[str, object],
+    ) -> tuple[str, str, str]:
+        created_at = _normalize_timeline_timestamp(record.get("created_at"))
+        completed_at = _normalize_timeline_timestamp(record.get("completed_at"))
+        round_started_at = _normalize_timeline_timestamp(
+            record.get("round_started_at")
+        )
+        received_earliest = _normalize_timeline_timestamp(
+            record.get("round_received_earliest")
+        )
+        received_latest = _normalize_timeline_timestamp(
+            record.get("round_received_latest")
+        )
+        started_at = round_started_at or received_earliest or created_at or completed_at
+        received_at = received_latest or received_earliest or created_at or completed_at
+        updated_at = _latest_timeline_timestamp(received_at, completed_at)
+        return started_at, received_at, updated_at
 
     @staticmethod
     def _scope_has_units(bundle: _RuntimeBundle, scope: Scope) -> bool:
@@ -7072,6 +7527,57 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 if occurred_at is not None and occurred_at < cutoff:
                     expired.append((scope, unit))
         return expired
+
+    def _record_archived_incomplete_turns(
+        self,
+        bundle: _RuntimeBundle,
+        plan: list[tuple[Scope, MemoryUnit]],
+    ) -> None:
+        for scope, archived_units in _group_units_by_scope(plan):
+            current_captures = [
+                unit
+                for unit in self._units_in_scope(bundle, scope)
+                if unit.lifecycle.value == "active" and _is_capture_unit(unit)
+            ]
+            groups: dict[str, list[MemoryUnit]] = {}
+            for unit in current_captures:
+                turn_id = _metadata_text(unit, "turn_id")
+                if turn_id:
+                    groups.setdefault(turn_id, []).append(unit)
+            archived_turn_ids = {
+                _metadata_text(unit, "turn_id") for unit in archived_units
+            }
+            for turn_id in archived_turn_ids:
+                source_units = sorted(
+                    groups.get(turn_id, []),
+                    key=lambda unit: (
+                        _event_order(_metadata_text(unit, "event_kind")),
+                        _metadata_text(unit, "occurred_at"),
+                        unit.id,
+                    ),
+                )
+                if not source_units or _capture_turn_is_complete(source_units):
+                    continue
+                region_id = _metadata_text(source_units[0], "region_id")
+                if not region_id:
+                    continue
+                evolve_key = _stable_evolve_key(scope, region_id, turn_id)
+                source_unit_ids = [unit.id for unit in source_units]
+                source_fingerprint = _source_fingerprint(source_unit_ids)
+                started_at, received_earliest, received_latest = _capture_units_timeline(
+                    source_units
+                )
+                self._record_incomplete_evolution(
+                    evolve_key,
+                    scope.session,
+                    turn_id,
+                    region_id,
+                    source_fingerprint,
+                    source_unit_ids,
+                    started_at,
+                    received_earliest,
+                    received_latest,
+                )
 
     def _evolved_count(self, region: MemoryRegion) -> int:
         bundle = self._require_bundle()
@@ -7145,6 +7651,22 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "ALTER TABLE capture_evolutions "
                     "ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT ''"
                 )
+            if "last_error" not in columns:
+                connection.execute(
+                    "ALTER TABLE capture_evolutions "
+                    "ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"
+                )
+            capture_columns = {
+                "source_unit_ids": "TEXT NOT NULL DEFAULT '[]'",
+                "round_started_at": "TEXT NOT NULL DEFAULT ''",
+                "round_received_earliest": "TEXT NOT NULL DEFAULT ''",
+                "round_received_latest": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in capture_columns.items():
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE capture_evolutions ADD COLUMN {column} {definition}"
+                    )
             return
         with connection:
             connection.execute("ALTER TABLE capture_evolutions RENAME TO capture_evolutions_v1")
@@ -7353,44 +7875,150 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         turn_id: str,
         region_id: str,
         source_fingerprint: str,
+        source_unit_ids: list[str],
+        round_started_at: str,
+        round_received_earliest: str,
+        round_received_latest: str,
     ) -> tuple[str, str | None]:
         with closing(self._maintenance_db()) as connection, connection:
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO capture_evolutions
                    (evolve_key, session_id, turn_id, region_id, source_fingerprint,
-                    memory_id, status)
-                   VALUES (?, ?, ?, ?, ?, NULL, 'pending')""",
-                (evolve_key, session_id, turn_id, region_id, source_fingerprint),
+                    source_unit_ids, memory_id, status, round_started_at,
+                    round_received_earliest, round_received_latest)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?, ?)""",
+                (
+                    evolve_key,
+                    session_id,
+                    turn_id,
+                    region_id,
+                    source_fingerprint,
+                    json.dumps(source_unit_ids, ensure_ascii=False),
+                    round_started_at,
+                    round_received_earliest,
+                    round_received_latest,
+                ),
             )
             if cursor.rowcount == 1:
                 return "pending", None
             row = connection.execute(
-                """SELECT status, memory_id, source_fingerprint FROM capture_evolutions
+                """SELECT status, memory_id, source_fingerprint, last_error
+                   FROM capture_evolutions
                    WHERE evolve_key = ?""",
                 (evolve_key,),
             ).fetchone()
         if row is None:
             raise MemoryKernelUnavailableError("evolve reservation was not persisted")
-        if str(row[2]) != source_fingerprint:
+        if str(row[2]) != source_fingerprint or str(row[3]):
             with closing(self._maintenance_db()) as connection, connection:
                 connection.execute(
                     """UPDATE capture_evolutions
                        SET source_fingerprint = ?, memory_id = NULL,
-                           status = 'pending', completed_at = NULL
+                           status = 'pending', last_error = '', completed_at = NULL,
+                           source_unit_ids = ?, round_started_at = ?,
+                           round_received_earliest = ?, round_received_latest = ?
                        WHERE evolve_key = ?""",
-                    (source_fingerprint, evolve_key),
+                    (
+                        source_fingerprint,
+                        json.dumps(source_unit_ids, ensure_ascii=False),
+                        round_started_at,
+                        round_received_earliest,
+                        round_received_latest,
+                        evolve_key,
+                    ),
                 )
             return "pending", None
         return str(row[0]), None if row[1] is None else str(row[1])
+
+    def _record_incomplete_evolution(
+        self,
+        evolve_key: str,
+        session_id: str,
+        turn_id: str,
+        region_id: str,
+        source_fingerprint: str,
+        source_unit_ids: list[str],
+        round_started_at: str,
+        round_received_earliest: str,
+        round_received_latest: str,
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """INSERT INTO capture_evolutions
+                   (evolve_key, session_id, turn_id, region_id, source_fingerprint,
+                    source_unit_ids, memory_id, status, last_error, completed_at,
+                    round_started_at, round_received_earliest, round_received_latest)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', '', NULL, ?, ?, ?)
+                   ON CONFLICT(evolve_key) DO UPDATE SET
+                     source_fingerprint = excluded.source_fingerprint,
+                     source_unit_ids = excluded.source_unit_ids,
+                     memory_id = NULL,
+                     status = 'pending',
+                     last_error = '',
+                     completed_at = NULL,
+                     round_started_at = excluded.round_started_at,
+                     round_received_earliest = excluded.round_received_earliest,
+                     round_received_latest = excluded.round_received_latest
+                   WHERE capture_evolutions.status = 'pending'
+                     AND capture_evolutions.last_error = ''
+                     AND capture_evolutions.memory_id IS NULL""",
+                (
+                    evolve_key,
+                    session_id,
+                    turn_id,
+                    region_id,
+                    source_fingerprint,
+                    json.dumps(source_unit_ids, ensure_ascii=False),
+                    round_started_at,
+                    round_received_earliest,
+                    round_received_latest,
+                ),
+            )
 
     def _complete_evolution(self, evolve_key: str, memory_id: str) -> None:
         with closing(self._maintenance_db()) as connection, connection:
             connection.execute(
                 """UPDATE capture_evolutions
                    SET memory_id = ?, status = 'completed',
-                       completed_at = CURRENT_TIMESTAMP
+                       last_error = '', completed_at = CURRENT_TIMESTAMP
                    WHERE evolve_key = ?""",
                 (memory_id, evolve_key),
+            )
+
+    def _backfill_evolution_source_fingerprint(
+        self,
+        evolve_key: str,
+        source_fingerprint: str,
+        source_unit_ids: list[str],
+        round_started_at: str,
+        round_received_earliest: str,
+        round_received_latest: str,
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """UPDATE capture_evolutions
+                   SET source_fingerprint = ?, source_unit_ids = ?,
+                       round_started_at = ?, round_received_earliest = ?,
+                       round_received_latest = ?
+                   WHERE evolve_key = ? AND status = 'completed'
+                     AND source_fingerprint = ''""",
+                (
+                    source_fingerprint,
+                    json.dumps(source_unit_ids, ensure_ascii=False),
+                    round_started_at,
+                    round_received_earliest,
+                    round_received_latest,
+                    evolve_key,
+                ),
+            )
+
+    def _fail_evolution(self, evolve_key: str, error: str) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """UPDATE capture_evolutions
+                   SET last_error = ?, completed_at = NULL
+                   WHERE evolve_key = ? AND status != 'completed'""",
+                (error[:1000], evolve_key),
             )
 
     def _evolution_units(
@@ -7516,14 +8144,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         ]
         if remaining:
             raise MemoryKernelUnavailableError("evolved memory cleanup did not persist")
-
-    def _evolution_turns(self) -> list[tuple[str, str]]:
-        with closing(self._maintenance_db()) as connection:
-            rows = connection.execute(
-                """SELECT session_id, turn_id FROM capture_evolutions
-                   WHERE status = 'completed'"""
-            ).fetchall()
-        return [(str(row[0]), str(row[1])) for row in rows]
 
     def _idempotency_db(self) -> sqlite3.Connection:
         self._require_state_ready()
@@ -8017,6 +8637,58 @@ def _is_capture_unit(unit: MemoryUnit) -> bool:
     return bool(_metadata_text(unit, "capture_event_id"))
 
 
+def _is_capture_record(unit: MemoryUnit) -> bool:
+    return _is_capture_unit(unit) or _metadata_text(unit, "memory_type") == "capture"
+
+
+def _is_evolved_unit(unit: MemoryUnit) -> bool:
+    return _metadata_text(unit, "memory_type") == "evolved"
+
+
+def _capture_turn_is_complete(units: list[MemoryUnit]) -> bool:
+    event_kinds = {_metadata_text(unit, "event_kind") for unit in units}
+    return "user" in event_kinds and "assistant" in event_kinds
+
+
+def _is_default_recall_item(item: Any) -> bool:
+    if isinstance(item, MemoryUnit):
+        metadata: object = item.user_metadata
+    elif isinstance(item, Mapping):
+        metadata = item.get("user_metadata")
+    else:
+        metadata = getattr(item, "user_metadata", None)
+    if not isinstance(metadata, Mapping):
+        return True
+    memory_type = str(metadata.get("memory_type") or "")
+    return memory_type not in {"capture", "evolved"} and not bool(
+        metadata.get("capture_event_id")
+    )
+
+
+def _is_default_recall_candidate(item: Any) -> bool:
+    if isinstance(item, MemoryUnit) and item.user_metadata.get("restore_pending") is True:
+        return False
+    return _is_default_recall_item(item)
+
+
+def _default_recall_filter() -> FilterExpr:
+    return FilterGroup(
+        FilterLogic.AND,
+        [
+            FilterClause(
+                "user_metadata.memory_type",
+                FilterOp.NOT_IN,
+                ["capture", "evolved"],
+            ),
+            FilterClause(
+                "user_metadata.default_recall_excluded",
+                FilterOp.NOT_IN,
+                [True],
+            ),
+        ],
+    )
+
+
 def _fulltext_store(bundle: _RuntimeBundle) -> MilvusLiteFulltextStore | None:
     return next(
         (
@@ -8120,6 +8792,124 @@ def _event_order(kind: str) -> int:
 
 def _event_label(kind: str) -> str:
     return "用户" if kind == "user" else "助手"
+
+
+def _capture_event_sort_key(event: Mapping[str, object]) -> tuple[datetime, int, datetime, str]:
+    occurred = _parse_timestamp(str(event.get("occurred_at", "")))
+    received = _parse_timestamp(str(event.get("received_at", "")))
+    sort_time = occurred or received or datetime.min.replace(tzinfo=UTC)
+    tie_time = received or occurred or datetime.min.replace(tzinfo=UTC)
+    return (
+        sort_time,
+        _event_order(str(event.get("event_kind", ""))),
+        tie_time,
+        str(event.get("event_id", "")),
+    )
+
+
+def _capture_round_sort_key(item: Mapping[str, object]) -> tuple[datetime, str, str, str]:
+    started = _parse_timestamp(str(item.get("started_at", "")))
+    received = _parse_timestamp(str(item.get("received_at", "")))
+    sort_time = started or received or datetime.min.replace(tzinfo=UTC)
+    return (
+        sort_time,
+        str(item.get("region_id", "")),
+        str(item.get("session_id", "")),
+        str(item.get("turn_id", "")),
+    )
+
+
+def _normalize_timeline_timestamp(value: object) -> str:
+    parsed = _parse_timestamp("" if value is None else str(value))
+    return "" if parsed is None else parsed.isoformat()
+
+
+def _latest_timeline_timestamp(*values: object) -> str:
+    normalized = [
+        timestamp
+        for value in values
+        if (timestamp := _normalize_timeline_timestamp(value))
+    ]
+    return max(normalized, default="")
+
+
+def _evolution_failure_text(error: Exception) -> str:
+    detail = str(error).strip()
+    return f"{type(error).__name__}: {detail}" if detail else type(error).__name__
+
+
+def _capture_round_fingerprint(events: list[dict[str, object]]) -> str:
+    ordered = sorted(
+        events,
+        key=lambda event: (
+            _event_order(str(event.get("event_kind", ""))),
+            str(event.get("occurred_at", "")),
+            str(event.get("unit_id", "")),
+        ),
+    )
+    return _source_fingerprint([str(event.get("unit_id", "")) for event in ordered])
+
+
+def _capture_units_timeline(units: list[MemoryUnit]) -> tuple[str, str, str]:
+    occurred_at: list[datetime] = []
+    received_at: list[datetime] = []
+    for unit in units:
+        occurred = _parse_timestamp(_metadata_text(unit, "occurred_at"))
+        if occurred is not None:
+            occurred_at.append(occurred)
+        received = (
+            unit.temporal.t_ingest
+            or unit.temporal.t_valid
+            or unit.temporal.t_message
+        )
+        if received is not None:
+            received_at.append(
+                received.replace(tzinfo=UTC)
+                if received.tzinfo is None
+                else received.astimezone(UTC)
+            )
+    started = min(occurred_at) if occurred_at else min(received_at, default=None)
+    received_earliest = min(received_at, default=None)
+    received_latest = max(received_at, default=None)
+    return (
+        "" if started is None else started.isoformat(),
+        "" if received_earliest is None else received_earliest.isoformat(),
+        "" if received_latest is None else received_latest.isoformat(),
+    )
+
+
+def _capture_events_timeline(
+    events: list[dict[str, object]],
+) -> tuple[str, str, str]:
+    occurred_at = [
+        parsed
+        for event in events
+        if (parsed := _parse_timestamp(str(event.get("occurred_at", "")))) is not None
+    ]
+    received_at = [
+        parsed
+        for event in events
+        if (parsed := _parse_timestamp(str(event.get("received_at", "")))) is not None
+    ]
+    started = min(occurred_at) if occurred_at else min(received_at, default=None)
+    received_earliest = min(received_at, default=None)
+    received_latest = max(received_at, default=None)
+    return (
+        "" if started is None else started.isoformat(),
+        "" if received_earliest is None else received_earliest.isoformat(),
+        "" if received_latest is None else received_latest.isoformat(),
+    )
+
+
+def _json_string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item) for item in value if str(item).strip()]
 
 
 def _parse_timestamp(value: str) -> datetime | None:
@@ -8262,6 +9052,7 @@ def _search_response(
         item
         for item in items
         if not (isinstance(item, MemoryUnit) and item.user_metadata.get("restore_pending") is True)
+        and _is_default_recall_item(item)
     ]
     results = [_result_payload(item, request) for item in visible_items]
     if region is not None:

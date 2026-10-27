@@ -6,7 +6,7 @@ import hashlib
 import json
 import threading
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
@@ -148,6 +148,16 @@ def _graph_scope_expression(scope: Scope) -> str:
 def _combined_filter(scope: Scope, expr: FilterExpr | None) -> str:
     parts = [part for part in (_scope_expression(scope), _compile_metadata_filter(expr)) if part]
     return " && ".join(parts)
+
+
+def _recall_index_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(metadata)
+    memory_type = str(normalized.get("user_metadata.memory_type") or "")
+    if memory_type in {"capture", "evolved"} or bool(
+        normalized.get("user_metadata.capture_event_id")
+    ):
+        normalized["user_metadata.default_recall_excluded"] = True
+    return normalized
 
 
 def _physical_id(scope: Scope, logical_id: str) -> str:
@@ -296,10 +306,18 @@ class MilvusLiteVectorStore(_JiuwenMilvusVectorStore):  # type: ignore[misc]
         return _scope_expression(scope)
 
     def insert(self, scope: Scope, records: list[VectorRecord]) -> None:
+        records = [
+            replace(record, metadata=_recall_index_metadata(record.metadata))
+            for record in records
+        ]
         with wrap_backend("milvus vector insert"):
             super().insert(scope, records)
 
     def update(self, scope: Scope, records: list[VectorRecord]) -> None:
+        records = [
+            replace(record, metadata=_recall_index_metadata(record.metadata))
+            for record in records
+        ]
         with wrap_backend("milvus vector update"):
             super().update(scope, records)
 
@@ -412,7 +430,7 @@ class MilvusLiteFulltextStore(FulltextStore):  # type: ignore[misc]
             "scope_user": scope.user,
             "scope_agent": scope.agent,
             "scope_session": scope.session,
-            "metadata": document.metadata,
+            "metadata": _recall_index_metadata(document.metadata),
         }
 
     @staticmethod

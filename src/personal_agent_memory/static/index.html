@@ -15,7 +15,9 @@
     .workspace-bar { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 20px; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
     .workspace-bar h2 { margin:0; font-size:22px; }
     .eyebrow { margin:0 0 2px; color:var(--accent); font-size:12px; font-weight:700; letter-spacing:.12em; }
-    .workspace-tab { border:0; border-bottom:3px solid var(--accent); border-radius:0; background:transparent; color:var(--text); padding:8px 14px; cursor:default; }
+    .workspace-tabs { display:flex; gap:4px; }
+    .workspace-tab { border:0; border-bottom:3px solid transparent; border-radius:0; background:transparent; color:var(--muted); padding:8px 14px; cursor:pointer; }
+    .workspace-tab[aria-selected="true"] { border-bottom-color:var(--accent); color:var(--text); }
     .grid { display:grid; grid-template-columns:minmax(260px,.78fr) minmax(0,2.2fr); gap:18px; align-items:start; }
     .stack { display:grid; gap:18px; }
     section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }
@@ -54,9 +56,29 @@
     .evidence-list pre { margin:6px 0 0; }
     .result { border-top:1px solid var(--line); padding:12px 0; }
     .result:first-child { border-top:0; }
+    .raw-layout { display:grid; grid-template-columns:minmax(220px,.7fr) minmax(0,2fr); gap:18px; align-items:start; }
+    #raw-session-workspace { grid-column:1/-1; }
+    .raw-session-list, .raw-round-list, .raw-event-list { list-style:none; margin:0; padding:0; display:grid; gap:10px; }
+    .raw-session-list button { width:100%; text-align:left; background:transparent; color:inherit; border:1px solid var(--line); }
+    .raw-session-list button.active { border-color:var(--accent); background:var(--accent-soft); color:var(--text); }
+    .raw-round { border:1px solid var(--line); border-radius:10px; padding:14px; }
+    .raw-round-heading { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+    .raw-round-heading h3 { margin:0; color:var(--text); font-size:15px; }
+    .status-badge { display:inline-block; padding:3px 9px; border-radius:999px; font-size:12px; font-weight:700; background:var(--bg); }
+    .status-badge.completed { color:var(--success); }
+    .status-badge.failed { color:var(--danger); }
+    .status-badge.pending_completion, .status-badge.pending_distillation { color:var(--accent); }
+    .raw-event-list { margin-top:10px; }
+    .raw-event { padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); }
+    .raw-event header { display:flex; flex-wrap:wrap; justify-content:space-between; gap:6px; margin-bottom:6px; }
+    .raw-event p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .raw-diagnostic-list { list-style:none; margin:0 0 10px; padding:0; display:grid; gap:8px; }
+    .raw-diagnostic { padding:10px; border:1px dashed var(--line); border-radius:8px; background:var(--panel); }
+    .raw-diagnostic header { display:flex; flex-wrap:wrap; justify-content:space-between; gap:6px; margin-bottom:6px; }
+    .raw-diagnostic p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }
     pre { white-space:pre-wrap; overflow-wrap:anywhere; background:var(--bg); padding:12px; border-radius:8px; }
     .hidden { display:none !important; }
-    @media (max-width: 900px) { .grid { grid-template-columns:1fr; } .filter-grid { grid-template-columns:1fr; } header { padding:16px; } main { padding:14px; } }
+    @media (max-width: 900px) { .grid, .raw-layout { grid-template-columns:1fr; } .filter-grid { grid-template-columns:1fr; } header { padding:16px; } main { padding:14px; } }
   </style>
 </head>
 <body>
@@ -80,10 +102,11 @@
     <section class="workspace-bar">
       <div>
         <p class="eyebrow">区域工作区</p>
-        <h2>记忆</h2>
+        <h2 id="workspace-title">记忆</h2>
       </div>
-      <nav aria-label="区域工作区">
-        <button class="workspace-tab" type="button" aria-current="page">记忆</button>
+      <nav class="workspace-tabs" role="tablist" aria-label="区域工作区">
+        <button id="memory-tab" class="workspace-tab" type="button" role="tab" aria-selected="true" aria-controls="memory-workspace">记忆</button>
+        <button id="raw-session-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="raw-session-workspace">原始会话</button>
       </nav>
     </section>
 
@@ -120,7 +143,7 @@
         </section>
       </div>
 
-      <div class="stack">
+      <div id="memory-workspace" class="stack" role="tabpanel" aria-labelledby="memory-tab">
         <section>
           <h2>检索</h2>
           <form id="search-form">
@@ -199,6 +222,22 @@
           <p id="document-message" class="notice" aria-live="polite"></p>
           <ul id="history-list" class="history-list"></ul>
         </section>
+        </div>
+
+        <section id="raw-session-workspace" class="hidden" role="tabpanel" aria-labelledby="raw-session-tab">
+          <h2 id="raw-session-heading">原始会话</h2>
+          <p class="muted">只读证据视图，按会话和回合展示采集到的用户消息与助手最终回复。这里不参与默认记忆检索，也不提供全文搜索或重新提炼。</p>
+          <div class="raw-layout">
+            <div>
+              <h3>会话</h3>
+              <ul id="raw-session-list" class="raw-session-list" aria-label="原始会话列表"></ul>
+            </div>
+            <div>
+              <p id="raw-session-message" class="notice" aria-live="polite"></p>
+              <ol id="raw-round-list" class="raw-round-list" aria-label="原始会话时间线"></ol>
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   </div>
@@ -221,6 +260,16 @@
     archived: '已归档',
     forgotten: '已遗忘',
   };
+  const RAW_STATUS_LABELS = {
+    pending_completion: '待完成',
+    pending_distillation: '待提炼',
+    completed: '完成',
+    failed: '失败',
+  };
+  const EVENT_LABELS = {
+    user: '用户消息',
+    assistant: '助手回复',
+  };
   const state = {
     regions: [],
     selectedRegion: null,
@@ -237,6 +286,11 @@
     detailReady: false,
     appliedFilters: null,
     filtersDirty: false,
+    workspaceTab: 'memory',
+    rawRounds: [],
+    rawSelectedSession: null,
+    rawGeneration: 0,
+    rawController: null,
   };
   const $ = (id) => document.getElementById(id);
   const setMessage = (element, text, error = false, success = false) => {
@@ -288,6 +342,21 @@
   function showWorkspace() {
     $('login-panel').classList.add('hidden');
     $('workspace').classList.remove('hidden');
+  }
+  function switchWorkspace(tab) {
+    if (!['memory', 'raw-session'].includes(tab)) return;
+    state.workspaceTab = tab;
+    const memorySelected = tab === 'memory';
+    $('memory-tab').setAttribute('aria-selected', String(memorySelected));
+    $('raw-session-tab').setAttribute('aria-selected', String(!memorySelected));
+    $('memory-workspace').classList.toggle('hidden', !memorySelected);
+    $('raw-session-workspace').classList.toggle('hidden', memorySelected);
+    $('workspace-title').textContent = memorySelected ? '记忆' : '原始会话';
+    if (memorySelected) {
+      if (state.selectedRegion) loadMemories({ reset: true });
+    } else {
+      loadRawRounds();
+    }
   }
   function regionLabel(region) { return `${region.name} · ${region.kind} · ${region.region_id}`; }
   function renderRegions() {
@@ -364,7 +433,211 @@
     state.selectedRegion = regionId;
     resetDetail();
     renderRegions();
-    await loadMemories({ reset: true });
+    if (state.workspaceTab === 'raw-session') {
+      await loadRawRounds();
+    } else {
+      await loadMemories({ reset: true });
+    }
+  }
+  function rawStatusLabel(value) {
+    return RAW_STATUS_LABELS[value] || '状态未知';
+  }
+  function rawSessionGroups() {
+    const groups = new Map();
+    for (const round of state.rawRounds) {
+      const sessionId = String(round.session_id || '');
+      if (!sessionId) continue;
+      let group = groups.get(sessionId);
+      if (!group) {
+        group = { sessionId, rounds: [], updatedAt: '' };
+        groups.set(sessionId, group);
+      }
+      group.rounds.push(round);
+      if (String(round.updated_at || '') > group.updatedAt) {
+        group.updatedAt = String(round.updated_at || '');
+      }
+    }
+    return [...groups.values()].sort((left, right) => (
+      right.updatedAt.localeCompare(left.updatedAt) || left.sessionId.localeCompare(right.sessionId)
+    ));
+  }
+  function renderRawSessions(groups) {
+    const list = $('raw-session-list');
+    list.replaceChildren();
+    for (const group of groups) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.sessionId = group.sessionId;
+      button.classList.toggle('active', state.rawSelectedSession === group.sessionId);
+      button.setAttribute('aria-label', `查看原始会话：${group.sessionId}`);
+      const title = document.createElement('strong');
+      title.textContent = group.sessionId;
+      const meta = document.createElement('span');
+      meta.className = 'muted';
+      meta.textContent = `${group.rounds.length} 个回合 · 更新 ${formatTime(group.updatedAt)}`;
+      button.append(title, meta);
+      button.addEventListener('click', () => selectRawSession(group.sessionId));
+      item.append(button);
+      list.append(item);
+    }
+  }
+  function selectRawSession(sessionId) {
+    state.rawSelectedSession = sessionId;
+    for (const button of document.querySelectorAll('#raw-session-list button')) {
+      button.classList.toggle('active', button.dataset.sessionId === sessionId);
+    }
+    const group = rawSessionGroups().find(
+      (matchingGroup) => matchingGroup.sessionId === sessionId,
+    );
+    const list = $('raw-round-list');
+    list.replaceChildren();
+    if (!group || !group.rounds.length) {
+      setMessage($('raw-session-message'), '所选会话没有可显示的回合。');
+      return;
+    }
+    setMessage(
+      $('raw-session-message'),
+      `会话 ${group.sessionId} · ${group.rounds.length} 个回合，按开始时间顺序显示。`,
+      false,
+      true,
+    );
+    for (const round of group.rounds) {
+      const item = document.createElement('li');
+      item.className = 'raw-round';
+      const heading = document.createElement('div');
+      heading.className = 'raw-round-heading';
+      const title = document.createElement('h3');
+      title.textContent = `回合 ${round.turn_id}`;
+      const status = String(round.distillation_status || 'unknown');
+      const badge = document.createElement('span');
+      badge.className = `status-badge ${status}`;
+      badge.setAttribute('aria-label', `回合状态：${rawStatusLabel(status)}`);
+      badge.textContent = rawStatusLabel(status);
+      heading.append(title, badge);
+      item.append(heading);
+
+      const statusMessage = document.createElement('p');
+      statusMessage.className = status === 'failed' ? 'muted notice error' : 'muted';
+      if (status === 'pending_completion') {
+        if (!round.user_message && round.assistant_final) {
+          statusMessage.textContent = '缺少用户消息，回合尚未完成。';
+        } else if (round.user_message && !round.assistant_final) {
+          statusMessage.textContent = '缺少助手最终回复，回合尚未完成。';
+        } else {
+          statusMessage.textContent = '回合消息不完整，缺少用户消息和助手最终回复。';
+        }
+      } else if (status === 'pending_distillation') {
+        statusMessage.textContent = '完整回合已采集，等待提炼。';
+      } else if (status === 'completed') {
+        statusMessage.textContent = '回合已完成提炼状态。';
+      } else if (status === 'failed') {
+        statusMessage.textContent = `提炼失败：${round.failure_reason || '原因未记录'}`;
+      } else {
+        statusMessage.textContent = '回合状态未知。';
+      }
+      item.append(statusMessage);
+
+      const timeline = document.createElement('p');
+      timeline.className = 'muted raw-round-time';
+      const started = document.createElement('time');
+      started.dateTime = String(round.started_at || '');
+      started.textContent = `开始 ${formatTime(round.started_at)}`;
+      const updated = document.createElement('time');
+      updated.dateTime = String(round.updated_at || '');
+      updated.textContent = `更新 ${formatTime(round.updated_at)}`;
+      timeline.append(started, ' · ', updated);
+      item.append(timeline);
+
+      const diagnostics = Array.isArray(round.diagnostics) ? round.diagnostics : [];
+      if (diagnostics.length) {
+        const diagnosticList = document.createElement('ol');
+        diagnosticList.className = 'raw-diagnostic-list';
+        for (const diagnostic of diagnostics) {
+          const diagnosticItem = document.createElement('li');
+          diagnosticItem.className = 'raw-diagnostic';
+          const header = document.createElement('header');
+          const label = document.createElement('strong');
+          label.textContent = '只读诊断 / 旧提炼单元';
+          label.setAttribute('aria-label', '旧提炼单元只读诊断');
+          const received = document.createElement('time');
+          received.dateTime = String(diagnostic.received_at || '');
+          received.textContent = `接收 ${formatTime(diagnostic.received_at)}`;
+          header.append(label, received);
+          const content = document.createElement('p');
+          content.textContent = String(diagnostic.content || '');
+          diagnosticItem.append(header, content);
+          diagnosticList.append(diagnosticItem);
+        }
+        item.append(diagnosticList);
+      }
+
+      const eventList = document.createElement('ol');
+      eventList.className = 'raw-event-list';
+      const assistantFinalId = round.assistant_final
+        && (round.assistant_final.event_id || round.assistant_final.unit_id);
+      for (const event of round.events || []) {
+        if (event.record_type === 'evolved_diagnostic') continue;
+        const eventItem = document.createElement('li');
+        eventItem.className = 'raw-event';
+        const header = document.createElement('header');
+        const label = document.createElement('strong');
+        const isFinalAssistant = (event.event_id || event.unit_id) === assistantFinalId;
+        label.textContent = isFinalAssistant
+          ? '助手最终回复'
+          : (EVENT_LABELS[event.event_kind] || String(event.event_kind || '事件'));
+        const received = document.createElement('time');
+        received.dateTime = String(event.received_at || '');
+        received.textContent = `接收 ${formatTime(event.received_at)}`;
+        header.append(label, received);
+        const content = document.createElement('p');
+        content.textContent = String(event.content || '');
+        eventItem.append(header, content);
+        eventList.append(eventItem);
+      }
+      item.append(eventList);
+      list.append(item);
+    }
+  }
+  async function loadRawRounds() {
+    if (!state.selectedRegion) return false;
+    state.rawGeneration += 1;
+    const generation = state.rawGeneration;
+    if (state.rawController) state.rawController.abort();
+    const controller = new AbortController();
+    state.rawController = controller;
+    state.rawRounds = [];
+    state.rawSelectedSession = null;
+    $('raw-session-list').replaceChildren();
+    $('raw-round-list').replaceChildren();
+    setMessage($('raw-session-message'), '正在加载原始会话…');
+    try {
+      const rounds = await request(
+        `/api/v1/capture/rounds?region_id=${encodeURIComponent(state.selectedRegion)}`,
+        { signal: controller.signal },
+      );
+      if (generation !== state.rawGeneration) return false;
+      state.rawRounds = Array.isArray(rounds) ? rounds : [];
+      const groups = rawSessionGroups();
+      renderRawSessions(groups);
+      if (!groups.length) {
+        setMessage($('raw-session-message'), '当前区域没有原始会话记录。');
+        return true;
+      }
+      const selected = groups.some((group) => group.sessionId === state.rawSelectedSession)
+        ? state.rawSelectedSession
+        : groups[0].sessionId;
+      selectRawSession(selected);
+      return true;
+    } catch (error) {
+      if (error.name === 'AbortError' || generation !== state.rawGeneration) return false;
+      $('raw-session-list').replaceChildren();
+      $('raw-round-list').replaceChildren();
+      setMessage($('raw-session-message'), `加载原始会话失败：${error.message}`, true);
+      return false;
+    } finally {
+      if (state.rawController === controller) state.rawController = null;
+    }
   }
   function currentFilters() {
     return {
@@ -796,7 +1069,11 @@
       resetDetail();
       $('region-form').reset();
       await loadRegions();
-      await loadMemories({ reset: true });
+      if (state.workspaceTab === 'raw-session') {
+        await loadRawRounds();
+      } else {
+        await loadMemories({ reset: true });
+      }
     } catch (error) { setMessage($('status'), `创建区域失败：${error.message}`, true); }
   }
   async function bindProject(event) {
@@ -834,9 +1111,14 @@
       $('login-form').reset();
       await loadStatus();
       await loadRegions();
-      if (state.selectedRegion) await loadMemories({ reset: true });
+      if (state.selectedRegion) {
+        if (state.workspaceTab === 'raw-session') await loadRawRounds();
+        else await loadMemories({ reset: true });
+      }
     } catch (error) { setMessage($('login-message'), `登录失败：${error.message}`, true); }
   });
+  $('memory-tab').addEventListener('click', () => switchWorkspace('memory'));
+  $('raw-session-tab').addEventListener('click', () => switchWorkspace('raw-session'));
   $('search-form').addEventListener('submit', (event) => runSearch(event));
   $('memory-filter-form').addEventListener('submit', (event) => {
     event.preventDefault();
@@ -862,7 +1144,11 @@
   $('delete-document').addEventListener('click', deleteDocument);
   $('load-history').addEventListener('click', loadHistory);
   $('promotion-button').addEventListener('click', runPromotion);
-  loadStatus().then(async () => { await loadRegions(); await loadMemories({ reset: true }); }).catch(() => showLogin());
+  loadStatus().then(async () => {
+    await loadRegions();
+    if (state.workspaceTab === 'raw-session') await loadRawRounds();
+    else await loadMemories({ reset: true });
+  }).catch(() => showLogin());
 })();
 </script>
 </body>

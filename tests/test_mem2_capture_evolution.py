@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -224,7 +225,7 @@ def test_capture_routes_to_project_topic_and_isolated_chat_regions(tmp_path: Pat
             topic_id="rust",
         )
         assert project_result["scope"]["kind"] == "project_cwd"
-        assert {item["region_id"] for item in project_result["results"]} == {"project-one"}
+        assert project_result["results"] == []
         assert "fulltext_unavailable" not in project_result["degradation"]
         assert "vector_unavailable" not in project_result["degradation"]
 
@@ -237,7 +238,7 @@ def test_capture_routes_to_project_topic_and_isolated_chat_regions(tmp_path: Pat
             topic_id="  rust  ",
         )
         assert topic_result["scope"]["kind"] == "topic_session"
-        assert {item["region_id"] for item in topic_result["results"]} == {"rust"}
+        assert topic_result["results"] == []
 
         first_chat = _search(
             client, headers, "ALPHAUNIQUE", cwd=other_root, session_id="chat-session-one"
@@ -245,12 +246,8 @@ def test_capture_routes_to_project_topic_and_isolated_chat_regions(tmp_path: Pat
         second_chat = _search(
             client, headers, "BETAUNIQUE", cwd=other_root, session_id="chat-session-two"
         )
-        assert {item["region_id"] for item in first_chat["results"]} == {
-            str(chat_one["region_id"])
-        }
-        assert {item["region_id"] for item in second_chat["results"]} == {
-            str(chat_two["region_id"])
-        }
+        assert first_chat["results"] == []
+        assert second_chat["results"] == []
         assert _search(
             client, headers, "ALPHAUNIQUE", cwd=other_root, session_id="chat-session-two"
         )["results"] == []
@@ -293,7 +290,7 @@ def test_capture_routes_to_project_topic_and_isolated_chat_regions(tmp_path: Pat
         assert events[0]["library_id"] == chat_one["region_id"]
 
 
-def test_non_project_default_recall_is_user_plus_current_chat_only(tmp_path: Path) -> None:
+def test_non_project_default_recall_returns_user_memory_but_not_raw_chat(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     project_root = tmp_path / "project"
     project_root.mkdir()
@@ -342,12 +339,16 @@ def test_non_project_default_recall_is_user_plus_current_chat_only(tmp_path: Pat
         )
         assert result["scope"]["kind"] == "user_and_session"
         assert "cross_region" not in result["budget"]
-        assert {item["region_id"] for item in result["results"]} == {
-            "user",
-            _capture_region_id(client, headers, "chat-session"),
-        }
+        assert {item["region_id"] for item in result["results"]} == {"user"}
         assert all("project" not in str(item["content"]) for item in result["results"])
         assert all("topic" not in str(item["content"]) for item in result["results"])
+        assert all("chat" not in str(item["content"]) for item in result["results"])
+        raw_events = client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": "chat-session"},
+        ).json()
+        assert [item["content"] for item in raw_events] == ["DEFAULT-RECALL chat"]
 
 
 def test_explicit_session_region_search_uses_region_session_scope(tmp_path: Path) -> None:
@@ -428,7 +429,7 @@ def _capture_region_id(
     return str(events[0]["region_id"])
 
 
-def test_evolve_consolidates_capture_without_candidate_queue_and_survives_restart(
+def test_evolve_consolidates_capture_but_default_recall_excludes_it_after_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_dir = tmp_path / "state"
@@ -481,6 +482,15 @@ def test_evolve_consolidates_capture_without_candidate_queue_and_survives_restar
         ).json()
         assert rounds[0]["status"] == "done"
         assert rounds[0]["candidate_id"] is None
+        evolved_units = [
+            unit
+            for unit in _all_units(client)
+            if unit.user_metadata.get("memory_type") == "evolved"
+        ]
+        assert len(evolved_units) == 1
+        assert "用户: EVOLVE-SOURCE user fact" in evolved_units[0].content
+        assert "助手: EVOLVE-SOURCE assistant conclusion" in evolved_units[0].content
+        assert evolved_units[0].user_metadata["provenance"]
 
         fulltext_calls: list[str] = []
         fulltext_limits: list[int] = []
@@ -498,25 +508,18 @@ def test_evolve_consolidates_capture_without_candidate_queue_and_survives_restar
             client, headers, "助手", cwd=other_root, session_id="evolve-session"
         )
         assert "助手" in fulltext_calls
-        assert fulltext_limits and all(limit <= 20 for limit in fulltext_limits)
-        evolved_items = [
-            item
-            for item in result["results"]
-            if item.get("user_metadata", {}).get("memory_type") == "evolved"
-        ]
-        assert len(evolved_items) == 1
-        assert "用户: EVOLVE-SOURCE user fact" in str(evolved_items[0]["content"])
-        assert "助手: EVOLVE-SOURCE assistant conclusion" in str(evolved_items[0]["content"])
-        assert evolved_items[0]["user_metadata"]["provenance"]
+        assert fulltext_limits and all(limit <= 500 for limit in fulltext_limits)
+        assert result["results"] == []
 
     with TestClient(_app(state_dir)) as client:
         headers = _headers(state_dir)
         after_restart = _search(
             client, headers, "助手", cwd=other_root, session_id="evolve-session"
         )
+        assert after_restart["results"] == []
         assert any(
-            item.get("user_metadata", {}).get("memory_type") == "evolved"
-            for item in after_restart["results"]
+            unit.user_metadata.get("memory_type") == "evolved"
+            for unit in _all_units(client)
         )
 
 
@@ -570,19 +573,18 @@ def test_evolve_record_failure_restart_reconciles_without_duplicate(
         assert retried.status_code == 202, retried.text
         assert retried.json() == {"queued": 0}
         result = _search(client, headers, "助手", cwd=other_root, session_id="r1f1")
-        evolved = [
-            item
-            for item in result["results"]
-            if item.get("user_metadata", {}).get("memory_type") == "evolved"
-        ]
-        assert len(evolved) == 1
+        assert result["results"] == []
         with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
             rows = connection.execute(
                 "SELECT status, memory_id FROM capture_evolutions"
             ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] == "completed"
-        assert rows[0][1] == evolved[0]["document_id"]
+        assert rows[0][1] in {
+            unit.id
+            for unit in _all_units(client)
+            if unit.user_metadata.get("memory_type") == "evolved"
+        }
 
 
 def test_blank_topic_and_session_identifiers_return_422(tmp_path: Path) -> None:
@@ -770,10 +772,7 @@ def test_evolve_index_failure_retry_and_restart_converges(
         assert len(evolved) == 2
         assert all(unit.scope.agent == "codex" for unit in evolved)
         result = _search(client, headers, "用户", cwd=root, session_id="r3f1")
-        assert any(
-            item.get("user_metadata", {}).get("memory_type") == "evolved"
-            for item in result["results"]
-        )
+        assert result["results"] == []
 
     with TestClient(_app(state_dir)) as client:
         headers = _headers(state_dir)
@@ -794,10 +793,79 @@ def test_evolve_index_failure_retry_and_restart_converges(
             == 2
         )
         result = _search(client, headers, "用户", cwd=root, session_id="r3f1")
-        assert any(
-            item.get("user_metadata", {}).get("memory_type") == "evolved"
-            for item in result["results"]
+        assert result["results"] == []
+
+
+def test_evolve_visibility_failure_persists_failed_status_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    root.mkdir()
+    app = _app(state_dir)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _headers(state_dir)
+        _capture(
+            client,
+            headers,
+            _event(
+                "visibility-user",
+                "visibility-session",
+                "visibility-turn",
+                "user",
+                "visibility failure fact",
+                root,
+            ),
         )
+        _capture(
+            client,
+            headers,
+            _event(
+                "visibility-assistant",
+                "visibility-session",
+                "visibility-turn",
+                "assistant",
+                "visibility failure answer",
+                root,
+            ),
+        )
+        kernel = app.state.memory_kernel
+        original_visible = kernel._evolution_visible
+
+        def fail_visibility(*args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            raise RuntimeError("simulated visibility failure")
+
+        monkeypatch.setattr(kernel, "_evolution_visible", fail_visibility)
+        failed = client.post(
+            "/api/v1/capture/consolidate",
+            headers=headers,
+            json={"session_id": "visibility-session"},
+        )
+        assert failed.status_code in {500, 503}
+        failed_round = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"session_id": "visibility-session"},
+        ).json()[0]
+        assert failed_round["distillation_status"] == "failed"
+        assert "simulated visibility failure" in failed_round["failure_reason"]
+
+        monkeypatch.setattr(kernel, "_evolution_visible", original_visible)
+        retried = client.post(
+            "/api/v1/capture/consolidate",
+            headers=headers,
+            json={"session_id": "visibility-session"},
+        )
+        assert retried.status_code == 202, retried.text
+        assert retried.json() == {"queued": 1}
+        completed_round = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"session_id": "visibility-session"},
+        ).json()[0]
+        assert completed_round["distillation_status"] == "completed"
+        assert completed_round["failure_reason"] == ""
 
 
 def test_evolve_restart_cleans_unindexed_residual_and_retries(
@@ -844,20 +912,67 @@ def test_evolve_restart_cleans_unindexed_residual_and_retries(
             unit.user_metadata.get("memory_type") == "evolved"
             for unit in _all_units(client)
         )
+        failed_round = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"session_id": "r3f1-restart"},
+        ).json()[0]
+        assert failed_round["distillation_status"] == "failed"
+        assert "simulated interrupted cleanup" in failed_round["failure_reason"]
 
-    with TestClient(_app(state_dir)) as client:
+    with TestClient(_app(state_dir), raise_server_exceptions=False) as client:
         headers = _headers(state_dir)
+        kernel = client.app.state.memory_kernel
+        original_complete = kernel._complete_evolution
+        restarted_round = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"session_id": "r3f1-restart"},
+        ).json()[0]
+        assert restarted_round["distillation_status"] == "failed"
+        assert "simulated interrupted cleanup" in restarted_round["failure_reason"]
+
+        def fail_recovery_completion(evolve_key: str, memory_id: str) -> None:
+            del evolve_key, memory_id
+            raise RuntimeError("simulated recovery completion failure")
+
+        monkeypatch.setattr(kernel, "_complete_evolution", fail_recovery_completion)
+        failed_retry = client.post(
+            "/api/v1/capture/consolidate",
+            headers=headers,
+            json={"session_id": "r3f1-restart"},
+        )
+        assert failed_retry.status_code in {500, 503}
+        failed_rounds = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"session_id": "r3f1-restart"},
+        )
+        assert failed_rounds.status_code == 200, failed_rounds.text
+        failed_round = failed_rounds.json()[0]
+        assert failed_round["distillation_status"] == "failed"
+        assert "simulated recovery completion failure" in failed_round["failure_reason"]
+
+        monkeypatch.setattr(kernel, "_complete_evolution", original_complete)
         retried = client.post(
             "/api/v1/capture/consolidate",
             headers=headers,
             json={"session_id": "r3f1-restart"},
         )
         assert retried.status_code == 202, retried.text
-        assert retried.json() == {"queued": 1}
+        assert retried.json() == {"queued": 0}
+        completed_round = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"session_id": "r3f1-restart"},
+        ).json()[0]
+        assert completed_round["distillation_status"] == "completed"
+        assert completed_round["failure_reason"] == ""
         result = _search(client, headers, "助手", cwd=root, session_id="r3f1-restart")
+        assert result["results"] == []
         assert any(
-            item.get("user_metadata", {}).get("memory_type") == "evolved"
-            for item in result["results"]
+            unit.user_metadata.get("memory_type") == "evolved"
+            for unit in _all_units(client)
         )
 
 
@@ -895,16 +1010,111 @@ def test_codex_agent_scope_and_non_codex_compatibility(tmp_path: Path) -> None:
             },
         )
         assert result.status_code == 200, result.text
-        assert {item["document_id"] for item in result.json()["results"]} == {
-            personal_id,
-            captured["memory_id"],
-        }
+        assert {item["document_id"] for item in result.json()["results"]} == {personal_id}
+        raw_events = client.get(
+            "/api/v1/capture/events",
+            headers=headers,
+            params={"session_id": "r3f4-session"},
+        ).json()
+        assert [item["unit_id"] for item in raw_events] == [captured["memory_id"]]
         agents = {
             unit.scope.agent
             for unit in _all_units(client)
             if "R3F4" in unit.content
         }
         assert agents == {"personal-agent-memory", "codex"}
+
+
+def test_incomplete_turn_is_not_queued_and_remains_pending_after_archive(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    root.mkdir()
+    session_id = "incomplete-archive-session"
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        _capture(
+            client,
+            headers,
+            _event(
+                "incomplete-archive-user",
+                session_id,
+                "incomplete-turn",
+                "user",
+                "只有用户消息的未完成回合",
+                root,
+                occurred_at="2020-01-01T00:00:00Z",
+            ),
+        )
+        consolidated = client.post(
+            "/api/v1/capture/consolidate",
+            headers=headers,
+            json={"session_id": session_id},
+        )
+        assert consolidated.status_code == 202, consolidated.text
+        assert consolidated.json() == {"queued": 0}
+
+        before = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"session_id": session_id},
+        )
+        assert before.status_code == 200, before.text
+        before_round = before.json()[0]
+        assert before_round["distillation_status"] == "pending_completion"
+        assert before_round["memory_id"] is None
+        assert before_round["diagnostics"] == []
+        before_times = (
+            before_round["started_at"],
+            before_round["received_at"],
+            before_round["updated_at"],
+        )
+        assert not any(
+            unit.user_metadata.get("memory_type") == "evolved"
+            for unit in _all_units(client)
+        )
+        with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM capture_evolutions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        assert count == (0,)
+
+        region_id = _capture_region_id(client, headers, session_id)
+        policy = client.put(
+            f"/api/v1/libraries/{region_id}/retention-policy",
+            headers=headers,
+            json={"inbox_days": 0},
+        )
+        assert policy.status_code == 200, policy.text
+        cleaned = client.post(
+            f"/api/v1/libraries/{region_id}/retention-cleanup",
+            headers=headers,
+        )
+        assert cleaned.status_code == 200, cleaned.text
+        assert cleaned.json()["counts"]["captures_archived"] == 1
+
+        after = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"session_id": session_id},
+        )
+        assert after.status_code == 200, after.text
+        after_round = after.json()[0]
+        assert after_round["distillation_status"] == "pending_completion"
+        assert after_round["status"] == "pending"
+        assert after_round["memory_id"] is None
+        assert after_round["failure_reason"] == ""
+        assert after_round["diagnostics"] == []
+        assert after_round["created_at"]
+        assert after_round["started_at"]
+        assert after_round["received_at"]
+        assert (
+            after_round["started_at"],
+            after_round["received_at"],
+            after_round["updated_at"],
+        ) == before_times
 
 
 def test_session_retention_policy_archives_captures_but_keeps_evolved_units(
@@ -928,6 +1138,19 @@ def test_session_retention_policy_archives_captures_but_keeps_evolved_units(
                 occurred_at="2020-01-01T00:00:00Z",
             ),
         )
+        _capture(
+            client,
+            headers,
+            _event(
+                "old-capture-assistant",
+                "retention-session",
+                "turn-old",
+                "assistant",
+                "RETENTION-TRANSIENT assistant answer",
+                other_root,
+                occurred_at="2020-01-01T00:00:01Z",
+            ),
+        )
         evolved = client.post(
             "/api/v1/capture/consolidate",
             headers=headers,
@@ -948,7 +1171,7 @@ def test_session_retention_policy_archives_captures_but_keeps_evolved_units(
             f"/api/v1/libraries/{region_id}/retention-cleanup/preview",
             headers=headers,
         ).json()
-        assert preview["counts"]["captures_to_archive"] == 1
+        assert preview["counts"]["captures_to_archive"] == 2
         assert preview["counts"]["evolved_units_protected"] == 1
 
         cleaned = client.post(
@@ -956,7 +1179,7 @@ def test_session_retention_policy_archives_captures_but_keeps_evolved_units(
             headers=headers,
         )
         assert cleaned.status_code == 200, cleaned.text
-        assert cleaned.json()["counts"]["captures_archived"] == 1
+        assert cleaned.json()["counts"]["captures_archived"] == 2
         repeated_preview = client.get(
             f"/api/v1/libraries/{region_id}/retention-cleanup/preview",
             headers=headers,
@@ -967,19 +1190,24 @@ def test_session_retention_policy_archives_captures_but_keeps_evolved_units(
             headers=headers,
         ).json()
         assert repeated["counts"]["captures_archived"] == 0
-        assert client.get(
+        retained_events = client.get(
             "/api/v1/capture/events",
             headers=headers,
             params={"session_id": "retention-session"},
-        ).json() == []
+        ).json()
+        assert [item["record_type"] for item in retained_events] == [
+            "evolved_diagnostic"
+        ]
+        assert retained_events[0]["diagnostic_kind"] == "legacy_evolved"
+        assert "RETENTION-TRANSIENT" in retained_events[0]["content"]
 
         result = _search(
             client, headers, "RETENTION-TRANSIENT", cwd=other_root, session_id="retention-session"
         )
-        assert result["results"]
-        assert all(
-            item.get("user_metadata", {}).get("memory_type") == "evolved"
-            for item in result["results"]
+        assert result["results"] == []
+        assert any(
+            unit.user_metadata.get("memory_type") == "evolved"
+            for unit in _all_units(client)
         )
 
     with TestClient(_app(state_dir)) as client:
@@ -988,6 +1216,305 @@ def test_session_retention_policy_archives_captures_but_keeps_evolved_units(
             f"/api/v1/libraries/{region_id}/retention-policy", headers=headers
         ).json()
         assert persisted["inbox_days"] == 0
+
+
+def test_archived_captures_keep_completed_and_failed_round_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    app = _app(state_dir)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _headers(state_dir)
+        completed_session = "archived-completed-session"
+        for event_id, kind, content, occurred_at in (
+            ("archived-completed-user", "user", "archived completed fact", "2020-01-01T00:00:00Z"),
+            (
+                "archived-completed-assistant",
+                "assistant",
+                "archived completed answer",
+                "2020-01-01T00:00:01Z",
+            ),
+        ):
+            _capture(
+                client,
+                headers,
+                _event(
+                    event_id,
+                    completed_session,
+                    "turn",
+                    kind,
+                    content,
+                    other_root,
+                    occurred_at=occurred_at,
+                ),
+            )
+        completed_consolidation = client.post(
+            "/api/v1/capture/consolidate",
+            headers=headers,
+            json={"session_id": completed_session},
+        )
+        assert completed_consolidation.status_code == 202, completed_consolidation.text
+        completed_region = _capture_region_id(client, headers, completed_session)
+        completed_before = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"region_id": completed_region, "session_id": completed_session},
+        ).json()[0]
+        assert completed_before["distillation_status"] == "completed"
+        completed_memory_id = completed_before["memory_id"]
+        assert completed_memory_id
+        completed_times = (
+            completed_before["started_at"],
+            completed_before["received_at"],
+            completed_before["updated_at"],
+        )
+
+        failed_session = "archived-failed-session"
+        for event_id, kind, content, occurred_at in (
+            ("archived-failed-user", "user", "archived failed fact", "2020-01-01T00:10:00Z"),
+            (
+                "archived-failed-assistant",
+                "assistant",
+                "archived failed answer",
+                "2020-01-01T00:10:01Z",
+            ),
+        ):
+            _capture(
+                client,
+                headers,
+                _event(
+                    event_id,
+                    failed_session,
+                    "turn",
+                    kind,
+                    content,
+                    other_root,
+                    occurred_at=occurred_at,
+                ),
+            )
+        kernel = app.state.memory_kernel
+        original_visible = kernel._evolution_visible
+
+        def fail_visibility(*args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            raise RuntimeError("archived failed visibility error")
+
+        monkeypatch.setattr(kernel, "_evolution_visible", fail_visibility)
+        failed_consolidation = client.post(
+            "/api/v1/capture/consolidate",
+            headers=headers,
+            json={"session_id": failed_session},
+        )
+        assert failed_consolidation.status_code in {500, 503}
+        monkeypatch.setattr(kernel, "_evolution_visible", original_visible)
+        failed_region = _capture_region_id(client, headers, failed_session)
+        failed_before = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"region_id": failed_region, "session_id": failed_session},
+        ).json()[0]
+        assert failed_before["distillation_status"] == "failed"
+        assert "archived failed visibility error" in failed_before["failure_reason"]
+        failed_times = (
+            failed_before["started_at"],
+            failed_before["received_at"],
+            failed_before["updated_at"],
+        )
+
+        for region_id in (completed_region, failed_region):
+            policy = client.put(
+                f"/api/v1/libraries/{region_id}/retention-policy",
+                headers=headers,
+                json={"inbox_days": 0},
+            )
+            assert policy.status_code == 200, policy.text
+            cleaned = client.post(
+                f"/api/v1/libraries/{region_id}/retention-cleanup",
+                headers=headers,
+            )
+            assert cleaned.status_code == 200, cleaned.text
+            assert cleaned.json()["counts"]["captures_archived"] == 2
+
+        completed_after = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"region_id": completed_region, "session_id": completed_session},
+        ).json()[0]
+        assert completed_after["distillation_status"] == "completed"
+        assert completed_after["status"] == "done"
+        assert completed_after["memory_id"] == completed_memory_id
+        assert completed_after["failure_reason"] == ""
+        assert completed_after["user_message"] is None
+        assert completed_after["assistant_final"] is None
+        assert completed_after["diagnostics"]
+        assert completed_after["created_at"]
+        assert (
+            completed_after["started_at"],
+            completed_after["received_at"],
+            completed_after["updated_at"],
+        ) == completed_times
+        assert completed_after["completed_at"]
+
+        failed_after = client.get(
+            "/api/v1/capture/rounds",
+            headers=headers,
+            params={"region_id": failed_region, "session_id": failed_session},
+        ).json()[0]
+        assert failed_after["distillation_status"] == "failed"
+        assert failed_after["status"] == "failed"
+        assert failed_after["memory_id"] is None
+        assert "archived failed visibility error" in failed_after["failure_reason"]
+        assert failed_after["user_message"] is None
+        assert failed_after["assistant_final"] is None
+        assert failed_after["created_at"]
+        assert (
+            failed_after["started_at"],
+            failed_after["received_at"],
+            failed_after["updated_at"],
+        ) == failed_times
+        assert failed_after["completed_at"] is None
+
+
+def test_staged_retention_preserves_terminal_round_facts_and_timeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "unbound"
+    root.mkdir()
+    app = _app(state_dir)
+    now = datetime.now(UTC)
+    completed_session = "staged-completed-session"
+    failed_session = "staged-failed-session"
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _headers(state_dir)
+        for session_id in (completed_session, failed_session):
+            for event_id, kind, content, occurred_at in (
+                (
+                    f"{session_id}-user",
+                    "user",
+                    f"{session_id} user",
+                    (now - timedelta(days=40)).isoformat(),
+                ),
+                (
+                    f"{session_id}-assistant",
+                    "assistant",
+                    f"{session_id} assistant",
+                    (now - timedelta(days=20)).isoformat(),
+                ),
+            ):
+                _capture(
+                    client,
+                    headers,
+                    _event(
+                        event_id,
+                        session_id,
+                        "turn",
+                        kind,
+                        content,
+                        root,
+                        occurred_at=occurred_at,
+                    ),
+                )
+
+        completed = client.post(
+            "/api/v1/capture/consolidate",
+            headers=headers,
+            json={"session_id": completed_session},
+        )
+        assert completed.status_code == 202, completed.text
+
+        kernel = app.state.memory_kernel
+        original_visible = kernel._evolution_visible
+
+        def fail_visibility(*args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            raise RuntimeError("staged retention failure")
+
+        monkeypatch.setattr(kernel, "_evolution_visible", fail_visibility)
+        failed = client.post(
+            "/api/v1/capture/consolidate",
+            headers=headers,
+            json={"session_id": failed_session},
+        )
+        assert failed.status_code in {500, 503}
+        monkeypatch.setattr(kernel, "_evolution_visible", original_visible)
+
+        for session_id, expected_status in (
+            (completed_session, "completed"),
+            (failed_session, "failed"),
+        ):
+            region_id = _capture_region_id(client, headers, session_id)
+            params = {"region_id": region_id, "session_id": session_id}
+            initial = client.get(
+                "/api/v1/capture/rounds",
+                headers=headers,
+                params=params,
+            ).json()[0]
+            expected_memory_id = initial["memory_id"]
+            expected_completed_at = initial["completed_at"]
+            expected_times = (
+                initial["started_at"],
+                initial["received_at"],
+                initial["updated_at"],
+            )
+            assert initial["distillation_status"] == expected_status
+
+            for days in (30, 10):
+                policy = client.put(
+                    f"/api/v1/libraries/{region_id}/retention-policy",
+                    headers=headers,
+                    json={"inbox_days": days},
+                )
+                assert policy.status_code == 200, policy.text
+                cleaned = client.post(
+                    f"/api/v1/libraries/{region_id}/retention-cleanup",
+                    headers=headers,
+                )
+                assert cleaned.status_code == 200, cleaned.text
+                assert cleaned.json()["counts"]["captures_archived"] == 1
+                current = client.get(
+                    "/api/v1/capture/rounds",
+                    headers=headers,
+                    params=params,
+                ).json()[0]
+                assert current["distillation_status"] == expected_status
+                assert current["memory_id"] == expected_memory_id
+                assert current["completed_at"] == expected_completed_at
+                assert (
+                    current["started_at"],
+                    current["received_at"],
+                    current["updated_at"],
+                ) == expected_times
+                if expected_status == "failed":
+                    assert "staged retention failure" in current["failure_reason"]
+                else:
+                    assert current["failure_reason"] == ""
+
+        with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+            rows = connection.execute(
+                """SELECT session_id, status, memory_id, last_error,
+                          completed_at, source_unit_ids
+                   FROM capture_evolutions
+                   WHERE session_id IN (?, ?)""",
+                (completed_session, failed_session),
+            ).fetchall()
+        assert len(rows) == 2
+        by_session = {str(row[0]): row for row in rows}
+        assert by_session[completed_session][1] == "completed"
+        assert by_session[completed_session][2]
+        assert by_session[completed_session][3] == ""
+        assert by_session[completed_session][4]
+        assert json.loads(str(by_session[completed_session][5]))
+        assert by_session[failed_session][1] == "pending"
+        assert by_session[failed_session][2] is None
+        assert "staged retention failure" in str(by_session[failed_session][3])
+        assert by_session[failed_session][4] is None
+        assert json.loads(str(by_session[failed_session][5]))
 
 
 def test_capture_hook_spools_and_exits_zero_when_daemon_is_unavailable(tmp_path: Path) -> None:
@@ -1101,7 +1628,12 @@ def test_evolve_late_same_turn_event_replaces_without_duplicate_content(
             headers=headers,
             json={"session_id": "r4f2-session"},
         )
-        assert first.json() == {"queued": 1}
+        assert first.json() == {"queued": 0}
+        assert not [
+            unit
+            for unit in _all_units(client)
+            if unit.user_metadata.get("memory_type") == "evolved"
+        ]
 
         _capture(
             client,
@@ -1144,10 +1676,7 @@ def test_evolve_late_same_turn_event_replaces_without_duplicate_content(
             cwd=root,
             session_id="r4f2-session",
         )
-        assert any(
-            item.get("user_metadata", {}).get("memory_type") == "evolved"
-            for item in result["results"]
-        )
+        assert result["results"] == []
 
 
 def test_extreme_timezone_timestamp_is_rejected_before_retention(
