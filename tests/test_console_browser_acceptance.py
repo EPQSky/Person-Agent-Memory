@@ -6,16 +6,99 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
+import uvicorn
+
+from personal_agent_memory.app import create_app
+from personal_agent_memory.config import Settings
+from personal_agent_memory.mem2_kernel import Mem2MemoryKernel
 
 ROOT = Path(__file__).parents[1]
 CHROME = Path("/usr/bin/google-chrome")
+
+
+class _ManualSemanticExecutor:
+    def __init__(self) -> None:
+        self._tasks: deque[Callable[[], None]] = deque()
+        self._lock = threading.Lock()
+
+    @property
+    def worker_count(self) -> int:
+        return 1
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._tasks)
+
+    def submit(self, task_key: str, region_id: str, task: Callable[[], None]) -> bool:
+        del task_key, region_id
+        with self._lock:
+            self._tasks.append(task)
+        return True
+
+    def drain(self) -> None:
+        while self.pending_count:
+            with self._lock:
+                task = self._tasks.popleft()
+            task()
+
+    def close(self) -> None:
+        self.drain()
+
+
+class _ReadyServer(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config) -> None:
+        super().__init__(config)
+        self.ready = threading.Event()
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().startup(sockets)
+        self.ready.set()
+
+
+@contextmanager
+def _manual_semantic_live_app(
+    tmp_path: Path,
+    extractor: Callable[[dict[str, object]], list[dict[str, object]]],
+) -> Iterator[tuple[str, str, Path, _ManualSemanticExecutor]]:
+    state_dir = tmp_path / "manual-state"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    executor = _ManualSemanticExecutor()
+    kernel = Mem2MemoryKernel(
+        state_dir,
+        semantic_extractor=extractor,
+        semantic_executor=executor,
+    )
+    app = create_app(Settings(state_dir=state_dir), memory_kernel=kernel)
+    server = _ReadyServer(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_config=None,
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    server.ready.wait()
+    api_key = (state_dir / "api-key").read_text(encoding="utf-8").strip()
+    try:
+        yield f"http://127.0.0.1:{port}", api_key, state_dir, executor
+    finally:
+        server.should_exit = True
+        thread.join()
 
 
 def _wait_for_app(
@@ -1137,3 +1220,196 @@ def test_console_archived_real_retention_rounds_keep_stable_timeline(
             assert all("—" not in text for text in round_times.all_text_contents())
         finally:
             browser.close()
+
+
+def test_console_semantic_distillation_keeps_question_out_and_preference_with_evidence(
+    tmp_path: Path,
+) -> None:
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    sync_playwright = playwright_api.sync_playwright
+    expect = playwright_api.expect
+    project_root = tmp_path / "semantic-browser-project"
+    project_root.mkdir()
+    region_id = "semantic-browser-region"
+    session_id = "semantic-browser-session"
+    question = "帮我分析下当前项目"
+    preference_question = "我偏好项目统一使用 uv 管理依赖。"
+    preference_memory = "用户偏好项目统一使用 uv 管理依赖。"
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        messages = context["messages"]
+        assert isinstance(messages, list)
+        user_messages = [
+            item
+            for item in messages
+            if isinstance(item, dict) and item.get("role") == "user"
+        ]
+        memories: list[dict[str, object]] = []
+        for user_message in user_messages:
+            content = str(user_message.get("content", ""))
+            if "我偏好" not in content:
+                continue
+            memories.append(
+                {
+                    "content": preference_memory,
+                    "memory_type": "preference",
+                    "confidence": 0.97,
+                    "region_hint": "source",
+                    "user_event_id": user_message["event_id"],
+                    "evidence_snippet": "我偏好项目统一使用 uv 管理依赖",
+                    "claim_subject": "user:preference:dependency_manager",
+                    "claim_value": "uv",
+                    "durability": "durable_statement",
+                }
+            )
+        return memories
+
+    with _manual_semantic_live_app(tmp_path, extractor) as (
+        base_url,
+        api_key,
+        state_dir,
+        executor,
+    ):
+        headers = {"Authorization": f"Bearer {api_key}"}
+        with httpx.Client(
+            base_url=base_url,
+            headers=headers,
+            timeout=15,
+            trust_env=False,
+        ) as client:
+            region = client.post(
+                "/api/v1/regions",
+                json={
+                    "kind": "project",
+                    "name": "语义提炼验收区域",
+                    "region_id": region_id,
+                },
+            )
+            assert region.status_code == 201, region.text
+            binding = client.post(
+                "/api/v1/project-bindings",
+                json={"project_root": str(project_root), "region_id": region_id},
+            )
+            assert binding.status_code == 201, binding.text
+            for turn_id, marker, user_content, assistant_content, second in (
+                ("question-turn", "QUESTION", question, "当前项目分析已完成。", 0),
+                (
+                    "preference-turn",
+                    "PREFERENCE",
+                    preference_question,
+                    "已记录该偏好。",
+                    10,
+                ),
+            ):
+                for kind, content, offset in (
+                    ("user", user_content, 0),
+                    ("assistant", assistant_content, 1),
+                ):
+                    captured = client.post(
+                        "/api/v1/capture/events",
+                        json={
+                            "event_id": f"{marker}-{kind}",
+                            "session_id": session_id,
+                            "turn_id": turn_id,
+                            "event_kind": kind,
+                            "content": content,
+                            "occurred_at": f"2026-10-28T04:00:{second + offset:02d}Z",
+                            "cwd": str(project_root),
+                        },
+                    )
+                    assert captured.status_code == 202, captured.text
+
+            assert executor.pending_count == 2
+            executor.drain()
+            assert executor.pending_count == 0
+            rounds = client.get(
+                "/api/v1/capture/rounds",
+                params={"region_id": region_id, "session_id": session_id},
+            )
+            assert rounds.status_code == 200, rounds.text
+            rounds_by_turn = {
+                str(item["turn_id"]): item for item in rounds.json()
+            }
+            assert rounds_by_turn["question-turn"]["semantic_status"] == "skipped"
+            assert rounds_by_turn["question-turn"]["semantic_memory_ids"] == []
+            assert rounds_by_turn["preference-turn"]["semantic_status"] == "completed"
+            memory_ids = rounds_by_turn["preference-turn"]["semantic_memory_ids"]
+            assert isinstance(memory_ids, list) and len(memory_ids) == 1
+
+            formal = client.get(f"/api/v1/libraries/{region_id}/memories?limit=50")
+            assert formal.status_code == 200, formal.text
+            formal_items = formal.json()["items"]
+            assert [item["summary"] for item in formal_items] == [preference_memory]
+            assert question not in json.dumps(formal_items, ensure_ascii=False)
+            question_search = client.post(
+                "/api/v1/search",
+                json={"region_id": region_id, "query": question, "limit": 10},
+            )
+            assert question_search.status_code == 200, question_search.text
+            assert question not in json.dumps(
+                question_search.json()["results"], ensure_ascii=False
+            )
+            preference_search = client.post(
+                "/api/v1/search",
+                json={"region_id": region_id, "query": "uv", "limit": 10},
+            )
+            assert preference_search.status_code == 200, preference_search.text
+            assert any(
+                item["document_id"] == memory_ids[0]
+                for item in preference_search.json()["results"]
+            )
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME),
+                headless=True,
+                args=["--no-sandbox", "--no-proxy-server", "--proxy-bypass-list=*"],
+            )
+            try:
+                page = browser.new_page(viewport={"width": 1440, "height": 1100})
+                page.goto(base_url, wait_until="domcontentloaded")
+                page.get_by_label("API key").fill(api_key)
+                page.get_by_role("button", name="登录").click()
+                page.get_by_role(
+                    "button", name="语义提炼验收区域 · project · semantic-browser-region"
+                ).click()
+
+                memory_button = page.get_by_role(
+                    "button", name=f"查看记忆：{preference_memory}"
+                )
+                memory_button.wait_for()
+                expect(page.locator("#memory-workspace").get_by_text(question)).to_have_count(0)
+                memory_button.click()
+                expect(page.locator("#evidence-list")).to_contain_text(preference_question)
+                expect(page.locator("#source-list")).to_contain_text("turn:preference-turn")
+
+                page.get_by_role("tab", name="原始会话").click()
+                page.get_by_role(
+                    "button", name=f"查看原始会话：{session_id}"
+                ).click()
+                round_list = page.locator("#raw-round-list")
+                expect(round_list.get_by_text(question, exact=True)).to_be_visible()
+                expect(
+                    round_list.get_by_text("语义提炼：已跳过", exact=True)
+                ).to_be_visible()
+                expect(
+                    round_list.get_by_text(
+                        "语义诊断：model returned no semantic memories", exact=True
+                    )
+                ).to_be_visible()
+                expect(
+                    round_list.get_by_text(preference_question, exact=True)
+                ).to_be_visible()
+                expect(
+                    round_list.get_by_text("语义提炼：语义完成", exact=True)
+                ).to_be_visible()
+                expect(round_list).to_contain_text(memory_ids[0])
+                expect(
+                    round_list.get_by_text(
+                        "用户证据：我偏好项目统一使用 uv 管理依赖", exact=True
+                    )
+                ).to_be_visible()
+                expect(page.locator("#raw-session-workspace input")).to_have_count(0)
+                expect(page.get_by_role("button", name="重新提炼")).to_have_count(0)
+            finally:
+                browser.close()

@@ -7,8 +7,11 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import pytest
+
 from personal_agent_memory.model_client import (
     ModelEndpoint,
+    ModelServiceError,
     ModelTaskProfile,
     OpenAICompatibleClient,
 )
@@ -16,6 +19,7 @@ from personal_agent_memory.model_client import (
 
 class _ModelContractHandler(BaseHTTPRequestHandler):
     requests: list[tuple[str, dict[str, Any]]] = []
+    semantic_content: str | None = None
     lock = threading.Lock()
 
     def do_POST(self) -> None:  # noqa: N802
@@ -38,8 +42,41 @@ class _ModelContractHandler(BaseHTTPRequestHandler):
                 ]
             }
         else:
+            messages = payload.get("messages", [])
+            system = "\n".join(
+                str(message.get("content", ""))
+                for message in messages
+                if isinstance(message, dict) and message.get("role") == "system"
+            )
+            if "semantic-distillation-v1" in system:
+                chat_content = type(self).semantic_content or json.dumps({"memories": []})
+                chat_payload = None
+            elif "promotion-classifier-v1" in system:
+                chat_content = ""
+                chat_payload = {
+                    "category": "retain",
+                    "confidence": 0.5,
+                    "explicit": False,
+                    "topic_id": None,
+                    "claim_subject": "",
+                    "claim_value": "",
+                    "reason": "test response",
+                }
+            else:
+                chat_content = ""
+                chat_payload = {"entities": [], "relations": []}
             response = {
-                "choices": [{"message": {"content": json.dumps({"entities": [], "relations": []})}}]
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                chat_content
+                                if chat_payload is None
+                                else json.dumps(chat_payload)
+                            )
+                        }
+                    }
+                ]
             }
         body = json.dumps(response).encode("utf-8")
         self.send_response(200)
@@ -56,6 +93,7 @@ class _ModelContractHandler(BaseHTTPRequestHandler):
 def _model_contract_server() -> Iterator[tuple[str, type[_ModelContractHandler]]]:
     handler = _ModelContractHandler
     handler.requests = []
+    handler.semantic_content = None
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -76,7 +114,7 @@ def test_extraction_tasks_send_deterministic_profiles_with_bounded_output() -> N
         )
 
         client.extract_graph("Entity: alpha")
-        client.extract_candidate("User: choose alpha")
+        client.extract_semantic_memories({"messages": [{"role": "user", "content": "alpha"}]})
 
         chat_requests = [
             payload for path, payload in handler.requests if path == "/v1/chat/completions"
@@ -87,11 +125,12 @@ def test_extraction_tasks_send_deterministic_profiles_with_bounded_output() -> N
         assert graph["max_tokens"] == 4096
         assert "top_k" not in graph
 
-        candidate = chat_requests[1]
-        assert candidate["temperature"] == 0
-        assert candidate["top_p"] == 1
-        assert candidate["max_tokens"] == 2048
-        assert "top_k" not in candidate
+        semantic = chat_requests[1]
+        assert semantic["temperature"] == 0
+        assert semantic["top_p"] == 1
+        assert semantic["max_tokens"] == 2048
+        assert "top_k" not in semantic
+        assert "durability" in json.dumps(semantic["messages"], ensure_ascii=False)
 
 
 def test_embedding_and_reranking_payloads_have_no_generation_parameters() -> None:
@@ -120,7 +159,7 @@ def test_task_profiles_are_independent_and_optional_top_k_is_not_forced() -> Non
         )
 
         client.extract_graph("Entity: alpha")
-        client.extract_candidate("User: choose alpha")
+        client.extract_semantic_memories({"messages": [{"role": "user", "content": "alpha"}]})
 
         chat_requests = [
             payload for path, payload in handler.requests if path == "/v1/chat/completions"
@@ -157,3 +196,16 @@ def test_promotion_classifier_uses_bounded_candidate_profile() -> None:
         assert "topic_regions" in prompt
         assert "claim_subject" in prompt
         assert "claim_value" in prompt
+
+
+def test_semantic_distillation_rejects_invalid_json() -> None:
+    with _model_contract_server() as (base_url, handler):
+        handler.semantic_content = "{not valid json"
+        client = OpenAICompatibleClient(
+            None,
+            None,
+            ModelEndpoint(base_url, "graph-model"),
+        )
+
+        with pytest.raises(ModelServiceError, match="malformed JSON"):
+            client.extract_semantic_memories({"messages": [{"role": "user", "content": "x"}]})

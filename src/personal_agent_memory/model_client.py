@@ -210,10 +210,13 @@ class OpenAICompatibleClient:
             raise ModelServiceError("graph LLM returned malformed JSON")
         return decoded
 
-    def extract_candidate(self, conversation: str) -> dict[str, object]:
+    def extract_semantic_memories(
+        self,
+        context: dict[str, object],
+    ) -> list[dict[str, object]]:
         endpoint = self.graph
         if endpoint is None:
-            raise ModelServiceError("candidate extraction LLM is not configured")
+            raise ModelServiceError("semantic distillation LLM is not configured")
         response = self._request(
             "graph",
             endpoint,
@@ -224,17 +227,33 @@ class OpenAICompatibleClient:
                     {
                         "role": "system",
                         "content": (
-                            "candidate-extraction-v1: return one JSON object with eligible, "
-                            "suggested_type, body, confidence, evidence_kind, source_valid, "
-                            "conflict, and policy_allowed. Only durable decisions, constraints, "
-                            "preferences, domain facts, reusable experience, or external "
-                            "references are eligible. Never include hidden reasoning, tool output, "
-                            "complete files, injected memory, or transient task progress. "
-                            "evidence_kind is user_confirmed only when the user message itself "
-                            "confirms the fact; an assistant reply alone is never evidence."
+                            "semantic-distillation-v1: return JSON object {\"memories\": [...]}. "
+                            "Return zero memories for questions, greetings, imperatives, "
+                            "temporary plans, one-off outputs, hidden reasoning, tool output, "
+                            "assistant-only inference, or content without durable user value. "
+                            "Each memory must be one atomic, self-contained claim that remains "
+                            "understandable without the conversation. Never use dialogue "
+                            "references such as above, earlier, just now, previous message, "
+                            "上面, 刚才, 前述, or 上一条. memory_type must be one of decision, "
+                            "constraint, preference, domain_fact, reusable_experience, or "
+                            "external_reference. confidence must be a number from 0 to 1 and "
+                            "must be at least 0.90. region_hint must be source, user, or one "
+                            "topic_id from region_hints. user_event_id must identify a supplied "
+                            "user message. evidence_snippet must be an exact contiguous excerpt "
+                            "from that user message. The assistant message may provide context "
+                            "but is never user evidence. Include claim_subject and claim_value "
+                            "for checkable claims so conflicts can be detected. Each result must "
+                            "use content for the complete atomic memory text. durability is "
+                            "required for every result: use durable_statement only for stable "
+                            "knowledge, or temporary_plan for transient execution plans. Omit "
+                            "the result when durability is not clear. Do not publish scheduled "
+                            "or in-progress actions as durable statements."
                         ),
                     },
-                    {"role": "user", "content": conversation},
+                    {
+                        "role": "user",
+                        "content": json.dumps(context, ensure_ascii=False, sort_keys=True),
+                    },
                 ],
                 "response_format": {"type": "json_object"},
                 **self.candidate_profile.payload(),
@@ -242,20 +261,23 @@ class OpenAICompatibleClient:
         )
         choices = response.get("choices")
         if not isinstance(choices, list) or len(choices) != 1:
-            raise ModelServiceError("candidate extraction returned malformed data")
+            raise ModelServiceError("semantic distillation returned malformed data")
         choice = choices[0]
         if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
-            raise ModelServiceError("candidate extraction returned malformed data")
+            raise ModelServiceError("semantic distillation returned malformed data")
         content = choice["message"].get("content")
         if not isinstance(content, str):
-            raise ModelServiceError("candidate extraction returned malformed data")
+            raise ModelServiceError("semantic distillation returned malformed data")
         try:
             decoded = json.loads(content)
         except json.JSONDecodeError as error:
-            raise ModelServiceError("candidate extraction returned malformed JSON") from error
-        if not isinstance(decoded, dict):
-            raise ModelServiceError("candidate extraction returned malformed JSON")
-        return decoded
+            raise ModelServiceError("semantic distillation returned malformed JSON") from error
+        if not isinstance(decoded, dict) or not isinstance(decoded.get("memories"), list):
+            raise ModelServiceError("semantic distillation returned malformed JSON")
+        memories = decoded["memories"]
+        if len(memories) > 20 or any(not isinstance(item, dict) for item in memories):
+            raise ModelServiceError("semantic distillation returned malformed memories")
+        return [dict(item) for item in memories]
 
     def classify_promotion(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, NoReturn, Protocol, TypeAlias, runtime_checkable
 
@@ -54,6 +55,7 @@ class CreateMemoryRequest:
     actor: str
     idempotency_key: str
     region_id: str | None = None
+    user_metadata: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

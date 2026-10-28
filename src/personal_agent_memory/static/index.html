@@ -264,7 +264,15 @@
     pending_completion: '待完成',
     pending_distillation: '待提炼',
     completed: '完成',
+    skipped: '已跳过',
     failed: '失败',
+  };
+  const SEMANTIC_STATUS_LABELS = {
+    not_requested: '未请求',
+    pending: '待提炼',
+    completed: '语义完成',
+    skipped: '已跳过',
+    failed: '语义失败',
   };
   const EVENT_LABELS = {
     user: '用户消息',
@@ -509,7 +517,15 @@
       heading.className = 'raw-round-heading';
       const title = document.createElement('h3');
       title.textContent = `回合 ${round.turn_id}`;
-      const status = String(round.distillation_status || 'unknown');
+      const semanticStatus = String(round.semantic_status || 'not_requested');
+      const status = semanticStatus === 'not_requested'
+        ? String(round.distillation_status || 'unknown')
+        : ({
+          pending: 'pending_distillation',
+          completed: 'completed',
+          skipped: 'skipped',
+          failed: 'failed',
+        }[semanticStatus] || 'unknown');
       const badge = document.createElement('span');
       badge.className = `status-badge ${status}`;
       badge.setAttribute('aria-label', `回合状态：${rawStatusLabel(status)}`);
@@ -530,13 +546,71 @@
       } else if (status === 'pending_distillation') {
         statusMessage.textContent = '完整回合已采集，等待提炼。';
       } else if (status === 'completed') {
-        statusMessage.textContent = '回合已完成提炼状态。';
+        statusMessage.textContent = semanticStatus === 'completed'
+          ? '回合已完成语义提炼。'
+          : '回合已完成提炼状态。';
+      } else if (status === 'skipped') {
+        statusMessage.textContent = '回合语义提炼已跳过，未发布正式记忆。';
       } else if (status === 'failed') {
-        statusMessage.textContent = `提炼失败：${round.failure_reason || '原因未记录'}`;
+        statusMessage.textContent = semanticStatus === 'failed'
+          ? `语义提炼失败：${round.semantic_error || '原因未记录'}`
+          : `提炼失败：${round.failure_reason || '原因未记录'}`;
       } else {
         statusMessage.textContent = '回合状态未知。';
       }
       item.append(statusMessage);
+
+      const semanticSection = document.createElement('section');
+      semanticSection.className = 'raw-semantic';
+      const semanticHeading = document.createElement('strong');
+      semanticHeading.textContent = `语义提炼：${SEMANTIC_STATUS_LABELS[semanticStatus] || '状态未知'}`;
+      semanticSection.append(semanticHeading);
+      const semanticIds = Array.isArray(round.semantic_memory_ids)
+        ? round.semantic_memory_ids.map(String).filter(Boolean)
+        : [];
+      const semanticRefs = Array.isArray(round.semantic_memory_refs)
+        ? round.semantic_memory_refs
+        : [];
+      if (semanticIds.length) {
+        const references = document.createElement('ul');
+        references.className = 'raw-semantic-references';
+        for (const memoryId of semanticIds) {
+          const reference = semanticRefs.find(
+            (item) => String(item.memory_id || '') === memoryId,
+          ) || {};
+          const listItem = document.createElement('li');
+          const idText = document.createElement('code');
+          idText.textContent = memoryId;
+          const regionText = document.createElement('span');
+          regionText.textContent = ` · 区域 ${String(reference.region_id || round.region_id || '—')}`;
+          listItem.append(idText, regionText);
+          if (reference.evidence_snippet) {
+            const evidence = document.createElement('p');
+            evidence.className = 'muted';
+            evidence.textContent = `用户证据：${String(reference.evidence_snippet)}`;
+            listItem.append(evidence);
+          }
+          references.append(listItem);
+        }
+        semanticSection.append(references);
+      }
+      if (round.semantic_error) {
+        const semanticError = document.createElement('p');
+        semanticError.className = 'notice error';
+        semanticError.textContent = `语义提炼错误：${String(round.semantic_error)}`;
+        semanticSection.append(semanticError);
+      }
+      const semanticDiagnostics = Array.isArray(round.semantic_diagnostics)
+        ? round.semantic_diagnostics
+        : [];
+      for (const diagnostic of semanticDiagnostics) {
+        if (!['skipped', 'failed'].includes(String(diagnostic.status || ''))) continue;
+        const diagnosticText = document.createElement('p');
+        diagnosticText.className = 'muted notice';
+        diagnosticText.textContent = `语义诊断：${String(diagnostic.reason || diagnostic.status || '未记录原因')}`;
+        semanticSection.append(diagnosticText);
+      }
+      item.append(semanticSection);
 
       const timeline = document.createElement('p');
       timeline.className = 'muted raw-round-time';

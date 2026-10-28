@@ -15,12 +15,13 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Protocol, TypedDict, cast
 
 from jiuwen_memory.api import (
     Context,
@@ -139,6 +140,114 @@ _BROWSER_INDEX_RETRY_BATCH_SIZE = 100
 _BROWSER_INDEX_RETRY_MAX = 1_000
 _LINEAGE_MIGRATION_BATCH_SIZE = 100
 PromotionClassifier = Callable[[str, Mapping[str, object]], Mapping[str, object]]
+SemanticExtractor = Callable[[dict[str, object]], list[dict[str, object]]]
+SemanticTask = Callable[[], None]
+
+
+class SemanticTaskExecutor(Protocol):
+    def submit(self, task_key: str, region_id: str, task: SemanticTask) -> bool: ...
+
+    def drain(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    @property
+    def worker_count(self) -> int: ...
+
+    @property
+    def pending_count(self) -> int: ...
+
+
+class BoundedSemanticExecutor:
+    """Fixed worker pool with a bounded pending queue and per-region limits."""
+
+    def __init__(
+        self,
+        *,
+        max_workers: int = 2,
+        max_pending: int = 256,
+        max_region_workers: int = 1,
+    ) -> None:
+        if max_workers < 1:
+            raise ValueError("semantic max_workers must be positive")
+        if max_pending < 1:
+            raise ValueError("semantic max_pending must be positive")
+        if max_region_workers < 1 or max_region_workers > max_workers:
+            raise ValueError("semantic max_region_workers must be between 1 and max_workers")
+        self._pool = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="semantic-distillation",
+        )
+        self._max_workers = max_workers
+        self._max_pending = max_pending
+        self._max_region_workers = max_region_workers
+        self._condition = threading.Condition()
+        self._pending = 0
+        self._closed = False
+        self._region_semaphores: dict[str, threading.BoundedSemaphore] = {}
+        self._on_slot_available: Callable[[], None] | None = None
+
+    def set_slot_callback(self, callback: Callable[[], None]) -> None:
+        self._on_slot_available = callback
+
+    @property
+    def worker_count(self) -> int:
+        return self._max_workers
+
+    @property
+    def pending_count(self) -> int:
+        with self._condition:
+            return self._pending
+
+    def _region_semaphore(self, region_id: str) -> threading.BoundedSemaphore:
+        with self._condition:
+            semaphore = self._region_semaphores.get(region_id)
+            if semaphore is None:
+                semaphore = threading.BoundedSemaphore(self._max_region_workers)
+                self._region_semaphores[region_id] = semaphore
+            return semaphore
+
+    def submit(self, task_key: str, region_id: str, task: SemanticTask) -> bool:
+        del task_key
+        with self._condition:
+            if self._closed or self._pending >= self._max_pending:
+                return False
+            self._pending += 1
+        region_semaphore = self._region_semaphore(region_id)
+
+        def run() -> None:
+            try:
+                with region_semaphore:
+                    task()
+            finally:
+                with self._condition:
+                    self._pending -= 1
+                    self._condition.notify_all()
+                callback = self._on_slot_available
+                if callback is not None:
+                    with suppress(Exception):
+                        callback()
+
+        try:
+            self._pool.submit(run)
+        except RuntimeError:
+            with self._condition:
+                self._pending -= 1
+                self._condition.notify_all()
+            return False
+        return True
+
+    def drain(self) -> None:
+        with self._condition:
+            while self._pending:
+                self._condition.wait()
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+        self._pool.shutdown(wait=True, cancel_futures=False)
 
 
 class _PromotionCandidate(TypedDict):
@@ -165,6 +274,21 @@ class _PromotionOutcome(TypedDict):
     decision: dict[str, object]
 
 
+class _SemanticValidation(TypedDict):
+    content: str
+    memory_type: str
+    confidence: float
+    region_hint: str
+    target_region: MemoryRegion
+    user_event_id: str
+    evidence_snippet: str
+    user_occurred_at: str
+    claim_subject: str
+    claim_value: str
+    claims_explicit: bool
+    durability: str
+
+
 _PromotionClassified = tuple[_PromotionCandidate, _PromotionDecision, MemoryRegion]
 
 
@@ -180,6 +304,387 @@ _EVOLVE_CHUNK_LIMIT = 60_000
 _STATE_VERSION = "jiuwen-memory-0.2.0"
 _DEFAULT_SESSION_RETENTION_DAYS = 30
 _MAX_RECALL_CANDIDATE_POOL = 500
+_SEMANTIC_MIN_CONFIDENCE = 0.90
+_SEMANTIC_MAX_RESULTS = 20
+_SEMANTIC_DEICTIC_REFERENCE = re.compile(
+    r"上面|上述|前述|刚才|刚刚|上一条|前一条|此前对话|前文|"
+    r"如上所述|如前所述|如前文所述|正如前面|"
+    r"\b(?:above(?![-\w])|earlier(?![-\w])|just now|previous message|previous turn|"
+    r"as discussed|as mentioned|as previously stated|as stated previously|"
+    r"as (?:i|we) (?:previously )?(?:said|stated|mentioned|described)|"
+    r"like (?:i|we) said(?: (?:before|earlier|previously))?|"
+    r"as noted(?: (?:before|earlier|previously|above))?|"
+    r"as (?:i|we) (?:agreed|discussed)(?: (?:before|earlier|previously))?|"
+    r"per (?:our|my|the) "
+    r"(?:prior|previous|earlier|last|latest|recent|most\s+recent) "
+    r"(?:discussion|conversation|exchange|message|note)|"
+    r"(?:based on|following) (?:our|my|the) "
+    r"(?:prior|previous|earlier|last|latest|recent|most\s+recent) "
+    r"(?:discussion|conversation|exchange|message|note)|"
+    r"(?:as|like) (?:i|we) (?:said|stated|mentioned|described) "
+    r"(?:before|earlier|previously|above)|"
+    r"as noted (?:before|earlier|previously|above)|"
+    r"previously stated|as described (?:before|above|earlier)|"
+    r"described (?:before|above|earlier)|previous answer|prior answer|earlier answer|"
+    r"former|latter|aforementioned|aforesaid|"
+    r"prior\s+(?:option|choice|item|approach|statement|answer|message|turn|claim)|"
+    r"(?:previous|first|second|third|last|next)\s+(?:option|one|choice|item|approach|"
+    r"statement|answer|message|turn|claim|plan|policy|iteration|release|version|"
+    r"attempt|round|step)|"
+    r"according to (?:the )?(?:previous|earlier|above) (?:answer|message|turn))\b|"
+    r"前者|后者|上一轮|前一轮|上次|此前一轮|依照之前说明|按照之前说明|"
+    r"根据之前说明|如之前所述",
+    re.IGNORECASE,
+)
+_SEMANTIC_QUESTION_MARK = re.compile(r"[?？]\s*$")
+_SEMANTIC_YES_NO_QUESTION = re.compile(
+    r"^(?:is|are|was|were|am|do|does|did|can|could|would|should|will|"
+    r"shall|may|might|must|have|has|had)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_WH_QUESTION = re.compile(
+    r"^(?:what|how|why|which|who|whom|whose|when|where)\b"
+    r"(?:\s+(?:much|many|long|often|soon|far|old|large|big))?"
+    r"\s+(?:is|are|was|were|do|does|did|can|could|would|should|will|"
+    r"shall|may|might|must|has|have|had)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_ZH_WH_CLAUSE = re.compile(
+    r"^(?:是否|能否|要不要|是不是|如何|怎么|怎样|为什么|为何|哪个|哪些|谁|"
+    r"何时|什么时候|哪里|哪儿|多少|多久)"
+)
+_SEMANTIC_WH_MODAL_QUESTION = re.compile(
+    r"^(?:what|how|why|which|who|whom|whose|when|where)\b.*\b"
+    r"(?:should|can|could|would|will|do|does|did|must|may|might)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_WH_STATEMENT_PREDICATE = re.compile(
+    r"^(?:what|how|why|which|who|whom|whose|when|where)\b.*\b"
+    r"(?:must|should|can|could|will|would|is|are|was|were)\s+"
+    r"(?:be\s+)?(?:documented|stored|supported|required|used|configured|"
+    r"retained|logged|enforced|chosen|selected|defined|decided)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_WH_PASSIVE_QUESTION = re.compile(
+    r"^(?:what|which|who|whom|whose|where|when|why|how)\s+"
+    r"(?!(?:should|can|could|would|will|do|does|did|must|may|might|is|are|was|were)\b)"
+    r"(?P<subject>(?:[a-z][a-z-]*\s+){1,3})(?:is|are|was|were)\s+"
+    r"(?:[a-z]+ed|used|stored|supported|required|"
+    r"configured|retained|logged|enforced|chosen|selected|defined|decided)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_WH_CLAUSE_STATEMENT = re.compile(
+    r"^(?:"
+    r"what\s+(?:caused|causes|matters|mattered|happened|happens|failed|fails|"
+    r"changed|changes|broke|breaks)\b|"
+    r"(?:what|how|why|which)\s+(?:we|they|i|you)\s+[a-z][a-z-]*\b|"
+    r"(?:what|how|why|which)\s+(?:the|our|their|your|my)\s+"
+    r"(?:[a-z][a-z-]*\s+){0,2}(?:team|project|organization|company)\s+"
+    r"[a-z][a-z-]*\b"
+    r").*\b(?:is|are|was|were)\s+(?:be\s+)?[a-z]+ed\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_WH_SHORT_PASSIVE_QUESTION = re.compile(
+    r"^(?:what|which|where|when|why|how)\s+"
+    r"(?!(?:should|can|could|would|will|do|does|did|must|may|might)\b)"
+    r"(?:[a-z][a-z'\-]*\s+){1,64}"
+    r"(?:is|are|was|were|have|has|had|isn't|aren't|wasn't|weren't|"
+    r"haven't|hasn't|hadn't)\s+"
+    r"(?:(?:(?:been|being|not|never)\s+|not\s+yet\s+)){0,3}"
+    r"(?:(?:[a-z]+ly)(?:[,\s]+(?:and\s+)?[a-z]+ly){0,5}\s+){0,3}"
+    r"(?:[a-z]+ed|stored|created|kept|used|configured|logged|retained|"
+    r"supported|required|enforced|selected|defined)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_ZH_QUESTION_ANY = re.compile(
+    r"什么|怎么|怎样|如何|为什么|为何|哪个|哪些|谁|多少|多久|吗|呢"
+)
+_SEMANTIC_ZH_DECLARATIVE = re.compile(
+    r"取决于|说明|记录|需要|必须|应该|支持|使用|采用|通过|用于|已|"
+    r"将(?:在|于|会)|会(?:在|被|使用)|由[^。！？?]{0,20}决定|"
+    r"尚未|尚无|确定|结论"
+)
+_SEMANTIC_REQUEST = re.compile(
+    r"^(?:帮我|请(?:问|帮我|告诉我)|please\b|help me\b|"
+    r"(?:tell|show|give|send|provide|share|walk|guide|take|talk)\s+(?:me|us)\b|"
+    r"(?:walk|guide|take|talk)\s+(?:me|us)\s+through\b|"
+    r"(?:i(?:['’]d\s+like|\s+(?:want|need|would\s+like))\s+you\s+to)\b|"
+    r"can you\b|could you\b|would you\b|would you mind\b)",
+    re.IGNORECASE,
+)
+_SEMANTIC_LEADING_DEMONSTRATIVE = re.compile(
+    r"^(?:这|那)(?!(?:个|项|条|份|套|种|类|位|名|些|批|组|篇|款|版|段|次|场|台|家|座|所))"
+)
+_SEMANTIC_TRANSIENT = re.compile(
+    r"临时计划|一次性|下一步|稍后|今天先|暂时先|待办|明天|下周|下个月|"
+    r"将来|将要|即将|(?:我们|我|团队|项目组)计划|计划(?:在|于)|准备(?:在|于)?|"
+    r"\b(?:temporary plan|for now|next step|one[- ]off|todo|tomorrow|"
+    r"next\s+(?:week|month|quarter|sprint|release|year)|will\s+[a-z]+"
+    r"(?:\s+[a-z]+){0,3}\s+(?:next\s+year|soon|later|eventually)\b|"
+    r"will\s+(?:be\s+)?(?:deploy|ship|"
+    r"release|start|finish|run|do|deployed|shipped|released)|going to|"
+    r"(?:i|we|they|team|project)\s+(?:plan|plans|planned|planning|intend|intends|"
+    r"intended|intending|expect|expects|expected|expecting)\s+to\b|"
+    r"(?:i|we|they|team)\s+plan\b|"
+    r"in\s+q[1-4]\b|(?:starts?|begins?|launches?|ships?|deploys?|rolls?\s+out|"
+    r"takes?\s+place|happens?|occurs?)\s+in\s+"
+    r"(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|20\d{2})\b|will\s+[a-z]+(?:\s+[a-z]+){0,2}\s+in\s+"
+    r"(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|20\d{2})\b|"
+    r"(?:planned|scheduled|expected|slated|set|targeted|destined|due)\s+"
+    r"(?:for|on|in)\s+\w+|"
+    r"(?:planned|slated|set|due|targeted|destined)\s+to\s+"
+    r"(?:happen|occur|take\s+place|deploy|launch|ship|start|finish|go\s+live)\b|"
+    r"(?:as soon as possible|asap)\b|"
+    r"(?:planned|scheduled|expected)\s+"
+    r"(?:soon|shortly|imminently|later|eventually|tomorrow|today|tonight|"
+    r"this\s+(?:morning|afternoon|evening|week|month|quarter)|"
+    r"in\s+(?:a\s+few|\d+)\s+(?:minutes?|hours?|days?|weeks?))\b|"
+    r"(?:today|tonight|this\s+(?:morning|afternoon|evening|week|month|quarter))\b|"
+    r"scheduled (?:for|to)|"
+    r"once\s+.+\s+(?:passes|completes|finishes|lands))\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_EN_PRONOUN = re.compile(
+    r"\b(?:it|them|they|he|she|him|her)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_EN_DEMONSTRATIVE = re.compile(
+    r"\b(?:this|that|these|those)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_EN_SUBORDINATOR = re.compile(
+    r"\b(?:because|since|when|whenever|while|if|unless|although|though|"
+    r"whereas|after|before|once|so\s+that|in\s+case|as\s+soon\s+as|"
+    r"which|who|whom|whose|where|that)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_ZH_PRONOUN = re.compile(
+    r"(?<!其)(?:它|他们|她们)|"
+    r"(?:依赖|基于|使用|需要|支持|包含|排除|针对|对于)(?:它|他们|她们)"
+)
+_SEMANTIC_ZH_SUBORDINATOR = re.compile(
+    r"因为|由于|如果|若是|若|当|虽然|尽管|即使|一旦|只要|以便|从而"
+)
+_SEMANTIC_ZH_NOUN_PREFIX = (
+    "(?:个|项|条|份|套|种|类|位|名|些|批|组|篇|款|版|段|次|场|台|家|座|所)"
+    "(?:项目|服务|系统|模块|接口|数据库|政策|策略|版本|配置|文件|仓库|"
+    "用户|请求|事件|回合|记忆|索引|表|库|工具|插件|前端|后端|平台|方案|"
+    "流程|规则|约束|设置|选项|功能|特性|资源|主题|区域|字段|参数|时间|"
+    "周期|频率|公司|报告|步骤|结论|部署|团队)"
+)
+_SEMANTIC_AUXILIARIES = frozenset(
+    {
+        "am",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "may",
+        "might",
+        "must",
+        "has",
+        "have",
+        "had",
+    }
+)
+_SEMANTIC_SUBJECT_CLOSED_CLASS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "they",
+        "them",
+        "we",
+        "i",
+        "you",
+        "he",
+        "she",
+        "his",
+        "her",
+        "its",
+        "their",
+        "our",
+        "my",
+        "your",
+        "all",
+        "both",
+        "each",
+        "every",
+        "some",
+        "any",
+        "no",
+    }
+)
+_SEMANTIC_DEMONSTRATIVE_BASE_VERBS = frozenset(
+    {
+        "use", "uses", "have", "has", "do", "does", "provide", "provides",
+        "support", "supports", "require", "requires", "need", "needs",
+        "contain", "contains", "store", "stores", "run", "runs", "return", "returns",
+        "write", "writes", "read", "reads", "allow", "allows", "mean", "means",
+        "enable", "enables", "accept", "accepts", "include", "includes",
+        "exclude", "excludes", "time", "times", "prefer", "prefers",
+        "cache", "caches", "validate", "validates", "encrypt", "encrypts",
+        "fetch", "fetches", "process", "processes", "authenticate", "authenticates",
+        "forward", "forwards", "serve", "serves", "enforce", "enforces",
+        "perform", "performs", "employ", "employs", "handle", "handles",
+        "like", "likes", "depend", "depends", "rely", "relies", "cause", "causes",
+        "help", "helps", "reduce", "reduces", "fail", "fails", "become", "becomes",
+        "deploy", "deploys", "migrate", "migrates",
+        "implement", "implements", "create", "creates", "update", "updates",
+        "delete", "deletes", "manage", "manages", "keep", "keeps",
+        "can", "could", "will", "would", "should", "may", "might", "must",
+    }
+)
+_SEMANTIC_ADVERB_CLOSED_CLASS = frozenset(
+    {
+        "also",
+        "then",
+        "now",
+        "still",
+        "always",
+        "never",
+        "only",
+        "just",
+        "even",
+        "often",
+        "usually",
+        "typically",
+        "generally",
+        "frequently",
+        "automatically",
+        "currently",
+        "already",
+        "again",
+    }
+)
+_SEMANTIC_EN_COORDINATION = re.compile(
+    r"\b(?:and|or|but|as\s+well\s+as)\b", re.IGNORECASE
+)
+_SEMANTIC_ZH_COORDINATION = re.compile(
+    r"并且|而且|同时|，且|,且|(?<![合吞兼])并(?!且|发|行|列|集|轨|网|购|非)"
+)
+_SEMANTIC_CLAUSE_BOUNDARY = re.compile(r"[.,;:!?。；！？、]")
+_SEMANTIC_EN_PREPOSITION = frozenset(
+    {
+        "on",
+        "in",
+        "to",
+        "for",
+        "with",
+        "about",
+        "from",
+        "into",
+        "over",
+        "under",
+        "around",
+        "by",
+        "at",
+        "per",
+        "via",
+        "as",
+        "of",
+    }
+)
+_SEMANTIC_NON_DURABLE_INTENT = re.compile(
+    r"\b(?:considering|evaluating|thinking about|weighing|exploring)\b|"
+    r"\b(?:may|might)\s+(?:be|become|use|prefer|need|change|move|adopt|choose|"
+    r"migrate|replace|introduce|drop)\b|"
+    r"\b(?:need|trying) to (?:choose|decide)\b|"
+    r"(?:正在)?(?:考虑|评估|权衡|比较|探索)|需要(?:选择|决定)|"
+    r"(?:可能|也许|或许)(?:使用|采用|选择|需要|偏好)|"
+    r"尚未(?:选择|决定)",
+    re.IGNORECASE,
+)
+_SEMANTIC_IMPERATIVE = re.compile(
+    r"^(?:deploy|run|build|test|apply|restart|migrate|install|update|remove|"
+    r"delete|create|configure|enable|disable|use(?!\s+of\b)|prefer|choose|adopt|"
+    r"set(?!\s+of\b)|change|add|write(?!\s+(?:access|permission)\b)|"
+    r"read(?!\s+(?:access|only)\b)|keep|make|ensure|note|remember|avoid|require|"
+    r"containerize|dockerize|provision|virtualize|refactor|optimize|publish|"
+    r"upload|download|copy|move|validate|verify|check|monitor|integrate|implement|"
+    r"rename|replace|convert|rewrite|switch|send|receive|start|stop|open|close|"
+    r"load|store|fetch|post|put|patch|invoke|trigger|schedule|wait|help|give|"
+    r"review|analyze|analyse|assess|examine|inspect|audit|evaluate|design|document|"
+    r"explain|describe|clarify|summarize|summarise|list|show|tell|"
+    r"walk|guide|take|talk|provide|share)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_FUTURE_ACTION = re.compile(
+    r"\bwill\s+[a-z]+\b.*\b(?:at|by|after|before|tomorrow|tonight|"
+    r"next\s+(?:week|month|quarter|sprint|release)|midnight|noon)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_ACTION_WITHOUT_DURABILITY = re.compile(
+    r"\b(?:i|we|they|team|service|system|project|user)\s+"
+    r"(?:is|are|am|was|were|will|shall)\s+(?:be\s+)?[a-z]+ing\b|"
+    r"\b(?:is|are)\s+(?:going to|about to|due to)\b|"
+    r"\b(?:on|by|before|after)\s+(?:monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday|the weekend)\b|"
+    r"正在|即将|将要|计划(?:在|于)|准备(?:在|于)|下(?:周|个月|个季度)",
+    re.IGNORECASE,
+)
+_SEMANTIC_COMPOUND_CLAIM = re.compile(
+    r"[,，]\s*(?:and|but)\s+(?:the\s+|this\s+|that\s+|it\s+|they\s+|we\s+|i\s+)?"
+    r"(?:requires?|prefers?|uses?|needs?|must|will|should|is|are|was|were)\b|"
+    r"\band\s+(?:the\s+|this\s+|that\s+|it\s+|they\s+|we\s+|i\s+)?"
+    r"(?:requires?|prefers?|uses?|needs?|must|will|should|is|are|was|were)\b|"
+    r"^(?:the\s+)?user\s+(?:prefers?|likes?|requires?|needs?|wants?)\s+"
+    r"[^.!?;]+,\s*[^.!?;]+,\s*(?:and|or)\s+[^.!?;]+[.!?]?$|"
+    r"^(?:the\s+)?(?:user|i|we)\s+(?:prefers?|likes?|wants?|needs?|requires?)\s+"
+    r"[^.!?;]+?\s+(?:and|or|as\s+well\s+as)\s+[^.!?;]+[.!?]?$|"
+    r"^用户(?:偏好|喜欢|要求|需要|希望)[^。！？；]+[、，]"
+    r"[^。！？；]+(?:和|以及|、)[^。！？；]+[。！？]?$|"
+    r"^(?:用户|我)(?:偏好|喜欢|希望|需要|要求)[^。！？；]+?"
+    r"(?:和|与|以及)[^。！？；]+[。！？]?$|"
+    r"并且|而且|同时|，且|,且|且(?:要求|需要|偏好|使用|采用|支持|禁止|必须|会|将)",
+    re.IGNORECASE,
+)
+_SEMANTIC_COORDINATED_PREDICATE = re.compile(
+    r"\b(?:is|are|was|were|seems?|remains?)\s+(?:also\s+)?"
+    r"[a-z][a-z-]*(?:\s*,\s*[a-z][a-z-]*)*,?\s+"
+    r"(?:and|or|but|yet|as\s+well\s+as)\s+"
+    r"(?:also\s+)?[a-z][a-z-]*\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_SUBORDINATING_CLAIM = re.compile(
+    r"\b(?:whereas|although|though)\b|"
+    r"\bwhile\s+(?:the|a|an|this|that|these|those|it|they|we|i|he|she)\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_COORDINATED_MODIFIER = re.compile(
+    r"^(?:the\s+)?(?:user|i|we)\s+(?:prefers?|likes?|wants?|needs?|requires?|uses?)\s+"
+    r"[a-z][a-z-]*\s+(?:and|or)\s+[a-z][a-z-]*\s+[a-z][a-z-]*[.!?]?$",
+    re.IGNORECASE,
+)
+_SEMANTIC_NON_SEMANTIC_OUTPUT = re.compile(
+    r"隐藏推理|内部推理|工具原始输出|命令输出|标准输出|命令(?:执行|返回|结果)|"
+    r"\b(?:hidden reasoning|chain of thought|tool output|stdout|stderr|shell output|"
+    r"exit (?:code|status)|the command (?:printed|returned|output|failed|succeeded)|"
+    r"traceback|assertionerror|failed\s+tests?/\S+|error\s+\S+\.py|"
+    r"(?:passed|failed|skipped)\b[^\n]{0,60}\b(?:tests?|specs?)/\S+|"
+    r"(?:tests?|specs?)\b[^\n]{0,40}\b(?:passed|failed))\b|"
+    r"测试失败|断言失败",
+    re.IGNORECASE,
+)
 _SESSION_RETENTION_SCHEMA = """CREATE TABLE IF NOT EXISTS session_retention_policy (
     region_id TEXT PRIMARY KEY,
     retention_days INTEGER NOT NULL,
@@ -199,8 +704,31 @@ _CAPTURE_EVOLUTIONS_SCHEMA = """CREATE TABLE IF NOT EXISTS capture_evolutions (
     round_started_at TEXT NOT NULL DEFAULT '',
     round_received_earliest TEXT NOT NULL DEFAULT '',
     round_received_latest TEXT NOT NULL DEFAULT '',
+    semantic_status TEXT NOT NULL DEFAULT 'pending',
+    semantic_memory_ids TEXT NOT NULL DEFAULT '[]',
+    semantic_memory_refs TEXT NOT NULL DEFAULT '[]',
+    semantic_diagnostics TEXT NOT NULL DEFAULT '[]',
+    semantic_error TEXT NOT NULL DEFAULT '',
+    semantic_updated_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT
+)"""
+_SEMANTIC_PUBLICATION_SCHEMA = """CREATE TABLE IF NOT EXISTS semantic_memory_versions (
+    memory_id TEXT NOT NULL,
+    region_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    source_unit_ids TEXT NOT NULL DEFAULT '[]',
+    source_event_ids TEXT NOT NULL DEFAULT '[]',
+    source_unit_regions TEXT NOT NULL DEFAULT '[]',
+    source_references TEXT NOT NULL DEFAULT '[]',
+    source_region_ids TEXT NOT NULL DEFAULT '[]',
+    user_event_id TEXT NOT NULL DEFAULT '',
+    evidence_snippet TEXT NOT NULL DEFAULT '',
+    user_occurred_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (memory_id, session_id, turn_id)
 )"""
 _GOVERNANCE_AUDIT_SCHEMA = """CREATE TABLE IF NOT EXISTS governance_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -308,6 +836,8 @@ _MAINTENANCE_SCHEMA = (
     + ";\n"
     + _GOVERNANCE_AUDIT_SCHEMA
     + ";\n"
+    + _SEMANTIC_PUBLICATION_SCHEMA
+    + ";\n"
     + _PROMOTION_SCHEMA
     + ";"
 )
@@ -408,6 +938,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         embedding_dimension: int = _DEFAULT_EMBEDDING_DIM,
         graph: ModelEndpoint | None = None,
         promotion_classifier: PromotionClassifier | None = None,
+        semantic_extractor: SemanticExtractor | None = None,
+        semantic_executor: SemanticTaskExecutor | None = None,
         config_overrides: Mapping[str, Any] | None = None,
         regions: RegionRegistry | None = None,
     ) -> None:
@@ -417,8 +949,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._embedding = embedding
         self._embedding_dimension = embedding_dimension
         self._promotion_classifier = promotion_classifier
-        self._promotion_model = (
-            OpenAICompatibleClient(None, None, graph) if graph is not None else None
+        model_client = OpenAICompatibleClient(None, None, graph) if graph is not None else None
+        self._promotion_model = model_client
+        self._semantic_extractor = semantic_extractor or (
+            model_client.extract_semantic_memories if model_client is not None else None
         )
         self._config_overrides = config_overrides
         self._regions_registry = regions
@@ -453,6 +987,16 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._promotion_lock = threading.RLock()
         self._promotion_threads: dict[str, threading.Thread] = {}
         self._promotion_threads_lock = threading.Lock()
+        self._semantic_executor = semantic_executor or BoundedSemanticExecutor()
+        self._semantic_state_lock = threading.Lock()
+        self._semantic_active_versions: dict[str, str] = {}
+        self._semantic_requested_versions: dict[str, str] = {}
+        self._semantic_deferred_versions: dict[str, str] = {}
+        slot_callback = getattr(self._semantic_executor, "set_slot_callback", None)
+        if callable(slot_callback):
+            slot_callback(self._retry_deferred_semantic_distillations)
+        self._semantic_region_locks: dict[str, threading.RLock] = {}
+        self._semantic_region_locks_guard = threading.Lock()
         self._promotion_schema_ready = False
         self._browser_index_active_tokens: set[str] = set()
 
@@ -502,6 +1046,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     pass
                 self._retry_pending_browser_index(bundle, strict=False)
                 self._recover_promotion_outbox(bundle)
+                self._recover_semantic_distillations()
             except Exception as error:
                 self._promotion_schema_ready = False
                 self._bundle = None
@@ -586,6 +1131,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         await asyncio.to_thread(self._close)
 
     def _close(self) -> None:
+        self._wait_for_semantic_tasks()
         self._wait_for_promotion_threads()
         self._wait_for_scope_graph_updates()
         with self._lock:
@@ -1885,6 +2431,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     )
                 return _write_response(request, existing_id, status="existing")
             user_metadata = {
+                **dict(request.user_metadata or {}),
                 "memory_type": request.memory_type,
                 "source_references": list(request.source_references),
                 "request_actor": request.actor,
@@ -1907,6 +2454,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
             if existing_id is not None:
                 self._queue_scope_graph_update(bundle, scope)
+                self._schedule_semantic_for_capture(
+                    bundle,
+                    scope,
+                    region,
+                    request.turn_id,
+                )
                 return _capture_response(
                     request,
                     existing_id,
@@ -1979,7 +2532,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryKernelUnavailableError("mem2 runtime did not create a memory unit")
         unit = units[0]
         if isinstance(request, CreateMemoryRequest):
+            semantic_write = user_metadata.get("semantic_schema") == "semantic-distillation-v1"
             try:
+                if index_token is not None:
+                    self._update_browser_index_pending(index_token, [unit.id])
                 self._complete_idempotency(
                     _write_identity(request),
                     request.idempotency_key,
@@ -1987,6 +2543,21 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     unit.id,
                 )
             except Exception as error:
+                if semantic_write:
+                    if index_token is not None:
+                        self._complete_browser_index_pending(index_token)
+                    self._release_pending_idempotency(
+                        _write_identity(request),
+                        request.idempotency_key,
+                    )
+                elif index_token is not None:
+                    # The unit is already persisted, so keep the pending browser
+                    # index token with its unit id and the pending idempotency
+                    # record. Clearing the in-memory active marker lets a later
+                    # retry or a restart rebuild the formal list index without
+                    # duplicating the memory.
+                    with self._browser_index_lock:
+                        self._browser_index_active_tokens.discard(index_token)
                 raise MemoryKernelUnavailableError(
                     "memory was created but its idempotency completion is pending"
                 ) from error
@@ -2020,6 +2591,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryKernelUnavailableError(
                 "capture was stored but its idempotency completion is pending"
             ) from error
+        self._schedule_semantic_for_capture(
+            bundle,
+            scope,
+            region,
+            request.turn_id,
+        )
         self._queue_scope_graph_update(bundle, scope)
         return _capture_response(request, unit.id, region, scope, status="accepted")
 
@@ -2986,6 +3563,17 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         except Exception:
             self._complete_browser_index_pending(index_token)
             raise
+        metadata_patch: dict[str, object] = {
+            "governance_actor": request.actor,
+            "governance_source": request.source,
+            "operation_id": request.operation_id,
+            "previous_revision": request.expected_revision,
+            "governance_updated_at": governance_updated_at,
+            "logical_memory_id": logical_memory_id,
+        }
+        if request.actor != "semantic-distillation":
+            metadata_patch["semantic_owned"] = False
+            metadata_patch["semantic_manual_override"] = True
         try:
             updated = bundle.runtime.api.update(
                 unit.id,
@@ -2993,14 +3581,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 MemoryPatch(
                     content=request.content,
                     mode=mode,
-                    user_metadata={
-                        "governance_actor": request.actor,
-                        "governance_source": request.source,
-                        "operation_id": request.operation_id,
-                        "previous_revision": request.expected_revision,
-                        "governance_updated_at": governance_updated_at,
-                        "logical_memory_id": logical_memory_id,
-                    },
+                    user_metadata=metadata_patch,
                 ),
                 security=_security_for(scope),
             )
@@ -3014,6 +3595,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 detail={"previous_unit_id": unit.id},
             )
             raise
+        if request.actor != "semantic-distillation":
+            self._clear_manual_override_semantic_metadata(bundle, scope, updated)
         self._persist_unit_logical_memory_id(
             bundle,
             scope,
@@ -4840,6 +5423,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         session_id = (
             _normalize_session_id(request.session_id) if request.session_id is not None else None
         )
+        self._enqueue_pending_semantic_records(session_id=session_id, retry_failed=True)
         created = 0
         all_scopes = [
             scope
@@ -4906,6 +5490,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     received_earliest,
                     received_latest,
                 )
+                self._enqueue_semantic_distillation(evolve_key, retry_failed=True)
                 if status == "completed" and memory_id is not None:
                     continue
                 try:
@@ -4924,6 +5509,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 except Exception as error:
                     self._fail_evolution(evolve_key, _evolution_failure_text(error))
                     raise
+        self._enqueue_pending_semantic_records(session_id=session_id, retry_failed=True)
         if bundle.graph_store is not None:
             with self._graph_write_lock:
                 graph_scopes = list(all_scopes)
@@ -4946,6 +5532,1469 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         region_id=self._region_id_for_scope(scope),
                     )
         return {"queued": created}
+
+    def _semantic_enabled(self) -> bool:
+        return self._semantic_extractor is not None
+
+    def _schedule_semantic_for_capture(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        region: MemoryRegion,
+        turn_id: str,
+    ) -> None:
+        """Queue semantic distillation without putting a model call in the capture budget."""
+        if not self._semantic_enabled():
+            return
+        try:
+            units = self._semantic_round_capture_units(
+                bundle,
+                session_id=scope.session,
+                region_id=region.region_id,
+                turn_id=turn_id,
+            )
+            if not _capture_turn_is_complete(units):
+                return
+            source_ids = [unit.id for unit in units]
+            started_at, received_earliest, received_latest = _capture_units_timeline(units)
+            evolve_key = _stable_evolve_key(scope, region.region_id, turn_id)
+            self._reserve_evolution(
+                evolve_key,
+                scope.session,
+                turn_id,
+                region.region_id,
+                _source_fingerprint(source_ids),
+                source_ids,
+                started_at,
+                received_earliest,
+                received_latest,
+            )
+            self._enqueue_semantic_distillation(evolve_key, retry_failed=True)
+        except Exception as error:
+            # Capture remains fail-open. A later consolidate/recovery retries the task.
+            with suppress(Exception):
+                evolve_key = _stable_evolve_key(scope, region.region_id, turn_id)
+                record = self._semantic_record(evolve_key)
+                if record is not None:
+                    self._set_semantic_failed(
+                        evolve_key,
+                        _evolution_failure_text(error),
+                        expected_fingerprint=str(record.get("source_fingerprint", "")),
+                    )
+
+    def _semantic_round_capture_units(
+        self,
+        bundle: _RuntimeBundle,
+        *,
+        session_id: str,
+        region_id: str,
+        turn_id: str,
+    ) -> list[MemoryUnit]:
+        units: list[MemoryUnit] = []
+        for candidate_scope in bundle.kv_store.scopes():
+            if candidate_scope.session != session_id:
+                continue
+            for unit in self._units_in_scope(bundle, candidate_scope):
+                if unit.lifecycle.value != "active" or not _is_capture_unit(unit):
+                    continue
+                if _metadata_text(unit, "session_id") != session_id:
+                    continue
+                if _metadata_text(unit, "region_id") != region_id:
+                    continue
+                if _metadata_text(unit, "turn_id") != turn_id:
+                    continue
+                units.append(unit)
+        return sorted(
+            units,
+            key=lambda unit: (
+                _event_order(_metadata_text(unit, "event_kind")),
+                _metadata_text(unit, "occurred_at"),
+                unit.id,
+            ),
+        )
+
+    def _enqueue_pending_semantic_records(
+        self,
+        *,
+        session_id: str | None,
+        retry_failed: bool,
+    ) -> None:
+        if not self._semantic_enabled():
+            return
+        statuses = ["pending", "not_requested"]
+        if retry_failed:
+            statuses.append("failed")
+        placeholders = ", ".join("?" for _ in statuses)
+        where = f"semantic_status IN ({placeholders})"
+        values: list[object] = list(statuses)
+        if session_id is not None:
+            where += " AND session_id = ?"
+            values.append(session_id)
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                f"SELECT evolve_key FROM capture_evolutions WHERE {where}",
+                values,
+            ).fetchall()
+        for row in rows:
+            self._enqueue_semantic_distillation(str(row[0]), retry_failed=retry_failed)
+
+    def _recover_semantic_distillations(self) -> None:
+        self._enqueue_pending_semantic_records(session_id=None, retry_failed=True)
+
+    def _retry_deferred_semantic_distillations(self) -> None:
+        with self._semantic_state_lock:
+            evolve_keys = list(self._semantic_deferred_versions)
+            self._semantic_deferred_versions.clear()
+        for evolve_key in evolve_keys:
+            self._enqueue_semantic_distillation(evolve_key, retry_failed=True)
+
+    def _enqueue_semantic_distillation(
+        self,
+        evolve_key: str,
+        *,
+        retry_failed: bool,
+    ) -> None:
+        if not self._semantic_enabled():
+            return
+        record = self._semantic_record(evolve_key)
+        if record is None:
+            return
+        status = str(record.get("semantic_status", ""))
+        if status in {"completed", "skipped"}:
+            return
+        if status == "failed" and not retry_failed:
+            return
+        version = str(record.get("source_fingerprint", ""))
+        with self._semantic_state_lock:
+            if evolve_key in self._semantic_active_versions:
+                self._semantic_requested_versions[evolve_key] = version
+                return
+            self._semantic_active_versions[evolve_key] = version
+            self._semantic_requested_versions[evolve_key] = version
+        submission_error: Exception | None
+        try:
+            submitted = self._semantic_executor.submit(
+                evolve_key,
+                str(record["region_id"]),
+                lambda: self._run_semantic_distillation(evolve_key),
+            )
+        except Exception as error:
+            submitted = False
+            submission_error = error
+        else:
+            submission_error = None
+        if submitted:
+            return
+        with self._semantic_state_lock:
+            self._semantic_active_versions.pop(evolve_key, None)
+            self._semantic_requested_versions.pop(evolve_key, None)
+            if submission_error is None:
+                self._semantic_deferred_versions[evolve_key] = version
+        with suppress(Exception):
+            self._retire_stale_semantic_versions(
+                evolve_key,
+                session_id=str(record["session_id"]),
+                turn_id=str(record["turn_id"]),
+                expected_fingerprint=version,
+            )
+        with suppress(Exception):
+            detail = (
+                "semantic task queue is full"
+                if submission_error is None
+                else _evolution_failure_text(submission_error)
+            )
+            self._set_semantic_failed(evolve_key, detail, expected_fingerprint=version)
+
+    def _wait_for_semantic_tasks(self) -> None:
+        self._semantic_executor.drain()
+        self._semantic_executor.close()
+
+    def _run_semantic_distillation(self, evolve_key: str) -> None:
+        record = self._semantic_record(evolve_key)
+        expected_fingerprint = (
+            "" if record is None else str(record.get("source_fingerprint", ""))
+        )
+        try:
+            self._distill_semantic_turn(
+                evolve_key,
+                expected_fingerprint=expected_fingerprint,
+            )
+        except Exception as error:
+            if record is not None:
+                with suppress(Exception):
+                    self._cleanup_semantic_version(
+                        session_id=str(record["session_id"]),
+                        turn_id=str(record["turn_id"]),
+                        source_fingerprint=expected_fingerprint,
+                    )
+            with suppress(Exception):
+                if self._semantic_version_is_current(evolve_key, expected_fingerprint):
+                    self._set_semantic_failed(
+                        evolve_key,
+                        _evolution_failure_text(error),
+                        expected_fingerprint=expected_fingerprint,
+                    )
+        finally:
+            with self._semantic_state_lock:
+                active = self._semantic_active_versions.pop(evolve_key, None)
+                requested = self._semantic_requested_versions.pop(evolve_key, None)
+            latest_record = self._semantic_record(evolve_key)
+            latest_fingerprint = (
+                "" if latest_record is None else str(latest_record.get("source_fingerprint", ""))
+            )
+            should_retry = bool(
+                latest_fingerprint
+                and (
+                    latest_fingerprint != expected_fingerprint
+                    or (
+                        requested is not None
+                        and active is not None
+                        and requested != active
+                    )
+                )
+            )
+        if should_retry:
+            self._enqueue_semantic_distillation(evolve_key, retry_failed=True)
+
+    def _distill_semantic_turn(
+        self,
+        evolve_key: str,
+        *,
+        expected_fingerprint: str,
+    ) -> None:
+        bundle = self._require_bundle()
+        record = self._semantic_record(evolve_key)
+        if record is None:
+            return
+        if (
+            record.get("semantic_status") in {"completed", "skipped"}
+            and str(record.get("source_fingerprint", "")) == expected_fingerprint
+        ):
+            return
+        session_id = str(record["session_id"])
+        turn_id = str(record["turn_id"])
+        region_id = str(record["region_id"])
+        units = self._semantic_round_capture_units(
+            bundle,
+            session_id=session_id,
+            region_id=region_id,
+            turn_id=turn_id,
+        )
+        if not _capture_turn_is_complete(units):
+            # An archived or not-yet-complete turn stays pending rather than inventing facts.
+            return
+        source_ids = [unit.id for unit in units]
+        unit_fingerprint = _source_fingerprint(source_ids)
+        if unit_fingerprint != expected_fingerprint:
+            return
+        started_at, received_earliest, received_latest = _capture_units_timeline(units)
+        status, _ = self._reserve_evolution(
+            evolve_key,
+            session_id,
+            turn_id,
+            region_id,
+            unit_fingerprint,
+            source_ids,
+            started_at,
+            received_earliest,
+            received_latest,
+        )
+        del status
+        record = self._semantic_record(evolve_key)
+        if record is None:
+            return
+        if str(record.get("source_fingerprint", "")) != expected_fingerprint:
+            return
+        self._set_semantic_pending(evolve_key, expected_fingerprint=expected_fingerprint)
+        self._cleanup_semantic_version(
+            session_id=session_id,
+            turn_id=turn_id,
+            source_fingerprint=expected_fingerprint,
+        )
+        # A superseding assistant version makes older published versions stale
+        # before the model runs. This keeps failure paths from exposing a
+        # conclusion that no longer belongs to the current turn fingerprint.
+        self._retire_stale_semantic_versions(
+            evolve_key,
+            session_id=session_id,
+            turn_id=turn_id,
+            expected_fingerprint=expected_fingerprint,
+        )
+        source_region = self._regions.require_region(region_id)
+        region_hints = [
+            {"hint": "source", "region_id": source_region.region_id},
+            {"hint": "user", "region_id": "user"},
+            *[
+                {"hint": region.region_id, "region_id": region.region_id, "name": region.name}
+                for region in self._regions.list_regions()
+                if region.kind == "topic"
+            ],
+        ]
+        user_units = [
+            unit for unit in units if _metadata_text(unit, "event_kind") == "user"
+        ]
+        assistant_units = [
+            unit for unit in units if _metadata_text(unit, "event_kind") == "assistant"
+        ]
+        context: dict[str, object] = {
+            "schema": "semantic-distillation-v1",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "source_region": {
+                "region_id": source_region.region_id,
+                "kind": source_region.kind,
+                "name": source_region.name,
+            },
+            "region_hints": region_hints,
+            "messages": [
+                {
+                    "role": _metadata_text(unit, "event_kind"),
+                    "event_id": _metadata_text(unit, "event_id"),
+                    "content": unit.content,
+                    "occurred_at": _metadata_text(unit, "occurred_at"),
+                    "final_assistant": unit.id == assistant_units[-1].id,
+                }
+                for unit in units
+            ],
+        }
+        extractor = self._semantic_extractor
+        if extractor is None:
+            self._set_semantic_failed(
+                evolve_key,
+                "semantic distillation is not configured",
+                expected_fingerprint=expected_fingerprint,
+            )
+            return
+        results = extractor(context)
+        if not isinstance(results, list):
+            raise MemoryKernelUnavailableError("semantic extractor returned a non-list result")
+        if len(results) > _SEMANTIC_MAX_RESULTS:
+            raise MemoryKernelUnavailableError("semantic extractor returned too many results")
+        if not self._semantic_source_is_current(
+            bundle,
+            evolve_key,
+            expected_fingerprint=expected_fingerprint,
+            expected_unit_ids=source_ids,
+        ):
+            return
+        self._retire_stale_semantic_versions(
+            evolve_key,
+            session_id=session_id,
+            turn_id=turn_id,
+            expected_fingerprint=expected_fingerprint,
+        )
+        if not self._semantic_source_is_current(
+            bundle,
+            evolve_key,
+            expected_fingerprint=expected_fingerprint,
+            expected_unit_ids=source_ids,
+        ):
+            return
+        if not results:
+            self._set_semantic_skipped(
+                evolve_key,
+                [{"status": "skipped", "reason": "model returned no semantic memories"}],
+                expected_fingerprint=expected_fingerprint,
+            )
+            return
+
+        memory_ids: list[str] = []
+        memory_refs: list[dict[str, object]] = []
+        diagnostics: list[dict[str, object]] = []
+        source_event_ids = [_metadata_text(unit, "event_id") for unit in units]
+        source_unit_regions = [
+            {"unit_id": unit.id, "region_id": region_id} for unit in units
+        ]
+        for index, raw_result in enumerate(results):
+            validated, reason = self._validate_semantic_result(
+                raw_result,
+                source_region=source_region,
+                user_units=user_units,
+            )
+            if validated is None:
+                diagnostics.append(
+                    {
+                        "index": index,
+                        "status": "skipped",
+                        "reason": reason,
+                    }
+                )
+                continue
+            target_region = validated["target_region"]
+            memory_type = validated["memory_type"]
+            content = validated["content"]
+            subject = validated["claim_subject"]
+            value = validated["claim_value"]
+            evidence_snippet = validated["evidence_snippet"]
+            user_event_id = validated["user_event_id"]
+            semantic_key = _semantic_key(
+                region_id=region_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                user_event_id=user_event_id,
+                evidence_snippet=evidence_snippet,
+                memory_type=memory_type,
+                target_region_id=target_region.region_id,
+                content=content,
+                claim_subject=subject,
+                claim_value=value,
+            )
+            if not self._semantic_source_is_current(
+                bundle,
+                evolve_key,
+                expected_fingerprint=expected_fingerprint,
+                expected_unit_ids=source_ids,
+            ):
+                return
+            with self._semantic_region_lock(target_region.region_id):
+                if not self._semantic_source_is_current(
+                    bundle,
+                    evolve_key,
+                    expected_fingerprint=expected_fingerprint,
+                    expected_unit_ids=source_ids,
+                ):
+                    return
+                existing = self._find_semantic_memory(
+                    bundle,
+                    target_region,
+                    semantic_key=semantic_key,
+                    content=content,
+                    memory_type=memory_type,
+                    claim_subject=subject,
+                    claim_value=value,
+                    claims_explicit=validated["claims_explicit"],
+                )
+                if existing is not None:
+                    memory_id = existing.id
+                    self._merge_semantic_sources(
+                        bundle,
+                        target_region,
+                        existing,
+                        semantic_key=semantic_key,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        source_region=source_region,
+                        source_ids=source_ids,
+                        source_event_ids=source_event_ids,
+                        source_unit_regions=source_unit_regions,
+                        source_fingerprint=expected_fingerprint,
+                        user_event_id=user_event_id,
+                        evidence_snippet=evidence_snippet,
+                        user_occurred_at=validated["user_occurred_at"],
+                    )
+                    memory_ids.append(memory_id)
+                    memory_refs.append(
+                        {
+                            "memory_id": memory_id,
+                            "region_id": target_region.region_id,
+                            "user_event_id": user_event_id,
+                            "evidence_snippet": evidence_snippet,
+                            "source_fingerprint": expected_fingerprint,
+                            "reused": True,
+                        }
+                    )
+                    diagnostics.append(
+                        {
+                            "index": index,
+                            "status": "reused",
+                            "memory_id": memory_id,
+                            "reason": "equivalent semantic memory already exists",
+                        }
+                    )
+                    continue
+                conflict = self._semantic_conflict(
+                    bundle,
+                    target_region,
+                    subject=subject,
+                    value=value,
+                )
+                if conflict is not None:
+                    diagnostics.append(
+                        {
+                            "index": index,
+                            "status": "skipped",
+                            "reason": f"semantic claim conflicts with memory {conflict.id}",
+                        }
+                    )
+                    continue
+                request = CreateMemoryRequest(
+                    library_id=target_region.region_id,
+                    region_id=target_region.region_id,
+                    content=content,
+                    memory_type=memory_type,
+                    source_references=tuple(
+                        [
+                            *(
+                                f"event:{event_id}"
+                                for event_id in source_event_ids
+                                if event_id
+                            ),
+                            f"session:{session_id}",
+                            f"turn:{turn_id}",
+                        ]
+                    ),
+                    actor="semantic-distillation",
+                    idempotency_key=f"semantic:{semantic_key}:{expected_fingerprint}",
+                    user_metadata={
+                        "semantic_schema": "semantic-distillation-v1",
+                        "semantic_owned": True,
+                        "semantic_key": semantic_key,
+                        "semantic_source_fingerprint": expected_fingerprint,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "source_region_id": region_id,
+                        "source_region_kind": source_region.kind,
+                        "source_region_ids": [region_id],
+                        "source_unit_ids": source_ids,
+                        "source_event_ids": source_event_ids,
+                        "source_unit_regions": json.dumps(
+                            source_unit_regions,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        "provenance": source_ids,
+                        "confidence": validated["confidence"],
+                        "region_hint": validated["region_hint"],
+                        "user_event_id": user_event_id,
+                        "evidence_snippet": evidence_snippet,
+                        "user_occurred_at": validated["user_occurred_at"],
+                        "user_event_ids": [user_event_id],
+                        "evidence_snippets": [evidence_snippet],
+                        "claim_subject": subject,
+                        "claim_value": value,
+                    },
+                )
+                response = self._write(request)
+                memory_id = str(response.get("memory_id") or response.get("id") or "")
+                if not memory_id:
+                    raise MemoryKernelUnavailableError(
+                        "semantic memory write returned no memory identifier"
+                    )
+                self._record_semantic_version(
+                    memory_id,
+                    region_id=target_region.region_id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    source_fingerprint=expected_fingerprint,
+                    source_unit_ids=source_ids,
+                    source_event_ids=source_event_ids,
+                    source_unit_regions=source_unit_regions,
+                    source_references=[
+                        *(
+                            f"event:{event_id}"
+                            for event_id in source_event_ids
+                            if event_id
+                        ),
+                        f"session:{session_id}",
+                        f"turn:{turn_id}",
+                    ],
+                    source_region_ids=[region_id, target_region.region_id],
+                    user_event_id=user_event_id,
+                    evidence_snippet=evidence_snippet,
+                    user_occurred_at=validated["user_occurred_at"],
+                )
+            memory_ids.append(memory_id)
+            memory_refs.append(
+                {
+                    "memory_id": memory_id,
+                    "region_id": target_region.region_id,
+                    "user_event_id": user_event_id,
+                    "evidence_snippet": evidence_snippet,
+                    "source_fingerprint": expected_fingerprint,
+                    "reused": False,
+                }
+            )
+            diagnostics.append(
+                {
+                    "index": index,
+                    "status": "published",
+                    "memory_id": memory_id,
+                }
+            )
+        if not self._semantic_source_is_current(
+            bundle,
+            evolve_key,
+            expected_fingerprint=expected_fingerprint,
+            expected_unit_ids=source_ids,
+        ):
+            return
+        if memory_ids:
+            self._set_semantic_completed(
+                evolve_key,
+                memory_ids,
+                memory_refs,
+                diagnostics,
+                expected_fingerprint=expected_fingerprint,
+            )
+        else:
+            self._set_semantic_skipped(
+                evolve_key,
+                diagnostics,
+                expected_fingerprint=expected_fingerprint,
+            )
+
+    def _validate_semantic_result(
+        self,
+        raw_result: object,
+        *,
+        source_region: MemoryRegion,
+        user_units: list[MemoryUnit],
+    ) -> tuple[_SemanticValidation | None, str]:
+        if not isinstance(raw_result, Mapping):
+            return None, "semantic result must be an object"
+        content = str(raw_result.get("content") or raw_result.get("body") or "").strip()
+        if not content:
+            return None, "semantic content is missing"
+        if len(content) > 65_535:
+            return None, "semantic content exceeds the memory limit"
+        if not _semantic_content_is_atomic(content):
+            return None, "semantic content contains more than one atomic claim"
+        memory_type = str(raw_result.get("memory_type") or "").strip()
+        if memory_type not in FORMAL_MEMORY_TYPES:
+            return None, "memory_type is not an allowed formal semantic type"
+        confidence = raw_result.get("confidence")
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not _SEMANTIC_MIN_CONFIDENCE <= float(confidence) <= 1.0
+        ):
+            return None, "confidence must be between 0.90 and 1.0"
+        region_hint = str(raw_result.get("region_hint") or "").strip()
+        if not region_hint:
+            return None, "region_hint is missing"
+        user_event_id = str(raw_result.get("user_event_id") or "").strip()
+        evidence_snippet = str(raw_result.get("evidence_snippet") or "").strip()
+        if not user_event_id or not evidence_snippet:
+            return None, "user evidence event and snippet are required"
+        user_by_event = {
+            _metadata_text(unit, "event_id"): unit
+            for unit in user_units
+            if _metadata_text(unit, "event_id")
+        }
+        user_unit = user_by_event.get(user_event_id)
+        if user_unit is None:
+            return None, "user_event_id does not identify a user message in this turn"
+        if _semantic_user_event_is_pure_question(user_unit.content):
+            return None, "the user event is a question rather than a durable statement"
+        if _semantic_user_event_is_pure_request(user_unit.content):
+            return None, "the user event is a request rather than a durable statement"
+        if _semantic_text_is_question(content) or _semantic_text_is_question(evidence_snippet):
+            return None, "semantic content is a question rather than a durable claim"
+        if _semantic_text_is_request(content) or _semantic_text_is_request(evidence_snippet):
+            return None, "semantic content is a request rather than a durable claim"
+        if evidence_snippet not in user_unit.content:
+            return None, "evidence_snippet is not an exact excerpt of the user event"
+        evidence_clause = _semantic_clause_containing_evidence(user_unit.content, evidence_snippet)
+        if _SEMANTIC_NON_DURABLE_INTENT.search(evidence_clause):
+            return None, "evidence describes a non-durable intention rather than a durable claim"
+        if _semantic_text_is_imperative(evidence_clause):
+            return None, "evidence describes an imperative request rather than a durable claim"
+        if _semantic_text_is_imperative(content):
+            return None, "semantic content is an imperative request"
+        if _SEMANTIC_DEICTIC_REFERENCE.search(content):
+            return None, "semantic content depends on dialogue references"
+        if (
+            _semantic_has_unbound_pronoun(content)
+            or _SEMANTIC_LEADING_DEMONSTRATIVE.search(content)
+        ):
+            return None, "semantic content contains an unbound pronoun"
+        if (
+            _SEMANTIC_TRANSIENT.search(content)
+            or _SEMANTIC_TRANSIENT.search(evidence_snippet)
+            or _SEMANTIC_NON_SEMANTIC_OUTPUT.search(content)
+            or _SEMANTIC_NON_SEMANTIC_OUTPUT.search(evidence_snippet)
+            or _SEMANTIC_FUTURE_ACTION.search(content)
+            or _SEMANTIC_FUTURE_ACTION.search(evidence_snippet)
+        ):
+            return None, "semantic content is transient or non-semantic output"
+        if inspect_sensitive_text(content) is not None or inspect_sensitive_text(
+            evidence_snippet
+        ) is not None or inspect_sensitive_text(user_unit.content) is not None:
+            return None, "semantic content failed the sensitive-content check"
+        durability = str(raw_result.get("durability") or "").strip().casefold()
+        durable_values = {
+            "durable",
+            "durable_statement",
+            "stable",
+            "stable_fact",
+        }
+        if durability and durability not in durable_values:
+            return None, "semantic result is not marked durable"
+        if _SEMANTIC_ACTION_WITHOUT_DURABILITY.search(content):
+            return None, "semantic result requires an explicit durable classification"
+        if not durability:
+            return None, "semantic result requires an explicit durable classification"
+        raw_subject = str(raw_result.get("claim_subject") or "").strip()
+        raw_value = str(raw_result.get("claim_value") or "").strip()
+        claims_explicit = bool(
+            _normalize_promotion_text(raw_subject)
+            and _normalize_promotion_claim_value(raw_value)
+        )
+        if not _semantic_evidence_supports_content(
+            content,
+            evidence_snippet,
+            claim_value=raw_value if claims_explicit else "",
+            context=evidence_clause,
+        ):
+            return None, "evidence_snippet does not support the semantic content"
+        target_region = self._semantic_target_region(region_hint, source_region)
+        if target_region is None:
+            return None, "region_hint does not identify the source, user, or an existing topic"
+        claim_subject, claim_value = _semantic_claim_fields(
+            raw_subject,
+            raw_value,
+            content,
+        )
+        if not claim_subject or not claim_value:
+            return None, "semantic claim identity cannot be derived for conflict checks"
+        return (
+            {
+                "content": content,
+                "memory_type": memory_type,
+                "confidence": float(confidence),
+                "region_hint": region_hint,
+                "target_region": target_region,
+                "user_event_id": user_event_id,
+                "evidence_snippet": evidence_snippet,
+                "user_occurred_at": _metadata_text(user_unit, "occurred_at"),
+                "claim_subject": claim_subject,
+                "claim_value": claim_value,
+                "claims_explicit": claims_explicit,
+                "durability": durability,
+            },
+            "",
+        )
+
+    def _semantic_target_region(
+        self,
+        region_hint: str,
+        source_region: MemoryRegion,
+    ) -> MemoryRegion | None:
+        if region_hint in {"source", source_region.region_id}:
+            return source_region
+        if region_hint == "user":
+            return self._regions.ensure_user_region()
+        try:
+            target = self._regions.require_region(region_hint)
+        except RegionError:
+            return None
+        return target if target.kind == "topic" else None
+
+    @contextmanager
+    def _semantic_region_lock(self, region_id: str) -> Iterator[None]:
+        with self._semantic_region_locks_guard:
+            lock = self._semantic_region_locks.get(region_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._semantic_region_locks[region_id] = lock
+        with lock:
+            yield
+
+    def _semantic_version_is_current(
+        self,
+        evolve_key: str,
+        expected_fingerprint: str,
+    ) -> bool:
+        if not expected_fingerprint:
+            return False
+        try:
+            bundle = self._require_bundle()
+            record = self._semantic_record(evolve_key)
+        except Exception:
+            return False
+        if record is None or str(record.get("source_fingerprint", "")) != expected_fingerprint:
+            return False
+        try:
+            units = self._semantic_round_capture_units(
+                bundle,
+                session_id=str(record["session_id"]),
+                region_id=str(record["region_id"]),
+                turn_id=str(record["turn_id"]),
+            )
+        except Exception:
+            return False
+        return _source_fingerprint([unit.id for unit in units]) == expected_fingerprint
+
+    def _semantic_source_is_current(
+        self,
+        bundle: _RuntimeBundle,
+        evolve_key: str,
+        *,
+        expected_fingerprint: str,
+        expected_unit_ids: list[str],
+    ) -> bool:
+        record = self._semantic_record(evolve_key)
+        if record is None or str(record.get("source_fingerprint", "")) != expected_fingerprint:
+            return False
+        units = self._semantic_round_capture_units(
+            bundle,
+            session_id=str(record["session_id"]),
+            region_id=str(record["region_id"]),
+            turn_id=str(record["turn_id"]),
+        )
+        current_ids = [unit.id for unit in units]
+        return (
+            current_ids == expected_unit_ids
+            and _source_fingerprint(current_ids) == expected_fingerprint
+        )
+
+    def _semantic_conflict(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        *,
+        subject: str,
+        value: str,
+    ) -> MemoryUnit | None:
+        if not subject or not value:
+            return None
+        target_scope = _scope_for_region(region)
+        normalized_subject = _normalize_promotion_text(subject)
+        normalized_value = _normalize_promotion_claim_value(value)
+        for unit in self._units_in_scope(bundle, target_scope):
+            if unit.lifecycle.value != "active" or _metadata_text(unit, "memory_type") not in (
+                FORMAL_MEMORY_TYPES
+            ):
+                continue
+            existing_subject = _metadata_text(unit, "claim_subject") or _metadata_text(
+                unit, "semantic_claim_subject"
+            )
+            existing_value = _metadata_text(unit, "claim_value") or _metadata_text(
+                unit, "semantic_claim_value"
+            )
+            if not existing_subject or not existing_value:
+                existing_subject, existing_value = _promotion_claim_signature(unit.content)
+            if not existing_subject or not existing_value:
+                existing_subject, existing_value = _semantic_claim_fields("", "", unit.content)
+            existing_subject = _normalize_promotion_text(existing_subject)
+            existing_value = _normalize_promotion_claim_value(existing_value)
+            if (
+                existing_subject
+                and existing_value
+                and _promotion_subjects_compatible(existing_subject, normalized_subject)
+                and _promotion_values_conflict(
+                    normalized_subject,
+                    (existing_value, normalized_value),
+                )
+            ):
+                return unit
+        return None
+
+    def _find_semantic_memory(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        *,
+        semantic_key: str,
+        content: str,
+        memory_type: str,
+        claim_subject: str,
+        claim_value: str,
+        claims_explicit: bool,
+    ) -> MemoryUnit | None:
+        target_scope = _scope_for_region(region)
+        normalized_subject = _normalize_promotion_text(claim_subject)
+        normalized_value = _normalize_promotion_claim_value(claim_value)
+        normalized_content = _normalize_promotion_text(content)
+        for unit in self._units_in_scope(bundle, target_scope):
+            if unit.lifecycle.value != "active":
+                continue
+            if _metadata_text(unit, "semantic_key") == semantic_key:
+                return unit
+            if (
+                _metadata_text(unit, "memory_type") == memory_type
+                and _normalize_promotion_text(unit.content) == normalized_content
+            ):
+                return unit
+            if not claims_explicit or not normalized_subject or not normalized_value:
+                continue
+            existing_subject = _metadata_text(unit, "claim_subject")
+            existing_value = _metadata_text(unit, "claim_value")
+            if (
+                _normalize_promotion_text(existing_subject) == normalized_subject
+                and _normalize_promotion_claim_value(existing_value) == normalized_value
+            ):
+                return unit
+        return None
+
+    def _record_semantic_version(
+        self,
+        memory_id: str,
+        *,
+        region_id: str,
+        session_id: str,
+        turn_id: str,
+        source_fingerprint: str,
+        source_unit_ids: list[str],
+        source_event_ids: list[str],
+        source_unit_regions: list[dict[str, object]],
+        source_references: list[str],
+        source_region_ids: list[str],
+        user_event_id: str,
+        evidence_snippet: str,
+        user_occurred_at: str,
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """INSERT INTO semantic_memory_versions
+                   (memory_id, region_id, session_id, turn_id, source_fingerprint,
+                    source_unit_ids, source_event_ids, source_unit_regions,
+                    source_references, source_region_ids, user_event_id,
+                    evidence_snippet, user_occurred_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(memory_id, session_id, turn_id) DO UPDATE SET
+                     region_id = excluded.region_id,
+                     source_fingerprint = excluded.source_fingerprint,
+                     source_unit_ids = excluded.source_unit_ids,
+                     source_event_ids = excluded.source_event_ids,
+                     source_unit_regions = excluded.source_unit_regions,
+                     source_references = excluded.source_references,
+                     source_region_ids = excluded.source_region_ids,
+                     user_event_id = excluded.user_event_id,
+                     evidence_snippet = excluded.evidence_snippet,
+                     user_occurred_at = excluded.user_occurred_at,
+                     updated_at = excluded.updated_at""",
+                (
+                    memory_id,
+                    region_id,
+                    session_id,
+                    turn_id,
+                    source_fingerprint,
+                    json.dumps(source_unit_ids, ensure_ascii=False),
+                    json.dumps(source_event_ids, ensure_ascii=False),
+                    json.dumps(source_unit_regions, ensure_ascii=False),
+                    json.dumps(source_references, ensure_ascii=False),
+                    json.dumps(source_region_ids, ensure_ascii=False),
+                    user_event_id,
+                    evidence_snippet,
+                    user_occurred_at,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def _semantic_versions_for_memory(self, memory_id: str) -> list[dict[str, object]]:
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                """SELECT session_id, turn_id, source_fingerprint, source_unit_ids,
+                          source_event_ids, source_unit_regions, source_references,
+                          source_region_ids, user_event_id, evidence_snippet,
+                          user_occurred_at, region_id
+                   FROM semantic_memory_versions WHERE memory_id = ?
+                   ORDER BY updated_at, session_id, turn_id""",
+                (memory_id,),
+            ).fetchall()
+        return [
+            {
+                "session_id": str(row[0]),
+                "turn_id": str(row[1]),
+                "source_fingerprint": str(row[2]),
+                "source_unit_ids": _json_string_list(row[3]),
+                "source_event_ids": _json_string_list(row[4]),
+                "source_unit_regions": _json_object_list(row[5]),
+                "source_references": _json_string_list(row[6]),
+                "source_region_ids": _json_string_list(row[7]),
+                "user_event_id": str(row[8]),
+                "evidence_snippet": str(row[9]),
+                "user_occurred_at": str(row[10]),
+                "region_id": str(row[11]),
+            }
+            for row in rows
+        ]
+
+    def _rebuild_semantic_metadata(
+        self,
+        unit: MemoryUnit,
+        versions: list[dict[str, object]],
+    ) -> None:
+        metadata = dict(unit.user_metadata)
+        latest = versions[-1]
+        source_ids: list[str] = []
+        source_event_ids: list[str] = []
+        source_unit_regions: list[dict[str, object]] = []
+        source_references: list[str] = []
+        source_region_ids: list[str] = []
+        for version in versions:
+            source_ids.extend(_json_string_list(version.get("source_unit_ids")))
+            source_event_ids.extend(_json_string_list(version.get("source_event_ids")))
+            source_unit_regions.extend(_json_object_list(version.get("source_unit_regions")))
+            source_references.extend(_json_string_list(version.get("source_references")))
+            source_region_ids.extend(_json_string_list(version.get("source_region_ids")))
+        metadata["semantic_source_fingerprint"] = str(
+            latest.get("source_fingerprint", "")
+        )
+        metadata["session_id"] = str(latest.get("session_id", ""))
+        metadata["turn_id"] = str(latest.get("turn_id", ""))
+        metadata["source_unit_ids"] = list(dict.fromkeys(source_ids))
+        metadata["source_event_ids"] = list(dict.fromkeys(source_event_ids))
+        metadata["source_unit_regions"] = json.dumps(
+            _unique_object_dicts(source_unit_regions),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        metadata["source_references"] = list(dict.fromkeys(source_references))
+        metadata["source_region_ids"] = list(dict.fromkeys(source_region_ids))
+        metadata["provenance"] = list(metadata["source_unit_ids"])
+        metadata["user_event_ids"] = [
+            str(version["user_event_id"])
+            for version in versions
+            if str(version.get("user_event_id", "")).strip()
+        ]
+        metadata["evidence_snippets"] = [
+            str(version["evidence_snippet"])
+            for version in versions
+            if str(version.get("evidence_snippet", "")).strip()
+        ]
+        first_ref = next(
+            (
+                version
+                for version in versions
+                if str(version.get("user_event_id", "")).strip()
+                and str(version.get("evidence_snippet", "")).strip()
+            ),
+            None,
+        )
+        if first_ref is not None:
+            metadata["user_event_id"] = str(first_ref["user_event_id"])
+            metadata["evidence_snippet"] = str(first_ref["evidence_snippet"])
+            metadata["user_occurred_at"] = str(first_ref.get("user_occurred_at", ""))
+        unit.user_metadata.clear()
+        unit.user_metadata.update(metadata)
+        unit.provenance = list(metadata["source_unit_ids"])
+
+    def _retire_stale_semantic_versions(
+        self,
+        evolve_key: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        expected_fingerprint: str,
+    ) -> None:
+        bundle = self._require_bundle()
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT memory_id, region_id
+                   FROM semantic_memory_versions
+                   WHERE session_id = ? AND turn_id = ?
+                     AND source_fingerprint != ?""",
+                (session_id, turn_id, expected_fingerprint),
+            ).fetchall()
+        for memory_id, stored_region_id in ((str(row[0]), str(row[1])) for row in rows):
+            region = self._regions.require_region(stored_region_id)
+            target_scope = _scope_for_region(region)
+            with self._semantic_region_lock(region.region_id):
+                current = load_units(bundle.kv_store, target_scope, [memory_id])
+                if not current or current[0].lifecycle.value != "active":
+                    continue
+                stale = current[0]
+                revision = _unit_revision(stale)
+                semantic_owned = _metadata_text(stale, "semantic_owned").casefold() == "true"
+                remaining = self._drop_stale_semantic_version(
+                    stale,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+                if remaining or not semantic_owned:
+                    bundle.kv_store.update(
+                        target_scope,
+                        memory_key(stale.id),
+                        dumps(stale),
+                    )
+                    self._refresh_browser_index_ids(
+                        bundle,
+                        region,
+                        target_scope,
+                        [stale.id],
+                    )
+                    if bundle.graph_store is not None:
+                        self._reproject_graph_scope(
+                            bundle,
+                            target_scope,
+                            region_id=region.region_id,
+                        )
+                    continue
+                self._delete_document(
+                    DeleteMemoryRequest(
+                        library_id=region.region_id,
+                        path=stale.id,
+                        expected_revision=revision,
+                        operation_id=(
+                            f"semantic-version:{evolve_key[:16]}:{stale.id[:16]}"
+                        ),
+                        actor="semantic-distillation",
+                        source="semantic-version-replacement",
+                        preview_token=revision,
+                        mode="forget",
+                    )
+                )
+                with closing(self._maintenance_db()) as connection, connection:
+                    connection.execute(
+                        "DELETE FROM semantic_memory_versions WHERE memory_id = ?",
+                        (stale.id,),
+                    )
+
+    def _cleanup_semantic_version(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        source_fingerprint: str,
+    ) -> None:
+        bundle = self._require_bundle()
+        locations: dict[str, str] = {}
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                """SELECT memory_id, region_id FROM semantic_memory_versions
+                   WHERE session_id = ? AND turn_id = ?
+                     AND source_fingerprint = ?""",
+                (session_id, turn_id, source_fingerprint),
+            ).fetchall()
+        for row in rows:
+            locations[str(row[0])] = str(row[1])
+        for region in self._regions.list_regions():
+            scope = _scope_for_region(region)
+            for unit in self._units_in_scope(bundle, scope):
+                if unit.lifecycle.value != "active":
+                    continue
+                if _metadata_text(unit, "semantic_schema") != "semantic-distillation-v1":
+                    continue
+                if (
+                    _metadata_text(unit, "session_id") != session_id
+                    or _metadata_text(unit, "turn_id") != turn_id
+                    or _metadata_text(unit, "semantic_source_fingerprint")
+                    != source_fingerprint
+                ):
+                    continue
+                locations.setdefault(unit.id, region.region_id)
+        cleaned_ids: list[str] = []
+        for memory_id, region_id in locations.items():
+            try:
+                region = self._regions.require_region(region_id)
+            except RegionError:
+                continue
+            scope = _scope_for_region(region)
+            with self._semantic_region_lock(region.region_id):
+                current = load_units(bundle.kv_store, scope, [memory_id])
+                if not current or current[0].lifecycle.value != "active":
+                    cleaned_ids.append(memory_id)
+                    continue
+                unit = current[0]
+                revision = _unit_revision(unit)
+                semantic_owned = _metadata_text(unit, "semantic_owned").casefold() == "true"
+                remaining = self._drop_stale_semantic_version(
+                    unit,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+                if remaining or not semantic_owned:
+                    bundle.kv_store.update(scope, memory_key(unit.id), dumps(unit))
+                    self._refresh_browser_index_ids(bundle, region, scope, [unit.id])
+                    if bundle.graph_store is not None:
+                        self._reproject_graph_scope(
+                            bundle,
+                            scope,
+                            region_id=region.region_id,
+                        )
+                else:
+                    self._delete_document(
+                        DeleteMemoryRequest(
+                            library_id=region.region_id,
+                            path=unit.id,
+                            expected_revision=revision,
+                            operation_id=(
+                                "semantic-partial:"
+                                f"{source_fingerprint[:16]}:{unit.id[:16]}"
+                            ),
+                            actor="semantic-distillation",
+                            source="semantic-partial-cleanup",
+                            preview_token=revision,
+                            mode="forget",
+                        )
+                    )
+                    with closing(self._maintenance_db()) as connection, connection:
+                        connection.execute(
+                            "DELETE FROM semantic_memory_versions WHERE memory_id = ?",
+                            (unit.id,),
+                        )
+                    cleaned_ids.append(memory_id)
+        if cleaned_ids:
+            with closing(self._idempotency_db()) as connection, connection:
+                connection.executemany(
+                    "DELETE FROM memory_write_idempotency WHERE memory_id = ?",
+                    [(memory_id,) for memory_id in cleaned_ids],
+                )
+        with closing(self._idempotency_db()) as connection, connection:
+            connection.execute(
+                """DELETE FROM memory_write_idempotency
+                   WHERE status = 'pending'
+                     AND idempotency_key LIKE ?""",
+                (f"semantic:%:{source_fingerprint}",),
+            )
+        self._discard_browser_index_pending_for_units(cleaned_ids)
+
+    def _discard_browser_index_pending_for_units(self, unit_ids: list[str]) -> None:
+        wanted = set(unit_ids)
+        if not wanted:
+            return
+        with closing(self._maintenance_db()) as connection:
+            rows = connection.execute(
+                "SELECT token, unit_ids FROM memory_browser_index_pending"
+            ).fetchall()
+        tokens: list[str] = []
+        for row in rows:
+            try:
+                raw_ids = json.loads(str(row[1]))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw_ids, list):
+                continue
+            if wanted.intersection(str(value) for value in raw_ids):
+                tokens.append(str(row[0]))
+        for token in tokens:
+            self._complete_browser_index_pending(token)
+
+    def _drop_stale_semantic_version(
+        self,
+        unit: MemoryUnit,
+        *,
+        session_id: str,
+        turn_id: str,
+    ) -> bool:
+        versions = self._semantic_versions_for_memory(unit.id)
+        remaining = [
+            version
+            for version in versions
+            if not (
+                str(version.get("session_id", "")) == session_id
+                and str(version.get("turn_id", "")) == turn_id
+            )
+        ]
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """DELETE FROM semantic_memory_versions
+                   WHERE memory_id = ? AND session_id = ? AND turn_id = ?""",
+                (unit.id, session_id, turn_id),
+            )
+        if remaining:
+            self._rebuild_semantic_metadata(unit, remaining)
+            return True
+        self._clear_semantic_metadata(unit)
+        return False
+
+    @staticmethod
+    def _clear_semantic_metadata(unit: MemoryUnit) -> None:
+        for key in (
+            "semantic_schema",
+            "semantic_owned",
+            "semantic_key",
+            "semantic_source_fingerprint",
+        ):
+            unit.user_metadata.pop(key, None)
+
+    def _clear_manual_override_semantic_metadata(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        unit: MemoryUnit,
+    ) -> None:
+        for key in (
+            "semantic_schema",
+            "semantic_owned",
+            "semantic_key",
+            "semantic_source_fingerprint",
+            "claim_subject",
+            "claim_value",
+            "semantic_claim_subject",
+            "semantic_claim_value",
+            "session_id",
+            "turn_id",
+            "source_region_id",
+            "source_region_kind",
+            "source_region_ids",
+            "source_unit_ids",
+            "source_event_ids",
+            "source_unit_regions",
+            "provenance",
+            "confidence",
+            "region_hint",
+            "user_event_id",
+            "user_occurred_at",
+            "user_event_ids",
+            "evidence_snippet",
+            "evidence_snippets",
+        ):
+            unit.user_metadata.pop(key, None)
+        unit.provenance = []
+        bundle.kv_store.update(scope, memory_key(unit.id), dumps(unit))
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                "DELETE FROM semantic_memory_versions WHERE memory_id = ?",
+                (unit.id,),
+            )
+
+    def _merge_semantic_sources(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        unit: MemoryUnit,
+        *,
+        semantic_key: str,
+        session_id: str,
+        turn_id: str,
+        source_region: MemoryRegion,
+        source_ids: list[str],
+        source_event_ids: list[str],
+        source_unit_regions: list[dict[str, object]],
+        source_fingerprint: str,
+        user_event_id: str,
+        evidence_snippet: str,
+        user_occurred_at: str,
+    ) -> None:
+        scope = _scope_for_region(region)
+        current_references = [
+            *(f"event:{event_id}" for event_id in source_event_ids if event_id),
+            f"session:{session_id}",
+            f"turn:{turn_id}",
+        ]
+        self._record_semantic_version(
+            unit.id,
+            region_id=region.region_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            source_fingerprint=source_fingerprint,
+            source_unit_ids=source_ids,
+            source_event_ids=source_event_ids,
+            source_unit_regions=source_unit_regions,
+            source_references=current_references,
+            source_region_ids=[region.region_id, source_region.region_id],
+            user_event_id=user_event_id,
+            evidence_snippet=evidence_snippet,
+            user_occurred_at=user_occurred_at,
+        )
+        versions = self._semantic_versions_for_memory(unit.id)
+        metadata = dict(unit.user_metadata)
+        metadata["semantic_schema"] = "semantic-distillation-v1"
+        metadata["semantic_key"] = semantic_key
+        unit.user_metadata.clear()
+        unit.user_metadata.update(metadata)
+        self._rebuild_semantic_metadata(unit, versions)
+        bundle.kv_store.update(scope, memory_key(unit.id), dumps(unit))
+        self._refresh_browser_index_ids(bundle, region, scope, [unit.id])
+        if bundle.graph_store is not None:
+            self._reproject_graph_scope(bundle, scope, region_id=region.region_id)
+
+    def _semantic_record(self, evolve_key: str) -> dict[str, object] | None:
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                """SELECT session_id, turn_id, region_id, semantic_status,
+                          semantic_memory_ids, semantic_memory_refs,
+                          semantic_diagnostics, semantic_error, semantic_updated_at,
+                          source_fingerprint
+                   FROM capture_evolutions WHERE evolve_key = ?""",
+                (evolve_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "session_id": str(row[0]),
+            "turn_id": str(row[1]),
+            "region_id": str(row[2]),
+            "semantic_status": str(row[3]),
+            "semantic_memory_ids": _json_string_list(row[4]),
+            "semantic_memory_refs": _json_object_list(row[5]),
+            "semantic_diagnostics": _json_object_list(row[6]),
+            "semantic_error": str(row[7]),
+            "semantic_updated_at": None if row[8] is None else str(row[8]),
+            "source_fingerprint": str(row[9]),
+        }
+
+    def _set_semantic_pending(
+        self,
+        evolve_key: str,
+        *,
+        expected_fingerprint: str,
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """UPDATE capture_evolutions
+                   SET semantic_status = 'pending', semantic_error = '',
+                       semantic_updated_at = ?
+                   WHERE evolve_key = ? AND source_fingerprint = ?
+                     AND semantic_status != 'completed'""",
+                (datetime.now(UTC).isoformat(), evolve_key, expected_fingerprint),
+            )
+
+    def _set_semantic_completed(
+        self,
+        evolve_key: str,
+        memory_ids: list[str],
+        memory_refs: list[dict[str, object]],
+        diagnostics: list[dict[str, object]],
+        *,
+        expected_fingerprint: str,
+    ) -> None:
+        unique_ids = list(dict.fromkeys(memory_ids))
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """UPDATE capture_evolutions
+                   SET semantic_status = 'completed', semantic_memory_ids = ?,
+                       semantic_memory_refs = ?, semantic_diagnostics = ?,
+                       semantic_error = '', semantic_updated_at = ?
+                   WHERE evolve_key = ? AND source_fingerprint = ?
+                     AND semantic_status != 'completed'""",
+                (
+                    json.dumps(unique_ids, ensure_ascii=False),
+                    json.dumps(memory_refs, ensure_ascii=False),
+                    json.dumps(diagnostics, ensure_ascii=False),
+                    datetime.now(UTC).isoformat(),
+                    evolve_key,
+                    expected_fingerprint,
+                ),
+            )
+
+    def _set_semantic_skipped(
+        self,
+        evolve_key: str,
+        diagnostics: list[dict[str, object]],
+        *,
+        expected_fingerprint: str,
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """UPDATE capture_evolutions
+                   SET semantic_status = 'skipped', semantic_memory_ids = '[]',
+                       semantic_memory_refs = '[]', semantic_diagnostics = ?,
+                       semantic_error = '', semantic_updated_at = ?
+                   WHERE evolve_key = ? AND source_fingerprint = ?
+                     AND semantic_status != 'completed'""",
+                (
+                    json.dumps(diagnostics, ensure_ascii=False),
+                    datetime.now(UTC).isoformat(),
+                    evolve_key,
+                    expected_fingerprint,
+                ),
+            )
+
+    def _set_semantic_failed(
+        self,
+        evolve_key: str,
+        error: str,
+        *,
+        expected_fingerprint: str,
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """UPDATE capture_evolutions
+                   SET semantic_status = 'failed', semantic_error = ?,
+                       semantic_updated_at = ?
+                   WHERE evolve_key = ? AND source_fingerprint = ?
+                     AND semantic_status != 'completed'""",
+                (
+                    error[:1000],
+                    datetime.now(UTC).isoformat(),
+                    evolve_key,
+                    expected_fingerprint,
+                ),
+            )
 
     async def start_promotion(self, request: PromotionRunRequest) -> dict[str, object]:
         return await asyncio.to_thread(self._start_promotion, request)
@@ -7216,6 +9265,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "space": event["space"],
                     "status": "pending",
                     "distillation_status": "pending_completion",
+                    "semantic_status": "not_requested",
+                    "semantic_memory_ids": [],
+                    "semantic_memory_refs": [],
+                    "semantic_diagnostics": [],
+                    "semantic_error": "",
+                    "semantic_updated_at": None,
                     "candidate_id": None,
                     "memory_id": None,
                     "last_error": "",
@@ -7270,6 +9325,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "space": record_memory_region.space,
                 "status": "pending",
                 "distillation_status": "pending_completion",
+                "semantic_status": evolution_record["semantic_status"],
+                "semantic_memory_ids": evolution_record["semantic_memory_ids"],
+                "semantic_memory_refs": evolution_record["semantic_memory_refs"],
+                "semantic_diagnostics": evolution_record["semantic_diagnostics"],
+                "semantic_error": evolution_record["semantic_error"],
+                "semantic_updated_at": evolution_record["semantic_updated_at"],
                 "candidate_id": None,
                 "memory_id": evolution_record["memory_id"],
                 "last_error": evolution_record["last_error"],
@@ -7382,6 +9443,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             if record is not None:
                 round_payload["candidate_id"] = None
                 round_payload["memory_id"] = record["memory_id"]
+                round_payload["semantic_status"] = record["semantic_status"]
+                round_payload["semantic_memory_ids"] = record["semantic_memory_ids"]
+                round_payload["semantic_memory_refs"] = record["semantic_memory_refs"]
+                round_payload["semantic_diagnostics"] = record["semantic_diagnostics"]
+                round_payload["semantic_error"] = record["semantic_error"]
+                round_payload["semantic_updated_at"] = record["semantic_updated_at"]
                 record_created_at = _normalize_timeline_timestamp(
                     record["created_at"]
                 )
@@ -7408,7 +9475,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 """SELECT session_id, turn_id, region_id, status, memory_id,
                           source_fingerprint, last_error, created_at, completed_at,
                           evolve_key, source_unit_ids, round_started_at,
-                          round_received_earliest, round_received_latest
+                          round_received_earliest, round_received_latest,
+                          semantic_status, semantic_memory_ids, semantic_memory_refs,
+                          semantic_diagnostics, semantic_error, semantic_updated_at
                    FROM capture_evolutions"""
             ).fetchall()
         return {
@@ -7424,6 +9493,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "round_started_at": str(row[11]),
                 "round_received_earliest": str(row[12]),
                 "round_received_latest": str(row[13]),
+                "semantic_status": str(row[14]),
+                "semantic_memory_ids": _json_string_list(row[15]),
+                "semantic_memory_refs": _json_object_list(row[16]),
+                "semantic_diagnostics": _json_object_list(row[17]),
+                "semantic_error": str(row[18]),
+                "semantic_updated_at": None if row[19] is None else str(row[19]),
             }
             for row in rows
         }
@@ -7611,6 +9686,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         migrate_promotions: bool = True,
     ) -> None:
         connection.executescript(_BROWSER_INDEX_SCHEMA)
+        connection.executescript(_SEMANTIC_PUBLICATION_SCHEMA)
         browser_columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(memory_browser_index)").fetchall()
@@ -7661,6 +9737,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "round_started_at": "TEXT NOT NULL DEFAULT ''",
                 "round_received_earliest": "TEXT NOT NULL DEFAULT ''",
                 "round_received_latest": "TEXT NOT NULL DEFAULT ''",
+                "semantic_status": "TEXT NOT NULL DEFAULT 'not_requested'",
+                "semantic_memory_ids": "TEXT NOT NULL DEFAULT '[]'",
+                "semantic_memory_refs": "TEXT NOT NULL DEFAULT '[]'",
+                "semantic_diagnostics": "TEXT NOT NULL DEFAULT '[]'",
+                "semantic_error": "TEXT NOT NULL DEFAULT ''",
+                "semantic_updated_at": "TEXT",
             }
             for column, definition in capture_columns.items():
                 if column not in columns:
@@ -7677,9 +9759,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             connection.execute(
                 """INSERT OR REPLACE INTO capture_evolutions
                    (evolve_key, session_id, turn_id, region_id, source_fingerprint, memory_id,
-                    status, created_at, completed_at)
+                    status, semantic_status, created_at, completed_at)
                    SELECT evolve_key, session_id, turn_id, region_id, '', memory_id,
-                          'completed', created_at, created_at
+                          'completed', 'not_requested', created_at, created_at
                    FROM capture_evolutions_v1"""
             )
             connection.execute("DROP TABLE capture_evolutions_v1")
@@ -7885,8 +9967,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 """INSERT OR IGNORE INTO capture_evolutions
                    (evolve_key, session_id, turn_id, region_id, source_fingerprint,
                     source_unit_ids, memory_id, status, round_started_at,
-                    round_received_earliest, round_received_latest)
-                   VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?, ?)""",
+                    round_received_earliest, round_received_latest, semantic_status)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?, ?, ?)""",
                 (
                     evolve_key,
                     session_id,
@@ -7897,6 +9979,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     round_started_at,
                     round_received_earliest,
                     round_received_latest,
+                    "pending" if self._semantic_enabled() else "not_requested",
                 ),
             )
             if cursor.rowcount == 1:
@@ -7909,24 +9992,40 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             ).fetchone()
         if row is None:
             raise MemoryKernelUnavailableError("evolve reservation was not persisted")
-        if str(row[2]) != source_fingerprint or str(row[3]):
+        source_changed = str(row[2]) != source_fingerprint
+        if source_changed or str(row[3]):
             with closing(self._maintenance_db()) as connection, connection:
-                connection.execute(
-                    """UPDATE capture_evolutions
-                       SET source_fingerprint = ?, memory_id = NULL,
-                           status = 'pending', last_error = '', completed_at = NULL,
-                           source_unit_ids = ?, round_started_at = ?,
-                           round_received_earliest = ?, round_received_latest = ?
-                       WHERE evolve_key = ?""",
-                    (
-                        source_fingerprint,
-                        json.dumps(source_unit_ids, ensure_ascii=False),
-                        round_started_at,
-                        round_received_earliest,
-                        round_received_latest,
-                        evolve_key,
-                    ),
-                )
+                if source_changed:
+                    connection.execute(
+                        """UPDATE capture_evolutions
+                           SET source_fingerprint = ?, memory_id = NULL,
+                               status = 'pending', last_error = '', completed_at = NULL,
+                               source_unit_ids = ?, round_started_at = ?,
+                               round_received_earliest = ?, round_received_latest = ?,
+                               semantic_status = ?,
+                               semantic_memory_ids = '[]',
+                               semantic_memory_refs = '[]',
+                               semantic_diagnostics = '[]',
+                               semantic_error = '', semantic_updated_at = NULL
+                           WHERE evolve_key = ?""",
+                        (
+                            source_fingerprint,
+                            json.dumps(source_unit_ids, ensure_ascii=False),
+                            round_started_at,
+                            round_received_earliest,
+                            round_received_latest,
+                            "pending" if self._semantic_enabled() else "not_requested",
+                            evolve_key,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE capture_evolutions
+                           SET memory_id = NULL, status = 'pending',
+                               last_error = '', completed_at = NULL
+                           WHERE evolve_key = ?""",
+                        (evolve_key,),
+                    )
             return "pending", None
         return str(row[0]), None if row[1] is None else str(row[1])
 
@@ -7947,8 +10046,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 """INSERT INTO capture_evolutions
                    (evolve_key, session_id, turn_id, region_id, source_fingerprint,
                     source_unit_ids, memory_id, status, last_error, completed_at,
-                    round_started_at, round_received_earliest, round_received_latest)
-                   VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', '', NULL, ?, ?, ?)
+                    round_started_at, round_received_earliest, round_received_latest,
+                    semantic_status)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', '', NULL, ?, ?, ?, ?)
                    ON CONFLICT(evolve_key) DO UPDATE SET
                      source_fingerprint = excluded.source_fingerprint,
                      source_unit_ids = excluded.source_unit_ids,
@@ -7972,6 +10072,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     round_started_at,
                     round_received_earliest,
                     round_received_latest,
+                    "pending" if self._semantic_enabled() else "not_requested",
                 ),
             )
 
@@ -8711,6 +10812,650 @@ def _source_fingerprint(source_ids: list[str]) -> str:
     return hashlib.sha256("\0".join(source_ids).encode()).hexdigest()
 
 
+def _semantic_key(
+    *,
+    region_id: str,
+    session_id: str,
+    turn_id: str,
+    user_event_id: str,
+    evidence_snippet: str,
+    memory_type: str,
+    target_region_id: str,
+    content: str,
+    claim_subject: str,
+    claim_value: str,
+) -> str:
+    payload = [
+        region_id,
+        session_id,
+        turn_id,
+        user_event_id,
+        evidence_snippet,
+        memory_type,
+        target_region_id,
+        _normalize_promotion_text(content),
+        _normalize_promotion_text(claim_subject),
+        _normalize_promotion_claim_value(claim_value),
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _semantic_claim_fields(subject: str, value: str, content: str) -> tuple[str, str]:
+    normalized_subject = _normalize_promotion_text(subject)
+    normalized_value = _normalize_promotion_claim_value(value)
+    if normalized_subject and normalized_value:
+        return normalized_subject, normalized_value
+    normalized_content = _normalize_promotion_text(content)
+    third_person = re.match(
+        r"^the user\s+(prefers?|likes?|uses?|requires?|needs?|wants?)\s+(.+)$",
+        normalized_content,
+    )
+    if third_person:
+        derived_value = third_person.group(2).strip().rstrip(".!。")
+        category = _preference_category(derived_value)
+        derived_subject = f"user:preference:{category}" if category else ""
+    else:
+        chinese_third_person = re.match(
+            r"^用户(?:偏好|喜欢|使用|需要|要求|希望)(.+)$", normalized_content
+        )
+        if chinese_third_person:
+            derived_value = chinese_third_person.group(1).strip().rstrip(".!。")
+            category = _preference_category(derived_value)
+            derived_subject = f"user:preference:{category}" if category else ""
+        else:
+            derived_subject, derived_value = _promotion_claim_signature(content)
+    subject_value = normalized_subject or _normalize_promotion_text(derived_subject)
+    claim_value = normalized_value or _normalize_promotion_claim_value(derived_value)
+    if not subject_value or not claim_value:
+        return "", ""
+    return subject_value, claim_value
+
+
+def _semantic_sentences(content: str) -> list[str]:
+    protected = re.sub(
+        r"\b(Inc|Ltd|Co|Corp|Dr|Mr|Mrs|Ms|etc|e\.g|i\.e|U\.S)\.(?=\s|$)",
+        lambda match: match.group(1) + "<SEMANTIC_DOT>",
+        content,
+        flags=re.IGNORECASE,
+    )
+    return [
+        part.replace("<SEMANTIC_DOT>", ".").strip()
+        for part in re.split(r"(?<=[。！？])|(?<=[.!?])(?=\s)", protected)
+        if part.strip()
+    ]
+
+
+def _semantic_clauses(content: str) -> list[str]:
+    return [
+        part.strip()
+        for part in re.split(r"(?<=[。！？?!.])\s*|[，,；;]\s*", content)
+        if part.strip()
+    ]
+
+
+_SEMANTIC_WH_ACTIVE_LEAD = re.compile(
+    r"^(?:what|which|who|whom|whose|why|how|when|where)\s+(?P<body>.+)$",
+    re.IGNORECASE,
+)
+
+
+def _semantic_is_wh_active_question(sentence: str) -> bool:
+    match = _SEMANTIC_WH_ACTIVE_LEAD.match(sentence.strip())
+    if match is None:
+        return False
+    body = match.group("body")
+    if re.search(
+        r"\b(?:is|are|was|were|must|should|can|could|will|would|do|does|did|"
+        r"has|have|had)\b",
+        body,
+        re.IGNORECASE,
+    ):
+        return False
+    tokens = re.findall(r"[A-Za-z][A-Za-z'-]*", body)
+    return bool(tokens) and any(_semantic_word_is_predicate(token) for token in tokens)
+
+
+def _semantic_is_wh_passive_question(sentence: str) -> bool:
+    match = _SEMANTIC_WH_PASSIVE_QUESTION.match(sentence)
+    if match is None:
+        return False
+    subject_clause = match.group("subject")
+    return re.search(r"\b[a-z]{3,}ed\b", subject_clause.casefold()) is None
+
+
+def _semantic_sentence_is_question(sentence: str) -> bool:
+    stripped = sentence.strip()
+    if not stripped:
+        return False
+    if re.match(r"^May\s+\d{4}\b", stripped, re.IGNORECASE):
+        return False
+    if _SEMANTIC_QUESTION_MARK.search(stripped):
+        return True
+    if _SEMANTIC_ZH_WH_CLAUSE.match(stripped):
+        # A Chinese wh-clause is a question only when it has no declarative
+        # predicate. "是否启用缓存取决于部署环境。" states a fact.
+        return _SEMANTIC_ZH_DECLARATIVE.search(stripped) is None
+    if _SEMANTIC_WH_CLAUSE_STATEMENT.match(stripped):
+        return False
+    if _SEMANTIC_WH_SHORT_PASSIVE_QUESTION.match(stripped):
+        return True
+    if _SEMANTIC_WH_STATEMENT_PREDICATE.match(stripped):
+        return False
+    if _semantic_is_wh_active_question(stripped):
+        return True
+    if _semantic_is_wh_passive_question(stripped):
+        return True
+    return bool(
+        _SEMANTIC_YES_NO_QUESTION.search(stripped)
+        or _SEMANTIC_WH_QUESTION.search(stripped)
+    )
+
+
+def _semantic_sentence_is_request(sentence: str) -> bool:
+    stripped = sentence.strip()
+    return bool(stripped and _SEMANTIC_REQUEST.search(stripped))
+
+
+def _semantic_starts_question(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped:
+        return False
+    if re.match(r"^May\s+\d{4}\b", stripped, re.IGNORECASE):
+        return False
+    if _SEMANTIC_QUESTION_MARK.search(stripped) and re.match(
+        r"^(?:what|how|why|which|who|whom|whose|when|where|"
+        r"is|are|was|were|am|do|does|did|can|could|would|should|will|"
+        r"shall|may|might|must|have|has|had)\b",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return True
+    if _SEMANTIC_WH_CLAUSE_STATEMENT.match(stripped):
+        return False
+    if _SEMANTIC_WH_SHORT_PASSIVE_QUESTION.match(stripped):
+        return True
+    if _SEMANTIC_WH_STATEMENT_PREDICATE.match(stripped):
+        return False
+    if _SEMANTIC_ZH_WH_CLAUSE.match(stripped):
+        return _SEMANTIC_ZH_DECLARATIVE.search(stripped) is None
+    if _SEMANTIC_ZH_QUESTION_ANY.search(stripped) and not re.search(r"[，,]", stripped):
+        return _SEMANTIC_ZH_DECLARATIVE.search(stripped) is None
+    if _SEMANTIC_WH_MODAL_QUESTION.search(stripped):
+        return True
+    return bool(
+        _SEMANTIC_YES_NO_QUESTION.search(stripped)
+        or _SEMANTIC_WH_QUESTION.search(stripped)
+    )
+
+
+def _semantic_text_is_question(content: str) -> bool:
+    if _semantic_starts_question(content):
+        return True
+    clauses = _semantic_clauses(content)
+    return bool(clauses) and all(_semantic_sentence_is_question(item) for item in clauses)
+
+
+def _semantic_text_is_request(content: str) -> bool:
+    stripped = content.strip()
+    if stripped and _SEMANTIC_REQUEST.search(stripped):
+        return True
+    clauses = _semantic_clauses(content)
+    return bool(clauses) and all(_semantic_sentence_is_request(item) for item in clauses)
+
+
+def _semantic_text_is_imperative(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped:
+        return False
+    if _SEMANTIC_IMPERATIVE.match(stripped):
+        return True
+    return bool(
+        re.match(
+            r"^(?!(?:the|a|an|this|that|these|those|i|we|you|they|he|she|it|there|"
+            r"what|how|why|which|who|whom|whose|when|where)\b)"
+            r"[A-Za-z][A-Za-z-]+\s+(?:the|a|an|this|that|these|those)\b",
+            stripped,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _semantic_user_event_is_pure_question(content: str) -> bool:
+    sentences = _semantic_sentences(content)
+    if len(sentences) > 1:
+        return all(_semantic_sentence_is_question(item) for item in sentences)
+    if _semantic_starts_question(content):
+        return True
+    clauses = _semantic_clauses(content)
+    return bool(clauses) and all(_semantic_sentence_is_question(item) for item in clauses)
+
+
+def _semantic_user_event_is_pure_request(content: str) -> bool:
+    sentences = _semantic_sentences(content)
+    if len(sentences) > 1:
+        return all(_semantic_sentence_is_request(item) for item in sentences)
+    stripped = content.strip()
+    if stripped and _SEMANTIC_REQUEST.search(stripped):
+        return True
+    clauses = _semantic_clauses(content)
+    return bool(clauses) and all(_semantic_sentence_is_request(item) for item in clauses)
+
+
+def _semantic_word_is_predicate(word: str) -> bool:
+    folded = word.casefold().strip("'\u2019")
+    if not folded:
+        return False
+    if folded in _SEMANTIC_AUXILIARIES:
+        return True
+    if not folded.isalpha() or not folded.islower():
+        return False
+    if folded.endswith(("ss", "us", "is")):
+        return False
+    if len(folded) >= 3 and folded.endswith("s"):
+        return True
+    return len(folded) >= 4 and folded.endswith("ed")
+
+
+def _semantic_coordination_adds_predicate(sentence: str) -> bool:
+    if _SEMANTIC_ZH_COORDINATION.search(sentence):
+        return True
+    for match in _SEMANTIC_EN_COORDINATION.finditer(sentence):
+        tail = _SEMANTIC_CLAUSE_BOUNDARY.split(sentence[match.end() :], maxsplit=1)[0]
+        tokens = re.findall(r"[A-Za-z][A-Za-z'\u2019.-]*", tail)
+        index = 0
+        while index < len(tokens) and tokens[index].casefold() in _SEMANTIC_SUBJECT_CLOSED_CLASS:
+            index += 1
+        while index < len(tokens) and tokens[index].casefold() in _SEMANTIC_ADVERB_CLOSED_CLASS:
+            index += 1
+        if index >= len(tokens):
+            continue
+        candidate = tokens[index]
+        if not _semantic_word_is_predicate(candidate):
+            continue
+        folded = candidate.casefold()
+        if folded in _SEMANTIC_AUXILIARIES:
+            return True
+        following = tokens[index + 1 :]
+        if not following:
+            # "-s" forms at the end of a clause are usually plural nouns in an
+            # object list ("retries and timeouts").
+            continue
+        if folded in _SEMANTIC_AUXILIARIES:
+            return True
+        if folded.endswith("ed"):
+            return True
+        stem = folded[:-1] if folded.endswith("s") else folded
+        if (
+            folded in _SEMANTIC_DEMONSTRATIVE_BASE_VERBS
+            or stem in _SEMANTIC_DEMONSTRATIVE_BASE_VERBS
+        ):
+            return True
+    return False
+
+
+def _semantic_word_after(text: str, index: int) -> str:
+    match = re.match(r"\s*([A-Za-z][A-Za-z'\u2019-]*)", text[index:])
+    return "" if match is None else match.group(1)
+
+
+def _semantic_main_clause(sentence: str) -> str:
+    match = _SEMANTIC_EN_SUBORDINATOR.search(sentence)
+    main = sentence if match is None else sentence[: match.start()]
+    zh_match = _SEMANTIC_ZH_SUBORDINATOR.search(main)
+    if zh_match is not None:
+        main = main[: zh_match.start()]
+    return main
+
+
+def _semantic_has_unbound_pronoun(content: str) -> bool:
+    for sentence in _semantic_sentences(content):
+        if re.match(r"^(?:it|they|them)\b", sentence, re.IGNORECASE):
+            return True
+        if re.match(r"^(?:这|那)", sentence) and not re.match(
+            r"^(?:这|那)" + _SEMANTIC_ZH_NOUN_PREFIX, sentence
+        ):
+            return True
+        main = _semantic_main_clause(sentence)
+        if _SEMANTIC_EN_PRONOUN.search(main):
+            return True
+        for match in _SEMANTIC_EN_DEMONSTRATIVE.finditer(main):
+            word = _semantic_word_after(main, match.end())
+            if not word:
+                return True
+            folded = word.casefold()
+            if folded in _SEMANTIC_AUXILIARIES or folded in _SEMANTIC_SUBJECT_CLOSED_CLASS:
+                return True
+            if _semantic_word_is_predicate(word):
+                rest = re.findall(r"[A-Za-z][A-Za-z'\u2019.-]*", main[match.end() :])
+                following = rest[1:] if rest and rest[0].casefold() == folded else []
+                demonstrative_noun = bool(
+                    folded.endswith("s")
+                    and following
+                    and (
+                        following[0].casefold() in _SEMANTIC_DEMONSTRATIVE_BASE_VERBS
+                        or (following[0].endswith("s") and len(following) > 1)
+                    )
+                )
+                if not demonstrative_noun:
+                    return True
+        if _SEMANTIC_ZH_PRONOUN.search(main):
+            return True
+    return False
+
+
+_SEMANTIC_SUPPORT_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "this", "that", "these", "those", "user", "users",
+        "project", "service", "system", "api", "we", "i", "you", "they", "it",
+        "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
+        "do", "does", "did", "can", "could", "will", "would", "should", "must",
+        "may", "might", "use", "uses", "used", "using", "prefer", "prefers",
+        "preferred", "like", "likes", "need", "needs", "required", "requires",
+        "for", "with", "from", "into", "and", "or", "but", "to", "of", "in",
+        "on", "at", "by", "as", "which", "who", "what",
+    }
+)
+
+
+_SEMANTIC_NEGATION = re.compile(
+    r"\b(?:not|never|no|cannot|can't|couldn't|didn't|doesn't|don't|"
+    r"isn't|aren't|wasn't|weren't|won't|wouldn't|shouldn't|mustn't)\b|"
+    r"不(?:使用|需要|偏好|支持|采用|包含|运行|是|有|会|允许|要求|记录|"
+    r"部署|迁移|工作|正常)|没有|尚未|未曾|并未|无法|不需要|不用|不偏好",
+    re.IGNORECASE,
+)
+_SEMANTIC_CJK_RUN = re.compile(r"[\u4e00-\u9fff]{2,}")
+_SEMANTIC_SUPPORT_ALIASES = {
+    "postgres": "postgresql",
+    "pg": "postgresql",
+    "k8s": "kubernetes",
+    "golang": "go",
+    "mongo": "mongodb",
+    "nodejs": "node",
+    "node.js": "node",
+    "py": "python",
+    "js": "javascript",
+    "ts": "typescript",
+}
+
+
+def _normalize_semantic_support_text(text: str) -> str:
+    normalized = _normalize_promotion_text(text)
+    for alias, canonical in _SEMANTIC_SUPPORT_ALIASES.items():
+        normalized = re.sub(
+            rf"\b{re.escape(alias)}\b",
+            canonical,
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    return normalized
+
+
+def _semantic_clause_containing_evidence(text: str, evidence: str) -> str:
+    start = text.find(evidence)
+    if start < 0:
+        return ""
+    end = start + len(evidence)
+    boundary = re.compile(r"[.!?;；。！？]")
+    previous = max((match.end() for match in boundary.finditer(text, 0, start)), default=0)
+    following = boundary.search(text, end)
+    return text[previous : following.start() if following else len(text)].strip()
+
+
+_SEMANTIC_PROPER_NOUN_SKIP = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "this",
+        "that",
+        "these",
+        "those",
+        "i",
+        "we",
+        "you",
+        "they",
+        "he",
+        "she",
+        "it",
+        "my",
+        "our",
+        "your",
+        "their",
+        "there",
+        "may",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "when",
+        "where",
+        "how",
+        "why",
+    }
+)
+
+
+def _semantic_proper_noun_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for match in re.finditer(r"\b[A-Z][A-Za-z0-9.-]+\b", text):
+        word = match.group(0)
+        if word.casefold() in _SEMANTIC_PROPER_NOUN_SKIP:
+            continue
+        terms.update(_semantic_support_terms(word))
+    return terms
+
+
+def _semantic_preposition_terms(text: str) -> dict[str, set[str]]:
+    normalized = _normalize_semantic_support_text(text)
+    phrases: dict[str, set[str]] = {}
+    pattern = re.compile(
+        r"\b(on|in|to|for|with|about|from|into|over|under|around|by|at|per|via|as|of|"
+        r"during|across|within|between|through|toward|against)"
+        r"\s+([a-z0-9][a-z0-9 '\-]*)",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(normalized):
+        boundary = re.split(
+            r"\b(?:and|or|but|because|which|who|that)\b|[,.!?;]",
+            match.group(2),
+            maxsplit=1,
+        )[0]
+        terms = _semantic_support_terms(boundary)
+        if terms:
+            phrases.setdefault(match.group(1).casefold(), set()).update(terms)
+    return phrases
+
+
+def _semantic_support_terms(content: str) -> set[str]:
+    normalized = _normalize_semantic_support_text(content)
+    terms = {
+        word
+        for word in re.findall(r"[a-z0-9]+", normalized)
+        if len(word) >= 2 and word not in _SEMANTIC_SUPPORT_STOPWORDS
+    }
+    for run in _SEMANTIC_CJK_RUN.findall(normalized):
+        terms.update(run[index : index + 2] for index in range(len(run) - 1))
+    return terms
+
+
+_SEMANTIC_UNSUPPORTED_QUALIFIER_TERMS = frozenset(
+    {
+        "again",
+        "all",
+        "almost",
+        "also",
+        "always",
+        "any",
+        "currently",
+        "each",
+        "even",
+        "ever",
+        "every",
+        "exclusively",
+        "just",
+        "mainly",
+        "merely",
+        "most",
+        "nearly",
+        "never",
+        "now",
+        "once",
+        "only",
+        "presently",
+        "primarily",
+        "quite",
+        "rarely",
+        "rather",
+        "simply",
+        "solely",
+        "sometimes",
+        "still",
+        "strictly",
+        "too",
+        "usually",
+        "very",
+        "yet",
+    }
+)
+
+
+_SEMANTIC_SUPPORT_BRIDGE_TERMS = frozenset(
+    {
+        "happen",
+        "happened",
+        "happening",
+        "happens",
+        "matter",
+        "mattered",
+        "mattering",
+        "matters",
+        "still",
+    }
+)
+
+_SEMANTIC_SUPPORT_PARAPHRASE_TERMS = frozenset(
+    {
+        "choice",
+        "deployment",
+        "documentation",
+        "process",
+    }
+)
+
+
+def _semantic_support_term_is_present(term: str, evidence_terms: set[str]) -> bool:
+    if term in evidence_terms:
+        return True
+    if term.endswith("ies") and term[:-3] + "y" in evidence_terms:
+        return True
+    if term.endswith("es") and term[:-2] in evidence_terms:
+        return True
+    if term.endswith("d") and term[:-1] in evidence_terms:
+        return True
+    if term.endswith("s") and term[:-1] in evidence_terms:
+        return True
+    return term + "s" in evidence_terms or term + "d" in evidence_terms
+
+
+def _semantic_evidence_supports_content(
+    content: str,
+    evidence: str,
+    *,
+    claim_value: str = "",
+    context: str = "",
+) -> bool:
+    normalized_evidence = _normalize_semantic_support_text(evidence)
+    terms = _semantic_support_terms(content)
+    if not terms:
+        compact_content = re.sub(r"[\W_]+", "", _normalize_semantic_support_text(content))
+        compact_evidence = re.sub(r"[\W_]+", "", normalized_evidence)
+        return bool(compact_content) and compact_content in compact_evidence
+    numeric_terms = {term for term in terms if term.isdigit()}
+    if any(term not in normalized_evidence for term in numeric_terms):
+        return False
+    semantic_terms = terms - numeric_terms
+    if semantic_terms and not any(term in normalized_evidence for term in semantic_terms):
+        return False
+    value_terms = _semantic_support_terms(
+        re.sub(r"\bwithout\b.*$", "", claim_value, flags=re.IGNORECASE)
+    ) & terms
+    if any(term not in normalized_evidence for term in value_terms):
+        return False
+    content_prepositions = _semantic_preposition_terms(content)
+    evidence_prepositions = _semantic_preposition_terms(evidence)
+    if not set(content_prepositions) <= set(evidence_prepositions):
+        return False
+    for preposition, phrase_terms in content_prepositions.items():
+        evidence_terms = evidence_prepositions.get(preposition, set())
+        if not phrase_terms <= evidence_terms:
+            return False
+    content_terms_without_inference = _semantic_support_terms(
+        re.sub(r"\bwithout\b.*$", "", content, flags=re.IGNORECASE)
+    )
+    evidence_terms = _semantic_support_terms(evidence)
+    context_terms = _semantic_support_terms(context or evidence)
+    unsupported_terms = {
+        term
+        for term in content_terms_without_inference
+        if term.isascii()
+        and not term.isdigit()
+        and term not in _SEMANTIC_SUPPORT_PARAPHRASE_TERMS
+        and not _semantic_support_term_is_present(term, evidence_terms)
+        and not _semantic_support_term_is_present(term, context_terms)
+    }
+    if any(_semantic_value_dimension(term) for term in unsupported_terms):
+        return False
+    if any(
+        term in _SEMANTIC_UNSUPPORTED_QUALIFIER_TERMS
+        or (len(term) > 4 and term.endswith("ly"))
+        for term in unsupported_terms
+    ):
+        return False
+    if unsupported_terms:
+        return False
+    proper_nouns = _semantic_proper_noun_terms(content)
+    if any(noun not in normalized_evidence for noun in proper_nouns):
+        return False
+    content_words = set(re.findall(r"[a-z0-9_-]+", _normalize_semantic_support_text(content)))
+    evidence_words = set(re.findall(r"[a-z0-9_-]+", normalized_evidence))
+    if any(
+        _semantic_values_are_opposites(left, right)
+        for left in content_words
+        for right in evidence_words
+    ):
+        return False
+    content_negated = bool(_SEMANTIC_NEGATION.search(content))
+    evidence_negated = bool(_SEMANTIC_NEGATION.search(evidence))
+    return content_negated == evidence_negated
+
+
+def _semantic_content_is_atomic(content: str) -> bool:
+    sentences = _semantic_sentences(content)
+    clauses = [
+        part.strip()
+        for part in re.split(
+            r"[;；\n]|(?<!\d):(?![/\\\d])|：|"
+            r"(?<!\d)(?<!\d\s)[—–](?!\d)(?!\s\d)|\s[—-]\s",
+            content,
+        )
+        if part.strip()
+    ]
+    compound = _SEMANTIC_COMPOUND_CLAIM.search(content)
+    coordinated_modifier = _SEMANTIC_COORDINATED_MODIFIER.fullmatch(content.strip())
+    return (
+        len(sentences) <= 1
+        and len(clauses) <= 1
+        and not (compound and coordinated_modifier is None)
+        and not _SEMANTIC_COORDINATED_PREDICATE.search(content)
+        and not _SEMANTIC_SUBORDINATING_CLAIM.search(content)
+        and not _semantic_coordination_adds_predicate(content)
+    )
+
+
 def _metadata_text(unit: MemoryUnit, key: str) -> str:
     value = unit.user_metadata.get(key)
     return "" if value is None else str(value)
@@ -8912,6 +11657,33 @@ def _json_string_list(value: object) -> list[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
+def _json_object_list(value: object) -> list[dict[str, object]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        {str(key): item_value for key, item_value in item.items()}
+        for item in value
+        if isinstance(item, Mapping)
+    ]
+
+
+def _unique_object_dicts(values: list[dict[str, object]]) -> list[dict[str, object]]:
+    seen: set[str] = set()
+    result: list[dict[str, object]] = []
+    for value in values:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if encoded in seen:
+            continue
+        seen.add(encoded)
+        result.append(value)
+    return result
+
+
 def _parse_timestamp(value: str) -> datetime | None:
     if not value:
         return None
@@ -8928,7 +11700,7 @@ def _audit_sort_key(item: dict[str, str]) -> datetime:
 
 
 def _write_request_hash(request: CreateMemoryRequest) -> str:
-    payload = {
+    payload: dict[str, object] = {
         "library_id": request.library_id,
         "region_id": request.region_id,
         "content": request.content,
@@ -8936,6 +11708,8 @@ def _write_request_hash(request: CreateMemoryRequest) -> str:
         "source_references": list(request.source_references),
         "actor": request.actor,
     }
+    if request.user_metadata:
+        payload["user_metadata"] = dict(request.user_metadata)
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -9599,6 +12373,157 @@ def _promotion_claim_signature(content: str) -> tuple[str, str]:
     return "", ""
 
 
+_SEMANTIC_VALUE_ANTONYMS = {
+    frozenset(("enabled", "disabled")),
+    frozenset(("enable", "disable")),
+    frozenset(("allow", "deny")),
+    frozenset(("allow", "forbid")),
+    frozenset(("dark", "light")),
+    frozenset(("true", "false")),
+    frozenset(("on", "off")),
+    frozenset(("yes", "no")),
+    frozenset(("required", "optional")),
+    frozenset(("internal", "external")),
+    frozenset(("private", "public")),
+    frozenset(("read-only", "read-write")),
+    frozenset(("synchronous", "asynchronous")),
+    frozenset(("sync", "async")),
+    frozenset(("primary", "secondary")),
+    frozenset(("include", "exclude")),
+    frozenset(("encrypt", "decrypt")),
+    frozenset(("local", "remote")),
+}
+
+
+_SEMANTIC_VALUE_DIMENSIONS: dict[str, str] = {
+    "hour": "frequency:hour",
+    "hourly": "frequency:hour",
+    "every hour": "frequency:hour",
+    "per hour": "frequency:hour",
+    "每小时": "frequency:hour",
+    "day": "frequency:day",
+    "daily": "frequency:day",
+    "every day": "frequency:day",
+    "per day": "frequency:day",
+    "每天": "frequency:day",
+    "night": "frequency:night",
+    "nightly": "frequency:night",
+    "每晚": "frequency:night",
+    "week": "frequency:week",
+    "weekly": "frequency:week",
+    "every week": "frequency:week",
+    "per week": "frequency:week",
+    "每周": "frequency:week",
+    "biweek": "frequency:biweek",
+    "biweekly": "frequency:biweek",
+    "fortnight": "frequency:biweek",
+    "fortnightly": "frequency:biweek",
+    "every two weeks": "frequency:biweek",
+    "每两周": "frequency:biweek",
+    "month": "frequency:month",
+    "monthly": "frequency:month",
+    "every month": "frequency:month",
+    "per month": "frequency:month",
+    "每月": "frequency:month",
+    "quarter": "frequency:quarter",
+    "quarterly": "frequency:quarter",
+    "every quarter": "frequency:quarter",
+    "每季度": "frequency:quarter",
+    "half-year": "frequency:halfyear",
+    "halfyear": "frequency:halfyear",
+    "semi-annual": "frequency:halfyear",
+    "semi-annually": "frequency:halfyear",
+    "semiannual": "frequency:halfyear",
+    "semiannually": "frequency:halfyear",
+    "每半年": "frequency:halfyear",
+    "year": "frequency:year",
+    "yearly": "frequency:year",
+    "annual": "frequency:year",
+    "annually": "frequency:year",
+    "every year": "frequency:year",
+    "每年": "frequency:year",
+    "monday": "weekday:monday",
+    "tuesday": "weekday:tuesday",
+    "wednesday": "weekday:wednesday",
+    "thursday": "weekday:thursday",
+    "friday": "weekday:friday",
+    "saturday": "weekday:saturday",
+    "sunday": "weekday:sunday",
+    "周一": "weekday:monday",
+    "周二": "weekday:tuesday",
+    "周三": "weekday:wednesday",
+    "周四": "weekday:thursday",
+    "周五": "weekday:friday",
+    "周六": "weekday:saturday",
+    "周日": "weekday:sunday",
+    "january": "month:january",
+    "february": "month:february",
+    "march": "month:march",
+    "april": "month:april",
+    "may": "month:may",
+    "june": "month:june",
+    "july": "month:july",
+    "august": "month:august",
+    "september": "month:september",
+    "october": "month:october",
+    "november": "month:november",
+    "december": "month:december",
+    "true": "boolean:true",
+    "yes": "boolean:true",
+    "on": "boolean:true",
+    "enabled": "boolean:true",
+    "enable": "boolean:true",
+    "allowed": "boolean:true",
+    "是": "boolean:true",
+    "真": "boolean:true",
+    "开启": "boolean:true",
+    "启用": "boolean:true",
+    "false": "boolean:false",
+    "no": "boolean:false",
+    "off": "boolean:false",
+    "disabled": "boolean:false",
+    "disable": "boolean:false",
+    "forbidden": "boolean:false",
+    "否": "boolean:false",
+    "假": "boolean:false",
+    "关闭": "boolean:false",
+    "禁用": "boolean:false",
+}
+
+
+def _semantic_value_dimension(value: str) -> str:
+    normalized = _normalize_promotion_claim_value(value)
+    if not normalized:
+        return ""
+    collapsed = " ".join(normalized.split())
+    return _SEMANTIC_VALUE_DIMENSIONS.get(collapsed, "")
+
+
+def _semantic_values_share_dimension(left: str, right: str) -> bool:
+    left_dimension = _semantic_value_dimension(left)
+    right_dimension = _semantic_value_dimension(right)
+    if not left_dimension or not right_dimension:
+        return False
+    left_kind, _, left_value = left_dimension.partition(":")
+    right_kind, _, right_value = right_dimension.partition(":")
+    return left_kind == right_kind and left_value != right_value
+
+
+def _semantic_values_are_opposites(left: str, right: str) -> bool:
+    if _semantic_values_share_dimension(left, right):
+        return True
+    left_words = set(re.findall(r"[a-z0-9_-]+", left.casefold()))
+    right_words = set(re.findall(r"[a-z0-9_-]+", right.casefold()))
+    for left_word in left_words:
+        for right_word in right_words:
+            if frozenset((left_word, right_word)) in _SEMANTIC_VALUE_ANTONYMS:
+                return True
+            for prefix in ("im", "in", "un", "non", "dis"):
+                if left_word == prefix + right_word or right_word == prefix + left_word:
+                    return True
+    return False
+
+
 def _promotion_values_conflict(subject: str, values: tuple[str, ...]) -> bool:
     normalized = [
         _normalize_promotion_text(value)
@@ -9611,13 +12536,24 @@ def _promotion_values_conflict(subject: str, values: tuple[str, ...]) -> bool:
     negated = [bool(negation.search(value)) for value in normalized]
     if any(negated) and not all(negated):
         return True
+    if any(
+        _semantic_values_are_opposites(left, right)
+        for index, left in enumerate(normalized)
+        for right in normalized[index + 1 :]
+    ):
+        return True
     if subject.startswith("user:prefer"):
         return True
     return bool(
         re.search(
             r"\b(?:target|mode|theme|status|state|version|branch|path|port|"
             r"default|setting|count|size|language|database|style|indentation|"
-            r"verbosity|color|font|speed)\b",
+            r"verbosity|color|font|speed|timezone|time\s+zone|owner|assignee|"
+            r"email|host|endpoint|url|uri|address|location|region|date|deadline|"
+            r"currency|name|"
+            r"datastore|cloud|provider|runtime|engine|framework|platform|"
+            r"implementation|environment|primary|current|active|selected|chosen|main|official|"
+            r"preferred|canonical|authoritative|assigned|designated|configured)\b",
             subject.casefold(),
         )
     )
