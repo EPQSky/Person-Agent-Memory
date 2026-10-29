@@ -62,6 +62,7 @@ from jiuwen_memory.storage.types import ScoredID, TextQuery
 from jiuwen_memory.storage.vector import VectorProducer
 
 from personal_agent_memory.config import MemoryKernelKind
+from personal_agent_memory.entity_graph import DETAIL_DEFAULT_LIMIT, EntityGraphStore
 from personal_agent_memory.memory_kernel import (
     CWD_SCOPE_PREFIX,
     FORMAL_MEMORY_TYPES,
@@ -141,6 +142,9 @@ _BROWSER_INDEX_RETRY_MAX = 1_000
 _LINEAGE_MIGRATION_BATCH_SIZE = 100
 PromotionClassifier = Callable[[str, Mapping[str, object]], Mapping[str, object]]
 SemanticExtractor = Callable[[dict[str, object]], list[dict[str, object]]]
+EntityGraphExtractor = Callable[
+    [dict[str, object]], Mapping[str, object] | list[dict[str, object]]
+]
 SemanticTask = Callable[[], None]
 
 
@@ -976,6 +980,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         graph: ModelEndpoint | None = None,
         promotion_classifier: PromotionClassifier | None = None,
         semantic_extractor: SemanticExtractor | None = None,
+        graph_extractor: EntityGraphExtractor | None = None,
         semantic_executor: SemanticTaskExecutor | None = None,
         config_overrides: Mapping[str, Any] | None = None,
         regions: RegionRegistry | None = None,
@@ -990,6 +995,15 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._promotion_model = model_client
         self._semantic_extractor = semantic_extractor or (
             model_client.extract_semantic_memories if model_client is not None else None
+        )
+        self._graph_extractor = graph_extractor or (
+            (
+                lambda context: model_client.extract_graph(
+                    json.dumps(context, ensure_ascii=False, sort_keys=True)
+                )
+            )
+            if model_client is not None
+            else None
         )
         self._config_overrides = config_overrides
         self._regions_registry = regions
@@ -1016,6 +1030,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._maintenance_lock = threading.RLock()
         self._browser_index_lock = threading.RLock()
         self._graph_write_lock = threading.RLock()
+        self._entity_graph_store = EntityGraphStore(
+            self._state_dir / "mem2" / "maintenance.sqlite3"
+        )
+        self._entity_graph_lock = threading.RLock()
+        self._entity_graph_threads: dict[str, threading.Thread] = {}
+        self._entity_graph_requested: set[str] = set()
+        self._entity_graph_recovery_thread: threading.Thread | None = None
         self._governance_locks: dict[str, threading.RLock] = {}
         self._governance_locks_guard = threading.Lock()
         self._idempotency_locks: dict[tuple[str, str], tuple[threading.Lock, int]] = {}
@@ -1084,6 +1105,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 self._retry_pending_browser_index(bundle, strict=False)
                 self._recover_promotion_outbox(bundle)
                 self._recover_semantic_distillations()
+                self._schedule_entity_graph_recovery()
             except Exception as error:
                 self._promotion_schema_ready = False
                 self._bundle = None
@@ -1171,6 +1193,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._wait_for_semantic_tasks()
         self._wait_for_promotion_threads()
         self._wait_for_scope_graph_updates()
+        self._wait_for_entity_graph_updates()
         with self._lock:
             bundle = self._bundle
             self._bundle = None
@@ -1336,6 +1359,287 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             **counts,
         }
 
+    def entity_graph_status(self, library_id: str) -> dict[str, object]:
+        region = self._regions.require_region(validate_library_id(library_id))
+        if self._graph_extractor is None:
+            self._entity_graph_store.not_configured(region.region_id)
+        self._wait_for_entity_graph_update(region.region_id)
+        return self._entity_graph_store.status(region.region_id)
+
+    async def rebuild_entity_graph(self, library_id: str) -> dict[str, object]:
+        return await asyncio.to_thread(self._rebuild_entity_graph_serialized, library_id)
+
+    def _rebuild_entity_graph_serialized(self, library_id: str) -> dict[str, object]:
+        region = self._regions.require_region(validate_library_id(library_id))
+        with self._governance_region_lock(region.region_id):
+            return self._rebuild_entity_graph(region)
+
+    def _rebuild_entity_graph(self, region: MemoryRegion) -> dict[str, object]:
+        if self._graph_extractor is None:
+            self._entity_graph_store.not_configured(region.region_id)
+            return self._entity_graph_store.status(region.region_id)
+        bundle = self._require_bundle()
+        try:
+            memories: list[dict[str, object]] = []
+            for scope, unit in self._region_unit_pairs(bundle, region):
+                if not _is_formal_semantic_unit(unit):
+                    continue
+                memories.append(self._entity_graph_memory_payload(bundle, region, scope, unit))
+            return self._entity_graph_store.rebuild(
+                region.region_id, memories, self._graph_extractor
+            )
+        except Exception:
+            self._entity_graph_store.fail(
+                region.region_id, "entity graph extractor returned invalid data"
+            )
+            return {
+                **self._entity_graph_store.status(region.region_id),
+                "error": "entity graph projection failed",
+            }
+
+    def _project_entity_graph_memory(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        scope: Scope,
+        unit: MemoryUnit,
+    ) -> dict[str, object]:
+        if self._graph_extractor is None:
+            return {"status": "skipped", "rejected": 0}
+        return self._entity_graph_store.project(
+            region.region_id,
+            self._entity_graph_memory_payload(bundle, region, scope, unit),
+            self._graph_extractor,
+        )
+
+    def _entity_graph_memory_payload(
+        self,
+        bundle: _RuntimeBundle,
+        region: MemoryRegion,
+        scope: Scope,
+        unit: MemoryUnit,
+    ) -> dict[str, object]:
+        evidence = self._browser_evidence(bundle, region, unit)
+        source_references = unit.user_metadata.get("source_references")
+        if not isinstance(source_references, list):
+            source_references = list(unit.provenance)
+        return {
+            "memory_id": unit.id,
+            "content": unit.content,
+            "memory_type": _metadata_text(unit, "memory_type"),
+            "source_references": list(source_references),
+            "evidence": evidence,
+            "evidence_snippets": _metadata_strings(unit, "evidence_snippets"),
+            "region": {
+                "region_id": region.region_id,
+                "kind": region.kind,
+                "name": region.name,
+            },
+            "scope": {
+                "org": scope.org,
+                "space": scope.space,
+                "user": scope.user,
+                "agent": scope.agent,
+                "session": scope.session,
+            },
+        }
+
+    def _queue_entity_graph_update(self, region_id: str) -> None:
+        if self._graph_extractor is None:
+            self._entity_graph_store.not_configured(region_id)
+            return
+        with self._entity_graph_lock:
+            self._entity_graph_requested.add(region_id)
+            if region_id in self._entity_graph_threads:
+                return
+            thread = threading.Thread(
+                target=self._run_entity_graph_update,
+                args=(region_id,),
+                name="memory-entity-graph-update",
+                daemon=True,
+            )
+            self._entity_graph_threads[region_id] = thread
+        thread.start()
+
+    def _schedule_entity_graph_recovery(self) -> None:
+        if self._graph_extractor is None:
+            return
+        with self._entity_graph_lock:
+            if (
+                self._entity_graph_recovery_thread is not None
+                and self._entity_graph_recovery_thread.is_alive()
+            ):
+                return
+            thread = threading.Thread(
+                target=self._recover_entity_graph_projections,
+                name="memory-entity-graph-recovery",
+                daemon=True,
+            )
+            self._entity_graph_recovery_thread = thread
+        thread.start()
+
+    def _recover_entity_graph_projections(self) -> None:
+        try:
+            for region in self._regions.list_regions():
+                self._queue_entity_graph_update(region.region_id)
+        except Exception:
+            return
+        finally:
+            with self._entity_graph_lock:
+                if self._entity_graph_recovery_thread is threading.current_thread():
+                    self._entity_graph_recovery_thread = None
+
+    def _run_entity_graph_update(self, region_id: str) -> None:
+        restart_thread: threading.Thread | None = None
+        try:
+            region = self._regions.require_region(region_id)
+            while True:
+                with self._entity_graph_lock:
+                    if region_id not in self._entity_graph_requested:
+                        return
+                    self._entity_graph_requested.discard(region_id)
+                with self._governance_region_lock(region_id):
+                    self._rebuild_entity_graph(region)
+        except Exception:
+            self._entity_graph_store.fail(region_id, "entity graph projection failed")
+        finally:
+            with self._entity_graph_lock:
+                if self._entity_graph_threads.get(region_id) is threading.current_thread():
+                    self._entity_graph_threads.pop(region_id, None)
+                    if region_id in self._entity_graph_requested:
+                        restart_thread = threading.Thread(
+                            target=self._run_entity_graph_update,
+                            args=(region_id,),
+                            name="memory-entity-graph-update",
+                            daemon=True,
+                        )
+                        self._entity_graph_threads[region_id] = restart_thread
+                    else:
+                        self._entity_graph_requested.discard(region_id)
+            if restart_thread is not None:
+                restart_thread.start()
+
+    def _wait_for_entity_graph_update(
+        self, region_id: str, *, timeout: float = 30.0
+    ) -> None:
+        if timeout < 0:
+            raise ValueError("entity graph wait timeout must not be negative")
+        with self._entity_graph_lock:
+            thread = self._entity_graph_threads.get(region_id)
+        if thread is not None:
+            thread.join(timeout=timeout)
+
+    def entity_graph(
+        self,
+        library_id: str,
+        *,
+        entity_id: str | None = None,
+        memory_id: str | None = None,
+        entity_type: str | None = None,
+        q: str | None = None,
+        hops: int = 1,
+        limit: int = 200,
+        wait_for_update: bool = True,
+        wait_timeout: float | None = None,
+    ) -> dict[str, object]:
+        region = self._regions.require_region(validate_library_id(library_id))
+        if wait_for_update:
+            self._wait_for_entity_graph_update(
+                region.region_id,
+                timeout=30.0 if wait_timeout is None else wait_timeout,
+            )
+        return self._entity_graph_store.graph(
+            region.region_id,
+            entity_id=entity_id,
+            memory_id=memory_id,
+            entity_type=entity_type,
+            q=q,
+            hops=hops,
+            limit=limit,
+        )
+
+    def entity_graph_memory(
+        self,
+        library_id: str,
+        memory_id: str,
+        *,
+        wait_for_update: bool = True,
+        wait_timeout: float | None = None,
+    ) -> dict[str, object]:
+        region = self._regions.require_region(validate_library_id(library_id))
+        if wait_for_update:
+            self._wait_for_entity_graph_update(
+                region.region_id,
+                timeout=30.0 if wait_timeout is None else wait_timeout,
+            )
+        return self._entity_graph_store.memory_detail(region.region_id, memory_id)
+
+    def entity_graph_entity(
+        self,
+        library_id: str,
+        entity_id: str,
+        *,
+        limit: int = DETAIL_DEFAULT_LIMIT,
+        offset: int | None = None,
+        cursor: str | None = None,
+        wait_for_update: bool = True,
+        wait_timeout: float | None = None,
+    ) -> dict[str, object]:
+        region = self._regions.require_region(validate_library_id(library_id))
+        if wait_for_update:
+            self._wait_for_entity_graph_update(
+                region.region_id,
+                timeout=30.0 if wait_timeout is None else wait_timeout,
+            )
+        detail = self._entity_graph_store.entity_detail(
+            region.region_id,
+            entity_id,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+        if detail is None:
+            raise MemoryRecordNotFoundError("entity not found")
+        return detail
+
+    def entity_graph_relation(
+        self,
+        library_id: str,
+        relation_id: str,
+        *,
+        limit: int = DETAIL_DEFAULT_LIMIT,
+        offset: int | None = None,
+        cursor: str | None = None,
+        wait_for_update: bool = True,
+        wait_timeout: float | None = None,
+    ) -> dict[str, object]:
+        region = self._regions.require_region(validate_library_id(library_id))
+        if wait_for_update:
+            self._wait_for_entity_graph_update(
+                region.region_id,
+                timeout=30.0 if wait_timeout is None else wait_timeout,
+            )
+        detail = self._entity_graph_store.relation_detail(
+            region.region_id,
+            relation_id,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+        if detail is None:
+            raise MemoryRecordNotFoundError("relation not found")
+        return detail
+
+    def _wait_for_entity_graph_updates(self) -> None:
+        with self._entity_graph_lock:
+            recovery_thread = self._entity_graph_recovery_thread
+        if recovery_thread is not None:
+            recovery_thread.join(timeout=30.0)
+        with self._entity_graph_lock:
+            threads = tuple(self._entity_graph_threads.values())
+        for thread in threads:
+            thread.join(timeout=30.0)
+
     async def rebuild_graph(self, library_id: str) -> dict[str, object]:
         return await asyncio.to_thread(self._rebuild_graph_serialized, library_id)
 
@@ -1354,7 +1658,17 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         region = self._graph_region_or_none(identifier)
         region_id = region.region_id if region is not None else identifier
         if bundle.graph_store is None:
-            return {"library_id": region_id, "status": "not_configured", "job_id": ""}
+            entity_graph = (
+                self._rebuild_entity_graph(region)
+                if region is not None
+                else {"status": "not_configured", "region_id": region_id}
+            )
+            return {
+                "library_id": region_id,
+                "status": "not_configured",
+                "job_id": "",
+                "entity_graph": entity_graph,
+            }
         job_ids: list[str] = []
         failure: str | None = None
         failure_scope: Scope | None = None
@@ -1401,6 +1715,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "detail": failure,
                 "job_id": job_ids[0] if job_ids else "",
                 "job_ids": job_ids,
+                "entity_graph": self._rebuild_entity_graph(region) if region is not None else {},
             }
         self._clear_graph_error(region_id=region_id)
         if region is not None:
@@ -1416,6 +1731,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "job_id": job_ids[0] if job_ids else "",
             "job_ids": job_ids,
             "graph": self.graph_status(region_id),
+            "entity_graph": self._rebuild_entity_graph(region) if region is not None else {},
         }
 
     def _verify_graph_projection(self, bundle: _RuntimeBundle, scope: Scope) -> None:
@@ -2488,6 +2804,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         scope,
                         [existing_id],
                     )
+                    if request.memory_type in FORMAL_MEMORY_TYPES:
+                        self._queue_entity_graph_update(indexed_region.region_id)
                 return _write_response(request, existing_id, status="existing")
             user_metadata = {
                 **dict(request.user_metadata or {}),
@@ -2631,6 +2949,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     index_token,
                     [unit.id],
                 )
+            if indexed_region is not None and request.memory_type in FORMAL_MEMORY_TYPES:
+                self._queue_entity_graph_update(indexed_region.region_id)
             response = _write_response(request, unit.id, status="created")
             response["browser_index_sync"] = browser_index_sync
             if browser_index_sync == "pending":
@@ -3703,6 +4023,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 scope,
                 region_id=region.region_id,
             )
+        self._queue_entity_graph_update(region.region_id)
         payload = _unit_payload(updated, region)
         payload["browser_index_sync"] = browser_index_sync
         if browser_index_sync == "pending":
@@ -3854,6 +4175,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 list(dict.fromkeys(deleted_ids)),
                 region.region_id,
             )
+            self._queue_entity_graph_update(region.region_id)
         detail: dict[str, object] = {
             "deleted": bool(deleted_ids),
             "mode": request.mode,
@@ -4105,6 +4427,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 old_scope,
                 region_id=region.region_id,
             )
+        self._queue_entity_graph_update(region.region_id)
         self._finish_governance_event(
             event_id,
             status="committed",
@@ -4204,6 +4527,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 scope,
                 region_id=region.region_id,
             )
+        self._queue_entity_graph_update(region.region_id)
         self._finish_governance_event(
             event_id,
             status="committed",
@@ -12670,10 +12994,7 @@ def _is_formal_semantic_unit(unit: MemoryUnit) -> bool:
     if _is_capture_unit(unit):
         return False
     memory_type = _metadata_text(unit, "memory_type")
-    return (
-        memory_type in FORMAL_MEMORY_TYPES
-        and unit.lifecycle.value in {"active", "superseded", "archived"}
-    )
+    return memory_type in FORMAL_MEMORY_TYPES and unit.lifecycle.value == "active"
 
 
 def _memory_sort_key(payload: Mapping[str, object]) -> tuple[datetime, str]:

@@ -34,6 +34,11 @@ from pydantic import (
 
 from personal_agent_memory.config import Settings
 from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
+from personal_agent_memory.entity_graph import (
+    DETAIL_DEFAULT_LIMIT,
+    DETAIL_MAX_LIMIT,
+    DETAIL_MAX_OFFSET,
+)
 from personal_agent_memory.memory_kernel import (
     MAX_LIBRARY_ID_LENGTH,
     AssociateWorktreeRegionRequest,
@@ -92,6 +97,7 @@ from personal_agent_memory.regions import (
 from personal_agent_memory.security import ApiKeyStore, ManagementSessionStore
 
 CAPTURE_BINDING_DEADLINE_SECONDS = 0.25
+ENTITY_GRAPH_MEMORY_DETAIL_GRACE_SECONDS = 0.20
 LibraryId = Annotated[
     str,
     BeforeValidator(lambda value: value.strip() if isinstance(value, str) else value),
@@ -616,6 +622,221 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 detail=str(error),
             ) from error
 
+    @app.get(
+        "/api/v1/libraries/{library_id}/entity-graph/status",
+        dependencies=[Depends(authenticate)],
+    )
+    async def entity_graph_status(library_id: str) -> dict[str, object]:
+        try:
+            return await asyncio.to_thread(selected_kernel.entity_graph_status, library_id)
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except RegionError as error:
+            raise region_error(error) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
+    @app.post(
+        "/api/v1/libraries/{library_id}/entity-graph/rebuild",
+        dependencies=[Depends(authenticate)],
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def rebuild_entity_graph(library_id: str) -> dict[str, object]:
+        try:
+            return await selected_kernel.rebuild_entity_graph(library_id)
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except RegionError as error:
+            raise region_error(error) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/entity-graph",
+        dependencies=[Depends(authenticate)],
+    )
+    @app.get(
+        "/api/v1/libraries/{library_id}/graph",
+        dependencies=[Depends(authenticate)],
+    )
+    async def read_entity_graph(
+        request: Request,
+        library_id: str,
+        entity_id: str | None = Query(default=None, max_length=600),
+        memory_id: str | None = Query(default=None, max_length=600),
+        entity_type: str | None = Query(default=None, max_length=40),
+        q: str | None = Query(default=None, max_length=500),
+        hops: int = Query(default=1, ge=1, le=2),
+        limit: int = Query(default=200, ge=1, le=200),
+    ) -> dict[str, object]:
+        allowed = {"entity_id", "memory_id", "entity_type", "q", "hops", "limit"}
+        unknown = sorted(set(request.query_params) - allowed)
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"unknown entity graph parameter: {', '.join(unknown)}",
+            )
+        try:
+            return await asyncio.to_thread(
+                selected_kernel.entity_graph,
+                library_id,
+                entity_id=entity_id,
+                memory_id=memory_id,
+                entity_type=entity_type,
+                q=q,
+                hops=hops,
+                limit=limit,
+            )
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except RegionError as error:
+            raise region_error(error) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/entity-graph/entities/{entity_id}",
+        dependencies=[Depends(authenticate)],
+    )
+    async def read_entity_graph_entity(
+        library_id: str,
+        entity_id: str,
+        limit: int = Query(
+            default=DETAIL_DEFAULT_LIMIT, ge=1, le=DETAIL_MAX_LIMIT
+        ),
+        offset: int | None = Query(default=None, ge=0, le=DETAIL_MAX_OFFSET),
+        cursor: str | None = Query(default=None, max_length=64),
+    ) -> dict[str, object]:
+        try:
+            detail = await asyncio.to_thread(
+                selected_kernel.entity_graph_entity,
+                library_id,
+                entity_id,
+                limit=limit,
+                offset=offset,
+                cursor=cursor,
+            )
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except RegionError as error:
+            raise region_error(error) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+        node = detail["entity"]
+        raw_supporting_memory_ids = detail.get("supporting_memory_ids", [])
+        supporting_memory_ids = (
+            list(dict.fromkeys(str(item) for item in raw_supporting_memory_ids))
+            if isinstance(raw_supporting_memory_ids, list)
+            else []
+        )
+        supporting_memories: list[dict[str, object]] = []
+        for supporting_memory_id in supporting_memory_ids:
+            try:
+                supporting_memories.append(
+                    await asyncio.to_thread(
+                        selected_kernel.inspect_memory,
+                        DocumentInspectRequest(
+                            library_id=library_id,
+                            path=str(supporting_memory_id),
+                        ),
+                    )
+                )
+            except MemoryGovernanceError:
+                continue
+        return {
+            "entity": node,
+            "supporting_memory_ids": supporting_memory_ids,
+            "supporting_memories": supporting_memories,
+            "supporting_memory_count": detail["supporting_memory_count"],
+            "supporting_memory_limit": detail["supporting_memory_limit"],
+            "supporting_memory_offset": detail["supporting_memory_offset"],
+            "has_more": detail["has_more"],
+            "next_cursor": detail["next_cursor"],
+            "relations": detail["relations"],
+            "graph": detail["graph"],
+            "read_only": True,
+        }
+
+    @app.get(
+        "/api/v1/libraries/{library_id}/entity-graph/relations/{relation_id}",
+        dependencies=[Depends(authenticate)],
+    )
+    async def read_entity_graph_relation(
+        library_id: str,
+        relation_id: str,
+        limit: int = Query(
+            default=DETAIL_DEFAULT_LIMIT, ge=1, le=DETAIL_MAX_LIMIT
+        ),
+        offset: int | None = Query(default=None, ge=0, le=DETAIL_MAX_OFFSET),
+        cursor: str | None = Query(default=None, max_length=64),
+    ) -> dict[str, object]:
+        try:
+            detail = await asyncio.to_thread(
+                selected_kernel.entity_graph_relation,
+                library_id,
+                relation_id,
+                limit=limit,
+                offset=offset,
+                cursor=cursor,
+            )
+        except MemoryRecordNotFoundError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
+            ) from error
+        except RegionError as error:
+            raise region_error(error) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)
+            ) from error
+        relation = detail["relation"]
+        supporting_memory_ids = detail["supporting_memory_ids"]
+        supporting_memories: list[dict[str, object]] = []
+        if isinstance(supporting_memory_ids, list):
+            for supporting_memory_id in supporting_memory_ids:
+                try:
+                    supporting_memories.append(
+                        await asyncio.to_thread(
+                            selected_kernel.inspect_memory,
+                            DocumentInspectRequest(
+                                library_id=library_id,
+                                path=str(supporting_memory_id),
+                            ),
+                        )
+                    )
+                except MemoryGovernanceError:
+                    continue
+        return {
+            "relation": relation,
+            "source_entity": detail["source_entity"],
+            "target_entity": detail["target_entity"],
+            "supporting_memory_ids": supporting_memory_ids,
+            "supporting_memories": supporting_memories,
+            "supporting_memory_count": detail["supporting_memory_count"],
+            "supporting_memory_limit": detail["supporting_memory_limit"],
+            "supporting_memory_offset": detail["supporting_memory_offset"],
+            "has_more": detail["has_more"],
+            "next_cursor": detail["next_cursor"],
+            "graph": detail["graph"],
+            "read_only": True,
+        }
+
 
 
 
@@ -1113,10 +1334,24 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     )
     async def read_memory(library_id: str, memory_id: str) -> dict[str, object]:
         try:
-            return await asyncio.to_thread(
+            payload = await asyncio.to_thread(
                 selected_kernel.inspect_memory,
                 DocumentInspectRequest(library_id=library_id, path=memory_id),
             )
+            graph_reader: Any = selected_kernel.entity_graph
+            graph = await asyncio.to_thread(
+                graph_reader,
+                library_id,
+                memory_id=memory_id,
+                hops=1,
+                wait_for_update=True,
+                wait_timeout=ENTITY_GRAPH_MEMORY_DETAIL_GRACE_SECONDS,
+            )
+            payload["associated_entities"] = graph.get("nodes", [])
+            payload["associated_relations"] = graph.get("edges", [])
+            payload["entity_graph"] = graph
+            payload["local_graph"] = graph
+            return payload
         except MemoryGovernanceError as error:
             raise mutation_error(error) from error
 

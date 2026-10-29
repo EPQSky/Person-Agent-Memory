@@ -70,6 +70,7 @@ class _ReadyServer(uvicorn.Server):
 def _manual_semantic_live_app(
     tmp_path: Path,
     extractor: Callable[[dict[str, object]], list[dict[str, object]]],
+    graph_extractor: Callable[[dict[str, object]], dict[str, object]] | None = None,
 ) -> Iterator[tuple[str, str, Path, _ManualSemanticExecutor]]:
     state_dir = tmp_path / "manual-state"
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -79,6 +80,7 @@ def _manual_semantic_live_app(
     kernel = Mem2MemoryKernel(
         state_dir,
         semantic_extractor=extractor,
+        graph_extractor=graph_extractor,
         semantic_executor=executor,
     )
     app = create_app(Settings(state_dir=state_dir), memory_kernel=kernel)
@@ -645,6 +647,105 @@ def test_console_login_region_memory_detail_and_governance(
             page.unroute(list_route)
         finally:
             browser.close()
+
+
+def test_console_memory_detail_graph_support_is_visible_in_current_panel(
+    tmp_path: Path,
+) -> None:
+    if not CHROME.exists():
+        pytest.skip("system Google Chrome is unavailable")
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    sync_playwright = playwright_api.sync_playwright
+    expect = playwright_api.expect
+
+    def graph_extractor(_: dict[str, object]) -> dict[str, object]:
+        return {
+            "entities": [
+                {"type": "project", "canonical_name": "Project Atlas"},
+                {"type": "technology", "canonical_name": "Python"},
+            ],
+            "relations": [
+                {
+                    "source": "project:Project Atlas",
+                    "target": "technology:Python",
+                    "type": "uses",
+                    "evidence": ["Project Atlas uses Python."],
+                }
+            ],
+        }
+
+    with _manual_semantic_live_app(tmp_path, lambda _: [], graph_extractor) as (
+        base_url,
+        api_key,
+        _state_dir,
+        _executor,
+    ):
+        headers = {"Authorization": f"Bearer {api_key}"}
+        with httpx.Client(
+            base_url=base_url,
+            headers=headers,
+            timeout=10,
+            trust_env=False,
+        ) as client:
+            region = client.post(
+                "/api/v1/regions",
+                json={"kind": "topic", "name": "图谱浏览器验收", "region_id": "graph-browser"},
+            )
+            assert region.status_code == 201, region.text
+            memory = client.post(
+                "/api/v1/memories",
+                json={
+                    "region_id": "graph-browser",
+                    "content": "Project Atlas uses Python.",
+                    "memory_type": "domain_fact",
+                    "source_references": ["source:graph-browser"],
+                    "idempotency_key": "graph-browser-memory",
+                },
+            )
+            assert memory.status_code == 201, memory.text
+            memory_id = str(memory.json()["id"])
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME),
+                headless=True,
+                args=["--no-sandbox", "--no-proxy-server", "--proxy-bypass-list=*"],
+            )
+            try:
+                page = browser.new_page(viewport={"width": 1440, "height": 1100})
+                page.goto(base_url, wait_until="domcontentloaded")
+                page.get_by_label("API key").fill(api_key)
+                page.get_by_role("button", name="登录").click()
+                page.get_by_role(
+                    "button", name="图谱浏览器验收 · topic · graph-browser"
+                ).click()
+                memory_button = page.get_by_role(
+                    "button", name="查看记忆：Project Atlas uses Python."
+                )
+                memory_button.wait_for()
+                memory_button.click()
+                page.locator("#detail-entity-list button").first.click()
+                support = page.locator("#detail-graph-support")
+                expect(support).to_be_visible()
+                expect(page.locator("#detail-graph-support-content")).to_contain_text(
+                    '"supporting_memories"'
+                )
+                expect(page.locator("#detail-graph-support-content")).to_contain_text(
+                    memory_id
+                )
+                page.locator("#detail-relation-list button").first.click()
+                expect(support).to_be_visible()
+                expect(page.locator("#detail-graph-support-heading")).to_have_text(
+                    "关系图谱支撑详情"
+                )
+                expect(page.locator("#detail-graph-support-content")).to_contain_text(
+                    '"supporting_memories"'
+                )
+                expect(page.locator("#detail-graph-support-content")).to_contain_text(
+                    memory_id
+                )
+            finally:
+                browser.close()
 
 
 def test_console_raw_session_keeps_questions_out_of_formal_memory(
@@ -1506,5 +1607,99 @@ def test_console_semantic_distillation_routes_project_and_user_memories_with_evi
                 ).to_be_visible()
                 expect(page.locator("#raw-session-workspace input")).to_have_count(0)
                 expect(page.get_by_role("button", name="重新提炼")).to_have_count(0)
+            finally:
+                browser.close()
+
+
+def test_console_memory_detail_opens_entity_graph_and_supporting_sources(
+    tmp_path: Path,
+) -> None:
+    assert CHROME.exists(), f"real Chromium is required at {CHROME}"
+
+    def semantic_extractor(_: dict[str, object]) -> list[dict[str, object]]:
+        return []
+
+    def graph_extractor(context: dict[str, object]) -> dict[str, object]:
+        content = str(context["memory"]["content"])
+        return {
+            "entities": [
+                {"type": "project", "canonical_name": "Project Atlas"},
+                {"type": "technology", "canonical_name": "Python"},
+            ],
+            "relations": [
+                {
+                    "source": "project:Project Atlas",
+                    "target": "technology:Python",
+                    "type": "uses",
+                    "evidence": [content],
+                }
+            ],
+        }
+
+    with _manual_semantic_live_app(
+        tmp_path,
+        semantic_extractor,
+        graph_extractor=graph_extractor,
+    ) as (base_url, api_key, _, _):
+        headers = {"Authorization": f"Bearer {api_key}"}
+        with httpx.Client(
+            base_url=base_url, headers=headers, timeout=10, trust_env=False
+        ) as client:
+            region = client.post(
+                "/api/v1/regions",
+                json={"kind": "topic", "name": "实体图谱验收", "region_id": "entity-browser"},
+            )
+            assert region.status_code == 201, region.text
+            memory = client.post(
+                "/api/v1/memories",
+                json={
+                    "region_id": "entity-browser",
+                    "content": "Project Atlas uses Python.",
+                    "memory_type": "domain_fact",
+                    "source_references": ["session:entity-browser"],
+                    "idempotency_key": "entity-browser-memory",
+                },
+            )
+            assert memory.status_code == 201, memory.text
+
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME),
+                headless=True,
+                args=["--no-sandbox", "--no-proxy-server", "--proxy-bypass-list=*"],
+            )
+            try:
+                page = browser.new_page(viewport={"width": 1440, "height": 1100})
+                page.goto(base_url, wait_until="domcontentloaded")
+                page.get_by_label("API key").fill(api_key)
+                page.get_by_role("button", name="登录").click()
+                page.get_by_role(
+                    "button", name="实体图谱验收 · topic · entity-browser"
+                ).click()
+                memory_button = page.get_by_role(
+                    "button", name="查看记忆：Project Atlas uses Python."
+                )
+                expect(memory_button).to_be_visible()
+                memory_button.click()
+                expect(page.locator("#detail-entity-list")).to_contain_text("Project Atlas")
+                expect(page.locator("#detail-relation-list")).to_contain_text("uses")
+                expect(page.locator("#detail-local-graph")).to_contain_text("Project Atlas")
+                page.get_by_role("tab", name="图谱").click()
+                expect(page.locator("#entity-graph-workspace")).to_be_visible()
+                expect(
+                    page.locator("#entity-graph-entities").get_by_role(
+                        "button", name="Project Atlas · project"
+                    )
+                ).to_be_visible()
+                expect(page.locator("#entity-graph-relations")).to_contain_text("uses")
+                page.locator("#entity-graph-entities").get_by_role(
+                    "button", name="Project Atlas · project"
+                ).click()
+                expect(page.locator("#entity-selection-detail")).to_be_visible()
+                expect(page.locator("#entity-selection-content")).to_contain_text(
+                    memory.json()["id"]
+                )
             finally:
                 browser.close()
