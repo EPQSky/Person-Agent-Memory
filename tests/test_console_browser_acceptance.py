@@ -1222,7 +1222,7 @@ def test_console_archived_real_retention_rounds_keep_stable_timeline(
             browser.close()
 
 
-def test_console_semantic_distillation_keeps_question_out_and_preference_with_evidence(
+def test_console_semantic_distillation_routes_project_and_user_memories_with_evidence(
     tmp_path: Path,
 ) -> None:
     playwright_api = pytest.importorskip("playwright.sync_api")
@@ -1233,8 +1233,11 @@ def test_console_semantic_distillation_keeps_question_out_and_preference_with_ev
     region_id = "semantic-browser-region"
     session_id = "semantic-browser-session"
     question = "帮我分析下当前项目"
+    project_fact_question = "This project uses pnpm for builds."
+    project_fact_memory = "This project uses pnpm for builds."
     preference_question = "我偏好项目统一使用 uv 管理依赖。"
     preference_memory = "用户偏好项目统一使用 uv 管理依赖。"
+    sensitive_assistant = "api_key = 'correct-horse-battery-staple'"
 
     def extractor(context: dict[str, object]) -> list[dict[str, object]]:
         messages = context["messages"]
@@ -1247,21 +1250,34 @@ def test_console_semantic_distillation_keeps_question_out_and_preference_with_ev
         memories: list[dict[str, object]] = []
         for user_message in user_messages:
             content = str(user_message.get("content", ""))
-            if "我偏好" not in content:
-                continue
-            memories.append(
-                {
-                    "content": preference_memory,
-                    "memory_type": "preference",
-                    "confidence": 0.97,
-                    "region_hint": "source",
-                    "user_event_id": user_message["event_id"],
-                    "evidence_snippet": "我偏好项目统一使用 uv 管理依赖",
-                    "claim_subject": "user:preference:dependency_manager",
-                    "claim_value": "uv",
-                    "durability": "durable_statement",
-                }
-            )
+            if "This project uses pnpm" in content:
+                memories.append(
+                    {
+                        "content": project_fact_memory,
+                        "memory_type": "constraint",
+                        "confidence": 0.97,
+                        "region_hint": "source",
+                        "user_event_id": user_message["event_id"],
+                        "evidence_snippet": "This project uses pnpm for builds",
+                        "claim_subject": "project:dependency_manager",
+                        "claim_value": "pnpm",
+                        "durability": "durable_statement",
+                    }
+                )
+            elif "我偏好" in content:
+                memories.append(
+                    {
+                        "content": preference_memory,
+                        "memory_type": "preference",
+                        "confidence": 0.97,
+                        "region_hint": "user",
+                        "user_event_id": user_message["event_id"],
+                        "evidence_snippet": "我偏好项目统一使用 uv 管理依赖",
+                        "claim_subject": "user:preference:dependency_manager",
+                        "claim_value": "uv",
+                        "durability": "durable_statement",
+                    }
+                )
         return memories
 
     with _manual_semantic_live_app(tmp_path, extractor) as (
@@ -1294,11 +1310,18 @@ def test_console_semantic_distillation_keeps_question_out_and_preference_with_ev
             for turn_id, marker, user_content, assistant_content, second in (
                 ("question-turn", "QUESTION", question, "当前项目分析已完成。", 0),
                 (
+                    "project-turn",
+                    "PROJECT",
+                    project_fact_question,
+                    "已确认项目依赖管理器。",
+                    10,
+                ),
+                (
                     "preference-turn",
                     "PREFERENCE",
                     preference_question,
-                    "已记录该偏好。",
-                    10,
+                    sensitive_assistant,
+                    20,
                 ),
             ):
                 for kind, content, offset in (
@@ -1319,7 +1342,7 @@ def test_console_semantic_distillation_keeps_question_out_and_preference_with_ev
                     )
                     assert captured.status_code == 202, captured.text
 
-            assert executor.pending_count == 2
+            assert executor.pending_count == 3
             executor.drain()
             assert executor.pending_count == 0
             rounds = client.get(
@@ -1332,15 +1355,23 @@ def test_console_semantic_distillation_keeps_question_out_and_preference_with_ev
             }
             assert rounds_by_turn["question-turn"]["semantic_status"] == "skipped"
             assert rounds_by_turn["question-turn"]["semantic_memory_ids"] == []
+            assert rounds_by_turn["project-turn"]["semantic_status"] == "completed"
+            project_memory_ids = rounds_by_turn["project-turn"]["semantic_memory_ids"]
+            assert isinstance(project_memory_ids, list) and len(project_memory_ids) == 1
             assert rounds_by_turn["preference-turn"]["semantic_status"] == "completed"
-            memory_ids = rounds_by_turn["preference-turn"]["semantic_memory_ids"]
-            assert isinstance(memory_ids, list) and len(memory_ids) == 1
+            preference_memory_ids = rounds_by_turn["preference-turn"]["semantic_memory_ids"]
+            assert isinstance(preference_memory_ids, list) and len(preference_memory_ids) == 1
 
             formal = client.get(f"/api/v1/libraries/{region_id}/memories?limit=50")
             assert formal.status_code == 200, formal.text
             formal_items = formal.json()["items"]
-            assert [item["summary"] for item in formal_items] == [preference_memory]
+            assert [item["summary"] for item in formal_items] == [project_fact_memory]
             assert question not in json.dumps(formal_items, ensure_ascii=False)
+            user_formal = client.get("/api/v1/libraries/user/memories?limit=50")
+            assert user_formal.status_code == 200, user_formal.text
+            assert [item["summary"] for item in user_formal.json()["items"]] == [
+                preference_memory
+            ]
             question_search = client.post(
                 "/api/v1/search",
                 json={"region_id": region_id, "query": question, "limit": 10},
@@ -1351,12 +1382,33 @@ def test_console_semantic_distillation_keeps_question_out_and_preference_with_ev
             )
             preference_search = client.post(
                 "/api/v1/search",
-                json={"region_id": region_id, "query": "uv", "limit": 10},
+                json={"region_id": "user", "query": "uv", "limit": 10},
             )
             assert preference_search.status_code == 200, preference_search.text
             assert any(
-                item["document_id"] == memory_ids[0]
+                item["document_id"] == preference_memory_ids[0]
                 for item in preference_search.json()["results"]
+            )
+            preference_detail = client.get(
+                f"/api/v1/libraries/user/memories/{preference_memory_ids[0]}"
+            )
+            assert preference_detail.status_code == 200, preference_detail.text
+            assert "correct-horse-battery-staple" not in preference_detail.text
+            sensitive_evidence = next(
+                item
+                for item in preference_detail.json()["evidence"]
+                if item["event_id"] == "PREFERENCE-assistant"
+            )
+            assert sensitive_evidence["redacted"] is True
+            assert sensitive_evidence["redaction_reason"] == "sensitive"
+            project_search = client.post(
+                "/api/v1/search",
+                json={"region_id": region_id, "query": "pnpm", "limit": 10},
+            )
+            assert project_search.status_code == 200, project_search.text
+            assert any(
+                item["document_id"] == project_memory_ids[0]
+                for item in project_search.json()["results"]
             )
 
         with sync_playwright() as playwright:
@@ -1374,15 +1426,54 @@ def test_console_semantic_distillation_keeps_question_out_and_preference_with_ev
                     "button", name="语义提炼验收区域 · project · semantic-browser-region"
                 ).click()
 
+                project_memory_button = page.get_by_role(
+                    "button", name=f"查看记忆：{project_fact_memory}"
+                )
+                project_memory_button.wait_for()
+                expect(page.locator("#memory-workspace").get_by_text(question)).to_have_count(0)
+                expect(
+                    page.locator("#memory-workspace").get_by_text(preference_memory)
+                ).to_have_count(0)
+                project_memory_button.click()
+                expect(page.locator("#detail-target-region")).to_contain_text(
+                    "语义提炼验收区域 · project · semantic-browser-region"
+                )
+                expect(page.locator("#detail-source-regions")).to_contain_text(
+                    "semantic-browser-region"
+                )
+                expect(page.locator("#evidence-list")).to_contain_text(project_fact_question)
+                expect(page.locator("#source-list")).to_contain_text("turn:project-turn")
+
+                page.get_by_role("button", name="用户记忆 · user · user").click()
                 memory_button = page.get_by_role(
                     "button", name=f"查看记忆：{preference_memory}"
                 )
                 memory_button.wait_for()
-                expect(page.locator("#memory-workspace").get_by_text(question)).to_have_count(0)
+                expect(
+                    page.locator("#memory-workspace").get_by_text(project_fact_memory)
+                ).to_have_count(0)
                 memory_button.click()
+                expect(page.locator("#detail-target-region")).to_contain_text(
+                    "用户记忆 · user · user"
+                )
+                expect(page.locator("#detail-source-regions")).to_contain_text(
+                    "semantic-browser-region"
+                )
+                expect(page.locator("#detail-evidence-basis")).to_contain_text(
+                    "我偏好项目统一使用 uv 管理依赖"
+                )
                 expect(page.locator("#evidence-list")).to_contain_text(preference_question)
+                expect(page.locator("#evidence-list")).to_contain_text(
+                    "正文因敏感内容已脱敏"
+                )
+                expect(page.locator("#evidence-list")).not_to_contain_text(
+                    "correct-horse-battery-staple"
+                )
                 expect(page.locator("#source-list")).to_contain_text("turn:preference-turn")
 
+                page.get_by_role(
+                    "button", name="语义提炼验收区域 · project · semantic-browser-region"
+                ).click()
                 page.get_by_role("tab", name="原始会话").click()
                 page.get_by_role(
                     "button", name=f"查看原始会话：{session_id}"
@@ -1401,9 +1492,13 @@ def test_console_semantic_distillation_keeps_question_out_and_preference_with_ev
                     round_list.get_by_text(preference_question, exact=True)
                 ).to_be_visible()
                 expect(
-                    round_list.get_by_text("语义提炼：语义完成", exact=True)
+                    round_list.get_by_text(project_fact_question, exact=True)
                 ).to_be_visible()
-                expect(round_list).to_contain_text(memory_ids[0])
+                expect(
+                    round_list.get_by_text("语义提炼：语义完成", exact=True)
+                ).to_have_count(2)
+                expect(round_list).to_contain_text(preference_memory_ids[0])
+                expect(round_list).to_contain_text(project_memory_ids[0])
                 expect(
                     round_list.get_by_text(
                         "用户证据：我偏好项目统一使用 uv 管理依赖", exact=True

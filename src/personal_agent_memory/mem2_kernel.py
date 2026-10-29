@@ -287,6 +287,7 @@ class _SemanticValidation(TypedDict):
     claim_value: str
     claims_explicit: bool
     durability: str
+    target_fallback_reason: str
 
 
 _PromotionClassified = tuple[_PromotionCandidate, _PromotionDecision, MemoryRegion]
@@ -306,6 +307,30 @@ _DEFAULT_SESSION_RETENTION_DAYS = 30
 _MAX_RECALL_CANDIDATE_POOL = 500
 _SEMANTIC_MIN_CONFIDENCE = 0.90
 _SEMANTIC_MAX_RESULTS = 20
+_SEMANTIC_PROJECT_SCOPE = re.compile(
+    r"(?:(?:this|our|my)\s+(?:project|repository|repo|workspace|codebase)\b|"
+    r"the\s+(?:current\s+)?(?:project|repository|repo|workspace|codebase)\b|"
+    r"the\s+user(?:['’])s\s+(?:project|repository|repo|workspace|codebase)\b|"
+    r"(?:^|[.!?。！？]\s+)(?:project|repository|repo|workspace|codebase)\b|"
+    r"(?:本项目|当前项目|这个项目|此项目|我的项目|该项目|"
+    r"本仓库|当前仓库|我的仓库|该仓库|"
+    r"本工作区|当前工作区|用户的项目|用户的仓库|用户的工作区|用户的代码库|"
+    r"(?:^|[。！？.!?]\s*)(?:项目|仓库|工作区|代码库)))",
+    re.IGNORECASE,
+)
+_SEMANTIC_USER_SCOPE_PREFIX = re.compile(
+    r"^(?:(?:i|we)\s+(?:prefer|like|want|need|require|must)\b|"
+    r"the\s+user\s+(?:prefers|likes|wants|needs|requires)\b|"
+    r"(?:我|我们)(?:偏好|喜欢|希望|想要|需要|要求)|"
+    r"用户(?:偏好|喜欢|希望|需要|要求))",
+    re.IGNORECASE,
+)
+_SEMANTIC_SENSITIVE_CLAIM_FIELD = re.compile(
+    r"(?<![\w-])(?:credential|credentials|api[\s_-]*key|access[\s_-]*token|"
+    r"client[\s_-]*secret|private[\s_-]*key|password|passwd|passcode|"
+    r"secret|token)(?![\w-])",
+    re.IGNORECASE,
+)
 _SEMANTIC_DEICTIC_REFERENCE = re.compile(
     r"上面|上述|前述|刚才|刚刚|上一条|前一条|此前对话|前文|"
     r"如上所述|如前所述|如前文所述|正如前面|"
@@ -925,6 +950,18 @@ class _RuntimeBundle:
     graph_store: MilvusLiteGraphStore | None
 
 
+class _SensitiveFilteringEvolver:
+    """Filter sensitive units before a graph association job reaches Jiuwen."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    def evolve(self, units: list[MemoryUnit], mode: EvolveMode) -> Any:
+        if mode == EvolveMode.ASSOCIATE:
+            units = [unit for unit in units if inspect_sensitive_text(unit.content) is None]
+        return self._delegate.evolve(units, mode)
+
+
 class Mem2MemoryKernel(UnavailableMemoryKernel):
     """Persistent JiuwenMemory runtime exposed through ``MemoryKernelPort``."""
 
@@ -1404,6 +1441,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 if unit.system_metadata.get("middle") != "true"
                 and unit.lifecycle.value == "active"
                 and unit.user_metadata.get("restore_pending") is not True
+                and inspect_sensitive_text(unit.content) is None
             ),
             key=lambda unit: unit.id,
         )
@@ -1722,24 +1760,51 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         if bundle.graph_store is None:
             return None
         try:
-            security = _security_for(scope)
-            job_id = bundle.runtime.api.evolve(
-                scope,
-                EvolveMode.ASSOCIATE,
-                security=security,
+            active_units = [
+                unit
+                for unit in self._units_in_scope(bundle, scope)
+                if unit.system_metadata.get("middle") != "true"
+                and unit.lifecycle.value == "active"
+                and unit.user_metadata.get("restore_pending") is not True
+            ]
+            sensitive_active = any(
+                inspect_sensitive_text(unit.content) is not None for unit in active_units
             )
+            sensitive_units_present = any(
+                inspect_sensitive_text(unit.content) is not None
+                for unit in self._units_in_scope(bundle, scope)
+            )
+            if sensitive_active:
+                self._prune_inactive_graph_nodes(
+                    bundle,
+                    scope,
+                    region_id=region_id,
+                )
+            engine = getattr(bundle.runtime.api, "_engine", None)
+            original_evolver = getattr(engine, "_evolver", None)
+            if sensitive_units_present and engine is not None and original_evolver is not None:
+                engine._evolver = _SensitiveFilteringEvolver(original_evolver)
+            security = _security_for(scope)
+            try:
+                job_id = bundle.runtime.api.evolve(
+                    scope,
+                    EvolveMode.ASSOCIATE,
+                    security=security,
+                )
+            finally:
+                if sensitive_units_present and engine is not None and original_evolver is not None:
+                    engine._evolver = original_evolver
             job_error = self._evolve_job_error(bundle, str(job_id))
             if job_error is not None:
                 raise MemoryKernelUnavailableError(job_error)
             store_error = self._graph_store_error(bundle, scope)
             if store_error is not None:
                 raise MemoryKernelUnavailableError(store_error)
-            if region_id is not None:
-                self._prune_inactive_graph_nodes(
-                    bundle,
-                    scope,
-                    region_id=region_id,
-                )
+            self._prune_inactive_graph_nodes(
+                bundle,
+                scope,
+                region_id=region_id,
+            )
             self._record_graph_projection(bundle, scope)
             self._clear_graph_error(region_id=region_id, scope=scope)
             self._clear_graph_projection_error(scope=scope)
@@ -2143,7 +2208,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         bundle: _RuntimeBundle,
         scope: Scope,
         *,
-        region_id: str,
+        region_id: str | None,
     ) -> None:
         graph_store = bundle.graph_store
         if graph_store is None:
@@ -2151,13 +2216,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         node_ids = getattr(graph_store, "node_ids", None)
         if not callable(node_ids):
             return
-        active_ids = {
-            unit.id
-            for unit in self._units_in_scope(bundle, scope)
-            if unit.system_metadata.get("middle") != "true"
-            and unit.lifecycle.value == "active"
-            and unit.user_metadata.get("restore_pending") is not True
-        }
+        active_ids = {unit.id for unit in self._active_graph_units(bundle, scope)}
         try:
             stale_ids = sorted(set(node_ids(scope)) - active_ids)
             if stale_ids:
@@ -3515,6 +3574,15 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "kind": region.kind,
         }
         payload["evidence"] = self._browser_evidence(bundle, region, unit)
+        payload["semantic_versions"] = self._semantic_versions_for_memory(
+            unit.id,
+            region_id=region.region_id,
+        )
+        payload["provenance_summary"] = self._memory_provenance_summary(
+            region,
+            payload,
+            payload["evidence"],
+        )
         history_entry = {
             key: value
             for key, value in payload.items()
@@ -3596,7 +3664,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
             raise
         if request.actor != "semantic-distillation":
-            self._clear_manual_override_semantic_metadata(bundle, scope, updated)
+            self._clear_manual_override_semantic_metadata(
+                bundle,
+                scope,
+                updated,
+                region_id=region.region_id,
+            )
         self._persist_unit_logical_memory_id(
             bundle,
             scope,
@@ -4670,6 +4743,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "event_id": "",
                         "deleted_at": "",
                         "redacted": False,
+                        "redaction_reason": "",
                         "resolved": False,
                     }
                 )
@@ -4677,7 +4751,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             source, source_region = resolved_hit
             source_payload = _unit_payload(source, source_region)
             source_references = source.user_metadata.get("source_references")
-            redacted = source.lifecycle.value == "forgotten"
+            forgotten = source.lifecycle.value == "forgotten"
+            sensitive = not forgotten and inspect_sensitive_text(source.content) is not None
+            redacted = forgotten or sensitive
+            redaction_reason = "forgotten" if forgotten else ("sensitive" if sensitive else "")
             payloads.append(
                 {
                     "id": source.id,
@@ -4686,9 +4763,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "created_at": source_payload.get("created_at", ""),
                     "deleted_at": source_payload.get("deleted_at", ""),
                     "redacted": redacted,
+                    "redaction_reason": redaction_reason,
                     "source_references": (
                         []
-                        if redacted
+                        if forgotten
                         else _json_metadata(
                             list(source_references)
                             if isinstance(source_references, list)
@@ -4707,6 +4785,93 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 }
             )
         return payloads
+
+    def _memory_provenance_summary(
+        self,
+        region: MemoryRegion,
+        payload: Mapping[str, object],
+        evidence: object,
+    ) -> dict[str, object]:
+        raw_metadata = payload.get("user_metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+        evidence_items = (
+            [item for item in evidence if isinstance(item, Mapping)]
+            if isinstance(evidence, list)
+            else []
+        )
+        source_region_ids = _string_list_value(metadata.get("source_region_ids"))
+        single_region_id = str(metadata.get("source_region_id") or "").strip()
+        if single_region_id and single_region_id not in source_region_ids:
+            source_region_ids.insert(0, single_region_id)
+        source_region_ids = list(dict.fromkeys(source_region_ids))
+        non_target_regions = [
+            region_id for region_id in source_region_ids if region_id != region.region_id
+        ]
+        source_region_ids = non_target_regions or source_region_ids or [region.region_id]
+        evidence_kinds = {
+            str(item.get("region_id") or ""): str(item.get("region_kind") or "")
+            for item in evidence_items
+            if str(item.get("region_id") or "")
+        }
+        source_regions: list[dict[str, str]] = []
+        for region_id in source_region_ids:
+            try:
+                source_region = self._regions.require_region(region_id)
+            except RegionError:
+                source_regions.append(
+                    {
+                        "region_id": region_id,
+                        "name": "",
+                        "kind": evidence_kinds.get(region_id, ""),
+                    }
+                )
+                continue
+            source_regions.append(
+                {
+                    "region_id": source_region.region_id,
+                    "name": source_region.name,
+                    "kind": source_region.kind,
+                }
+            )
+
+        source_unit_ids = _string_list_value(metadata.get("source_unit_ids"))
+        if not source_unit_ids:
+            source_unit_ids = _string_list_value(metadata.get("provenance"))
+        source_unit_ids.extend(
+            str(item.get("id") or "")
+            for item in evidence_items
+            if item.get("resolved") is True and str(item.get("id") or "")
+        )
+        event_ids = _string_list_value(metadata.get("source_event_ids"))
+        event_ids.extend(
+            str(item.get("event_id") or "")
+            for item in evidence_items
+            if str(item.get("event_id") or "")
+        )
+        snippets = _string_list_value(metadata.get("evidence_snippets"))
+        if not snippets:
+            snippets = _string_list_value(metadata.get("evidence_snippet"))
+        promotion = {
+            "promoted": metadata.get("promotion_marker") is True,
+            "classification": str(metadata.get("promotion_classification") or ""),
+            "job_id": str(metadata.get("promotion_job_id") or ""),
+            "evidence_kind": str(metadata.get("promotion_evidence_kind") or ""),
+        }
+        return {
+            "target_region": {
+                "region_id": region.region_id,
+                "name": region.name,
+                "kind": region.kind,
+            },
+            "source_regions": source_regions,
+            "evidence_basis": {
+                "source_unit_ids": list(dict.fromkeys(source_unit_ids)),
+                "event_ids": list(dict.fromkeys(event_ids)),
+                "snippets": list(dict.fromkeys(snippets)),
+                "references": _string_list_value(metadata.get("source_references")),
+            },
+            "promotion": promotion,
+        }
 
     def _browser_semantic_type(
         self,
@@ -5912,6 +6077,14 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 user_units=user_units,
             )
             if validated is None:
+                if "sensitive-content" in reason:
+                    self._record_semantic_sensitive_audit(
+                        raw_result=raw_result,
+                        reason=reason,
+                        source_region=source_region,
+                        source_units=units,
+                        source_fingerprint=expected_fingerprint,
+                    )
                 diagnostics.append(
                     {
                         "index": index,
@@ -5999,6 +6172,15 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                             "status": "reused",
                             "memory_id": memory_id,
                             "reason": "equivalent semantic memory already exists",
+                            **(
+                                {
+                                    "target_fallback_reason": validated[
+                                        "target_fallback_reason"
+                                    ]
+                                }
+                                if validated["target_fallback_reason"]
+                                else {}
+                            ),
                         }
                     )
                     continue
@@ -6009,11 +6191,35 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     value=value,
                 )
                 if conflict is not None:
+                    conflicting_memory, existing_value = conflict
+                    self._record_semantic_conflict_audit(
+                        source_region=source_region,
+                        source_units=units,
+                        source_fingerprint=expected_fingerprint,
+                        target_region=target_region,
+                        conflicting_memory=conflicting_memory,
+                        subject=subject,
+                        value=value,
+                        existing_value=existing_value,
+                        user_event_id=user_event_id,
+                    )
                     diagnostics.append(
                         {
                             "index": index,
                             "status": "skipped",
-                            "reason": f"semantic claim conflicts with memory {conflict.id}",
+                            "reason": (
+                                "semantic claim conflicts with memory "
+                                f"{conflicting_memory.id}"
+                            ),
+                            **(
+                                {
+                                    "target_fallback_reason": validated[
+                                        "target_fallback_reason"
+                                    ]
+                                }
+                                if validated["target_fallback_reason"]
+                                else {}
+                            ),
                         }
                     )
                     continue
@@ -6055,6 +6261,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "provenance": source_ids,
                         "confidence": validated["confidence"],
                         "region_hint": validated["region_hint"],
+                        "target_region_id": target_region.region_id,
+                        "target_region_kind": target_region.kind,
                         "user_event_id": user_event_id,
                         "evidence_snippet": evidence_snippet,
                         "user_occurred_at": validated["user_occurred_at"],
@@ -6062,6 +6270,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "evidence_snippets": [evidence_snippet],
                         "claim_subject": subject,
                         "claim_value": value,
+                        **(
+                            {"target_fallback_reason": validated["target_fallback_reason"]}
+                            if validated["target_fallback_reason"]
+                            else {}
+                        ),
                     },
                 )
                 response = self._write(request)
@@ -6109,6 +6322,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "index": index,
                     "status": "published",
                     "memory_id": memory_id,
+                    **(
+                        {"target_fallback_reason": validated["target_fallback_reason"]}
+                        if validated["target_fallback_reason"]
+                        else {}
+                    ),
                 }
             )
         if not self._semantic_source_is_current(
@@ -6160,8 +6378,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         ):
             return None, "confidence must be between 0.90 and 1.0"
         region_hint = str(raw_result.get("region_hint") or "").strip()
-        if not region_hint:
-            return None, "region_hint is missing"
         user_event_id = str(raw_result.get("user_event_id") or "").strip()
         evidence_snippet = str(raw_result.get("evidence_snippet") or "").strip()
         if not user_event_id or not evidence_snippet:
@@ -6207,10 +6423,18 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             or _SEMANTIC_FUTURE_ACTION.search(evidence_snippet)
         ):
             return None, "semantic content is transient or non-semantic output"
+        raw_subject = str(raw_result.get("claim_subject") or "").strip()
+        raw_value = str(raw_result.get("claim_value") or "").strip()
+        sensitive_fields, _ = _semantic_sensitive_fields(raw_result)
         if inspect_sensitive_text(content) is not None or inspect_sensitive_text(
             evidence_snippet
-        ) is not None or inspect_sensitive_text(user_unit.content) is not None:
-            return None, "semantic content failed the sensitive-content check"
+        ) is not None or inspect_sensitive_text(user_unit.content) is not None or sensitive_fields:
+            field_suffix = (
+                f" in model field(s): {', '.join(sensitive_fields)}"
+                if sensitive_fields
+                else ""
+            )
+            return None, f"semantic content failed the sensitive-content check{field_suffix}"
         durability = str(raw_result.get("durability") or "").strip().casefold()
         durable_values = {
             "durable",
@@ -6224,8 +6448,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             return None, "semantic result requires an explicit durable classification"
         if not durability:
             return None, "semantic result requires an explicit durable classification"
-        raw_subject = str(raw_result.get("claim_subject") or "").strip()
-        raw_value = str(raw_result.get("claim_value") or "").strip()
         claims_explicit = bool(
             _normalize_promotion_text(raw_subject)
             and _normalize_promotion_claim_value(raw_value)
@@ -6237,9 +6459,25 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             context=evidence_clause,
         ):
             return None, "evidence_snippet does not support the semantic content"
-        target_region = self._semantic_target_region(region_hint, source_region)
-        if target_region is None:
-            return None, "region_hint does not identify the source, user, or an existing topic"
+        project_scoped = bool(_SEMANTIC_PROJECT_SCOPE.search(content))
+        if (
+            project_scoped
+            and memory_type in {"preference", "constraint"}
+            and _SEMANTIC_USER_SCOPE_PREFIX.search(content)
+        ):
+            project_scoped = False
+        if project_scoped and region_hint not in {"", "source", source_region.region_id}:
+            target_region = source_region
+            target_fallback_reason = (
+                "project-scoped content was retained in the source region instead of "
+                f"the requested region_hint {region_hint!r}"
+            )
+        else:
+            target_region, target_fallback_reason = self._semantic_target_region(
+                region_hint,
+                source_region,
+                memory_type=memory_type,
+            )
         claim_subject, claim_value = _semantic_claim_fields(
             raw_subject,
             raw_value,
@@ -6261,6 +6499,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "claim_value": claim_value,
                 "claims_explicit": claims_explicit,
                 "durability": durability,
+                "target_fallback_reason": target_fallback_reason,
             },
             "",
         )
@@ -6269,16 +6508,225 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self,
         region_hint: str,
         source_region: MemoryRegion,
-    ) -> MemoryRegion | None:
+        *,
+        memory_type: str,
+    ) -> tuple[MemoryRegion, str]:
+        if not region_hint:
+            return source_region, "region_hint was missing; retained in the source region"
         if region_hint in {"source", source_region.region_id}:
-            return source_region
+            if memory_type == "preference" and source_region.kind == "topic":
+                return (
+                    self._regions.ensure_user_region(),
+                    "preference content cannot target a topic; redirected to the user region",
+                )
+            return source_region, ""
         if region_hint == "user":
-            return self._regions.ensure_user_region()
+            if memory_type in {
+                "domain_fact",
+                "reusable_experience",
+                "external_reference",
+            }:
+                return (
+                    source_region,
+                    f"{memory_type} content cannot target the user region; "
+                    "retained in the source region",
+                )
+            return self._regions.ensure_user_region(), ""
         try:
             target = self._regions.require_region(region_hint)
         except RegionError:
-            return None
-        return target if target.kind == "topic" else None
+            return (
+                source_region,
+                f"region_hint {region_hint!r} did not identify an existing topic; "
+                "retained in the source region",
+            )
+        if target.kind == "topic":
+            if memory_type == "preference":
+                return (
+                    self._regions.ensure_user_region(),
+                    "preference content cannot target a topic; redirected to the user region",
+                )
+            return target, ""
+        return (
+            source_region,
+            f"region_hint {region_hint!r} did not identify an existing topic; "
+            "retained in the source region",
+        )
+
+    def _record_semantic_sensitive_audit(
+        self,
+        *,
+        raw_result: Mapping[str, object],
+        reason: str,
+        source_region: MemoryRegion,
+        source_units: list[MemoryUnit],
+        source_fingerprint: str,
+    ) -> None:
+        source_unit_ids = [unit.id for unit in source_units]
+        source_event_ids = [
+            event_id
+            for unit in source_units
+            if (event_id := _metadata_text(unit, "event_id"))
+        ]
+        content = str(raw_result.get("content") or raw_result.get("body") or "")
+        evidence = str(raw_result.get("evidence_snippet") or "")
+        operation_id = "semantic-sensitive:" + hashlib.sha256(
+            json.dumps(
+                [
+                    source_fingerprint,
+                    source_region.region_id,
+                    str(raw_result.get("user_event_id") or ""),
+                    hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        categories = sorted(
+            {
+                category
+                for text in (content, evidence, *(unit.content for unit in source_units))
+                if (finding := inspect_sensitive_text(text)) is not None
+                for category in finding.categories
+            }
+        )
+        sensitive_fields, field_categories = _semantic_sensitive_fields(raw_result)
+        categories = sorted({*categories, *field_categories})
+        user_unit = next(
+            (
+                unit
+                for unit in source_units
+                if _metadata_text(unit, "event_kind") == "user"
+            ),
+            None,
+        )
+        audit_unit_id = user_unit.id if user_unit is not None else source_unit_ids[0]
+        region_hint = str(raw_result.get("region_hint") or "")
+        if "region_hint" in sensitive_fields:
+            region_hint = "[redacted]"
+        self._record_semantic_audit(
+            action="sensitive",
+            region_id=source_region.region_id,
+            unit_id=audit_unit_id,
+            operation_id=operation_id,
+            detail={
+                "classification": "sensitive",
+                "reason": reason,
+                "region_hint": region_hint,
+                "sensitive_fields": list(sensitive_fields),
+                "source_region_id": source_region.region_id,
+                "source_region_kind": source_region.kind,
+                "source_unit_ids": source_unit_ids,
+                "source_event_ids": source_event_ids,
+                "sensitive_categories": categories,
+            },
+        )
+
+    def _record_semantic_conflict_audit(
+        self,
+        *,
+        source_region: MemoryRegion,
+        source_units: list[MemoryUnit],
+        source_fingerprint: str,
+        target_region: MemoryRegion,
+        conflicting_memory: MemoryUnit,
+        subject: str,
+        value: str,
+        existing_value: str,
+        user_event_id: str,
+    ) -> None:
+        operation_id = "semantic-conflict:" + hashlib.sha256(
+            json.dumps(
+                [
+                    source_fingerprint,
+                    target_region.region_id,
+                    conflicting_memory.id,
+                    subject,
+                    value,
+                    user_event_id,
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        safe_subject = subject if inspect_sensitive_text(subject) is None else "[redacted]"
+        conflicting_values = [
+            item if inspect_sensitive_text(item) is None else "[redacted]"
+            for item in (existing_value, value)
+        ]
+        self._record_semantic_audit(
+            action="conflict",
+            region_id=target_region.region_id,
+            unit_id=conflicting_memory.id,
+            operation_id=operation_id,
+            detail={
+                "classification": "conflict",
+                "reason": "semantic claim conflicts with current active memory",
+                "source_region_id": source_region.region_id,
+                "source_region_kind": source_region.kind,
+                "target_region_id": target_region.region_id,
+                "target_region_kind": target_region.kind,
+                "source_unit_ids": [unit.id for unit in source_units],
+                "source_event_ids": [
+                    event_id
+                    for unit in source_units
+                    if (event_id := _metadata_text(unit, "event_id"))
+                ],
+                "claim_subject": safe_subject,
+                "conflicting_values": conflicting_values,
+                "conflicting_memory_id": conflicting_memory.id,
+            },
+        )
+
+    def _record_semantic_audit(
+        self,
+        *,
+        action: str,
+        region_id: str,
+        unit_id: str,
+        operation_id: str,
+        detail: Mapping[str, object],
+    ) -> None:
+        serialized_detail = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        with closing(self._maintenance_db()) as connection, connection:
+            lineage_row = connection.execute(
+                """SELECT logical_memory_id FROM memory_browser_index
+                   WHERE region_id = ? AND unit_id = ?""",
+                (region_id, unit_id),
+            ).fetchone()
+            logical_memory_id = str(lineage_row[0]) if lineage_row is not None else ""
+            row = connection.execute(
+                """SELECT id FROM governance_events
+                   WHERE operation_id = ? AND action = ?
+                   ORDER BY id LIMIT 1""",
+                (operation_id, action),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """INSERT INTO governance_events
+                       (region_id, unit_id, logical_memory_id, action, actor, source,
+                        operation_id, before_content, after_content, detail, status, created_at)
+                       VALUES (?, ?, ?, ?, 'semantic-distillation',
+                               'semantic-distillation', ?, '', '', ?, 'committed', ?)""",
+                    (
+                        region_id,
+                        unit_id,
+                        logical_memory_id,
+                        action,
+                        operation_id,
+                        serialized_detail,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+                return
+            connection.execute(
+                """UPDATE governance_events
+                   SET region_id = ?, unit_id = ?, logical_memory_id = ?, detail = ?,
+                       status = 'committed'
+                   WHERE id = ?""",
+                (region_id, unit_id, logical_memory_id, serialized_detail, int(row[0])),
+            )
 
     @contextmanager
     def _semantic_region_lock(self, region_id: str) -> Iterator[None]:
@@ -6345,7 +6793,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         *,
         subject: str,
         value: str,
-    ) -> MemoryUnit | None:
+    ) -> tuple[MemoryUnit, str] | None:
         if not subject or not value:
             return None
         target_scope = _scope_for_region(region)
@@ -6377,7 +6825,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     (existing_value, normalized_value),
                 )
             ):
-                return unit
+                return unit, existing_value
         return None
 
     def _find_semantic_memory(
@@ -6399,6 +6847,26 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         for unit in self._units_in_scope(bundle, target_scope):
             if unit.lifecycle.value != "active":
                 continue
+            if unit.user_metadata.get("semantic_manual_override") is True:
+                if _metadata_text(unit, "memory_type") != memory_type:
+                    continue
+                existing_subject, existing_value = _semantic_claim_fields(
+                    "",
+                    "",
+                    unit.content,
+                )
+                if (
+                    _promotion_subjects_compatible(
+                        _normalize_promotion_text(existing_subject),
+                        normalized_subject,
+                    )
+                    and _promotion_claim_values_equivalent(
+                        _normalize_promotion_claim_value(existing_value),
+                        normalized_value,
+                    )
+                ):
+                    return unit
+                continue
             if _metadata_text(unit, "semantic_key") == semantic_key:
                 return unit
             if (
@@ -6410,9 +6878,21 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 continue
             existing_subject = _metadata_text(unit, "claim_subject")
             existing_value = _metadata_text(unit, "claim_value")
+            if not existing_subject or not existing_value:
+                existing_subject, existing_value = _semantic_claim_fields(
+                    existing_subject,
+                    existing_value,
+                    unit.content,
+                )
             if (
-                _normalize_promotion_text(existing_subject) == normalized_subject
-                and _normalize_promotion_claim_value(existing_value) == normalized_value
+                _promotion_subjects_compatible(
+                    _normalize_promotion_text(existing_subject),
+                    normalized_subject,
+                )
+                and _promotion_claim_values_equivalent(
+                    _normalize_promotion_claim_value(existing_value),
+                    normalized_value,
+                )
             ):
                 return unit
         return None
@@ -6472,16 +6952,38 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 ),
             )
 
-    def _semantic_versions_for_memory(self, memory_id: str) -> list[dict[str, object]]:
+    def _semantic_versions_for_memory(
+        self,
+        memory_id: str,
+        *,
+        region_id: str = "",
+    ) -> list[dict[str, object]]:
         with closing(self._maintenance_db()) as connection:
+            memory_ids = [memory_id]
+            if region_id:
+                lineage_row = connection.execute(
+                    """SELECT logical_memory_id FROM memory_browser_index
+                       WHERE region_id = ? AND unit_id = ?""",
+                    (region_id, memory_id),
+                ).fetchone()
+                logical_memory_id = str(lineage_row[0]) if lineage_row is not None else ""
+                if logical_memory_id:
+                    lineage_ids = connection.execute(
+                        """SELECT unit_id FROM memory_browser_index
+                           WHERE region_id = ? AND logical_memory_id = ?""",
+                        (region_id, logical_memory_id),
+                    ).fetchall()
+                    memory_ids.extend(str(row[0]) for row in lineage_ids)
+            memory_ids = list(dict.fromkeys(memory_ids))
+            placeholders = ", ".join("?" for _ in memory_ids)
             rows = connection.execute(
-                """SELECT session_id, turn_id, source_fingerprint, source_unit_ids,
+                f"""SELECT session_id, turn_id, source_fingerprint, source_unit_ids,
                           source_event_ids, source_unit_regions, source_references,
                           source_region_ids, user_event_id, evidence_snippet,
                           user_occurred_at, region_id
-                   FROM semantic_memory_versions WHERE memory_id = ?
+                   FROM semantic_memory_versions WHERE memory_id IN ({placeholders})
                    ORDER BY updated_at, session_id, turn_id""",
-                (memory_id,),
+                tuple(memory_ids),
             ).fetchall()
         return [
             {
@@ -6795,7 +7297,39 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         bundle: _RuntimeBundle,
         scope: Scope,
         unit: MemoryUnit,
+        *,
+        region_id: str,
     ) -> None:
+        promotion_owned = unit.user_metadata.get("promotion_marker") is True
+        source_region_ids = _metadata_strings(unit, "source_region_ids")
+        source_region_id = _metadata_text(unit, "source_region_id")
+        if source_region_id and source_region_id not in source_region_ids:
+            source_region_ids.insert(0, source_region_id)
+        cross_region_semantic = (
+            _metadata_text(unit, "semantic_schema") == "semantic-distillation-v1"
+            and any(source_id != region_id for source_id in source_region_ids)
+        )
+        preserved_provenance_keys = {
+            "source_region_id",
+            "source_region_kind",
+            "source_region_ids",
+            "source_unit_ids",
+            "source_event_ids",
+            "source_unit_regions",
+            "provenance",
+        }
+        if cross_region_semantic:
+            preserved_provenance_keys.update(
+                {
+                    "session_id",
+                    "turn_id",
+                    "user_event_id",
+                    "user_event_ids",
+                    "user_occurred_at",
+                    "evidence_snippet",
+                    "evidence_snippets",
+                }
+            )
         for key in (
             "semantic_schema",
             "semantic_owned",
@@ -6810,6 +7344,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "source_region_id",
             "source_region_kind",
             "source_region_ids",
+            "target_region_id",
+            "target_region_kind",
             "source_unit_ids",
             "source_event_ids",
             "source_unit_regions",
@@ -6822,14 +7358,20 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "evidence_snippet",
             "evidence_snippets",
         ):
+            if key in preserved_provenance_keys and (
+                promotion_owned or cross_region_semantic
+            ):
+                continue
             unit.user_metadata.pop(key, None)
-        unit.provenance = []
+        if not promotion_owned and not cross_region_semantic:
+            unit.provenance = []
         bundle.kv_store.update(scope, memory_key(unit.id), dumps(unit))
-        with closing(self._maintenance_db()) as connection, connection:
-            connection.execute(
-                "DELETE FROM semantic_memory_versions WHERE memory_id = ?",
-                (unit.id,),
-            )
+        if not promotion_owned and not cross_region_semantic:
+            with closing(self._maintenance_db()) as connection, connection:
+                connection.execute(
+                    "DELETE FROM semantic_memory_versions WHERE memory_id = ?",
+                    (unit.id,),
+                )
 
     def _merge_semantic_sources(
         self,
@@ -6870,7 +7412,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             evidence_snippet=evidence_snippet,
             user_occurred_at=user_occurred_at,
         )
-        versions = self._semantic_versions_for_memory(unit.id)
+        versions = self._semantic_versions_for_memory(unit.id, region_id=region.region_id)
         metadata = dict(unit.user_metadata)
         metadata["semantic_schema"] = "semantic-distillation-v1"
         metadata["semantic_key"] = semantic_key
@@ -7407,9 +7949,23 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
         conflicts: dict[tuple[str, str, tuple[str, ...]], list[_PromotionClassified]] = {}
         for (target_id, subject), values in claims.items():
-            if len(values) < 2:
+            equivalence_groups: list[tuple[str, list[_PromotionClassified]]] = []
+            for value, value_items in values.items():
+                equivalent_group = next(
+                    (
+                        group
+                        for group in equivalence_groups
+                        if _promotion_claim_values_equivalent(group[0], value)
+                    ),
+                    None,
+                )
+                if equivalent_group is None:
+                    equivalence_groups.append((value, list(value_items)))
+                else:
+                    equivalent_group[1].extend(value_items)
+            if len(equivalence_groups) < 2:
                 continue
-            items = [item for batch in values.values() for item in batch]
+            items = [item for _, group in equivalence_groups for item in group]
             source_ids = {
                 source_id
                 for candidate, _, _ in items
@@ -7417,9 +7973,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             }
             if len(source_ids) < 2:
                 continue
-            if not _promotion_values_conflict(subject, tuple(values)):
+            representatives = tuple(group[0] for group in equivalence_groups)
+            if not _promotion_values_conflict(subject, representatives):
                 continue
-            conflicts[(subject, target_id, tuple(sorted(values)))] = items
+            conflicts[(subject, target_id, tuple(sorted(representatives)))] = items
         return conflicts
 
     def _promotion_evidence_source_ids(self, candidate: _PromotionCandidate) -> tuple[str, ...]:
@@ -7868,6 +8425,22 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             self._governance_region_lock(target.region_id),
             self._graph_write_lock,
         ):
+            claim_target = self._promoted_claim_target(bundle, target_scope, decision)
+            if claim_target is not None:
+                claim_key = _metadata_text(claim_target, "promotion_key") or promotion_key
+                promotion_key = claim_key
+                target_metadata["promotion_key"] = promotion_key
+                target_payload = outbox_payload.get("target")
+                if isinstance(target_payload, dict):
+                    outbox_metadata = target_payload.get("user_metadata")
+                    if isinstance(outbox_metadata, dict):
+                        outbox_metadata["promotion_key"] = promotion_key
+                claim_record = self._promotion_record(promotion_key)
+                if (
+                    claim_record is not None
+                    and str(claim_record["target_unit_id"]) != claim_target.id
+                ):
+                    self._repair_promotion_record_target(promotion_key, claim_target)
             conflict = self._promotion_existing_conflict(
                 bundle,
                 target_scope,
@@ -7941,19 +8514,43 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         != _normalize_promotion_text(unit.content)
                         or (bool(expected_hash) and expected_hash != current_hash)
                     )
-                    if target_changed:
+                    manual_override = (
+                        target_unit.user_metadata.get("semantic_manual_override") is True
+                    )
+                    if manual_override:
+                        existing_subject, existing_value = _promotion_claim_signature(
+                            target_unit.content
+                        )
+                    else:
+                        existing_subject = _metadata_text(
+                            target_unit,
+                            "promotion_claim_subject",
+                        )
+                        existing_value = _metadata_text(
+                            target_unit,
+                            "promotion_claim_value",
+                        )
+                    existing_subject = _normalize_promotion_text(existing_subject)
+                    existing_value = _normalize_promotion_claim_value(existing_value)
+                    if not existing_subject or not existing_value:
                         existing_subject, existing_value = _promotion_claim_signature(
                             target_unit.content
                         )
                         existing_subject = _normalize_promotion_text(existing_subject)
                         existing_value = _normalize_promotion_claim_value(existing_value)
-                        if not existing_subject or not existing_value:
-                            existing_subject = _normalize_promotion_text(
-                                _metadata_text(target_unit, "promotion_claim_subject")
-                            )
-                            existing_value = _normalize_promotion_claim_value(
-                                _metadata_text(target_unit, "promotion_claim_value")
-                            )
+                    claim_equivalent = (
+                        bool(existing_subject)
+                        and bool(existing_value)
+                        and _promotion_subjects_compatible(
+                            existing_subject,
+                            _normalize_promotion_text(decision["claim_subject"]),
+                        )
+                        and _promotion_claim_values_equivalent(
+                            existing_value,
+                            decision["claim_value"],
+                        )
+                    )
+                    if target_changed and not claim_equivalent:
                         if (
                             existing_subject
                             and existing_value
@@ -8071,6 +8668,25 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     decision,
                     evidence_kind,
                 )
+                repaired_record = self._promotion_record(promotion_key)
+                if repaired_record is None:
+                    raise MemoryKernelUnavailableError(
+                        "promotion record repair did not persist"
+                    )
+                merged_unit_ids, merged_region_ids = self._merge_promotion_sources(
+                    bundle,
+                    target_scope,
+                    target,
+                    existing,
+                    repaired_record,
+                    source_ids,
+                    source_event_ids,
+                    source_references,
+                    source_regions,
+                    source_region_ids,
+                    source_unit_regions,
+                    evidence_kind,
+                )
                 self._complete_promotion_outbox(promotion_key)
                 if bundle.graph_store is not None:
                     self._associate_graph_scope(
@@ -8083,8 +8699,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "decision": {
                         "source_unit_id": unit.id,
                         "source_region_id": source_region.region_id,
-                        "source_unit_ids": source_ids,
-                        "source_region_ids": source_region_ids,
+                        "source_unit_ids": merged_unit_ids,
+                        "source_region_ids": merged_region_ids,
                         "classification": str(decision["category"]),
                         "confidence": decision["confidence"],
                         "evidence_kind": evidence_kind,
@@ -8645,6 +9261,38 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             ),
         }
 
+    def _repair_promotion_record_target(
+        self,
+        promotion_key: str,
+        target_unit: MemoryUnit,
+    ) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            row = connection.execute(
+                """SELECT audit_event_id FROM promotion_records
+                   WHERE promotion_key = ?""",
+                (promotion_key,),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                """UPDATE promotion_records SET target_unit_id = ?
+                   WHERE promotion_key = ?""",
+                (target_unit.id, promotion_key),
+            )
+            if row[0] is not None:
+                connection.execute(
+                    """UPDATE governance_events
+                       SET unit_id = ?, logical_memory_id = ?, after_content = ?,
+                           status = 'committed'
+                       WHERE id = ? AND action = 'promote'""",
+                    (
+                        target_unit.id,
+                        _unit_logical_memory_id(target_unit),
+                        target_unit.content,
+                        int(row[0]),
+                    ),
+                )
+
     def _promotion_existing_conflict(
         self,
         bundle: _RuntimeBundle,
@@ -8875,6 +9523,42 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             ),
             None,
         )
+
+    def _promoted_claim_target(
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        decision: _PromotionDecision,
+    ) -> MemoryUnit | None:
+        subject = _normalize_promotion_text(decision["claim_subject"])
+        value = _normalize_promotion_claim_value(decision["claim_value"])
+        if not subject or not value:
+            return None
+        for unit in sorted(
+            self._units_in_scope(bundle, scope),
+            key=lambda item: item.id,
+        ):
+            if (
+                unit.lifecycle.value != "active"
+                or unit.user_metadata.get("promotion_marker") is not True
+                or not _metadata_text(unit, "promotion_key")
+            ):
+                continue
+            if unit.user_metadata.get("semantic_manual_override") is True:
+                existing_subject, existing_value = _promotion_claim_signature(unit.content)
+            else:
+                existing_subject = _metadata_text(unit, "promotion_claim_subject")
+                existing_value = _metadata_text(unit, "promotion_claim_value")
+            if not existing_subject or not existing_value:
+                existing_subject, existing_value = _promotion_claim_signature(unit.content)
+            existing_subject = _normalize_promotion_text(existing_subject)
+            existing_value = _normalize_promotion_claim_value(existing_value)
+            if (
+                _promotion_subjects_compatible(existing_subject, subject)
+                and _promotion_claim_values_equivalent(existing_value, value)
+            ):
+                return unit
+        return None
 
     def _persist_promotion(
         self,
@@ -12268,6 +12952,14 @@ def _metadata_strings(unit: MemoryUnit, key: str) -> list[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
+def _string_list_value(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 def _normalize_promotion_text(content: str) -> str:
     return " ".join(content.casefold().split())
 
@@ -12551,7 +13243,8 @@ def _promotion_values_conflict(subject: str, values: tuple[str, ...]) -> bool:
             r"verbosity|color|font|speed|timezone|time\s+zone|owner|assignee|"
             r"email|host|endpoint|url|uri|address|location|region|date|deadline|"
             r"currency|name|"
-            r"datastore|cloud|provider|runtime|engine|framework|platform|"
+            r"datastore|cloud|package\s+manager|provider|runtime|tool(?:chain)?|"
+            r"engine|framework|platform|"
             r"implementation|environment|primary|current|active|selected|chosen|main|official|"
             r"preferred|canonical|authoritative|assigned|designated|configured)\b",
             subject.casefold(),
@@ -12563,12 +13256,60 @@ def _normalize_promotion_claim_value(value: str) -> str:
     return _normalize_promotion_text(value).strip(" .!。！?？,，;；:")
 
 
+def _semantic_sensitive_fields(
+    raw_result: Mapping[str, object],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    fields = (
+        ("claim_subject", str(raw_result.get("claim_subject") or "").strip()),
+        ("claim_value", str(raw_result.get("claim_value") or "").strip()),
+        ("region_hint", str(raw_result.get("region_hint") or "").strip()),
+    )
+    sensitive_fields: list[str] = []
+    categories: set[str] = set()
+    for field_name, field_value in fields:
+        if not field_value:
+            continue
+        finding = inspect_sensitive_text(field_value)
+        claim_label = _SEMANTIC_SENSITIVE_CLAIM_FIELD.search(field_value) is not None
+        if finding is None and not claim_label:
+            continue
+        sensitive_fields.append(field_name)
+        if finding is not None:
+            categories.update(finding.categories)
+        if claim_label:
+            categories.add("sensitive-claim-field")
+    return tuple(sensitive_fields), tuple(sorted(categories))
+
+
 def _promotion_subjects_compatible(left: str, right: str) -> bool:
-    if left == right:
+    def normalized(subject: str) -> tuple[str, str]:
+        value = _normalize_promotion_text(subject)
+        match = re.match(r"^user:prefer(?:ence)?(?P<suffix>(?::.*)?)$", value)
+        if match is not None:
+            return "user:preference", match.group("suffix")
+        return value, ""
+
+    left_family, left_suffix = normalized(left)
+    right_family, right_suffix = normalized(right)
+    return (
+        left_family == right_family
+        and (not left_suffix or not right_suffix or left_suffix == right_suffix)
+    )
+
+
+def _promotion_claim_values_equivalent(left: str, right: str) -> bool:
+    left_value = _normalize_promotion_claim_value(left)
+    right_value = _normalize_promotion_claim_value(right)
+    if left_value == right_value:
         return True
-    if left == "user:preference" and right.startswith("user:prefer"):
+    fillers = {"mode", "preference", "setting", "style", "theme"}
+    left_tokens = set(re.findall(r"[a-z0-9_.-]+", left_value))
+    right_tokens = set(re.findall(r"[a-z0-9_.-]+", right_value))
+    if not left_tokens or not right_tokens:
+        return False
+    if left_tokens < right_tokens and right_tokens - left_tokens <= fillers:
         return True
-    return right == "user:preference" and left.startswith("user:prefer")
+    return right_tokens < left_tokens and left_tokens - right_tokens <= fillers
 
 
 def _heuristic_promotion_decision(
