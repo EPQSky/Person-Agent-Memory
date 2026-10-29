@@ -378,6 +378,44 @@ class MemoryKernelPort(Protocol):
 
     def graph_status(self, library_id: str | None = None) -> dict[str, object]: ...
 
+    def entity_graph_status(self, library_id: str) -> dict[str, object]: ...
+
+    async def rebuild_entity_graph(self, library_id: str) -> dict[str, object]: ...
+
+    def entity_graph(
+        self,
+        library_id: str,
+        *,
+        entity_id: str | None = None,
+        memory_id: str | None = None,
+        entity_type: str | None = None,
+        q: str | None = None,
+        hops: int = 1,
+        limit: int = 200,
+    ) -> dict[str, object]: ...
+
+    def entity_graph_memory(self, library_id: str, memory_id: str) -> dict[str, object]: ...
+
+    def entity_graph_entity(
+        self,
+        library_id: str,
+        entity_id: str,
+        *,
+        limit: int = 50,
+        offset: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, object]: ...
+
+    def entity_graph_relation(
+        self,
+        library_id: str,
+        relation_id: str,
+        *,
+        limit: int = 50,
+        offset: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, object]: ...
+
     async def rebuild_graph(self, library_id: str) -> dict[str, object]: ...
 
     async def write(self, request: MemoryWriteRequest) -> dict[str, object]: ...
@@ -535,6 +573,53 @@ class UnavailableMemoryKernel:
 
     def graph_status(self, library_id: str | None = None) -> dict[str, object]:
         return {"status": "unavailable", "backend": "mem2"}
+
+    def entity_graph_status(self, library_id: str) -> dict[str, object]:
+        self._raise()
+
+    async def rebuild_entity_graph(self, library_id: str) -> dict[str, object]:
+        self._raise()
+
+    def entity_graph(
+        self,
+        library_id: str,
+        *,
+        entity_id: str | None = None,
+        memory_id: str | None = None,
+        entity_type: str | None = None,
+        q: str | None = None,
+        hops: int = 1,
+        limit: int = 200,
+    ) -> dict[str, object]:
+        del entity_id, memory_id, entity_type, q, hops, limit
+        self._raise()
+
+    def entity_graph_memory(self, library_id: str, memory_id: str) -> dict[str, object]:
+        self._raise()
+
+    def entity_graph_entity(
+        self,
+        library_id: str,
+        entity_id: str,
+        *,
+        limit: int = 50,
+        offset: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, object]:
+        del entity_id, limit, offset, cursor
+        self._raise()
+
+    def entity_graph_relation(
+        self,
+        library_id: str,
+        relation_id: str,
+        *,
+        limit: int = 50,
+        offset: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, object]:
+        del relation_id, limit, offset, cursor
+        self._raise()
 
     async def rebuild_graph(self, library_id: str) -> dict[str, object]:
         self._raise()

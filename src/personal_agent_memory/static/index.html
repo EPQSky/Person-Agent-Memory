@@ -76,6 +76,10 @@
     .raw-diagnostic { padding:10px; border:1px dashed var(--line); border-radius:8px; background:var(--panel); }
     .raw-diagnostic header { display:flex; flex-wrap:wrap; justify-content:space-between; gap:6px; margin-bottom:6px; }
     .raw-diagnostic p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .entity-list, .relation-list { list-style:none; margin:0; padding:0; display:grid; gap:8px; }
+    .entity-list button, .relation-list button { width:100%; text-align:left; background:transparent; color:inherit; border:1px solid var(--line); }
+    .entity-list button:hover, .relation-list button:hover { border-color:var(--accent); background:var(--accent-soft); color:var(--text); }
+    .graph-summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin-bottom:14px; }
     pre { white-space:pre-wrap; overflow-wrap:anywhere; background:var(--bg); padding:12px; border-radius:8px; }
     .hidden { display:none !important; }
     @media (max-width: 900px) { .grid, .raw-layout { grid-template-columns:1fr; } .filter-grid { grid-template-columns:1fr; } header { padding:16px; } main { padding:14px; } }
@@ -106,6 +110,7 @@
       </div>
       <nav class="workspace-tabs" role="tablist" aria-label="区域工作区">
         <button id="memory-tab" class="workspace-tab" type="button" role="tab" aria-selected="true" aria-controls="memory-workspace">记忆</button>
+        <button id="entity-graph-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="entity-graph-workspace">图谱</button>
         <button id="raw-session-tab" class="workspace-tab" type="button" role="tab" aria-selected="false" aria-controls="raw-session-workspace">原始会话</button>
       </nav>
     </section>
@@ -217,6 +222,16 @@
           <h3>证据与来源</h3>
           <ul id="source-list" class="source-list"></ul>
           <ul id="evidence-list" class="evidence-list"></ul>
+          <h3>关联实体</h3>
+          <ul id="detail-entity-list" class="entity-list"></ul>
+          <h3>关联关系</h3>
+          <ul id="detail-relation-list" class="relation-list"></ul>
+          <h3>局部图</h3>
+          <pre id="detail-local-graph">当前记忆没有可显示的局部图。</pre>
+          <section id="detail-graph-support" class="hidden" aria-label="图谱支撑详情">
+            <h3 id="detail-graph-support-heading">图谱支撑详情</h3>
+            <pre id="detail-graph-support-content"></pre>
+          </section>
           <div class="actions">
             <button id="save-document" type="button">保存更正</button>
             <button id="delete-document" class="danger" type="button">遗忘记忆</button>
@@ -225,6 +240,28 @@
           <p id="document-message" class="notice" aria-live="polite"></p>
           <ul id="history-list" class="history-list"></ul>
         </section>
+        </div>
+
+        <div id="entity-graph-workspace" class="stack hidden" role="tabpanel" aria-labelledby="entity-graph-tab">
+          <section>
+            <h2>实体知识图谱</h2>
+            <p class="muted">图谱由正式语义记忆只读派生。实体和关系都保留正式记忆证据。</p>
+            <form id="entity-graph-filter-form">
+              <div class="filter-grid">
+                <div><label for="entity-graph-query">实体搜索</label><input id="entity-graph-query" maxlength="500" placeholder="实体名称或明确别名"></div>
+                <div><label for="entity-graph-type">实体类型</label><select id="entity-graph-type"><option value="">全部类型</option><option>project</option><option>technology</option><option>component</option><option>concept</option><option>person</option><option>organization</option><option>constraint</option><option>reference</option></select></div>
+                <div><label for="entity-graph-hops">局部跳数</label><select id="entity-graph-hops"><option value="1">一跳</option><option value="2">两跳</option></select></div>
+              </div>
+              <div class="actions"><button type="submit">读取图谱</button></div>
+            </form>
+            <p id="entity-graph-message" class="notice" aria-live="polite"></p>
+            <div id="entity-graph-summary" class="graph-summary"></div>
+            <h3>实体</h3><ul id="entity-graph-entities" class="entity-list"></ul>
+            <h3>关系</h3><ul id="entity-graph-relations" class="relation-list"></ul>
+            <section id="entity-selection-detail" class="hidden" aria-label="图谱支撑详情">
+              <h3>支撑正式记忆与来源</h3><pre id="entity-selection-content"></pre>
+            </section>
+          </section>
         </div>
 
         <section id="raw-session-workspace" class="hidden" role="tabpanel" aria-labelledby="raw-session-tab">
@@ -302,6 +339,7 @@
     rawSelectedSession: null,
     rawGeneration: 0,
     rawController: null,
+    entityGraph: null,
   };
   const $ = (id) => document.getElementById(id);
   const setMessage = (element, text, error = false, success = false) => {
@@ -355,16 +393,21 @@
     $('workspace').classList.remove('hidden');
   }
   function switchWorkspace(tab) {
-    if (!['memory', 'raw-session'].includes(tab)) return;
+    if (!['memory', 'entity-graph', 'raw-session'].includes(tab)) return;
     state.workspaceTab = tab;
     const memorySelected = tab === 'memory';
+    const graphSelected = tab === 'entity-graph';
     $('memory-tab').setAttribute('aria-selected', String(memorySelected));
-    $('raw-session-tab').setAttribute('aria-selected', String(!memorySelected));
+    $('entity-graph-tab').setAttribute('aria-selected', String(graphSelected));
+    $('raw-session-tab').setAttribute('aria-selected', String(tab === 'raw-session'));
     $('memory-workspace').classList.toggle('hidden', !memorySelected);
-    $('raw-session-workspace').classList.toggle('hidden', memorySelected);
-    $('workspace-title').textContent = memorySelected ? '记忆' : '原始会话';
+    $('entity-graph-workspace').classList.toggle('hidden', !graphSelected);
+    $('raw-session-workspace').classList.toggle('hidden', tab !== 'raw-session');
+    $('workspace-title').textContent = memorySelected ? '记忆' : (graphSelected ? '图谱' : '原始会话');
     if (memorySelected) {
       if (state.selectedRegion) loadMemories({ reset: true });
+    } else if (graphSelected) {
+      if (state.selectedRegion) loadEntityGraph();
     } else {
       loadRawRounds();
     }
@@ -430,6 +473,11 @@
     $('document-content').readOnly = false;
     $('source-list').replaceChildren();
     $('evidence-list').replaceChildren();
+    $('detail-entity-list').replaceChildren();
+    $('detail-relation-list').replaceChildren();
+    $('detail-local-graph').textContent = '当前记忆没有可显示的局部图。';
+    $('detail-graph-support').classList.add('hidden');
+    $('detail-graph-support-content').textContent = '';
     $('history-list').replaceChildren();
     setGovernanceDisabled(true);
   }
@@ -449,6 +497,8 @@
     renderRegions();
     if (state.workspaceTab === 'raw-session') {
       await loadRawRounds();
+    } else if (state.workspaceTab === 'entity-graph') {
+      await loadEntityGraph();
     } else {
       await loadMemories({ reset: true });
     }
@@ -931,6 +981,133 @@
     if (sourceUnitIds.length) parts.push(`来源单元 ${sourceUnitIds.join(', ')}`);
     $('detail-evidence-basis').textContent = parts.length ? parts.join(' · ') : '—';
   }
+  function graphEntityLabel(entity) {
+    return `${String(entity.canonical_name || '—')} · ${String(entity.type || entity.entity_type || 'unknown')}`;
+  }
+  function graphRelationLabel(relation, entities = new Map()) {
+    const source = entities.get(String(relation.source))?.canonical_name || relation.source;
+    const target = entities.get(String(relation.target))?.canonical_name || relation.target;
+    return `${source} — ${String(relation.type || relation.relation_type || 'unknown')} → ${target}`;
+  }
+  function renderGraphLists(graph) {
+    const entities = Array.isArray(graph?.nodes) ? graph.nodes : [];
+    const relations = Array.isArray(graph?.edges) ? graph.edges : [];
+    const byId = new Map(entities.map((entity) => [String(entity.id), entity]));
+    const entityList = $('entity-graph-entities');
+    const relationList = $('entity-graph-relations');
+    entityList.replaceChildren();
+    relationList.replaceChildren();
+    for (const entity of entities) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = graphEntityLabel(entity);
+      button.addEventListener('click', () => inspectGraphEntity(String(entity.id)));
+      item.append(button);
+      entityList.append(item);
+    }
+    for (const relation of relations) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = graphRelationLabel(relation, byId);
+      button.addEventListener('click', () => inspectGraphRelation(String(relation.id)));
+      item.append(button);
+      relationList.append(item);
+    }
+    const summary = $('entity-graph-summary');
+    summary.replaceChildren();
+    for (const [label, value] of [['实体', entities.length], ['关系', relations.length], ['跳数', graph?.hops || 1]]) {
+      const item = document.createElement('div');
+      item.className = 'meta-item';
+      const name = document.createElement('span');
+      name.textContent = label;
+      const count = document.createElement('strong');
+      count.textContent = String(value);
+      item.append(name, count);
+      summary.append(item);
+    }
+  }
+  function renderMemoryGraph(memory) {
+    const graph = memory.entity_graph || memory.local_graph || {};
+    const entities = Array.isArray(memory.associated_entities) ? memory.associated_entities : (graph.nodes || []);
+    const relations = Array.isArray(memory.associated_relations) ? memory.associated_relations : (graph.edges || []);
+    const byId = new Map(entities.map((entity) => [String(entity.id), entity]));
+    const entityList = $('detail-entity-list');
+    const relationList = $('detail-relation-list');
+    entityList.replaceChildren();
+    relationList.replaceChildren();
+    for (const entity of entities) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = graphEntityLabel(entity);
+      button.addEventListener('click', () => inspectGraphEntity(String(entity.id)));
+      item.append(button);
+      entityList.append(item);
+    }
+    for (const relation of relations) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = graphRelationLabel(relation, byId);
+      button.addEventListener('click', () => inspectGraphRelation(String(relation.id)));
+      const evidence = document.createElement('span');
+      evidence.className = 'muted';
+      evidence.textContent = ` · 证据 ${Array.isArray(relation.evidence) ? relation.evidence.length : 0}`;
+      button.append(evidence);
+      item.append(button);
+      relationList.append(item);
+    }
+    $('detail-local-graph').textContent = JSON.stringify({ nodes: entities, edges: relations }, null, 2);
+  }
+  async function loadEntityGraph() {
+    if (!state.selectedRegion) return;
+    setMessage($('entity-graph-message'), '正在读取实体知识图谱…');
+    try {
+      const params = new URLSearchParams();
+      const query = $('entity-graph-query').value.trim();
+      const type = $('entity-graph-type').value;
+      if (query) params.set('q', query);
+      if (type) params.set('entity_type', type);
+      params.set('hops', $('entity-graph-hops').value);
+      const graph = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/entity-graph?${params}`);
+      state.entityGraph = graph;
+      renderGraphLists(graph);
+      setMessage($('entity-graph-message'), `已读取 ${graph.nodes?.length || 0} 个实体和 ${graph.edges?.length || 0} 条关系。`, false, true);
+    } catch (error) {
+      setMessage($('entity-graph-message'), `读取图谱失败：${error.message}`, true);
+    }
+  }
+  async function inspectGraphEntity(entityId) {
+    if (!state.selectedRegion) return;
+    try {
+      const payload = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/entity-graph/entities/${encodeURIComponent(entityId)}`);
+      showGraphSupport(payload, '实体');
+    } catch (error) {
+      setMessage($('entity-graph-message'), `读取实体支撑失败：${error.message}`, true);
+    }
+  }
+  async function inspectGraphRelation(relationId) {
+    if (!state.selectedRegion) return;
+    try {
+      const payload = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/entity-graph/relations/${encodeURIComponent(relationId)}`);
+      showGraphSupport(payload, '关系');
+    } catch (error) {
+      setMessage($('entity-graph-message'), `读取关系支撑失败：${error.message}`, true);
+    }
+  }
+  function showGraphSupport(payload, label) {
+    $('detail-graph-support-heading').textContent = `${label}图谱支撑详情`;
+    $('detail-graph-support-content').textContent = JSON.stringify(payload, null, 2);
+    $('detail-graph-support').classList.remove('hidden');
+    if (state.workspaceTab === 'memory') {
+      $('detail-graph-support').scrollIntoView({ block: 'nearest' });
+    } else {
+      $('entity-selection-detail').classList.remove('hidden');
+      $('entity-selection-content').textContent = JSON.stringify(payload, null, 2);
+    }
+  }
   async function openMemory(memoryId) {
     if (!state.selectedRegion) return;
     const generation = ++state.detailGeneration;
@@ -954,6 +1131,7 @@
       $('document-content').value = String(memory.content || '');
       renderProvenance(memory);
       renderSources(memory);
+      renderMemoryGraph(memory);
       state.detailReady = true;
       const lifecycle = String(memory.lifecycle || '');
       setDetailGovernance(lifecycle);
@@ -1185,6 +1363,8 @@
       await loadRegions();
       if (state.workspaceTab === 'raw-session') {
         await loadRawRounds();
+      } else if (state.workspaceTab === 'entity-graph') {
+        await loadEntityGraph();
       } else {
         await loadMemories({ reset: true });
       }
@@ -1227,12 +1407,18 @@
       await loadRegions();
       if (state.selectedRegion) {
         if (state.workspaceTab === 'raw-session') await loadRawRounds();
+        else if (state.workspaceTab === 'entity-graph') await loadEntityGraph();
         else await loadMemories({ reset: true });
       }
     } catch (error) { setMessage($('login-message'), `登录失败：${error.message}`, true); }
   });
   $('memory-tab').addEventListener('click', () => switchWorkspace('memory'));
+  $('entity-graph-tab').addEventListener('click', () => switchWorkspace('entity-graph'));
   $('raw-session-tab').addEventListener('click', () => switchWorkspace('raw-session'));
+  $('entity-graph-filter-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    loadEntityGraph();
+  });
   $('search-form').addEventListener('submit', (event) => runSearch(event));
   $('memory-filter-form').addEventListener('submit', (event) => {
     event.preventDefault();
@@ -1261,6 +1447,7 @@
   loadStatus().then(async () => {
     await loadRegions();
     if (state.workspaceTab === 'raw-session') await loadRawRounds();
+    else if (state.workspaceTab === 'entity-graph') await loadEntityGraph();
     else await loadMemories({ reset: true });
   }).catch(() => showLogin());
 })();
