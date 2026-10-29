@@ -208,6 +208,9 @@
             <div class="meta-item"><span>更新时间</span><strong id="detail-updated">—</strong></div>
             <div class="meta-item"><span>来源数量</span><strong id="detail-source-count">—</strong></div>
             <div class="meta-item"><span>版本</span><strong id="detail-version">—</strong></div>
+            <div class="meta-item"><span>晋升目标</span><strong id="detail-target-region">—</strong></div>
+            <div class="meta-item"><span>来源区域</span><strong id="detail-source-regions">—</strong></div>
+            <div class="meta-item"><span>证据依据</span><strong id="detail-evidence-basis">—</strong></div>
           </div>
           <label for="document-content">完整正文</label>
           <textarea id="document-content" spellcheck="false"></textarea>
@@ -420,6 +423,9 @@
     $('detail-updated').textContent = '—';
     $('detail-source-count').textContent = '—';
     $('detail-version').textContent = '—';
+    $('detail-target-region').textContent = '—';
+    $('detail-source-regions').textContent = '—';
+    $('detail-evidence-basis').textContent = '—';
     $('document-content').value = '';
     $('document-content').readOnly = false;
     $('source-list').replaceChildren();
@@ -885,12 +891,45 @@
         }
         const content = document.createElement('pre');
         content.textContent = evidenceItem.redacted
-          ? '（正文已因遗忘隐藏）'
+          ? (evidenceItem.redaction_reason === 'sensitive'
+            ? '（正文因敏感内容已脱敏）'
+            : '（正文已因遗忘隐藏）')
           : (evidenceItem.content || '（没有可读取的证据正文）');
         item.append(label, meta, content);
         evidenceList.append(item);
       }
     }
+  }
+  function renderProvenance(memory) {
+    const summary = memory.provenance_summary && typeof memory.provenance_summary === 'object'
+      ? memory.provenance_summary
+      : {};
+    const target = summary.target_region && typeof summary.target_region === 'object'
+      ? summary.target_region
+      : (memory.region || {});
+    const targetParts = [target.name, target.kind, target.region_id].filter(Boolean);
+    $('detail-target-region').textContent = targetParts.length
+      ? targetParts.join(' · ')
+      : '—';
+    const sourceRegions = Array.isArray(summary.source_regions) ? summary.source_regions : [];
+    const sourceText = sourceRegions
+      .map((item) => [item.name, item.kind, item.region_id].filter(Boolean).join(' · '))
+      .filter(Boolean)
+      .join('；');
+    $('detail-source-regions').textContent = sourceText || '—';
+    const basis = summary.evidence_basis && typeof summary.evidence_basis === 'object'
+      ? summary.evidence_basis
+      : {};
+    const parts = [];
+    const snippets = Array.isArray(basis.snippets) ? basis.snippets.filter(Boolean) : [];
+    if (snippets.length) parts.push(snippets.map((value) => `“${value}”`).join('；'));
+    const eventIds = Array.isArray(basis.event_ids) ? basis.event_ids.filter(Boolean) : [];
+    if (eventIds.length) parts.push(`事件 ${eventIds.join(', ')}`);
+    const sourceUnitIds = Array.isArray(basis.source_unit_ids)
+      ? basis.source_unit_ids.filter(Boolean)
+      : [];
+    if (sourceUnitIds.length) parts.push(`来源单元 ${sourceUnitIds.join(', ')}`);
+    $('detail-evidence-basis').textContent = parts.length ? parts.join(' · ') : '—';
   }
   async function openMemory(memoryId) {
     if (!state.selectedRegion) return;
@@ -913,6 +952,7 @@
       $('detail-source-count').textContent = String(memory.source_count ?? 0);
       $('detail-version').textContent = state.sourceVersion;
       $('document-content').value = String(memory.content || '');
+      renderProvenance(memory);
       renderSources(memory);
       state.detailReady = true;
       const lifecycle = String(memory.lifecycle || '');

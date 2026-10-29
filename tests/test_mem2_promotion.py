@@ -5,6 +5,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from personal_agent_memory.app import create_app
@@ -53,6 +54,33 @@ def _write(
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def _memories(
+    client: TestClient,
+    headers: dict[str, str],
+    region_id: str,
+) -> list[dict[str, object]]:
+    response = client.get(
+        f"/api/v1/libraries/{region_id}/memories?limit=100",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    return list(response.json()["items"])
+
+
+def _detail(
+    client: TestClient,
+    headers: dict[str, str],
+    region_id: str,
+    memory_id: str,
+) -> dict[str, object]:
+    response = client.get(
+        f"/api/v1/libraries/{region_id}/memories/{memory_id}",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
 
 
 def _wait_promotion(
@@ -1160,6 +1188,90 @@ def test_model_claim_complementary_values_are_not_treated_as_conflict(tmp_path: 
         assert status["summary"]["promoted"] == 2
 
 
+def test_single_value_package_manager_conflict_preserves_first_target_and_audits_once(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers, "project", "alpha")
+        _region(client, headers, "project", "beta")
+        _write(
+            client,
+            headers,
+            "alpha",
+            "The build uses pnpm.",
+            key="package-manager-pnpm",
+            memory_type="constraint",
+        )
+        _write(
+            client,
+            headers,
+            "beta",
+            "The build uses npm.",
+            key="package-manager-npm",
+            memory_type="constraint",
+        )
+        kernel = client.app.state.memory_kernel
+
+        def classify(content: str, context: dict[str, object]) -> dict[str, object]:
+            del context
+            value = "pnpm" if "pnpm" in content else "npm"
+            return {
+                "category": "user",
+                "confidence": 0.99,
+                "explicit": True,
+                "topic_id": None,
+                "claim_subject": "build package manager",
+                "claim_value": value,
+                "reason": "single-valued build tooling choice",
+            }
+
+        kernel._promotion_classifier = classify
+        first = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["alpha"]},
+        )
+        assert first.status_code == 202, first.text
+        first_status = _wait_promotion(client, headers, str(first.json()["job_id"]))
+        assert first_status["summary"]["promoted"] == 1
+
+        second = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["beta"]},
+        )
+        assert second.status_code == 202, second.text
+        second_status = _wait_promotion(client, headers, str(second.json()["job_id"]))
+        assert second_status["summary"]["promoted"] == 0
+        assert second_status["summary"]["conflict_groups"] == 1
+
+        active_user = [
+            item
+            for item in _memories(client, headers, "user")
+            if item["lifecycle"] == "active"
+        ]
+        assert [item["summary"] for item in active_user] == ["The build uses pnpm."]
+        assert "The build uses npm." not in {item["summary"] for item in active_user}
+
+        repeated = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["beta"]},
+        )
+        assert repeated.status_code == 202, repeated.text
+        repeated_status = _wait_promotion(client, headers, str(repeated.json()["job_id"]))
+        assert repeated_status["summary"]["promoted"] == 0
+        assert repeated_status["summary"]["conflict_groups"] == 1
+
+        history = client.get("/api/v1/libraries/beta/history", headers=headers).json()
+        conflicts = [item for item in history if item["action"] == "conflict"]
+        assert len(conflicts) == 1
+        assert "pnpm" in conflicts[0]["detail"]
+        assert "npm" in conflicts[0]["detail"]
+
+
 def test_existing_manual_target_fact_is_checked_for_conflict(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     with TestClient(_app(state_dir)) as client:
@@ -1513,6 +1625,80 @@ def test_multi_source_groups_by_claim_after_punctuation_difference(tmp_path: Pat
             item for item in user_results if item["content"].startswith("I prefer compact diffs")
         )
         assert set(promoted["user_metadata"]["source_unit_ids"]) == {first["id"], second["id"]}
+
+
+def test_equivalent_preference_values_merge_across_sources_and_repeat_idempotently(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers, "project", "alpha")
+        _region(client, headers, "project", "beta")
+        dark = _write(
+            client,
+            headers,
+            "alpha",
+            "I prefer dark.",
+            key="equivalent-dark",
+            memory_type="preference",
+        )
+        dark_mode = _write(
+            client,
+            headers,
+            "beta",
+            "I prefer dark mode.",
+            key="equivalent-dark-mode",
+            memory_type="preference",
+        )
+        kernel = client.app.state.memory_kernel
+        kernel._promotion_classifier = lambda content, context: {
+            "category": "user",
+            "confidence": 0.99,
+            "explicit": True,
+            "topic_id": None,
+            "claim_subject": "user:preference:theme",
+            "claim_value": "dark mode" if "dark mode" in content else "dark",
+            "reason": "equivalent theme preference values",
+        }
+
+        first = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["alpha", "beta"]},
+        )
+        assert first.status_code == 202, first.text
+        first_status = _wait_promotion(client, headers, str(first.json()["job_id"]))
+        assert first_status["summary"]["promoted"] == 1
+        assert first_status["summary"]["conflict_groups"] == 0
+
+        promoted = [
+            item
+            for item in _search(client, headers, region_id="user", query="dark")["results"]
+        ]
+        assert len(promoted) == 1
+        metadata = promoted[0]["user_metadata"]
+        assert set(metadata["source_unit_ids"]) == {dark["id"], dark_mode["id"]}
+        assert metadata["promotion_evidence_kind"] == "multi_source"
+
+        second = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["alpha", "beta"]},
+        )
+        assert second.status_code == 202, second.text
+        second_status = _wait_promotion(client, headers, str(second.json()["job_id"]))
+        assert second_status["summary"]["promoted"] == 0
+        assert second_status["summary"]["conflict_groups"] == 0
+
+        with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM promotion_records"
+            ).fetchone() == (1,)
+            assert connection.execute(
+                """SELECT COUNT(*) FROM governance_events
+                   WHERE actor = 'platform:auto-promotion' AND action = 'promote'"""
+            ).fetchone() == (1,)
 
 
 def test_indentation_preference_conflict_is_detected(tmp_path: Path) -> None:
@@ -1897,3 +2083,309 @@ def test_promotion_schema_migrates_existing_ticket08_database(tmp_path: Path) ->
     assert record[0] == "explicit"
     assert json.loads(record[1]) == ["old-unit"]
     assert json.loads(record[2]) == ["old-region"]
+
+
+def test_same_claim_identity_merges_different_wording_into_one_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers, "project", "alpha")
+        _region(client, headers, "project", "beta")
+        alpha_source = _write(
+            client,
+            headers,
+            "alpha",
+            "I prefer dark mode.",
+            key="claim-identity-alpha",
+            memory_type="preference",
+        )
+
+        def classify(content: str, context: dict[str, object]) -> dict[str, object]:
+            del content, context
+            return {
+                "category": "user",
+                "confidence": 0.99,
+                "explicit": True,
+                "topic_id": None,
+                "claim_subject": "user:preference:theme",
+                "claim_value": "dark",
+                "reason": "same normalized claim identity",
+            }
+
+        kernel = client.app.state.memory_kernel
+        kernel._promotion_classifier = classify
+        first = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["alpha"]},
+        )
+        assert first.status_code == 202, first.text
+        first_status = _wait_promotion(client, headers, str(first.json()["job_id"]))
+        assert first_status["summary"]["promoted"] == 1
+
+        maintenance = state_dir / "mem2" / "maintenance.sqlite3"
+        with sqlite3.connect(maintenance) as connection:
+            first_record = connection.execute(
+                """SELECT promotion_key, target_unit_id, audit_event_id
+                   FROM promotion_records"""
+            ).fetchone()
+            assert first_record is not None
+            original_key = str(first_record[0])
+            original_target_id = str(first_record[1])
+            original_audit_id = int(first_record[2])
+            connection.execute("DELETE FROM promotion_records")
+
+        captured_outbox: dict[str, object] = {}
+        original_complete = kernel._complete_promotion_outbox
+
+        def capture_and_complete(promotion_key: str) -> None:
+            with sqlite3.connect(maintenance) as connection:
+                row = connection.execute(
+                    "SELECT payload FROM promotion_outbox WHERE promotion_key = ?",
+                    (promotion_key,),
+                ).fetchone()
+            if row is not None:
+                captured_outbox["payload"] = json.loads(str(row[0]))
+            original_complete(promotion_key)
+
+        monkeypatch.setattr(
+            kernel,
+            "_complete_promotion_outbox",
+            capture_and_complete,
+        )
+
+        beta_source = _write(
+            client,
+            headers,
+            "beta",
+            "The user prefers dark mode.",
+            key="claim-identity-beta",
+            memory_type="preference",
+        )
+        second = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["beta"]},
+        )
+        assert second.status_code == 202, second.text
+        second_status = _wait_promotion(client, headers, str(second.json()["job_id"]))
+        assert second_status["summary"]["promoted"] == 0
+
+        user_results = _search(client, headers, region_id="user", query="dark")["results"]
+        promoted = [
+            item
+            for item in user_results
+            if item["content"] in {"I prefer dark mode.", "The user prefers dark mode."}
+        ]
+        assert len(promoted) == 1
+        assert promoted[0]["document_id"] == original_target_id
+        metadata = promoted[0]["user_metadata"]
+        assert set(metadata["source_unit_ids"]) == {
+            alpha_source["id"],
+            beta_source["id"],
+        }
+        assert set(metadata["source_region_ids"]) == {"alpha", "beta"}
+        history = client.get("/api/v1/libraries/user/history", headers=headers).json()
+        promote_audits = [item for item in history if item["action"] == "promote"]
+        assert len(promote_audits) == 1
+        assert promote_audits[0]["id"] == f"governance-{original_audit_id}"
+
+    with sqlite3.connect(maintenance) as connection:
+        repaired = connection.execute(
+            """SELECT promotion_key, target_unit_id, audit_event_id
+               FROM promotion_records"""
+        ).fetchone()
+        assert repaired is not None
+        repaired_key = str(repaired[0])
+        assert str(repaired[1]) == original_target_id
+        assert int(repaired[2]) == original_audit_id
+        assert repaired_key == original_key
+        assert connection.execute("SELECT COUNT(*) FROM promotion_records").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM promotion_outbox").fetchone() == (0,)
+
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        detail = client.get(
+            f"/api/v1/libraries/user/memories/{original_target_id}",
+            headers=headers,
+        )
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["user_metadata"]["promotion_key"] == repaired_key
+
+    payload = captured_outbox.get("payload")
+    assert isinstance(payload, dict)
+    target = payload.get("target")
+    assert isinstance(target, dict)
+    target_metadata = target.get("user_metadata")
+    assert isinstance(target_metadata, dict)
+    assert target_metadata["promotion_key"] == repaired_key
+
+
+def test_superseded_promotion_target_is_repaired_before_merging_same_claim(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers, "project", "alpha")
+        _region(client, headers, "project", "beta")
+        alpha_source = _write(
+            client,
+            headers,
+            "alpha",
+            "I prefer dark mode.",
+            key="supersede-claim-alpha",
+            memory_type="preference",
+        )
+
+        def classify(content: str, context: dict[str, object]) -> dict[str, object]:
+            del context
+            value = "light" if "light" in content else "dark"
+            return {
+                "category": "user",
+                "confidence": 0.99,
+                "explicit": True,
+                "topic_id": None,
+                "claim_subject": "user:preference:theme",
+                "claim_value": value,
+                "reason": "theme preference",
+            }
+
+        kernel = client.app.state.memory_kernel
+        kernel._promotion_classifier = classify
+        first = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["alpha"]},
+        )
+        assert first.status_code == 202, first.text
+        first_status = _wait_promotion(client, headers, str(first.json()["job_id"]))
+        assert first_status["summary"]["promoted"] == 1
+        target = next(
+            item
+            for item in _search(client, headers, region_id="user", query="dark")["results"]
+            if item["content"] == "I prefer dark mode."
+        )
+        old_target_id = str(target["document_id"])
+        inspected = _inspect_document(
+            client,
+            headers,
+            region_id="user",
+            path=old_target_id,
+        )
+        corrected = client.put(
+            "/api/v1/libraries/user/document",
+            headers=headers,
+            json={
+                "path": old_target_id,
+                "content": "I prefer light mode.",
+                "expected_source_version": inspected["version"],
+                "operation_id": "supersede-promotion-target",
+                "actor_type": "user",
+                "source": "manual-supersede-test",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        corrected_id = str(corrected.json()["id"])
+        assert corrected_id != old_target_id
+
+        beta_source = _write(
+            client,
+            headers,
+            "beta",
+            "I prefer light mode.",
+            key="supersede-claim-beta",
+            memory_type="preference",
+        )
+        second = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["beta"]},
+        )
+        assert second.status_code == 202, second.text
+        second_status = _wait_promotion(client, headers, str(second.json()["job_id"]))
+        assert second_status["summary"]["promoted"] == 0
+
+        active = [
+            item
+            for item in _memories(client, headers, "user")
+            if item["lifecycle"] == "active"
+        ]
+        assert [item["id"] for item in active] == [corrected_id]
+        detail = _detail(client, headers, "user", corrected_id)
+        assert detail["content"] == "I prefer light mode."
+        assert set(detail["user_metadata"]["source_unit_ids"]) == {
+            alpha_source["id"],
+            beta_source["id"],
+        }
+
+    with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+        record = connection.execute(
+            """SELECT promotion_key, target_unit_id, audit_event_id
+               FROM promotion_records"""
+        ).fetchone()
+        assert record is not None
+        assert str(record[1]) == corrected_id
+        audit = connection.execute(
+            "SELECT unit_id, after_content FROM governance_events WHERE id = ?",
+            (int(record[2]),),
+        ).fetchone()
+        assert audit == (corrected_id, "I prefer light mode.")
+
+
+def test_explicit_preference_subject_conflicts_with_ordinary_user_memory(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers, "user", "user")
+        _region(client, headers, "project", "alpha")
+        _write(
+            client,
+            headers,
+            "user",
+            "I prefer dark mode.",
+            key="ordinary-compatible-dark",
+            memory_type="preference",
+        )
+        source = _write(
+            client,
+            headers,
+            "alpha",
+            "I prefer light mode.",
+            key="ordinary-compatible-light",
+            memory_type="preference",
+        )
+        kernel = client.app.state.memory_kernel
+        kernel._promotion_classifier = lambda content, context: {
+            "category": "user",
+            "confidence": 0.99,
+            "explicit": True,
+            "topic_id": None,
+            "claim_subject": "user:preference:theme",
+            "claim_value": "light",
+            "reason": "compatible preference subject",
+        }
+        started = client.post(
+            "/api/v1/promotions",
+            headers=headers,
+            json={"source_region_ids": ["alpha"]},
+        )
+        assert started.status_code == 202, started.text
+        status = _wait_promotion(client, headers, str(started.json()["job_id"]))
+        assert status["summary"]["promoted"] == 0
+        assert status["summary"]["conflict_groups"] == 1
+
+        active = [
+            item
+            for item in _memories(client, headers, "user")
+            if item["lifecycle"] == "active"
+        ]
+        assert [item["summary"] for item in active] == ["I prefer dark mode."]
+        assert source["id"] not in " ".join(str(item["id"]) for item in active)
+        history = client.get("/api/v1/libraries/alpha/history", headers=headers).json()
+        assert len([item for item in history if item["action"] == "conflict"]) == 1

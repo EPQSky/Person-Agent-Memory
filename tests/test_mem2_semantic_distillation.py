@@ -701,7 +701,7 @@ def test_temporal_and_structured_plan_results_are_skipped(tmp_path: Path) -> Non
         assert _formal_memories(client, headers, "semantic-project") == []
 
 
-def test_conflict_and_invalid_region_do_not_publish(tmp_path: Path) -> None:
+def test_conflict_skips_and_invalid_region_falls_back_to_source(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     root = tmp_path / "project"
     executor = ManualSemanticExecutor()
@@ -716,6 +716,7 @@ def test_conflict_and_invalid_region_do_not_publish(tmp_path: Path) -> None:
                 event_id="conflict-turn-user",
                 subject="theme",
                 value="light",
+                region_hint="missing-topic",
             ),
             _memory(
                 content="The user prefers the missing topic.",
@@ -761,14 +762,31 @@ def test_conflict_and_invalid_region_do_not_publish(tmp_path: Path) -> None:
             session_id="conflict-session",
             turn_id="conflict-turn",
         )
-        assert round_payload["semantic_status"] == "skipped"
+        assert round_payload["semantic_status"] == "completed"
         reasons = " ".join(
-            str(item["reason"]) for item in round_payload["semantic_diagnostics"]
+            str(item) for item in round_payload["semantic_diagnostics"]
         )
         assert "conflicts" in reasons
-        assert "region_hint" in reasons
+        assert "missing-topic" in reasons
+        assert "retained in the source region" in reasons
+        conflict_diagnostics = [
+            item
+            for item in round_payload["semantic_diagnostics"]
+            if item.get("status") == "skipped" and "conflicts" in str(item)
+        ]
+        assert len(conflict_diagnostics) == 1
+        assert "retained in the source region" in str(
+            conflict_diagnostics[0]["target_fallback_reason"]
+        )
         memories = _formal_memories(client, headers, "semantic-project")
-        assert [item["id"] for item in memories] == [existing.json()["id"]]
+        assert {item["id"] for item in memories} == {
+            existing.json()["id"],
+            round_payload["semantic_memory_ids"][0],
+        }
+        assert {item["summary"] for item in memories} == {
+            "Theme is dark.",
+            "The user prefers the missing topic.",
+        }
 
 
 def test_region_hints_publish_to_user_and_existing_topic_regions(tmp_path: Path) -> None:
@@ -797,6 +815,15 @@ def test_region_hints_publish_to_user_and_existing_topic_regions(tmp_path: Path)
                 value="prevents data races",
                 region_hint="rust-topic",
             ),
+            _memory(
+                content="This project uses pnpm for builds.",
+                memory_type="constraint",
+                evidence="This project uses pnpm for builds",
+                event_id="routing-turn-user",
+                subject="project package manager",
+                value="pnpm",
+                region_hint="user",
+            ),
         ]
 
     with TestClient(_app(state_dir, extractor, executor)) as client:
@@ -809,9 +836,10 @@ def test_region_hints_publish_to_user_and_existing_topic_regions(tmp_path: Path)
             session_id="routing-session",
             turn_id="routing-turn",
             user_content=(
-                "I prefer concise answers. Rust ownership prevents data races in my project."
+                "I prefer concise answers. Rust ownership prevents data races in my project. "
+                "This project uses pnpm for builds."
             ),
-            assistant_content="Noted for the user and Rust topic regions.",
+            assistant_content="Noted for the user, Rust topic, and project regions.",
             cwd=root,
         )
         executor.drain()
@@ -824,10 +852,331 @@ def test_region_hints_publish_to_user_and_existing_topic_regions(tmp_path: Path)
         )
         assert round_payload["semantic_status"] == "completed"
         refs = round_payload["semantic_memory_refs"]
-        assert {item["region_id"] for item in refs} == {"user", "rust-topic"}
+        assert {item["region_id"] for item in refs} == {
+            "user",
+            "rust-topic",
+            "semantic-project",
+        }
+        assert "project-scoped content was retained" in " ".join(
+            str(item) for item in round_payload["semantic_diagnostics"]
+        )
         assert len(_formal_memories(client, headers, "user")) == 1
         assert len(_formal_memories(client, headers, "rust-topic")) == 1
-        assert _formal_memories(client, headers, "semantic-project") == []
+        assert [item["summary"] for item in _formal_memories(
+            client,
+            headers,
+            "semantic-project",
+        )] == ["This project uses pnpm for builds."]
+
+
+def test_memory_type_boundaries_override_cross_region_hints(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    executor = ManualSemanticExecutor()
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        del context
+        return [
+            _memory(
+                content="The user prefers dark mode.",
+                memory_type="preference",
+                evidence="I prefer dark mode",
+                event_id="typed-routing-turn-user",
+                subject="user:preference:theme",
+                value="dark",
+                region_hint="typed-routing-topic",
+            ),
+            _memory(
+                content="Rust ownership prevents data races.",
+                memory_type="domain_fact",
+                evidence="Rust ownership prevents data races",
+                event_id="typed-routing-turn-user",
+                subject="rust ownership",
+                value="prevents data races",
+                region_hint="user",
+            ),
+        ]
+
+    with TestClient(_app(state_dir, extractor, executor)) as client:
+        headers = _headers(state_dir)
+        _prepare_project(client, headers, root)
+        _region(client, headers, "typed-routing-topic", kind="topic")
+        _capture_turn(
+            client,
+            headers,
+            session_id="typed-routing-session",
+            turn_id="typed-routing-turn",
+            user_content="I prefer dark mode. Rust ownership prevents data races.",
+            assistant_content="Noted.",
+            cwd=root,
+        )
+        executor.drain()
+        completed = _round(
+            client,
+            headers,
+            region_id="semantic-project",
+            session_id="typed-routing-session",
+            turn_id="typed-routing-turn",
+        )
+
+        assert completed["semantic_status"] == "completed", completed
+        refs_by_region = {
+            item["region_id"]: item["memory_id"]
+            for item in completed["semantic_memory_refs"]
+        }
+        assert set(refs_by_region) == {"user", "semantic-project"}
+        assert set(refs_by_region.values()) == set(completed["semantic_memory_ids"])
+        diagnostics = completed["semantic_diagnostics"]
+        assert diagnostics[0]["target_fallback_reason"]
+        assert "topic" in str(diagnostics[0]["target_fallback_reason"])
+        assert diagnostics[1]["target_fallback_reason"]
+        assert "user region" in str(diagnostics[1]["target_fallback_reason"])
+        assert [item["summary"] for item in _formal_memories(client, headers, "user")] == [
+            "The user prefers dark mode."
+        ]
+        assert [item["summary"] for item in _formal_memories(
+            client,
+            headers,
+            "semantic-project",
+        )] == ["Rust ownership prevents data races."]
+        assert _formal_memories(client, headers, "typed-routing-topic") == []
+
+
+def test_sentence_initial_project_scope_terms_stay_in_source_region(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    executor = ManualSemanticExecutor()
+    candidates = [
+        ("Project uses pnpm for builds.", "project"),
+        ("Repository uses pnpm for builds.", "repository"),
+        ("Workspace uses pnpm for builds.", "workspace"),
+        ("Codebase uses pnpm for builds.", "codebase"),
+    ]
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        del context
+        return [
+            _memory(
+                content=content,
+                memory_type="constraint",
+                evidence=content.removesuffix("."),
+                event_id="bare-project-scope-turn-user",
+                subject=f"project:{term}:package-manager",
+                value="pnpm",
+                region_hint="user",
+            )
+            for content, term in candidates
+        ]
+
+    with TestClient(_app(state_dir, extractor, executor)) as client:
+        headers = _headers(state_dir)
+        _prepare_project(client, headers, root)
+        _region(client, headers, "builds-topic", kind="topic")
+        _capture_turn(
+            client,
+            headers,
+            session_id="bare-project-scope-session",
+            turn_id="bare-project-scope-turn",
+            user_content=" ".join(content for content, _ in candidates),
+            assistant_content="Noted.",
+            cwd=root,
+        )
+        executor.drain()
+        round_payload = _round(
+            client,
+            headers,
+            region_id="semantic-project",
+            session_id="bare-project-scope-session",
+            turn_id="bare-project-scope-turn",
+        )
+
+        assert round_payload["semantic_status"] == "completed"
+        assert len(round_payload["semantic_memory_ids"]) == len(candidates)
+        assert [item["region_id"] for item in round_payload["semantic_memory_refs"]] == [
+            "semantic-project",
+        ] * len(candidates)
+        assert {
+            item["summary"]
+            for item in _formal_memories(client, headers, "semantic-project")
+        } == {content for content, _ in candidates}
+        regions = client.get("/api/v1/regions", headers=headers).json()
+        region_ids = {str(item["region_id"]) for item in regions}
+        assert "user" not in region_ids
+        assert _formal_memories(client, headers, "builds-topic") == []
+
+
+def test_possessive_project_scope_terms_stay_in_source_region(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    executor = ManualSemanticExecutor()
+    candidates = [
+        ("My project uses pnpm for builds.", "my-project"),
+        ("The user's repository uses npm for builds.", "user-repository"),
+        ("我的项目使用 uv 构建。", "我的项目"),
+    ]
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        del context
+        return [
+            _memory(
+                content=content,
+                memory_type="constraint",
+                evidence=content.removesuffix("。"),
+                event_id="possessive-project-scope-turn-user",
+                subject=f"project:{term}:package-manager",
+                value="pnpm" if "pnpm" in content else ("npm" if "npm" in content else "uv"),
+                region_hint="user",
+            )
+            for content, term in candidates
+        ]
+
+    with TestClient(_app(state_dir, extractor, executor)) as client:
+        headers = _headers(state_dir)
+        _prepare_project(client, headers, root)
+        _capture_turn(
+            client,
+            headers,
+            session_id="possessive-project-scope-session",
+            turn_id="possessive-project-scope-turn",
+            user_content=" ".join(content for content, _ in candidates),
+            assistant_content="Noted.",
+            cwd=root,
+        )
+        executor.drain()
+        round_payload = _round(
+            client,
+            headers,
+            region_id="semantic-project",
+            session_id="possessive-project-scope-session",
+            turn_id="possessive-project-scope-turn",
+        )
+
+        assert round_payload["semantic_status"] == "completed"
+        assert {
+            item["region_id"] for item in round_payload["semantic_memory_refs"]
+        } == {"semantic-project"}
+        assert {
+            item["summary"]
+            for item in _formal_memories(client, headers, "semantic-project")
+        } == {content for content, _ in candidates}
+        regions = client.get("/api/v1/regions", headers=headers).json()
+        assert "user" not in {str(item["region_id"]) for item in regions}
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["I prefer this project to use pnpm.", "I prefer my project to use pnpm."],
+)
+def test_project_phrase_inside_user_preference_stays_in_user_region(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    root.mkdir()
+    executor = ManualSemanticExecutor()
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        messages = context["messages"]
+        assert isinstance(messages, list)
+        user = next(
+            item
+            for item in messages
+            if isinstance(item, dict) and item.get("role") == "user"
+        )
+        return [
+            _memory(
+                content=content,
+                memory_type="preference",
+                evidence=content.removesuffix("."),
+                event_id=str(user["event_id"]),
+                subject="user:preference:package_manager",
+                value="pnpm",
+                region_hint="user",
+            )
+        ]
+
+    with TestClient(_app(state_dir, extractor, executor)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers, "preference-project")
+        _bind(client, headers, root, "preference-project")
+        _capture_turn(
+            client,
+            headers,
+            session_id="preference-project-session",
+            turn_id="preference-project-turn",
+            user_content=content,
+            assistant_content="Noted.",
+            cwd=root,
+        )
+        executor.drain()
+        completed = _round(
+            client,
+            headers,
+            region_id="preference-project",
+            session_id="preference-project-session",
+            turn_id="preference-project-turn",
+        )
+        assert completed["semantic_status"] == "completed"
+        assert [item["summary"] for item in _formal_memories(client, headers, "user")] == [
+            content
+        ]
+        assert _formal_memories(client, headers, "preference-project") == []
+
+
+def test_missing_region_hint_falls_back_to_source(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    executor = ManualSemanticExecutor()
+    content = "The user prefers concise answers."
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        del context
+        return [
+            _memory(
+                content=content,
+                memory_type="preference",
+                evidence="I prefer concise answers",
+                event_id="missing-hint-turn-user",
+                subject="user:preference:length",
+                value="concise",
+                region_hint="",
+            )
+        ]
+
+    with TestClient(_app(state_dir, extractor, executor)) as client:
+        headers = _headers(state_dir)
+        _prepare_project(client, headers, root)
+        _capture_turn(
+            client,
+            headers,
+            session_id="missing-hint-session",
+            turn_id="missing-hint-turn",
+            user_content="I prefer concise answers.",
+            assistant_content="Noted.",
+            cwd=root,
+        )
+        executor.drain()
+        round_payload = _round(
+            client,
+            headers,
+            region_id="semantic-project",
+            session_id="missing-hint-session",
+            turn_id="missing-hint-turn",
+        )
+        assert round_payload["semantic_status"] == "completed"
+        assert "region_hint was missing" in " ".join(
+            str(item) for item in round_payload["semantic_diagnostics"]
+        )
+        assert [item["summary"] for item in _formal_memories(
+            client,
+            headers,
+            "semantic-project",
+        )] == [content]
+        regions = client.get("/api/v1/regions", headers=headers).json()
+        assert "user" not in {str(item["region_id"]) for item in regions}
 
 
 def test_missing_claim_fields_do_not_collapse_distinct_results_and_same_body_is_reused(
@@ -4991,6 +5340,128 @@ def test_manual_overwrite_survives_later_semantic_version(tmp_path: Path) -> Non
         )
         assert preserved.status_code == 200, preserved.text
         assert preserved.json()["content"] == "The user prefers light mode."
+
+
+def test_manual_supersede_reuses_equivalent_later_semantic_claim(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    executor = ManualSemanticExecutor()
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        messages = context["messages"]
+        assert isinstance(messages, list)
+        user = next(
+            item
+            for item in messages
+            if isinstance(item, dict) and item["role"] == "user"
+        )
+        if user["event_id"] == "manual-supersede-dark-user":
+            content = "The user prefers dark mode."
+            value = "dark"
+        else:
+            content = "The user prefers light mode."
+            value = "light"
+        return [
+            _memory(
+                content=content,
+                memory_type="preference",
+                evidence=str(user["content"]),
+                event_id=str(user["event_id"]),
+                subject="user:preference:theme",
+                value=value,
+                region_hint="user",
+            )
+        ]
+
+    with TestClient(_app(state_dir, extractor, executor)) as client:
+        headers = _headers(state_dir)
+        _prepare_project(client, headers, root)
+        _capture_turn(
+            client,
+            headers,
+            session_id="manual-supersede-session",
+            turn_id="manual-supersede-dark",
+            user_content="I prefer dark mode.",
+            assistant_content="Noted.",
+            cwd=root,
+        )
+        executor.drain()
+        first = _round(
+            client,
+            headers,
+            region_id="semantic-project",
+            session_id="manual-supersede-session",
+            turn_id="manual-supersede-dark",
+        )
+        original_id = str(first["semantic_memory_ids"][0])
+        original = client.get(
+            f"/api/v1/libraries/user/memories/{original_id}",
+            headers=headers,
+        )
+        assert original.status_code == 200, original.text
+        corrected = client.put(
+            "/api/v1/libraries/user/document",
+            headers=headers,
+            json={
+                "path": original_id,
+                "content": "The user prefers light mode.",
+                "expected_source_version": original.json()["source_version"],
+                "operation_id": "manual-supersede-light",
+                "actor_type": "user",
+                "source": "manual-supersede-test",
+                "mode": "supersede",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        corrected_id = str(corrected.json()["id"])
+        assert corrected_id != original_id
+
+        _capture_turn(
+            client,
+            headers,
+            session_id="manual-supersede-session",
+            turn_id="manual-supersede-light",
+            user_content="I prefer light mode.",
+            assistant_content="Noted again.",
+            cwd=root,
+            second=10,
+        )
+        executor.drain()
+        second = _round(
+            client,
+            headers,
+            region_id="semantic-project",
+            session_id="manual-supersede-session",
+            turn_id="manual-supersede-light",
+        )
+
+        assert second["semantic_status"] == "completed", second
+        assert second["semantic_memory_ids"] == [corrected_id]
+        active = [
+            item
+            for item in _formal_memories(client, headers, "user")
+            if item["lifecycle"] == "active"
+        ]
+        assert [item["id"] for item in active] == [corrected_id]
+        detail = client.get(
+            f"/api/v1/libraries/user/memories/{corrected_id}",
+            headers=headers,
+        )
+        assert detail.status_code == 200, detail.text
+        payload = detail.json()
+        assert payload["content"] == "The user prefers light mode."
+        assert len(payload["user_metadata"]["source_unit_ids"]) >= 4
+        assert set(payload["user_metadata"]["source_event_ids"]) >= {
+            "manual-supersede-dark-user",
+            "manual-supersede-light-user",
+        }
+        assert len(payload["semantic_versions"]) == 2
+        with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+            conflict_count = connection.execute(
+                """SELECT COUNT(*) FROM governance_events
+                   WHERE actor = 'semantic-distillation' AND action = 'conflict'"""
+            ).fetchone()[0]
+        assert conflict_count == 0
 
 
 def test_queue_saturation_retries_final_version_after_capacity_returns(
