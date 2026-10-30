@@ -1444,6 +1444,7 @@ class EntityGraphStore:
         *,
         entity_id: str | None = None,
         memory_id: str | None = None,
+        memory_ids: Sequence[str] | None = None,
         entity_type: str | None = None,
         q: str | None = None,
         hops: int = 1,
@@ -1463,8 +1464,17 @@ class EntityGraphStore:
         relation_limit = min(GRAPH_MAX_EDGE_LIMIT + 1, edge_budget + 1)
         candidate_limit = min(GRAPH_MAX_NODE_LIMIT + 1, limit + 1)
         normalized_q = normalize_name(q) if q is not None else ""
+        normalized_memory_ids = (
+            tuple(dict.fromkeys(str(value) for value in memory_ids if str(value)))
+            if memory_ids is not None
+            else ()
+        )
+        bounded_memory_ids = normalized_memory_ids[:GRAPH_MAX_NODE_LIMIT]
         has_explicit_seed = (
-            entity_id is not None or memory_id is not None or q is not None
+            entity_id is not None
+            or memory_id is not None
+            or memory_ids is not None
+            or q is not None
         )
         with self._connection() as connection:
             seed_ids: list[str] = []
@@ -1480,26 +1490,25 @@ class EntityGraphStore:
                         limit=1,
                     )
                 seed_ids = [str(row[0]) for row in seed_rows]
+            elif memory_ids is not None:
+                seed_rows = self._memory_seed_rows(
+                    connection,
+                    region_id,
+                    memory_ids=bounded_memory_ids,
+                    entity_type=entity_type,
+                    lifecycles=lifecycles,
+                    limit=limit,
+                )
+                seed_ids = [str(row[0]) for row in seed_rows]
             elif memory_id is not None:
-                if memory_id:
-                    seed_rows = connection.execute(
-                        f"""SELECT DISTINCT m.entity_id
-                            FROM entity_graph_memory_entities m
-                            JOIN entity_graph_entities e
-                              ON e.region_id = m.region_id AND e.entity_id = m.entity_id
-                            WHERE m.region_id = ? AND m.memory_id = ?
-                              AND m.lifecycle IN ({', '.join('?' for _ in lifecycles)})
-                              {"AND e.entity_type = ?" if entity_type else ""}
-                            ORDER BY e.entity_type, e.normalized_name, e.entity_id
-                            LIMIT ?""",
-                        (
-                            region_id,
-                            memory_id,
-                            *lifecycles,
-                            *((entity_type,) if entity_type else ()),
-                            limit,
-                        ),
-                    ).fetchall()
+                seed_rows = self._memory_seed_rows(
+                    connection,
+                    region_id,
+                    memory_ids=(memory_id,) if memory_id else (),
+                    entity_type=entity_type,
+                    lifecycles=lifecycles,
+                    limit=limit,
+                )
                 seed_ids = [str(row[0]) for row in seed_rows]
             elif q is not None and normalized_q:
                 seed_rows = self._candidate_entity_rows(
@@ -1614,6 +1623,7 @@ class EntityGraphStore:
             )
             entity["selected"] = str(row[0]) in seed_set
             entity["graph_state"] = "direct" if entity["selected"] else "background"
+            entity["visual_state"] = entity["graph_state"]
             entity["degree"] = int(row[6])
             entity["updated_at"] = str(row[7])
             entities_list.append(entity)
@@ -1643,8 +1653,259 @@ class EntityGraphStore:
             "max_nodes": GRAPH_MAX_NODE_LIMIT,
             "max_edges": GRAPH_MAX_EDGE_LIMIT,
             "truncated": nodes_truncated or edges_truncated,
+            "seed_total": len(normalized_memory_ids) if memory_ids is not None else 0,
+            "seed_limit": GRAPH_MAX_NODE_LIMIT if memory_ids is not None else 0,
+            "seed_truncated": (
+                len(normalized_memory_ids) > GRAPH_MAX_NODE_LIMIT
+                if memory_ids is not None
+                else False
+            ),
             "read_only": True,
         }
+
+    def query_subgraph(
+        self,
+        region_id: str,
+        memory_ids: Sequence[str],
+        *,
+        hops: int = 1,
+        limit: int = GRAPH_MAX_NODE_LIMIT,
+        history: bool = False,
+    ) -> dict[str, object]:
+        normalized_memory_ids = tuple(
+            dict.fromkeys(str(value) for value in memory_ids if str(value))
+        )
+        bounded_memory_ids = normalized_memory_ids[:GRAPH_MAX_NODE_LIMIT]
+        graph = self.graph(
+            region_id,
+            memory_ids=bounded_memory_ids,
+            hops=hops,
+            limit=limit,
+            history=history,
+        )
+        graph_nodes = cast(list[dict[str, object]], graph["nodes"])
+        graph_edges = cast(list[dict[str, object]], graph["edges"])
+        node_ids = [str(node["id"]) for node in graph_nodes]
+        memory_entities = self._memory_entity_map(
+            region_id,
+            bounded_memory_ids,
+            node_ids,
+            history=history,
+        )
+        mapping_status = self._memory_mapping_status(
+            region_id,
+            normalized_memory_ids,
+            bounded_memory_ids,
+            memory_entities,
+            history=history,
+        )
+        for memory_id in normalized_memory_ids:
+            memory_entities.setdefault(str(memory_id), [])
+        direct_memory_set = set(normalized_memory_ids)
+        direct_entity_ids = {
+            str(node["id"])
+            for node in graph_nodes
+            if node.get("selected") is True
+        }
+        for node in graph_nodes:
+            state = "direct" if node.get("selected") is True else "query_expansion"
+            node["graph_state"] = state
+            node["visual_state"] = state
+            raw_supporting_memory_ids = node.get("evidence_memory_ids", [])
+            supporting_memory_ids = (
+                raw_supporting_memory_ids
+                if isinstance(raw_supporting_memory_ids, (list, tuple))
+                else []
+            )
+            node["supporting_memory_ids"] = list(
+                dict.fromkeys(
+                    str(value)
+                    for value in supporting_memory_ids
+                    if str(value)
+                )
+            )
+        for edge in graph_edges:
+            raw_edge_memory_ids = edge.get("memory_ids", [])
+            edge_memory_values = (
+                raw_edge_memory_ids
+                if isinstance(raw_edge_memory_ids, (list, tuple))
+                else []
+            )
+            edge_memory_ids = {
+                str(value) for value in edge_memory_values if str(value)
+            }
+            direct_edge = bool(edge_memory_ids & direct_memory_set) or (
+                str(edge.get("source", "")) in direct_entity_ids
+                and str(edge.get("target", "")) in direct_entity_ids
+            )
+            state = "direct" if direct_edge else "query_expansion"
+            edge["graph_state"] = state
+            edge["visual_state"] = state
+        truncated_memory_count = sum(
+            1 for value in mapping_status.values() if value == "truncated"
+        )
+        mapped_memory_count = sum(
+            1 for value in mapping_status.values() if value == "mapped"
+        )
+        unmapped_memory_count = sum(
+            1 for value in mapping_status.values() if value == "unmapped"
+        )
+        truncation_reasons: list[str] = []
+        if len(normalized_memory_ids) > GRAPH_MAX_NODE_LIMIT:
+            truncation_reasons.append("direct_memory_seed_limit")
+        if graph.get("truncated"):
+            truncation_reasons.append("graph_node_or_edge_limit")
+        if truncated_memory_count and "node_limit" not in truncation_reasons:
+            truncation_reasons.append("node_limit")
+        if truncated_memory_count or graph.get("truncated"):
+            graph["truncated"] = True
+            if "query_subgraph_truncated" not in cast(list[object], graph.get("degradation", [])):
+                graph["degradation"] = ["query_subgraph_truncated"]
+        graph["query_subgraph"] = True
+        graph["memory_entities"] = memory_entities
+        graph["direct_memory_ids"] = list(normalized_memory_ids)
+        graph["seed_memory_ids"] = list(bounded_memory_ids)
+        graph["seed_total"] = len(normalized_memory_ids)
+        graph["seed_limit"] = GRAPH_MAX_NODE_LIMIT
+        graph["seed_truncated"] = len(normalized_memory_ids) > GRAPH_MAX_NODE_LIMIT
+        graph["memory_mapping_status"] = mapping_status
+        graph["mapped_memory_count"] = mapped_memory_count
+        graph["mapping_count"] = mapped_memory_count
+        graph["unmapped_memory_count"] = unmapped_memory_count
+        graph["truncated_memory_count"] = truncated_memory_count
+        graph["truncation_reasons"] = truncation_reasons
+        graph["truncation_reason"] = ", ".join(truncation_reasons)
+        graph["no_mapped_entities"] = (
+            mapped_memory_count == 0 and truncated_memory_count == 0
+        )
+        return graph
+
+    def _memory_mapping_status(
+        self,
+        connection_region_id: str,
+        memory_ids: Sequence[str],
+        bounded_memory_ids: Sequence[str],
+        memory_entities: Mapping[str, list[str]],
+        *,
+        history: bool,
+    ) -> dict[str, str]:
+        lifecycles = (
+            ("active", "superseded", "archived") if history else ("active",)
+        )
+        lifecycle_placeholders = ", ".join("?" for _ in lifecycles)
+        bounded_ids = tuple(
+            dict.fromkeys(str(value) for value in bounded_memory_ids)
+        )[:GRAPH_MAX_NODE_LIMIT]
+        supported_ids: set[str] = set()
+        if bounded_ids:
+            memory_placeholders = ", ".join("?" for _ in bounded_ids)
+            with self._connection() as connection:
+                rows = connection.execute(
+                    f"""SELECT DISTINCT memory_id
+                        FROM entity_graph_memory_entities
+                        WHERE region_id = ?
+                          AND memory_id IN ({memory_placeholders})
+                          AND lifecycle IN ({lifecycle_placeholders})
+                        ORDER BY memory_id LIMIT ?""",
+                    (
+                        connection_region_id,
+                        *bounded_ids,
+                        *lifecycles,
+                        GRAPH_MAX_NODE_LIMIT,
+                    ),
+                ).fetchall()
+            supported_ids = {str(row[0]) for row in rows}
+        statuses: dict[str, str] = {}
+        bounded_set = set(bounded_ids)
+        for memory_id in memory_ids:
+            normalized = str(memory_id)
+            if normalized not in bounded_set:
+                statuses[normalized] = "truncated"
+            elif memory_entities.get(normalized):
+                statuses[normalized] = "mapped"
+            elif normalized in supported_ids:
+                statuses[normalized] = "truncated"
+            else:
+                statuses[normalized] = "unmapped"
+        return statuses
+
+    @staticmethod
+    def _memory_seed_rows(
+        connection: sqlite3.Connection,
+        region_id: str,
+        *,
+        memory_ids: Sequence[str],
+        entity_type: str | None,
+        lifecycles: Sequence[str],
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        if not memory_ids:
+            return []
+        memory_placeholders = ", ".join("?" for _ in memory_ids)
+        lifecycle_placeholders = ", ".join("?" for _ in lifecycles)
+        entity_type_clause = " AND e.entity_type = ?" if entity_type else ""
+        values: list[object] = [region_id, *memory_ids, *lifecycles]
+        if entity_type:
+            values.append(entity_type)
+        values.append(max(1, min(limit, GRAPH_MAX_NODE_LIMIT)))
+        return connection.execute(
+            f"""SELECT DISTINCT m.entity_id
+                FROM entity_graph_memory_entities m
+                JOIN entity_graph_entities e
+                  ON e.region_id = m.region_id AND e.entity_id = m.entity_id
+                WHERE m.region_id = ?
+                  AND m.memory_id IN ({memory_placeholders})
+                  AND m.lifecycle IN ({lifecycle_placeholders})
+                  {entity_type_clause}
+                ORDER BY e.entity_type, e.normalized_name, e.entity_id
+                LIMIT ?""",
+            values,
+        ).fetchall()
+
+    def _memory_entity_map(
+        self,
+        region_id: str,
+        memory_ids: Sequence[str],
+        entity_ids: Sequence[str],
+        *,
+        history: bool,
+    ) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {str(memory_id): [] for memory_id in memory_ids}
+        if not memory_ids or not entity_ids:
+            return result
+        bounded_memory_ids = tuple(
+            dict.fromkeys(str(value) for value in memory_ids)
+        )[:GRAPH_MAX_NODE_LIMIT]
+        bounded_entity_ids = tuple(
+            dict.fromkeys(str(value) for value in entity_ids)
+        )[:GRAPH_MAX_NODE_LIMIT]
+        lifecycles = (
+            ("active", "superseded", "archived") if history else ("active",)
+        )
+        lifecycle_placeholders = ", ".join("?" for _ in lifecycles)
+        memory_placeholders = ", ".join("?" for _ in bounded_memory_ids)
+        entity_placeholders = ", ".join("?" for _ in bounded_entity_ids)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""SELECT DISTINCT memory_id, entity_id
+                    FROM entity_graph_memory_entities
+                    WHERE region_id = ?
+                      AND memory_id IN ({memory_placeholders})
+                      AND entity_id IN ({entity_placeholders})
+                      AND lifecycle IN ({lifecycle_placeholders})
+                    ORDER BY memory_id, entity_id
+                    LIMIT ?""",
+                (
+                    region_id,
+                    *bounded_memory_ids,
+                    *bounded_entity_ids,
+                    *lifecycles,
+                    GRAPH_MAX_NODE_LIMIT * GRAPH_MAX_NODE_LIMIT,
+                ),
+            ).fetchall()
+        for row in rows:
+            result.setdefault(str(row[0]), []).append(str(row[1]))
+        return result
 
     @staticmethod
     def _candidate_entity_rows(

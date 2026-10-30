@@ -56,6 +56,8 @@
     .evidence-list pre { margin:6px 0 0; }
     .result { border-top:1px solid var(--line); padding:12px 0; }
     .result:first-child { border-top:0; }
+    .result-link { width:100%; text-align:left; background:transparent; color:inherit; border:1px solid var(--line); }
+    .result-link:hover { border-color:var(--accent); background:var(--accent-soft); color:var(--text); }
     .raw-layout { display:grid; grid-template-columns:minmax(220px,.7fr) minmax(0,2fr); gap:18px; align-items:start; }
     #raw-session-workspace { grid-column:1/-1; }
     .raw-session-list, .raw-round-list, .raw-event-list { list-style:none; margin:0; padding:0; display:grid; gap:10px; }
@@ -82,6 +84,9 @@
     .entity-list li, .relation-list li { display:grid; gap:6px; }
     .entity-list button.secondary, .relation-list button.secondary { width:auto; justify-self:start; padding:5px 9px; font-size:12px; }
     .graph-historical { opacity:.62; border-style:dashed !important; }
+    .graph-direct { border-color:var(--accent) !important; background:var(--accent-soft) !important; }
+    .graph-query-expansion { border-color:#8b6bd6 !important; }
+    .graph-background { opacity:.8; }
     .graph-summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin-bottom:14px; }
     pre { white-space:pre-wrap; overflow-wrap:anywhere; background:var(--bg); padding:12px; border-radius:8px; }
     .hidden { display:none !important; }
@@ -157,10 +162,20 @@
           <form id="search-form">
             <label for="search-query">查询</label>
             <input id="search-query" required placeholder="当前项目决策、偏好、领域事实…">
+            <label for="search-graph-hops">查询子图跳数</label>
+            <select id="search-graph-hops"><option value="1">一跳（默认）</option><option value="2">两跳</option></select>
             <div class="actions"><button type="submit">检索选中区域</button></div>
           </form>
           <p id="search-message" class="notice" aria-live="polite"></p>
           <div id="search-results"></div>
+          <section id="search-query-subgraph" class="hidden" aria-label="检索查询子图">
+            <h3>检索查询子图</h3>
+            <p id="search-query-subgraph-message" class="notice" aria-live="polite"></p>
+            <div id="search-query-subgraph-summary" class="graph-summary"></div>
+            <div class="actions"><button id="search-expand-two-hops" class="secondary" type="button" disabled>展开到两跳</button></div>
+            <h3>查询实体</h3><ul id="search-query-subgraph-entities" class="entity-list"></ul>
+            <h3>查询关系</h3><ul id="search-query-subgraph-relations" class="relation-list"></ul>
+          </section>
         </section>
 
         <section>
@@ -219,6 +234,8 @@
             <div class="meta-item"><span>晋升目标</span><strong id="detail-target-region">—</strong></div>
             <div class="meta-item"><span>来源区域</span><strong id="detail-source-regions">—</strong></div>
             <div class="meta-item"><span>证据依据</span><strong id="detail-evidence-basis">—</strong></div>
+            <div class="meta-item"><span>图谱映射</span><strong id="detail-graph-mapping-status">—</strong></div>
+            <div class="meta-item"><span>图谱状态</span><strong id="detail-entity-graph-status">—</strong></div>
           </div>
           <label for="document-content">完整正文</label>
           <textarea id="document-content" spellcheck="false"></textarea>
@@ -349,6 +366,8 @@
     rawController: null,
     entityGraph: null,
     entityGraphSeedId: null,
+    lastSearch: null,
+    lastQuerySubgraph: null,
   };
   const $ = (id) => document.getElementById(id);
   const setMessage = (element, text, error = false, success = false) => {
@@ -401,7 +420,7 @@
     $('login-panel').classList.add('hidden');
     $('workspace').classList.remove('hidden');
   }
-  function switchWorkspace(tab) {
+  async function switchWorkspace(tab) {
     if (!['memory', 'entity-graph', 'raw-session'].includes(tab)) return;
     state.workspaceTab = tab;
     const memorySelected = tab === 'memory';
@@ -414,12 +433,13 @@
     $('raw-session-workspace').classList.toggle('hidden', tab !== 'raw-session');
     $('workspace-title').textContent = memorySelected ? '记忆' : (graphSelected ? '图谱' : '原始会话');
     if (memorySelected) {
-      if (state.selectedRegion) loadMemories({ reset: true });
+      if (state.selectedRegion) return loadMemories({ reset: true });
     } else if (graphSelected) {
-      if (state.selectedRegion) loadEntityGraph();
+      if (state.selectedRegion) return loadEntityGraph();
     } else {
-      loadRawRounds();
+      return loadRawRounds();
     }
+    return false;
   }
   function regionLabel(region) { return `${region.name} · ${region.kind} · ${region.region_id}`; }
   function renderRegions() {
@@ -478,6 +498,8 @@
     $('detail-target-region').textContent = '—';
     $('detail-source-regions').textContent = '—';
     $('detail-evidence-basis').textContent = '—';
+    $('detail-graph-mapping-status').textContent = '—';
+    $('detail-entity-graph-status').textContent = '—';
     $('document-content').value = '';
     $('document-content').readOnly = false;
     $('source-list').replaceChildren();
@@ -1110,7 +1132,8 @@
       renderGraphLists(graph);
       const view = graph.history ? '历史' : '当前';
       const bounded = graph.truncated ? ' 已达到当前视图的有界读取上限。' : '';
-      setMessage($('entity-graph-message'), `已读取${view}视图：${graph.nodes?.length || 0} 个实体和 ${graph.edges?.length || 0} 条关系。${bounded}`, false, true);
+      const reason = graph.truncation_reason ? ` 原因：${graph.truncation_reason}。` : '';
+      setMessage($('entity-graph-message'), `已读取${view}视图：${graph.nodes?.length || 0} 个实体和 ${graph.edges?.length || 0} 条关系。${bounded}${reason}`, false, true);
     } catch (error) {
       setMessage($('entity-graph-message'), `读取图谱失败：${error.message}`, true);
     }
@@ -1197,6 +1220,17 @@
       $('detail-updated').textContent = formatTime(String(memory.updated_at || ''));
       $('detail-source-count').textContent = String(memory.source_count ?? 0);
       $('detail-version').textContent = state.sourceVersion;
+      const detailGraphStatus = memory.entity_graph_status && typeof memory.entity_graph_status === 'object'
+        ? String(memory.entity_graph_status.status || 'unknown')
+        : String(memory.entity_graph?.status || 'unknown');
+      const detailMappingStatus = String(
+        memory.graph_mapping_status || memory.entity_graph?.graph_mapping_status || 'unknown',
+      );
+      const detailDegradation = Array.isArray(memory.degradation)
+        ? memory.degradation.map(String).filter(Boolean)
+        : [];
+      $('detail-graph-mapping-status').textContent = graphMappingLabel(detailMappingStatus);
+      $('detail-entity-graph-status').textContent = detailGraphStatus;
       $('document-content').value = String(memory.content || '');
       renderProvenance(memory);
       renderSources(memory);
@@ -1205,7 +1239,9 @@
       const lifecycle = String(memory.lifecycle || '');
       setDetailGovernance(lifecycle);
       const readOnlyHint = lifecycle === 'active' ? '' : ' 该版本只读，只能查看信息和审计。';
-      setMessage($('document-message'), `已加载记忆详情，来源版本 ${state.sourceVersion}。${readOnlyHint}`, false, true);
+      const graphHint = ` 图谱映射：${graphMappingLabel(detailMappingStatus)}；图谱状态：${detailGraphStatus}。${detailDegradation.length ? ` 原因：${detailDegradation.join('、')}。` : ''}`;
+      setMessage($('document-message'), `已加载记忆详情，来源版本 ${state.sourceVersion}。${readOnlyHint}${graphHint}`, Boolean(detailDegradation.length), !detailDegradation.length);
+      return memory;
     } catch (error) {
       if (generation !== state.detailGeneration) return;
       clearDetailData();
@@ -1214,6 +1250,7 @@
         setMessage($('memory-list-message'), '该记忆已不在正式记忆列表中，列表已刷新。', true);
         await loadMemories({ reset: true });
       }
+      return null;
     }
   }
   async function saveDocument() {
@@ -1392,30 +1429,185 @@
       }
     }
   }
-  async function runSearch(event) {
-    event.preventDefault();
+  function querySubgraphMemoryIds(graph, nodeId) {
+    const node = Array.isArray(graph?.nodes)
+      ? graph.nodes.find((item) => String(item.id) === String(nodeId))
+      : null;
+    const mapping = graph && typeof graph.memory_entities === 'object' ? graph.memory_entities : {};
+    const mapped = Object.entries(mapping)
+      .filter(([, entityIds]) => Array.isArray(entityIds) && entityIds.includes(nodeId))
+      .map(([memoryId]) => memoryId);
+    const supporting = node && Array.isArray(node.supporting_memory_ids)
+      ? node.supporting_memory_ids
+      : node && Array.isArray(node.evidence_memory_ids)
+        ? node.evidence_memory_ids
+        : [];
+    return [...new Set([...supporting.map(String), ...mapped.map(String)])];
+  }
+  function graphStateLabel(value) {
+    return value === 'direct' ? '直接命中' : value === 'query_expansion' ? '查询扩展' : '背景实体';
+  }
+  function graphMappingLabel(value) {
+    return value === 'mapped'
+      ? '已映射'
+      : value === 'unmapped'
+        ? '未映射'
+        : value === 'truncated'
+          ? '受上限截断'
+          : value === 'degraded'
+            ? '图谱降级'
+            : value === 'not_configured'
+              ? '图谱未配置'
+              : String(value || '未知');
+  }
+  async function locateQuerySubgraphNode(node, graph) {
+    let memoryIds = querySubgraphMemoryIds(graph, String(node.id));
+    if (!memoryIds.length && state.selectedRegion) {
+      try {
+        const detail = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/entity-graph/entities/${encodeURIComponent(String(node.id))}`);
+        memoryIds = Array.isArray(detail.supporting_memory_ids)
+          ? detail.supporting_memory_ids.map(String)
+          : [];
+      } catch (error) {
+        setMessage($('search-message'), `读取实体支撑记忆失败：${error.message}`, true);
+      }
+    }
+    if (memoryIds.length) {
+      await switchWorkspace('memory');
+      for (const memoryId of memoryIds) {
+        const memory = await openMemory(memoryId);
+        if (!memory) continue;
+        let card = document.querySelector(`.memory-card[data-memory-id="${CSS.escape(memoryId)}"]`);
+        if (!card) {
+          const item = renderMemoryItem(memory);
+          $('document-list').prepend(item);
+          card = item.querySelector('.memory-card');
+        }
+        card?.scrollIntoView({ block: 'nearest' });
+        setMessage($('search-message'), `已定位支撑记忆 ${memoryId}，当前记忆列表项已高亮。`, false, true);
+        return;
+      }
+    }
+    await inspectGraphEntity(String(node.id));
+  }
+  function renderSearchQuerySubgraph(graph) {
+    const section = $('search-query-subgraph');
+    const entities = Array.isArray(graph?.nodes) ? graph.nodes : [];
+    const relations = Array.isArray(graph?.edges) ? graph.edges : [];
+    if (!graph) {
+      section.classList.add('hidden');
+      return;
+    }
+    section.classList.remove('hidden');
+    const status = String(graph.status || 'unknown');
+    const error = String(graph.error || '');
+    const detail = graph.message || (error ? `图谱降级：${error}` : `查询子图：${entities.length} 个实体，${relations.length} 条关系。`);
+    setMessage($('search-query-subgraph-message'), detail, status === 'degraded', status === 'ready');
+    const summary = $('search-query-subgraph-summary');
+    summary.replaceChildren();
+    for (const [label, value] of [
+      ['状态', status],
+      ['实体', entities.length],
+      ['关系', relations.length],
+      ['跳数', graph.hops || 1],
+      ['上限', `${graph.max_nodes || 200}/${graph.max_edges || 400}`],
+      ['截断', graph.truncated ? '是' : '否'],
+      ['直接种子', `${graph.mapped_memory_count || 0}/${graph.seed_total || 0}`],
+    ]) {
+      const item = document.createElement('div');
+      item.className = 'meta-item';
+      const name = document.createElement('span');
+      name.textContent = label;
+      const count = document.createElement('strong');
+      count.textContent = String(value);
+      item.append(name, count);
+      summary.append(item);
+    }
+    const entityList = $('search-query-subgraph-entities');
+    entityList.replaceChildren();
+    for (const entity of entities) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      const visualState = String(entity.visual_state || entity.graph_state || 'background');
+      button.type = 'button';
+      button.className = `graph-${visualState}`;
+      button.textContent = `${graphEntityLabel(entity)} · ${graphStateLabel(visualState)}`;
+      button.setAttribute('aria-label', `定位图谱实体：${entity.canonical_name || entity.id}`);
+      button.addEventListener('click', () => locateQuerySubgraphNode(entity, graph));
+      item.append(button);
+      entityList.append(item);
+    }
+    const byId = new Map(entities.map((entity) => [String(entity.id), entity]));
+    const relationList = $('search-query-subgraph-relations');
+    relationList.replaceChildren();
+    for (const relation of relations) {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = graphRelationLabel(relation, byId);
+      button.addEventListener('click', () => inspectGraphRelation(String(relation.id)));
+      item.append(button);
+      relationList.append(item);
+    }
+    $('search-expand-two-hops').disabled = Number(graph.hops || 1) >= 2 || status === 'degraded';
+  }
+  async function runSearch(event, graphHopsOverride = null) {
+    event?.preventDefault();
     if (!state.selectedRegion) return;
+    const graphHops = graphHopsOverride || Number($('search-graph-hops').value || 1);
+    $('search-graph-hops').value = String(graphHops);
     setMessage($('search-message'), '正在检索…');
     try {
       const packageValue = await request('/api/v1/search', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ region_id: state.selectedRegion, query: $('search-query').value, token_budget: 10000 }),
+        body: JSON.stringify({
+          region_id: state.selectedRegion,
+          query: $('search-query').value,
+          graph_hops: graphHops,
+          token_budget: 10000,
+        }),
       });
+      state.lastSearch = { query: $('search-query').value, graphHops };
+      state.lastQuerySubgraph = packageValue.query_subgraph || null;
       const container = $('search-results');
       container.replaceChildren();
       for (const result of packageValue.results || []) {
         const article = document.createElement('article');
         article.className = 'result';
-        const heading = document.createElement('strong');
-        heading.textContent = `${result.path} · ${result.source_type} · ${result.source_version}`;
+        article.dataset.memoryId = String(result.document_id || result.chunk_id || '');
+        const link = document.createElement('button');
+        link.type = 'button';
+        link.className = 'result-link';
+        link.textContent = `${result.path} · ${result.source_type} · ${result.source_version}`;
+        link.setAttribute('aria-label', `定位检索记忆：${result.document_id || result.chunk_id || ''}`);
+        link.addEventListener('click', () => openMemory(String(result.document_id || result.chunk_id || '')));
         const content = document.createElement('p');
         content.textContent = result.content;
-        article.append(heading, content);
+        const mappingStatus = String(result.graph_mapping_status || 'unknown');
+        const entityGraphStatus = result.entity_graph_status && typeof result.entity_graph_status === 'object'
+          ? String(result.entity_graph_status.status || 'unknown')
+          : 'unknown';
+        const reasons = Array.isArray(result.degradation)
+          ? result.degradation.map(String).filter(Boolean)
+          : [];
+        const graphNotice = document.createElement('p');
+        graphNotice.className = 'muted graph-result-status';
+        graphNotice.textContent = `图谱映射：${graphMappingLabel(mappingStatus)}；状态：${entityGraphStatus}${reasons.length ? `；原因：${reasons.join('、')}` : ''}`;
+        article.append(link, content, graphNotice);
         container.append(article);
       }
+      renderSearchQuerySubgraph(state.lastQuerySubgraph);
       const budget = packageValue.budget || {};
-      setMessage($('search-message'), `${(packageValue.results || []).length} 条结果，使用 ${budget.used_tokens ?? 0}/${budget.effective_tokens ?? 10000} token。`);
+      const graphMessage = state.lastQuerySubgraph?.status === 'no_mapped_entities'
+        ? ' 未找到可映射图谱实体。'
+        : state.lastQuerySubgraph?.status === 'degraded'
+          ? ' 图谱降级，列表结果仍可用。'
+          : '';
+      const mappingMessage = state.lastQuerySubgraph?.truncated
+        ? ` 查询子图已截断：${state.lastQuerySubgraph.truncation_reason || '达到有界上限'}。`
+        : '';
+      setMessage($('search-message'), `${(packageValue.results || []).length} 条结果，使用 ${budget.used_tokens ?? 0}/${budget.effective_tokens ?? 10000} token。${graphMessage}${mappingMessage}`);
     } catch (error) {
       setMessage($('search-message'), `检索失败：${error.message}`, true);
     }
@@ -1495,6 +1687,7 @@
   });
   $('entity-graph-rebuild').addEventListener('click', rebuildEntityGraph);
   $('search-form').addEventListener('submit', (event) => runSearch(event));
+  $('search-expand-two-hops').addEventListener('click', () => runSearch(null, 2));
   $('memory-filter-form').addEventListener('submit', (event) => {
     event.preventDefault();
     resetDetail();

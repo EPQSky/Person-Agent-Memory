@@ -98,6 +98,8 @@ class SearchMemoryRequest:
                 raise ValueError("at least one memory region is required")
             if len(set(self.region_ids)) != len(self.region_ids):
                 raise ValueError("memory regions must not contain duplicates")
+        if self.max_graph_hops not in {1, 2}:
+            raise ValueError("max_graph_hops must be 1 or 2")
         if not self.query.strip():
             raise ValueError("search query must not be empty")
 

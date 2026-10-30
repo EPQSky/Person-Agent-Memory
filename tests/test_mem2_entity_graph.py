@@ -2173,3 +2173,205 @@ def test_entity_graph_two_hop_search_keeps_direct_seed_before_background_limit(
     assert "Hub" in {node["canonical_name"] for node in graph["nodes"]}
     assert len(graph["nodes"]) <= GRAPH_MAX_NODE_LIMIT
     assert len(graph["edges"]) <= GRAPH_MAX_EDGE_LIMIT
+
+
+def test_entity_query_subgraph_marks_direct_and_expansion_entities_by_hop(
+    tmp_path: Path,
+) -> None:
+    def extractor(context: dict[str, object]) -> dict[str, object]:
+        source, target = str(context["memory"]["content"]).split(" connects ", 1)
+        return {
+            "entities": [
+                {"type": "concept", "canonical_name": source},
+                {"type": "concept", "canonical_name": target},
+            ],
+            "relations": [
+                {
+                    "source": f"concept:{source}",
+                    "target": f"concept:{target}",
+                    "type": "related_to",
+                    "evidence": [str(context["memory"]["content"])],
+                }
+            ],
+        }
+
+    store = EntityGraphStore(tmp_path / "query-subgraph.sqlite3")
+    base = {
+        "source_references": ["source:query-subgraph"],
+        "region": {"region_id": "graph", "name": "Graph", "kind": "topic"},
+    }
+    for memory_id, content in (
+        ("seed-hub", "Seed connects Hub"),
+        ("hub-mid", "Hub connects Mid"),
+        ("mid-leaf", "Mid connects Leaf"),
+    ):
+        assert store.project(
+            "graph",
+            {
+                **base,
+                "memory_id": memory_id,
+                "content": content,
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            },
+            extractor,
+        )["status"] == "ready"
+
+    one_hop = store.query_subgraph("graph", ["seed-hub"], hops=1)
+    one_by_name = {str(node["canonical_name"]): node for node in one_hop["nodes"]}
+    assert one_by_name["Seed"]["visual_state"] == "direct"
+    assert one_by_name["Hub"]["visual_state"] == "direct"
+    assert one_by_name["Mid"]["visual_state"] == "query_expansion"
+    assert "Leaf" not in one_by_name
+    assert one_hop["memory_entities"]["seed-hub"] == [
+        one_by_name["Seed"]["id"],
+        one_by_name["Hub"]["id"],
+    ]
+
+    two_hop = store.query_subgraph("graph", ["seed-hub"], hops=2)
+    two_by_name = {str(node["canonical_name"]): node for node in two_hop["nodes"]}
+    assert two_by_name["Leaf"]["visual_state"] == "query_expansion"
+    assert len(two_hop["nodes"]) <= GRAPH_MAX_NODE_LIMIT
+    assert len(two_hop["edges"]) <= GRAPH_MAX_EDGE_LIMIT
+
+
+def test_search_returns_entity_query_subgraph_and_memory_mapping(
+    tmp_path: Path,
+) -> None:
+    def extractor(context: dict[str, object]) -> dict[str, object]:
+        source, target = str(context["memory"]["content"]).split(" connects ", 1)
+        return {
+            "entities": [
+                {"type": "concept", "canonical_name": source},
+                {"type": "concept", "canonical_name": target},
+            ],
+            "relations": [
+                {
+                    "source": f"concept:{source}",
+                    "target": f"concept:{target}",
+                    "type": "related_to",
+                    "evidence": [str(context["memory"]["content"])],
+                }
+            ],
+        }
+
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir, extractor=extractor)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers)
+        seed_id = _memory(client, headers, "Seed connects Hub", "query-seed")
+        _memory(client, headers, "Hub connects Mid", "query-mid")
+        _memory(client, headers, "Mid connects Leaf", "query-leaf")
+
+        one_hop = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "region_id": "graph",
+                "query": "Seed",
+                "graph_hops": 1,
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert one_hop.status_code == 200, one_hop.text
+        one_payload = one_hop.json()
+        one_graph = one_payload["query_subgraph"]
+        assert one_graph["status"] == "ready"
+        assert one_graph["hops"] == 1
+        assert one_graph["read_only"] is True
+        assert len(one_graph["nodes"]) <= GRAPH_MAX_NODE_LIMIT
+        assert len(one_graph["edges"]) <= GRAPH_MAX_EDGE_LIMIT
+        one_names = {node["canonical_name"] for node in one_graph["nodes"]}
+        assert {"Seed", "Hub", "Mid"} <= one_names
+        assert "Leaf" not in one_names
+        seed_result = next(
+            item for item in one_payload["results"] if item["document_id"] == seed_id
+        )
+        assert seed_result["graph_mapped"] is True
+        assert seed_result["graph_entity_ids"]
+
+        two_hop = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "region_id": "graph",
+                "query": "Seed",
+                "graph_hops": 2,
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert two_hop.status_code == 200, two_hop.text
+        two_graph = two_hop.json()["query_subgraph"]
+        assert two_graph["hops"] == 2
+        assert "Leaf" in {node["canonical_name"] for node in two_graph["nodes"]}
+
+        rejected = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "region_id": "graph",
+                "query": "Seed",
+                "graph_hops": 3,
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert rejected.status_code == 422, rejected.text
+
+
+def test_search_keeps_results_when_entity_mapping_is_missing_or_degraded(
+    tmp_path: Path,
+) -> None:
+    def no_entities(_: dict[str, object]) -> dict[str, object]:
+        return {"entities": [], "relations": []}
+
+    state_dir = tmp_path / "no-entities"
+    with TestClient(_app(state_dir, extractor=no_entities)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers)
+        memory_id = _memory(
+            client,
+            headers,
+            "A formal memory without graph entities",
+            "no-entities",
+        )
+        response = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "region_id": "graph",
+                "query": "formal memory",
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert any(item["document_id"] == memory_id for item in payload["results"])
+        assert payload["query_subgraph"]["status"] == "no_mapped_entities"
+        assert payload["query_subgraph"]["nodes"] == []
+
+    def unavailable(_: dict[str, object]) -> dict[str, object]:
+        raise RuntimeError("deterministic query subgraph outage")
+
+    state_dir = tmp_path / "degraded"
+    with TestClient(_app(state_dir, extractor=unavailable)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers)
+        memory_id = _memory(client, headers, "A searchable degraded memory", "degraded")
+        response = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "region_id": "graph",
+                "query": "searchable degraded",
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert any(item["document_id"] == memory_id for item in payload["results"])
+        assert payload["query_subgraph"]["status"] == "degraded"
+        assert "graph_unavailable" in payload["degradation"]
