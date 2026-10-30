@@ -54,6 +54,7 @@ GRAPH_MAX_NODE_LIMIT = 200
 GRAPH_MAX_EDGE_LIMIT = 400
 GRAPH_SUPPORTING_MEMORY_LIMIT = 50
 GRAPH_SUPPORTING_EVIDENCE_LIMIT = 50
+GRAPH_VISIBLE_LIFECYCLES = frozenset({"active", "superseded", "archived"})
 _EVIDENCE_TEXT_KEYS = frozenset(
     {
         "content",
@@ -96,12 +97,14 @@ CREATE INDEX IF NOT EXISTS entity_graph_relations_region ON entity_graph_relatio
 CREATE TABLE IF NOT EXISTS entity_graph_memory_entities (
     region_id TEXT NOT NULL, memory_id TEXT NOT NULL, entity_id TEXT NOT NULL,
     canonical_name TEXT NOT NULL DEFAULT '', aliases TEXT NOT NULL DEFAULT '[]',
-    evidence TEXT NOT NULL DEFAULT '[]',
+    evidence TEXT NOT NULL DEFAULT '[]', lifecycle TEXT NOT NULL DEFAULT 'active',
+    updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (region_id, memory_id, entity_id)
 );
 CREATE TABLE IF NOT EXISTS entity_graph_memory_relations (
     region_id TEXT NOT NULL, memory_id TEXT NOT NULL, relation_id TEXT NOT NULL,
-    evidence TEXT NOT NULL DEFAULT '[]',
+    evidence TEXT NOT NULL DEFAULT '[]', lifecycle TEXT NOT NULL DEFAULT 'active',
+    updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (region_id, memory_id, relation_id)
 );
 CREATE INDEX IF NOT EXISTS entity_graph_memory_relations_relation
@@ -116,6 +119,10 @@ CREATE TABLE IF NOT EXISTS entity_graph_status (
 def normalize_name(value: object) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
     return " ".join(text.split())
+
+
+def _escape_like_literal(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _json(value: object) -> str:
@@ -452,6 +459,14 @@ class EntityGraphStore:
                 connection.execute(
                     f"ALTER TABLE {table} ADD COLUMN evidence TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "lifecycle" not in columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active'"
+                )
+            if "updated_at" not in columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+                )
             if table == "entity_graph_memory_entities":
                 if "canonical_name" not in columns:
                     connection.execute(
@@ -490,6 +505,18 @@ class EntityGraphStore:
                 "rejected": 1,
                 "reason": "sensitive memory identifier",
             }
+        lifecycle = _safe_text(memory.get("lifecycle")) or "active"
+        if lifecycle == "forgotten":
+            self.remove_memory(region_id, memory_id)
+            return {"status": "skipped", "rejected": 0, "reason": "forgotten memory"}
+        if lifecycle not in GRAPH_VISIBLE_LIFECYCLES:
+            self.remove_memory(region_id, memory_id)
+            return {
+                "status": "skipped",
+                "rejected": 1,
+                "reason": "unsupported memory lifecycle",
+            }
+        updated_at = _safe_text(memory.get("updated_at"))
         raw_content = _safe_text(memory.get("content"))
         raw_region = memory.get("region")
         direct_region_values = (
@@ -574,6 +601,7 @@ class EntityGraphStore:
         ):
             raise ValueError("entity graph relations must be a list")
         now = datetime.now(UTC).isoformat()
+        updated_at = updated_at or now
         rejected = 0
         with self._connection() as connection:
             self._remove_memory_locked(connection, region_id, memory_id)
@@ -630,9 +658,19 @@ class EntityGraphStore:
                         entity_refs[f"{entity_type}:{normalized_reference}"] = entity_id
                 connection.execute(
                     """INSERT OR REPLACE INTO entity_graph_memory_entities
-                       (region_id, memory_id, entity_id, canonical_name, aliases, evidence)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (region_id, memory_id, entity_id, canonical, _json(aliases), _json(evidence)),
+                       (region_id, memory_id, entity_id, canonical_name, aliases, evidence,
+                        lifecycle, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        region_id,
+                        memory_id,
+                        entity_id,
+                        canonical,
+                        _json(aliases),
+                        _json(evidence),
+                        lifecycle,
+                        updated_at,
+                    ),
                 )
                 self._merge_entity(
                     connection,
@@ -698,8 +736,10 @@ class EntityGraphStore:
                     ),
                 )
                 connection.execute(
-                    "INSERT OR IGNORE INTO entity_graph_memory_relations (region_id, memory_id, relation_id, evidence) VALUES (?, ?, ?, ?)",
-                    (region_id, memory_id, relation_id, _json(evidence)),
+                    """INSERT OR REPLACE INTO entity_graph_memory_relations
+                       (region_id, memory_id, relation_id, evidence, lifecycle, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (region_id, memory_id, relation_id, _json(evidence), lifecycle, updated_at),
                 )
             self._cleanup(connection, region_id)
             self._rebuild_aggregates(connection, region_id)
@@ -726,6 +766,14 @@ class EntityGraphStore:
     ) -> dict[str, object]:
         active_memory_ids = {
             memory_id
+            for memory in memories
+            if (memory_id := _safe_text(memory.get("memory_id")))
+        }
+        memory_lifecycles = {
+            memory_id: (
+                _safe_text(memory.get("lifecycle")) or "active",
+                _safe_text(memory.get("updated_at")),
+            )
             for memory in memories
             if (memory_id := _safe_text(memory.get("memory_id")))
         }
@@ -791,6 +839,7 @@ class EntityGraphStore:
             # A failed rebuild may follow a lifecycle change. Keep the last
             # usable projection for memories that are still active, but never
             # expose supports for memories absent from the current active set.
+            self._synchronize_memory_lifecycles(region_id, memory_lifecycles)
             self._prune_inactive_memories(region_id, active_memory_ids)
             self.fail(region_id, "entity graph extractor returned invalid data")
             return {
@@ -800,6 +849,33 @@ class EntityGraphStore:
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name)
+
+    def _synchronize_memory_lifecycles(
+        self,
+        region_id: str,
+        memory_lifecycles: Mapping[str, tuple[str, str]],
+    ) -> None:
+        if not memory_lifecycles:
+            return
+        with self._connection() as connection:
+            for memory_id, (lifecycle, updated_at) in memory_lifecycles.items():
+                if lifecycle not in GRAPH_VISIBLE_LIFECYCLES:
+                    self._remove_memory_locked(connection, region_id, memory_id)
+                    continue
+                connection.execute(
+                    """UPDATE entity_graph_memory_entities
+                       SET lifecycle = ?, updated_at = COALESCE(NULLIF(?, ''), updated_at)
+                       WHERE region_id = ? AND memory_id = ?""",
+                    (lifecycle, updated_at, region_id, memory_id),
+                )
+                connection.execute(
+                    """UPDATE entity_graph_memory_relations
+                       SET lifecycle = ?, updated_at = COALESCE(NULLIF(?, ''), updated_at)
+                       WHERE region_id = ? AND memory_id = ?""",
+                    (lifecycle, updated_at, region_id, memory_id),
+                )
+            self._cleanup(connection, region_id)
+            self._rebuild_aggregates(connection, region_id)
 
     @staticmethod
     def _remove_memory_locked(
@@ -1053,26 +1129,61 @@ class EntityGraphStore:
             ):
                 connection.execute(f"DELETE FROM {table} WHERE region_id = ?", (region_id,))
 
-    def status(self, region_id: str) -> dict[str, object]:
+    def status(
+        self,
+        region_id: str,
+        *,
+        history: bool = False,
+        pending: int = 0,
+    ) -> dict[str, object]:
+        lifecycles = ("active", "superseded", "archived") if history else ("active",)
+        lifecycle_placeholders = ", ".join("?" for _ in lifecycles)
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT status, projected_memories, rejected_items, last_error, updated_at FROM entity_graph_status WHERE region_id = ?",
                 (region_id,),
             ).fetchone()
             counts = connection.execute(
-                "SELECT COUNT(*) FROM entity_graph_entities WHERE region_id = ?", (region_id,)
+                f"""SELECT COUNT(DISTINCT entity_id)
+                    FROM entity_graph_memory_entities
+                    WHERE region_id = ? AND lifecycle IN ({lifecycle_placeholders})""",
+                (region_id, *lifecycles),
             ).fetchone()
             relations = connection.execute(
-                "SELECT COUNT(*) FROM entity_graph_relations WHERE region_id = ?", (region_id,)
+                f"""SELECT COUNT(DISTINCT relation_id)
+                    FROM entity_graph_memory_relations
+                    WHERE region_id = ? AND lifecycle IN ({lifecycle_placeholders})""",
+                (region_id, *lifecycles),
             ).fetchone()
+            projected = connection.execute(
+                f"""SELECT COUNT(DISTINCT memory_id)
+                    FROM (
+                        SELECT memory_id FROM entity_graph_memory_entities
+                        WHERE region_id = ? AND lifecycle IN ({lifecycle_placeholders})
+                        UNION
+                        SELECT memory_id FROM entity_graph_memory_relations
+                        WHERE region_id = ? AND lifecycle IN ({lifecycle_placeholders})
+                    )""",
+                (region_id, *lifecycles, region_id, *lifecycles),
+            ).fetchone()
+        last_error = str(row[3]) if row else ""
+        node_count = int(counts[0]) if counts else 0
+        edge_count = int(relations[0]) if relations else 0
+        projected_count = int(projected[0]) if projected else 0
         return {
             "status": str(row[0]) if row else "ready",
             "region_id": region_id,
-            "entities": int(counts[0]) if counts else 0,
-            "relations": int(relations[0]) if relations else 0,
-            "projected_memories": int(row[1]) if row else 0,
+            "history": history,
+            "entities": node_count,
+            "relations": edge_count,
+            "nodes": node_count,
+            "edges": edge_count,
+            "projected_memories": projected_count,
+            "pending": max(0, pending),
+            "pending_count": max(0, pending),
             "rejected_items": int(row[2]) if row else 0,
-            "last_error": str(row[3]) if row else "",
+            "last_error": last_error,
+            "error": last_error,
             "updated_at": str(row[4]) if row else datetime.now(UTC).isoformat(),
         }
 
@@ -1337,116 +1448,189 @@ class EntityGraphStore:
         q: str | None = None,
         hops: int = 1,
         limit: int = 200,
+        history: bool = False,
     ) -> dict[str, object]:
         if hops not in {1, 2}:
             raise ValueError("hops must be 1 or 2")
+        if entity_type is not None and entity_type not in ENTITY_TYPES:
+            allowed = ", ".join(sorted(ENTITY_TYPES))
+            raise ValueError(f"entity_type must be one of: {allowed}")
         limit = max(1, min(limit, GRAPH_MAX_NODE_LIMIT))
+        lifecycles = (
+            ("active", "superseded", "archived") if history else ("active",)
+        )
+        edge_budget = min(GRAPH_MAX_EDGE_LIMIT, max(1, limit * 4))
+        relation_limit = min(GRAPH_MAX_EDGE_LIMIT + 1, edge_budget + 1)
+        candidate_limit = min(GRAPH_MAX_NODE_LIMIT + 1, limit + 1)
+        normalized_q = normalize_name(q) if q is not None else ""
+        has_explicit_seed = (
+            entity_id is not None or memory_id is not None or q is not None
+        )
         with self._connection() as connection:
-            if entity_id:
-                entity_rows = connection.execute(
-                    """SELECT entity_id, entity_type, canonical_name, normalized_name, aliases, evidence
-                       FROM entity_graph_entities WHERE region_id = ? AND entity_id = ?""",
-                    (region_id, entity_id),
-                ).fetchall()
-                seed_ids = {entity_id} if entity_rows else set()
-                relation_rows: list[sqlite3.Row] = []
-                selected = set(seed_ids)
-                seed_entity_id = entity_id
-                edge_budget = max(limit, min(limit * 4, GRAPH_MAX_EDGE_LIMIT))
-                for _ in range(hops):
-                    if not selected:
-                        break
-                    placeholders = ", ".join("?" for _ in selected)
-                    rows = connection.execute(
-                        f"""SELECT relation_id, source_entity_id, target_entity_id, relation_type, evidence
-                            FROM entity_graph_relations
-                            WHERE region_id = ? AND (source_entity_id IN ({placeholders})
-                            OR target_entity_id IN ({placeholders}))
-                            ORDER BY relation_type, relation_id LIMIT ?""",
-                        (region_id, *selected, *selected, edge_budget),
-                    ).fetchall()
-                    relation_rows.extend(row for row in rows if row not in relation_rows)
-                    next_ids = {
-                        str(row[1]) if str(row[2]) in selected else str(row[2])
-                        for row in rows
-                    }
-                    selected.update(next_ids)
-                    selected = {seed_entity_id} | set(
-                        list(selected - {seed_entity_id})[: max(0, limit - 1)]
+            seed_ids: list[str] = []
+            seed_rows: list[sqlite3.Row] = []
+            if entity_id is not None:
+                if entity_id:
+                    seed_rows = self._candidate_entity_rows(
+                        connection,
+                        region_id,
+                        history=history,
+                        entity_type=entity_type,
+                        entity_ids=[entity_id],
+                        limit=1,
                     )
-                entity_ids = list(selected)[:limit]
-                if entity_ids:
-                    placeholders = ", ".join("?" for _ in entity_ids)
-                    entity_rows = connection.execute(
-                        f"""SELECT entity_id, entity_type, canonical_name, normalized_name, aliases, evidence
-                            FROM entity_graph_entities
-                            WHERE region_id = ? AND entity_id IN ({placeholders})
-                            ORDER BY entity_type, normalized_name LIMIT ?""",
-                        (region_id, *entity_ids, limit),
+                seed_ids = [str(row[0]) for row in seed_rows]
+            elif memory_id is not None:
+                if memory_id:
+                    seed_rows = connection.execute(
+                        f"""SELECT DISTINCT m.entity_id
+                            FROM entity_graph_memory_entities m
+                            JOIN entity_graph_entities e
+                              ON e.region_id = m.region_id AND e.entity_id = m.entity_id
+                            WHERE m.region_id = ? AND m.memory_id = ?
+                              AND m.lifecycle IN ({', '.join('?' for _ in lifecycles)})
+                              {"AND e.entity_type = ?" if entity_type else ""}
+                            ORDER BY e.entity_type, e.normalized_name, e.entity_id
+                            LIMIT ?""",
+                        (
+                            region_id,
+                            memory_id,
+                            *lifecycles,
+                            *((entity_type,) if entity_type else ()),
+                            limit,
+                        ),
                     ).fetchall()
-                relation_rows = [
-                    row for row in relation_rows
-                    if str(row[1]) in entity_ids and str(row[2]) in entity_ids
-                ][:edge_budget]
+                seed_ids = [str(row[0]) for row in seed_rows]
+            elif q is not None and normalized_q:
+                seed_rows = self._candidate_entity_rows(
+                    connection,
+                    region_id,
+                    history=history,
+                    entity_type=entity_type,
+                    q=normalized_q,
+                    # Reserve the direct matches before adding any neighborhood
+                    # candidates.  The graph output is bounded by ``limit``;
+                    # direct matches must not be lost to the expansion query.
+                    limit=limit,
+                )
+                seed_ids = [str(row[0]) for row in seed_rows]
+
+            relation_rows: list[sqlite3.Row] = []
+            selected_ids = set(seed_ids[:limit])
+            frontier = set(selected_ids)
+            for _ in range(hops if selected_ids else 0):
+                if not frontier:
+                    break
+                rows = self._relation_rows_for_entities(
+                    connection,
+                    region_id,
+                    sorted(frontier),
+                    relation_limit,
+                    history=history,
+                    outward=True,
+                )
+                known_relations = {str(row[0]) for row in relation_rows}
+                relation_rows.extend(
+                    row for row in rows if str(row[0]) not in known_relations
+                )
+                next_ids = {
+                    str(row[1]) if str(row[2]) in frontier else str(row[2])
+                    for row in rows
+                }
+                next_ids -= selected_ids
+                if not next_ids:
+                    break
+                selected_ids.update(next_ids)
+                if len(selected_ids) > GRAPH_MAX_NODE_LIMIT * 2:
+                    selected_ids = set(
+                        [*seed_ids[:limit], *sorted(selected_ids - set(seed_ids))][
+                            : GRAPH_MAX_NODE_LIMIT * 2
+                        ]
+                    )
+                frontier = next_ids
+
+            if selected_ids:
+                entity_rows = self._candidate_entity_rows(
+                    connection,
+                    region_id,
+                    history=history,
+                    entity_type=entity_type,
+                    entity_ids=sorted(selected_ids),
+                    # ``selected_ids`` is capped at twice the graph node
+                    # budget below.  Fetch that bounded working set in full so
+                    # final ordering can keep every direct seed before filling
+                    # the remaining node budget with background entities.
+                    limit=GRAPH_MAX_NODE_LIMIT * 2,
+                )
+            elif has_explicit_seed:
+                # An explicit seed with no match is an empty graph query, not
+                # a request for the default whole-region graph.
+                # Keep the normal bounded/read-only response contract below.
+                entity_rows = []
             else:
-                where = ["region_id = ?"]
-                values: list[object] = [region_id]
-                if entity_type:
-                    where.append("entity_type = ?")
-                    values.append(entity_type)
-                if q:
-                    query = f"%{normalize_name(q)}%"
-                    where.append("(normalized_name LIKE ? OR aliases LIKE ?)")
-                    values.extend([query, query])
-                if memory_id:
-                    where.append(
-                        "entity_id IN (SELECT entity_id FROM entity_graph_memory_entities WHERE region_id = ? AND memory_id = ?)"
-                    )
-                    values.extend([region_id, memory_id])
-                entity_rows = connection.execute(
-                    "SELECT entity_id, entity_type, canonical_name, normalized_name, aliases, evidence "
-                    f"FROM entity_graph_entities WHERE {' AND '.join(where)} "
-                    "ORDER BY entity_type, normalized_name LIMIT ?",
-                    (*values, limit),
-                ).fetchall()
-                entity_ids = [str(row[0]) for row in entity_rows]
-                relation_rows = self._relation_rows_for_entities(
-                    connection, region_id, entity_ids, limit
+                entity_rows = self._candidate_entity_rows(
+                    connection,
+                    region_id,
+                    history=history,
+                    entity_type=entity_type,
+                    limit=candidate_limit,
                 )
-                if memory_id:
-                    relation_rows = [
-                        row for row in relation_rows
-                        if connection.execute(
-                            """SELECT 1 FROM entity_graph_memory_relations
-                               WHERE region_id = ? AND memory_id = ? AND relation_id = ?""",
-                            (region_id, memory_id, row[0]),
-                        ).fetchone()
-                    ]
-            relation_ids = [str(row[0]) for row in relation_rows]
-            memory_rows: list[sqlite3.Row] = []
-            if relation_ids:
-                memory_rows = self._bounded_relation_memory_rows(
-                    connection, region_id, relation_ids
-                )
-        entities_list = [
-            self._entity_payload(
-                row, evidence_limit=GRAPH_SUPPORTING_EVIDENCE_LIMIT
+
+            row_by_id = {str(row[0]): row for row in entity_rows}
+            seed_set = {entity for entity in seed_ids if entity in row_by_id}
+            ordered_rows = [row_by_id[entity] for entity in seed_ids if entity in row_by_id]
+            remaining_rows = [row for row in entity_rows if str(row[0]) not in seed_set]
+            remaining_rows.sort(key=lambda row: str(row[0]))
+            remaining_rows.sort(key=lambda row: str(row[3]))
+            remaining_rows.sort(key=lambda row: str(row[1]))
+            remaining_rows.sort(key=lambda row: str(row[7]), reverse=True)
+            remaining_rows.sort(key=lambda row: int(row[6]), reverse=True)
+            ordered_rows.extend(remaining_rows)
+            nodes_truncated = len(ordered_rows) > limit
+            entity_rows = ordered_rows[:limit]
+            entity_ids = [str(row[0]) for row in entity_rows]
+            relation_rows = self._relation_rows_for_entities(
+                connection,
+                region_id,
+                entity_ids,
+                relation_limit,
+                history=history,
             )
-            for row in entity_rows
-        ][:limit]
+            edges_truncated = len(relation_rows) > edge_budget
+            relation_ids = [str(row[0]) for row in relation_rows]
+            entity_supports = self._entity_support_rows(
+                connection, region_id, entity_ids, lifecycles
+            )
+            relation_supports = self._relation_support_rows(
+                connection, region_id, relation_ids, lifecycles
+            )
+
+        entities_list = []
+        for row in entity_rows:
+            entity = self._entity_payload(
+                row,
+                evidence_limit=GRAPH_SUPPORTING_EVIDENCE_LIMIT,
+                supports=entity_supports.get(str(row[0]), []),
+            )
+            entity["selected"] = str(row[0]) in seed_set
+            entity["graph_state"] = "direct" if entity["selected"] else "background"
+            entity["degree"] = int(row[6])
+            entity["updated_at"] = str(row[7])
+            entities_list.append(entity)
         entity_id_set = {str(item["id"]) for item in entities_list}
         relations = [
             self._relation_payload(
-                row, evidence_limit=GRAPH_SUPPORTING_EVIDENCE_LIMIT
+                row,
+                evidence_limit=GRAPH_SUPPORTING_EVIDENCE_LIMIT,
+                supports=relation_supports.get(str(row[0]), []),
             )
             for row in relation_rows
             if str(row[1]) in entity_id_set and str(row[2]) in entity_id_set
-        ][: max(limit, min(limit * 4, GRAPH_MAX_EDGE_LIMIT))]
-        evidence_memory_ids: dict[str, list[str]] = {}
-        for row in memory_rows:
-            evidence_memory_ids.setdefault(str(row[0]), []).append(str(row[1]))
+        ][:edge_budget]
         for edge in relations:
-            edge["memory_ids"] = list(dict.fromkeys(evidence_memory_ids.get(str(edge["id"]), [])))
+            edge["memory_ids"] = [
+                str(row[1]) for row in relation_supports.get(str(edge["id"]), [])
+            ]
         return {
             "region_id": region_id,
             "nodes": entities_list,
@@ -1454,8 +1638,114 @@ class EntityGraphStore:
             "entities": entities_list,
             "relations": relations,
             "hops": hops,
+            "history": history,
+            "mode": "history" if history else "active",
+            "max_nodes": GRAPH_MAX_NODE_LIMIT,
+            "max_edges": GRAPH_MAX_EDGE_LIMIT,
+            "truncated": nodes_truncated or edges_truncated,
             "read_only": True,
         }
+
+    @staticmethod
+    def _candidate_entity_rows(
+        connection: sqlite3.Connection,
+        region_id: str,
+        *,
+        history: bool,
+        entity_type: str | None = None,
+        q: str | None = None,
+        entity_ids: Sequence[str] | None = None,
+        limit: int = GRAPH_MAX_NODE_LIMIT,
+    ) -> list[sqlite3.Row]:
+        lifecycles = (
+            ("active", "superseded", "archived") if history else ("active",)
+        )
+        lifecycle_placeholders = ", ".join("?" for _ in lifecycles)
+        where = [
+            "e.region_id = ?",
+            f"em.lifecycle IN ({lifecycle_placeholders})",
+        ]
+        values: list[object] = [region_id, *lifecycles]
+        if entity_type:
+            where.append("e.entity_type = ?")
+            values.append(entity_type)
+        if q:
+            query = f"%{_escape_like_literal(normalize_name(q))}%"
+            where.append(
+                "(e.normalized_name LIKE ? ESCAPE '\\' "
+                "OR LOWER(e.aliases) LIKE LOWER(?) ESCAPE '\\')"
+            )
+            values.extend([query, query])
+        if entity_ids is not None:
+            if not entity_ids:
+                return []
+            placeholders = ", ".join("?" for _ in entity_ids)
+            where.append(f"e.entity_id IN ({placeholders})")
+            values.extend(entity_ids)
+        return connection.execute(
+            f"""SELECT e.entity_id, e.entity_type, e.canonical_name, e.normalized_name,
+                       e.aliases, e.evidence,
+                       COUNT(DISTINCT CASE WHEN rm.relation_id IS NOT NULL THEN r.relation_id END)
+                           AS degree,
+                       MAX(em.updated_at) AS recent_updated_at
+                FROM entity_graph_entities e
+                JOIN entity_graph_memory_entities em
+                  ON em.region_id = e.region_id AND em.entity_id = e.entity_id
+                LEFT JOIN entity_graph_relations r
+                  ON r.region_id = e.region_id
+                 AND (r.source_entity_id = e.entity_id OR r.target_entity_id = e.entity_id)
+                LEFT JOIN entity_graph_memory_relations rm
+                  ON rm.region_id = r.region_id AND rm.relation_id = r.relation_id
+                 AND rm.lifecycle IN ({lifecycle_placeholders})
+                WHERE {' AND '.join(where)}
+                GROUP BY e.entity_id, e.entity_type, e.canonical_name,
+                         e.normalized_name, e.aliases, e.evidence
+                ORDER BY degree DESC, recent_updated_at DESC, e.entity_type,
+                         e.normalized_name, e.entity_id
+                LIMIT ?""",
+            (*lifecycles, *values, max(1, limit)),
+        ).fetchall()
+
+    @staticmethod
+    def _entity_support_rows(
+        connection: sqlite3.Connection,
+        region_id: str,
+        entity_ids: Sequence[str],
+        lifecycles: Sequence[str],
+    ) -> dict[str, list[sqlite3.Row]]:
+        result: dict[str, list[sqlite3.Row]] = {}
+        placeholders = ", ".join("?" for _ in lifecycles)
+        for entity_id in entity_ids:
+            result[entity_id] = connection.execute(
+                f"""SELECT region_id, memory_id, entity_id, canonical_name, aliases,
+                           evidence, lifecycle, updated_at
+                    FROM entity_graph_memory_entities
+                    WHERE region_id = ? AND entity_id = ?
+                      AND lifecycle IN ({placeholders})
+                    ORDER BY updated_at DESC, memory_id LIMIT ?""",
+                (region_id, entity_id, *lifecycles, GRAPH_SUPPORTING_MEMORY_LIMIT),
+            ).fetchall()
+        return result
+
+    @staticmethod
+    def _relation_support_rows(
+        connection: sqlite3.Connection,
+        region_id: str,
+        relation_ids: Sequence[str],
+        lifecycles: Sequence[str],
+    ) -> dict[str, list[sqlite3.Row]]:
+        result: dict[str, list[sqlite3.Row]] = {}
+        placeholders = ", ".join("?" for _ in lifecycles)
+        for relation_id in relation_ids:
+            result[relation_id] = connection.execute(
+                f"""SELECT region_id, memory_id, relation_id, evidence, lifecycle, updated_at
+                    FROM entity_graph_memory_relations
+                    WHERE region_id = ? AND relation_id = ?
+                      AND lifecycle IN ({placeholders})
+                    ORDER BY updated_at DESC, memory_id LIMIT ?""",
+                (region_id, relation_id, *lifecycles, GRAPH_SUPPORTING_MEMORY_LIMIT),
+            ).fetchall()
+        return result
 
     @staticmethod
     def _relation_rows_for_entities(
@@ -1463,18 +1753,36 @@ class EntityGraphStore:
         region_id: str,
         entity_ids: Sequence[str],
         limit: int,
+        *,
+        history: bool = False,
+        outward: bool = False,
     ) -> list[sqlite3.Row]:
         if not entity_ids:
             return []
         placeholders = ", ".join("?" for _ in entity_ids)
-        edge_limit = max(limit, min(limit * 4, GRAPH_MAX_EDGE_LIMIT))
+        lifecycles = (
+            ("active", "superseded", "archived") if history else ("active",)
+        )
+        lifecycle_placeholders = ", ".join("?" for _ in lifecycles)
+        endpoint_filter = (
+            f"(r.source_entity_id IN ({placeholders}) OR "
+            f"r.target_entity_id IN ({placeholders}))"
+            if outward
+            else f"r.source_entity_id IN ({placeholders}) AND "
+            f"r.target_entity_id IN ({placeholders})"
+        )
         return connection.execute(
-            f"""SELECT relation_id, source_entity_id, target_entity_id, relation_type, evidence
-                FROM entity_graph_relations
-                WHERE region_id = ? AND source_entity_id IN ({placeholders})
-                AND target_entity_id IN ({placeholders})
-                ORDER BY relation_type, relation_id LIMIT ?""",
-            (region_id, *entity_ids, *entity_ids, edge_limit),
+            f"""SELECT r.relation_id, r.source_entity_id, r.target_entity_id,
+                       r.relation_type, r.evidence
+                FROM entity_graph_relations r
+                JOIN entity_graph_memory_relations m
+                  ON m.region_id = r.region_id AND m.relation_id = r.relation_id
+                 AND m.lifecycle IN ({lifecycle_placeholders})
+                WHERE r.region_id = ? AND {endpoint_filter}
+                GROUP BY r.relation_id, r.source_entity_id, r.target_entity_id,
+                         r.relation_type, r.evidence
+                ORDER BY MAX(m.updated_at) DESC, r.relation_type, r.relation_id LIMIT ?""",
+            (*lifecycles, region_id, *entity_ids, *entity_ids, max(1, limit)),
         ).fetchall()
 
     @staticmethod
@@ -1501,11 +1809,37 @@ class EntityGraphStore:
 
     @staticmethod
     def _entity_payload(
-        row: sqlite3.Row, *, evidence_limit: int | None = None
+        row: sqlite3.Row,
+        *,
+        evidence_limit: int | None = None,
+        supports: Sequence[sqlite3.Row] | None = None,
     ) -> dict[str, object]:
-        aliases = _loads(row[4], [])
-        evidence = _loads(row[5], [])
-        evidence_items = evidence if isinstance(evidence, list) else []
+        support_rows = list(supports or [])
+        aliases: list[str] = _string_list(_loads(row[4], []))
+        evidence: list[object] = []
+        raw_evidence = _loads(row[5], [])
+        if isinstance(raw_evidence, list):
+            evidence.extend(raw_evidence)
+        lifecycle = "active"
+        updated_at = ""
+        if support_rows:
+            ordered_support_rows = sorted(support_rows, key=lambda item: str(item[1]))
+            aliases = []
+            evidence = []
+            lifecycle_values = [str(item[6]) for item in support_rows]
+            lifecycle = (
+                "active"
+                if "active" in lifecycle_values
+                else lifecycle_values[0]
+            )
+            updated_at = max(str(item[7]) for item in support_rows)
+            for support in ordered_support_rows:
+                aliases.extend(_string_list(_loads(support[4], [])))
+                parsed = _loads(support[5], [])
+                if isinstance(parsed, list):
+                    evidence.extend(parsed)
+            aliases = list(dict.fromkeys(aliases))
+        evidence_items = evidence
         effective_evidence_limit = (
             GRAPH_SUPPORTING_EVIDENCE_LIMIT
             if evidence_limit is None
@@ -1519,7 +1853,7 @@ class EntityGraphStore:
                 if isinstance(item, Mapping) and item.get("memory_id")
             )
         )[:GRAPH_SUPPORTING_MEMORY_LIMIT]
-        return {
+        payload: dict[str, object] = {
             "id": str(row[0]),
             "type": str(row[1]),
             "entity_type": str(row[1]),
@@ -1529,20 +1863,51 @@ class EntityGraphStore:
             "evidence_memory_ids": evidence_memory_ids,
             "evidence": evidence_items,
         }
+        if support_rows:
+            payload["lifecycle"] = lifecycle
+            payload["display_state"] = "current" if lifecycle == "active" else "historical"
+            payload["historical"] = lifecycle != "active"
+            payload["updated_at"] = updated_at
+        return payload
 
     @staticmethod
     def _relation_payload(
-        row: sqlite3.Row, *, evidence_limit: int | None = None
+        row: sqlite3.Row,
+        *,
+        evidence_limit: int | None = None,
+        supports: Sequence[sqlite3.Row] | None = None,
     ) -> dict[str, object]:
-        evidence = _loads(row[4], [])
-        evidence_items = evidence if isinstance(evidence, list) else []
+        support_rows = list(supports or [])
+        evidence: list[object] = []
+        raw_evidence = _loads(row[4], [])
+        if isinstance(raw_evidence, list):
+            evidence.extend(raw_evidence)
+        lifecycle = "active"
+        updated_at = ""
+        memory_ids: list[str] = []
+        if support_rows:
+            ordered_support_rows = sorted(support_rows, key=lambda item: str(item[1]))
+            evidence = []
+            lifecycle_values = [str(item[4]) for item in support_rows]
+            lifecycle = (
+                "active"
+                if "active" in lifecycle_values
+                else lifecycle_values[0]
+            )
+            updated_at = max(str(item[5]) for item in support_rows)
+            for support in ordered_support_rows:
+                memory_ids.append(str(support[1]))
+                parsed = _loads(support[3], [])
+                if isinstance(parsed, list):
+                    evidence.extend(parsed)
+        evidence_items = evidence
         effective_evidence_limit = (
             GRAPH_SUPPORTING_EVIDENCE_LIMIT
             if evidence_limit is None
             else min(evidence_limit, GRAPH_SUPPORTING_EVIDENCE_LIMIT)
         )
         evidence_items = evidence_items[:effective_evidence_limit]
-        return {
+        payload: dict[str, object] = {
             "id": str(row[0]),
             "source": str(row[1]),
             "target": str(row[2]),
@@ -1550,3 +1915,10 @@ class EntityGraphStore:
             "relation_type": str(row[3]),
             "evidence": evidence_items,
         }
+        if support_rows:
+            payload["memory_ids"] = list(dict.fromkeys(memory_ids))
+            payload["lifecycle"] = lifecycle
+            payload["display_state"] = "current" if lifecycle == "active" else "historical"
+            payload["historical"] = lifecycle != "active"
+            payload["updated_at"] = updated_at
+        return payload

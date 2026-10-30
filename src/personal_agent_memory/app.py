@@ -676,8 +676,19 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
         q: str | None = Query(default=None, max_length=500),
         hops: int = Query(default=1, ge=1, le=2),
         limit: int = Query(default=200, ge=1, le=200),
+        history: bool = Query(default=False),
+        include_history: bool | None = Query(default=None),
     ) -> dict[str, object]:
-        allowed = {"entity_id", "memory_id", "entity_type", "q", "hops", "limit"}
+        allowed = {
+            "entity_id",
+            "memory_id",
+            "entity_type",
+            "q",
+            "hops",
+            "limit",
+            "history",
+            "include_history",
+        }
         unknown = sorted(set(request.query_params) - allowed)
         if unknown:
             raise HTTPException(
@@ -694,6 +705,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 q=q,
                 hops=hops,
                 limit=limit,
+                history=history if include_history is None else include_history,
             )
         except MemoryRecordNotFoundError as error:
             raise HTTPException(
@@ -956,11 +968,14 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                     if request.cross_region_budget is None
                     else request.cross_region_budget.model_dump()
                 )
-            return build_context_package(
+            package = build_context_package(
                 raw,
                 requested_budget=request.token_budget,
                 target_model=request.target_model,
             )
+            if "entity_graph_status" in raw:
+                package["entity_graph_status"] = raw["entity_graph_status"]
+            return package
         except RegionError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)

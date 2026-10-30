@@ -15,6 +15,7 @@ from personal_agent_memory.app import create_app
 from personal_agent_memory.config import Settings
 from personal_agent_memory.entity_graph import (
     GRAPH_MAX_EDGE_LIMIT,
+    GRAPH_MAX_NODE_LIMIT,
     GRAPH_SUPPORTING_EVIDENCE_LIMIT,
     GRAPH_SUPPORTING_MEMORY_LIMIT,
     EntityGraphStore,
@@ -22,6 +23,10 @@ from personal_agent_memory.entity_graph import (
     stable_relation_id,
 )
 from personal_agent_memory.mem2_kernel import Mem2MemoryKernel
+from personal_agent_memory.memory_kernel import (
+    MemoryKernelUnavailableError,
+    UnavailableMemoryKernel,
+)
 
 
 def _extractor(context: dict[str, object]) -> dict[str, object]:
@@ -342,6 +347,7 @@ def test_mem2_kernel_preserves_invalid_source_reference_types_for_graph_validati
         headers = _headers(state_dir)
         _region(client, headers)
         memory_id = _memory(client, headers, "Project Atlas uses Python.", "kernel-source")
+        kernel._wait_for_entity_graph_updates()
         bundle = kernel._require_bundle()
         region = kernel._regions.require_region("graph")
         scope, unit = next(
@@ -816,7 +822,11 @@ def test_entity_graph_relation_detail_queries_tail_beyond_default_window(
         graph = client.get("/api/v1/libraries/graph/entity-graph", headers=headers)
         assert graph.status_code == 200, graph.text
         assert len(graph.json()["nodes"]) == 200
-        assert graph.json()["edges"] == []
+        assert len(graph.json()["edges"]) == 1
+        assert {node["canonical_name"] for node in graph.json()["nodes"]} >= {
+            "Entity-200",
+            "Entity-201",
+        }
 
         detail = client.get(
             f"/api/v1/libraries/graph/entity-graph/relations/{relation_id}",
@@ -1763,3 +1773,403 @@ def test_entity_and_relation_detail_bound_supporting_memory_reads(
             len(store.entity_detail("graph", entity_id, limit=1_000)["supporting_memory_ids"])
             == 50
         )
+
+
+def test_entity_graph_history_search_type_filter_and_degree_ordering(tmp_path: Path) -> None:
+    def extractor(context: dict[str, object]) -> dict[str, object]:
+        content = str(context["memory"]["content"])
+        source, target = content.removesuffix(".").split(" uses ", 1)
+        return {
+            "entities": [
+                {"type": "concept", "canonical_name": source},
+                {"type": "technology", "canonical_name": target},
+            ],
+            "relations": [
+                {
+                    "source": f"concept:{source}",
+                    "target": f"technology:{target}",
+                    "type": "uses",
+                    "evidence": [content],
+                }
+            ],
+        }
+
+    store = EntityGraphStore(tmp_path / "bounded-history.sqlite3")
+    base = {
+        "source_references": ["source:bounded"],
+        "region": {"region_id": "graph", "name": "Graph", "kind": "topic"},
+    }
+    memories = (
+        {
+            **base,
+            "memory_id": "hub-alpha",
+            "content": "Hub uses Alpha.",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            **base,
+            "memory_id": "hub-beta",
+            "content": "Hub uses Beta.",
+            "updated_at": "2026-01-02T00:00:00+00:00",
+        },
+        {
+            **base,
+            "memory_id": "hub-gamma",
+            "content": "Hub uses Gamma.",
+            "updated_at": "2025-01-01T00:00:00+00:00",
+        },
+        {
+            **base,
+            "memory_id": "fresh",
+            "content": "Fresh uses NewTool.",
+            "updated_at": "2026-02-01T00:00:00+00:00",
+        },
+        {
+            **base,
+            "memory_id": "legacy",
+            "content": "Legacy uses OldTool.",
+            "lifecycle": "superseded",
+            "updated_at": "2025-12-01T00:00:00+00:00",
+        },
+        {
+            **base,
+            "memory_id": "forgotten",
+            "content": "Forgotten uses Ghost.",
+            "lifecycle": "forgotten",
+            "updated_at": "2025-11-01T00:00:00+00:00",
+        },
+    )
+    for memory in memories:
+        result = store.project("graph", memory, extractor)
+        assert result["status"] in {"ready", "skipped"}
+
+    current = store.graph("graph", limit=GRAPH_MAX_NODE_LIMIT)
+    current_names = {node["canonical_name"] for node in current["nodes"]}
+    assert "Legacy" not in current_names
+    assert "OldTool" not in current_names
+    assert "Forgotten" not in current_names
+    assert "Ghost" not in current_names
+    assert current["nodes"][0]["canonical_name"] == "Hub"
+    assert current["nodes"][0]["degree"] == 3
+    current_order = [node["canonical_name"] for node in current["nodes"]]
+    assert current_order.index("Hub") < current_order.index("Fresh")
+    assert current["history"] is False
+
+    for seed in (
+        {"entity_id": stable_entity_id("graph", "concept", "No such entity")},
+        {"memory_id": "no-such-memory"},
+        {"q": "No such entity"},
+    ):
+        missing = store.graph("graph", hops=2, **seed)
+        assert missing["nodes"] == []
+        assert missing["edges"] == []
+        assert missing["hops"] == 2
+        assert missing["max_nodes"] == GRAPH_MAX_NODE_LIMIT
+        assert missing["max_edges"] == GRAPH_MAX_EDGE_LIMIT
+        assert missing["read_only"] is True
+
+    searched = store.graph("graph", q="Beta", hops=1)
+    assert [node["canonical_name"] for node in searched["nodes"]][:2] == [
+        "Beta",
+        "Hub",
+    ]
+    assert searched["nodes"][0]["graph_state"] == "direct"
+    assert searched["nodes"][1]["graph_state"] == "background"
+
+    filtered = store.graph("graph", q="Beta", entity_type="technology")
+    assert [node["canonical_name"] for node in filtered["nodes"]] == ["Beta"]
+    assert filtered["edges"] == []
+
+    history = store.graph("graph", history=True, limit=GRAPH_MAX_NODE_LIMIT)
+    history_names = {node["canonical_name"] for node in history["nodes"]}
+    assert {"Legacy", "OldTool"}.issubset(history_names)
+    assert "Forgotten" not in history_names
+    historical_edges = [edge for edge in history["edges"] if edge["historical"]]
+    assert historical_edges
+    assert historical_edges[0]["display_state"] == "historical"
+    assert "forgotten" not in json.dumps(history, ensure_ascii=False)
+
+
+def test_entity_graph_search_escapes_like_wildcards_and_keeps_literal_queries(
+    tmp_path: Path,
+) -> None:
+    def extractor(context: dict[str, object]) -> dict[str, object]:
+        content = str(context["memory"]["content"])
+        return {
+            "entities": [
+                {
+                    "type": "concept",
+                    "canonical_name": content.split(" | ", 1)[0],
+                    "aliases": [content.split(" | ", 1)[1]],
+                }
+            ],
+            "relations": [],
+        }
+
+    store = EntityGraphStore(tmp_path / "literal-search.sqlite3")
+    base = {
+        "source_references": ["source:literal-search"],
+        "region": {"region_id": "graph", "name": "Graph", "kind": "topic"},
+    }
+    memories = (
+        ("percent", "PercentEntity | literal%alias"),
+        ("underscore", "UnderscoreEntity | literal_alias"),
+        ("backslash", r"BackslashEntity | literal\alias"),
+        ("normal", "NormalEntity | normal-alias"),
+    )
+    for memory_id, content in memories:
+        memory = {
+            **base,
+            "memory_id": memory_id,
+            "content": content,
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        assert store.project("graph", memory, extractor)["status"] == "ready"
+
+    expected_by_query = {
+        "%": "PercentEntity",
+        "_": "UnderscoreEntity",
+        "\\": "BackslashEntity",
+        "normal": "NormalEntity",
+    }
+    for query, expected_name in expected_by_query.items():
+        graph = store.graph("graph", q=query)
+        assert [node["canonical_name"] for node in graph["nodes"]] == [expected_name]
+
+    assert store.graph("graph", q="missing")["nodes"] == []
+    assert store.graph("graph", q="literal%missing")["nodes"] == []
+    assert store.graph("graph", q="   ")["nodes"] == []
+
+
+def test_entity_graph_memory_seed_reads_a_bounded_entity_set(tmp_path: Path) -> None:
+    names = [f"Entity-{index:03d}" for index in range(GRAPH_MAX_NODE_LIMIT + 5)]
+    content = " ".join(names)
+
+    def extractor(_: dict[str, object]) -> dict[str, object]:
+        return {
+            "entities": [
+                {"type": "concept", "canonical_name": name} for name in names
+            ],
+            "relations": [],
+        }
+
+    store = EntityGraphStore(tmp_path / "bounded-memory-seed.sqlite3")
+    result = store.project(
+        "graph",
+        {
+            "memory_id": "memory-with-many-entities",
+            "content": content,
+            "source_references": ["source:bounded-memory-seed"],
+            "region": {"region_id": "graph", "name": "Graph", "kind": "topic"},
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        },
+        extractor,
+    )
+    assert result["status"] == "ready"
+
+    graph = store.graph(
+        "graph",
+        memory_id="memory-with-many-entities",
+        limit=GRAPH_MAX_NODE_LIMIT,
+    )
+    assert len(graph["nodes"]) == GRAPH_MAX_NODE_LIMIT
+    assert all(node["selected"] is True for node in graph["nodes"])
+    assert len(graph["edges"]) <= GRAPH_MAX_EDGE_LIMIT
+
+
+def test_unavailable_entity_graph_accepts_history_query_without_type_error(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    app = create_app(
+        Settings(state_dir=state_dir),
+        memory_kernel=UnavailableMemoryKernel(),
+    )
+    with TestClient(app) as client:
+        headers = _headers(state_dir)
+        response = client.get(
+            "/api/v1/libraries/graph/entity-graph?history=true",
+            headers=headers,
+        )
+    assert response.status_code == 503, response.text
+    assert "memory kernel is unavailable" in response.json()["detail"]
+
+    with pytest.raises(MemoryKernelUnavailableError):
+        UnavailableMemoryKernel().entity_graph("graph", history=True)
+
+
+def test_entity_graph_status_and_direct_search_degrade_independently(
+    tmp_path: Path,
+) -> None:
+    def unavailable(_: dict[str, object]) -> dict[str, object]:
+        raise RuntimeError("deterministic entity graph outage")
+
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir, extractor=unavailable)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers)
+        memory_id = _memory(client, headers, "Direct retrieval remains available.", "degrade")
+
+        status = client.get("/api/v1/libraries/graph/entity-graph/status", headers=headers)
+        assert status.status_code == 200, status.text
+        status_payload = status.json()
+        assert status_payload["status"] == "degraded"
+        assert status_payload["nodes"] == 0
+        assert status_payload["edges"] == 0
+        assert status_payload["pending"] == 0
+        assert status_payload["error"]
+        assert status_payload["updated_at"]
+
+        search = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "library_id": "graph",
+                "query": "Direct retrieval",
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert search.status_code == 200, search.text
+        payload = search.json()
+        assert any(item["document_id"] == memory_id for item in payload["results"])
+        assert payload["entity_graph_status"]["status"] == "degraded"
+        assert "graph_unavailable" in payload["degradation"]
+
+
+def test_library_search_falls_back_to_legacy_scope_after_region_registration(
+    tmp_path: Path,
+) -> None:
+    def unavailable(_: dict[str, object]) -> dict[str, object]:
+        raise RuntimeError("deterministic entity graph outage")
+
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir, extractor=unavailable)) as client:
+        headers = _headers(state_dir)
+        _region(client, headers)
+        region_memory_id = _memory(
+            client,
+            headers,
+            "Current region content is unrelated.",
+            "region-only",
+        )
+        legacy_response = client.post(
+            "/api/v1/memories",
+            headers=headers,
+            json={
+                "library_id": "graph",
+                "content": "Legacy library marker remains searchable.",
+                "memory_type": "domain_fact",
+                "source_references": ["source:legacy-library"],
+                "idempotency_key": "legacy-library",
+            },
+        )
+        assert legacy_response.status_code == 201, legacy_response.text
+        legacy_memory_id = str(legacy_response.json()["id"])
+
+        search = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "library_id": "graph",
+                "query": "Legacy library marker",
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert search.status_code == 200, search.text
+        payload = search.json()
+        result_ids = {str(item["document_id"]) for item in payload["results"]}
+        assert legacy_memory_id in result_ids
+        assert region_memory_id not in result_ids
+        assert payload["entity_graph_status"]["status"] == "degraded"
+        assert "graph_unavailable" in payload["degradation"]
+
+        explicit_region = client.post(
+            "/api/v1/search",
+            headers=headers,
+            json={
+                "region_id": "graph",
+                "query": "Legacy library marker",
+                "limit": 10,
+                "token_budget": 10_000,
+            },
+        )
+        assert explicit_region.status_code == 200, explicit_region.text
+        assert explicit_region.json()["results"] == []
+
+
+def test_entity_graph_rejects_unknown_entity_type_and_accepts_fixed_type(
+    tmp_path: Path,
+) -> None:
+    with TestClient(_app(tmp_path / "state")) as client:
+        state_dir = tmp_path / "state"
+        headers = _headers(state_dir)
+        _region(client, headers)
+        _memory(client, headers, "Project Atlas uses Python.", "type-filter")
+
+        invalid = client.get(
+            "/api/v1/libraries/graph/entity-graph",
+            params={"entity_type": "invalid"},
+            headers=headers,
+        )
+        assert invalid.status_code == 422, invalid.text
+        assert "entity_type must be one of" in invalid.json()["detail"]
+
+        valid = client.get(
+            "/api/v1/libraries/graph/entity-graph",
+            params={"entity_type": "technology"},
+            headers=headers,
+        )
+        assert valid.status_code == 200, valid.text
+        assert all(node["entity_type"] == "technology" for node in valid.json()["nodes"])
+
+
+def test_entity_graph_two_hop_search_keeps_direct_seed_before_background_limit(
+    tmp_path: Path,
+) -> None:
+    def extractor(context: dict[str, object]) -> dict[str, object]:
+        source, target = str(context["memory"]["content"]).split(" connects ", 1)
+        return {
+            "entities": [
+                {"type": "concept", "canonical_name": source},
+                {"type": "concept", "canonical_name": target},
+            ],
+            "relations": [
+                {
+                    "source": f"concept:{source}",
+                    "target": f"concept:{target}",
+                    "type": "related_to",
+                    "evidence": [str(context["memory"]["content"])],
+                }
+            ],
+        }
+
+    store = EntityGraphStore(tmp_path / "two-hop-seed.sqlite3")
+    base = {
+        "source_references": ["source:two-hop-seed"],
+        "region": {"region_id": "graph", "name": "Graph", "kind": "topic"},
+    }
+    seed_memory = {
+        **base,
+        "memory_id": "seed-hub",
+        "content": "Seed connects Hub",
+        "updated_at": "2020-01-01T00:00:00+00:00",
+    }
+    assert store.project("graph", seed_memory, extractor)["status"] in {"ready", "skipped"}
+    for index in range(250):
+        memory = {
+            **base,
+            "memory_id": f"hub-neighbor-{index:03d}",
+            "content": f"Hub connects Neighbor-{index:03d}",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        assert store.project("graph", memory, extractor)["status"] in {"ready", "skipped"}
+
+    graph = store.graph("graph", q="Seed", hops=2, limit=GRAPH_MAX_NODE_LIMIT)
+    seed = next(node for node in graph["nodes"] if node["canonical_name"] == "Seed")
+    assert seed["selected"] is True
+    assert seed["graph_state"] == "direct"
+    assert "Hub" in {node["canonical_name"] for node in graph["nodes"]}
+    assert len(graph["nodes"]) <= GRAPH_MAX_NODE_LIMIT
+    assert len(graph["edges"]) <= GRAPH_MAX_EDGE_LIMIT

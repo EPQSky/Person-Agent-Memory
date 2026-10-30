@@ -392,6 +392,7 @@ class MemoryKernelPort(Protocol):
         q: str | None = None,
         hops: int = 1,
         limit: int = 200,
+        history: bool = False,
     ) -> dict[str, object]: ...
 
     def entity_graph_memory(self, library_id: str, memory_id: str) -> dict[str, object]: ...
@@ -590,8 +591,9 @@ class UnavailableMemoryKernel:
         q: str | None = None,
         hops: int = 1,
         limit: int = 200,
+        history: bool = False,
     ) -> dict[str, object]:
-        del entity_id, memory_id, entity_type, q, hops, limit
+        del entity_id, memory_id, entity_type, q, hops, limit, history
         self._raise()
 
     def entity_graph_memory(self, library_id: str, memory_id: str) -> dict[str, object]:
