@@ -32,6 +32,7 @@ from pydantic import (
     model_validator,
 )
 
+from personal_agent_memory import __version__
 from personal_agent_memory.config import Settings
 from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
 from personal_agent_memory.entity_graph import (
@@ -412,7 +413,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
             if managed_kernel is not None:
                 await managed_kernel.close()
 
-    app = FastAPI(title="Personal Agent Memory", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Personal Agent Memory", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.state.memory_kernel = selected_kernel
     app.state.management_session_clock = (
@@ -1704,7 +1705,7 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 "result": {
                     "protocolVersion": protocol_version,
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "personal-agent-memory", "version": "0.1.0"},
+                    "serverInfo": {"name": "personal-agent-memory", "version": __version__},
                 },
             }
         if rpc.method == "tools/list":

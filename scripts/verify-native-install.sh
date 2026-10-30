@@ -209,6 +209,9 @@ assert (state_dir / "mem2" / "VERSION").read_text(encoding="utf-8") == (
 PY
 
 export PERSONAL_AGENT_MEMORY_API_KEY_FILE="$state_dir/api-key"
+# Keep the isolated acceptance run independent from a caller-provided direct key.
+# ``auth.mjs`` prefers PERSONAL_AGENT_MEMORY_API_KEY over the file path.
+unset PERSONAL_AGENT_MEMORY_API_KEY
 export PERSONAL_AGENT_MEMORY_URL="http://127.0.0.1:$port"
 export PLUGIN_DATA="$work_root/plugin-data"
 recall_script="$plugin_root/scripts/recall.mjs"

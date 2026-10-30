@@ -11,7 +11,7 @@ def test_cli_reports_release_version() -> None:
     result = CliRunner().invoke(cli, ["--version"])
 
     assert result.exit_code == 0
-    assert result.output == "0.1.0\n"
+    assert result.output == "0.2.0\n"
 
 
 def test_serve_requires_state_directory() -> None:

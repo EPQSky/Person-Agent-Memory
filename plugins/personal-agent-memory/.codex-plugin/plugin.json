@@ -1,6 +1,6 @@
 {
   "name": "personal-agent-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Project-scoped memory recall for local Codex sessions.",
   "author": {"name": "Personal Agent Memory contributors"},
   "license": "Apache-2.0",

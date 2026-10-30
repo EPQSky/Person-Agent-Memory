@@ -22,6 +22,19 @@ def executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
+def rewrite_release_version(path: Path, old_version: str, new_version: str) -> None:
+    content = path.read_text(encoding="utf-8")
+    if path.name == "pyproject.toml":
+        content = content.replace(
+            f'version = "{old_version}"', f'version = "{new_version}"', 1
+        )
+    else:
+        content = content.replace(
+            f'"version": "{old_version}"', f'"version": "{new_version}"', 1
+        )
+    path.write_text(content, encoding="utf-8")
+
+
 def plugin_tree_sha256(root: Path) -> str:
     entries: list[tuple[bytes, Path, str]] = []
     pending = [root]
@@ -146,6 +159,7 @@ def uninstall_test_environment(
     marketplace_ownership: str = "installer-managed",
     shared_marketplace: bool = False,
     valid_state_marker: bool = True,
+    release_version: str = "0.1.0",
 ) -> tuple[dict[str, str], dict[str, Path], Path]:
     home = tmp_path / "home"
     fake_bin = tmp_path / "bin"
@@ -161,7 +175,7 @@ def uninstall_test_environment(
     managed_codex_home = home / ".codex"
     managed_plugin_source = (
         managed_codex_home
-        / "plugins/cache/personal-agent-memory/personal-agent-memory/0.1.0"
+        / f"plugins/cache/personal-agent-memory/personal-agent-memory/{release_version}"
     )
     tool_environment = tmp_path / "tool-environment"
     token = "a" * 64
@@ -187,7 +201,7 @@ def uninstall_test_environment(
     for plugin_root in (plugin_registration_source, managed_plugin_source):
         (plugin_root / ".codex-plugin").mkdir(parents=True)
         (plugin_root / ".codex-plugin/plugin.json").write_text(
-            json.dumps({"name": "personal-agent-memory", "version": "0.1.0"}),
+            json.dumps({"name": "personal-agent-memory", "version": release_version}),
             encoding="utf-8",
         )
     if shared_marketplace:
@@ -254,7 +268,7 @@ exec "{sys.executable}" "$@"
         "state_ownership_token": token,
         "library_root": str(library_root),
         "library_root_ownership": "user-content-never-delete",
-        "installed_version": "0.1.0",
+        "installed_version": release_version,
         "marketplace_ownership": marketplace_ownership,
         "marketplace_source": str(marketplace_source),
         "marketplace_update_pending": False,
@@ -267,7 +281,7 @@ exec "{sys.executable}" "$@"
         "unit_sha256": hashlib.sha256(unit_path.read_bytes()).hexdigest(),
         "codex_home": str(managed_codex_home),
         "plugin_id": "personal-agent-memory@personal-agent-memory",
-        "plugin_version": "0.1.0",
+        "plugin_version": release_version,
         "plugin_registration_source": str(plugin_registration_source),
         "plugin_install_path": str(managed_plugin_source),
         "plugin_tree_sha256": plugin_tree_sha256(managed_plugin_source),
@@ -953,7 +967,7 @@ def test_real_codex_cli_add_to_managed_uninstall_contract(tmp_path: Path) -> Non
     codex = shutil.which("codex")
     if codex is None:
         pytest.skip("Codex CLI is required for the real managed uninstall contract")
-    environment, paths, _ = uninstall_test_environment(tmp_path)
+    environment, paths, _ = uninstall_test_environment(tmp_path, release_version="0.2.0")
     shutil.rmtree(paths["codex_home"])
     paths["codex_home"].mkdir()
     setup_environment = {**environment, "CODEX_HOME": str(paths["codex_home"])}
@@ -1831,7 +1845,7 @@ def test_supported_environment_installs_service_plugin_and_healthy_hook(
     fake_bin = tmp_path / "bin"
     plugin_install = (
         home
-        / ".codex/plugins/cache/personal-agent-memory/personal-agent-memory/0.1.0"
+        / ".codex/plugins/cache/personal-agent-memory/personal-agent-memory/0.2.0"
     )
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -2315,7 +2329,7 @@ esac
                 if directory_mode == "preexisting-state"
                 else "installer-created-exclusive"
             ),
-            "installed_version": "0.1.0",
+            "installed_version": "0.2.0",
             "marketplace_ownership": "preexisting" if legacy_upgrade else "installer-managed",
             "marketplace_source": str(ROOT),
             "marketplace_update_pending": False,
@@ -2326,7 +2340,7 @@ esac
             "daemon_path": str(fake_bin / "personal-agent-memory"),
             "unit_path": str(unit),
             "plugin_id": "personal-agent-memory@personal-agent-memory",
-            "plugin_version": "0.1.0",
+            "plugin_version": "0.2.0",
             "plugin_registration_source": str(
                 ROOT / "plugins/personal-agent-memory"
             ),
@@ -2395,7 +2409,7 @@ esac
             for line in log.splitlines()
         )
         assert "installer-test-secret" not in result.stdout
-        assert "Installed version: 0.1.0" in result.stdout
+        assert "Installed version: 0.2.0" in result.stdout
         for expected in (
             "Memory kernel:    mem2 (JiuwenMemory 0.2.0)",
             "Service status: active",
@@ -2568,8 +2582,7 @@ esac
                 / ".codex-plugin"
                 / "plugin.json",
             ):
-                content = path.read_text(encoding="utf-8")
-                path.write_text(content.replace("0.1.0", "0.1.1"), encoding="utf-8")
+                rewrite_release_version(path, "0.2.0", "0.2.1")
 
             remove_count = command_log.read_text(encoding="utf-8").count(
                 "codex plugin marketplace remove personal-agent-memory --json"
@@ -2734,8 +2747,7 @@ esac
                 / ".codex-plugin"
                 / "plugin.json",
             ):
-                content = path.read_text(encoding="utf-8")
-                path.write_text(content.replace("0.1.0", "0.2.0"), encoding="utf-8")
+                rewrite_release_version(path, "0.2.0", "0.2.2")
 
             next_upgrade = subprocess.run(
                 [str(next_release / "install.sh"), "--port", str(port)],
@@ -2748,7 +2760,7 @@ esac
             )
             assert next_upgrade.returncode == 0, next_upgrade.stderr
             next_metadata = json.loads(install_metadata_path.read_text(encoding="utf-8"))
-            assert next_metadata["installed_version"] == "0.2.0"
+            assert next_metadata["installed_version"] == "0.2.2"
             assert next_metadata["marketplace_ownership"] == "preexisting"
             assert next_metadata["marketplace_source"] == str(next_release)
             assert next_metadata["marketplace_previous_source"] == str(old_marketplace_source)
