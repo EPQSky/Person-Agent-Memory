@@ -79,6 +79,9 @@
     .entity-list, .relation-list { list-style:none; margin:0; padding:0; display:grid; gap:8px; }
     .entity-list button, .relation-list button { width:100%; text-align:left; background:transparent; color:inherit; border:1px solid var(--line); }
     .entity-list button:hover, .relation-list button:hover { border-color:var(--accent); background:var(--accent-soft); color:var(--text); }
+    .entity-list li, .relation-list li { display:grid; gap:6px; }
+    .entity-list button.secondary, .relation-list button.secondary { width:auto; justify-self:start; padding:5px 9px; font-size:12px; }
+    .graph-historical { opacity:.62; border-style:dashed !important; }
     .graph-summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin-bottom:14px; }
     pre { white-space:pre-wrap; overflow-wrap:anywhere; background:var(--bg); padding:12px; border-radius:8px; }
     .hidden { display:none !important; }
@@ -252,9 +255,14 @@
                 <div><label for="entity-graph-type">实体类型</label><select id="entity-graph-type"><option value="">全部类型</option><option>project</option><option>technology</option><option>component</option><option>concept</option><option>person</option><option>organization</option><option>constraint</option><option>reference</option></select></div>
                 <div><label for="entity-graph-hops">局部跳数</label><select id="entity-graph-hops"><option value="1">一跳</option><option value="2">两跳</option></select></div>
               </div>
-              <div class="actions"><button type="submit">读取图谱</button></div>
+              <div class="actions">
+                <label class="row"><input id="entity-graph-history" type="checkbox" style="width:auto"> 历史视图（弱化已替代或已归档关系）</label>
+                <button type="submit">读取图谱</button>
+                <button id="entity-graph-rebuild" class="secondary" type="button">幂等重建</button>
+              </div>
             </form>
             <p id="entity-graph-message" class="notice" aria-live="polite"></p>
+            <div id="entity-graph-status" class="notice" aria-live="polite">正在读取图谱状态…</div>
             <div id="entity-graph-summary" class="graph-summary"></div>
             <h3>实体</h3><ul id="entity-graph-entities" class="entity-list"></ul>
             <h3>关系</h3><ul id="entity-graph-relations" class="relation-list"></ul>
@@ -340,6 +348,7 @@
     rawGeneration: 0,
     rawController: null,
     entityGraph: null,
+    entityGraphSeedId: null,
   };
   const $ = (id) => document.getElementById(id);
   const setMessage = (element, text, error = false, success = false) => {
@@ -493,6 +502,7 @@
   }
   async function selectRegion(regionId) {
     state.selectedRegion = regionId;
+    state.entityGraphSeedId = null;
     resetDetail();
     renderRegions();
     if (state.workspaceTab === 'raw-session') {
@@ -1002,8 +1012,20 @@
       const button = document.createElement('button');
       button.type = 'button';
       button.textContent = graphEntityLabel(entity);
+      if (entity.historical === true || entity.display_state === 'historical') {
+        button.classList.add('graph-historical');
+        button.title = '历史支撑，当前视图已弱化显示';
+      }
       button.addEventListener('click', () => inspectGraphEntity(String(entity.id)));
-      item.append(button);
+      const expand = document.createElement('button');
+      expand.type = 'button';
+      expand.className = 'secondary';
+      expand.textContent = `展开 ${String(entity.canonical_name || '实体')} 邻域`;
+      expand.addEventListener('click', () => {
+        state.entityGraphSeedId = String(entity.id);
+        loadEntityGraph();
+      });
+      item.append(button, expand);
       entityList.append(item);
     }
     for (const relation of relations) {
@@ -1011,13 +1033,22 @@
       const button = document.createElement('button');
       button.type = 'button';
       button.textContent = graphRelationLabel(relation, byId);
+      if (relation.historical === true || relation.display_state === 'historical') {
+        button.classList.add('graph-historical');
+        button.title = '历史关系，当前视图已弱化显示';
+      }
       button.addEventListener('click', () => inspectGraphRelation(String(relation.id)));
       item.append(button);
       relationList.append(item);
     }
     const summary = $('entity-graph-summary');
     summary.replaceChildren();
-    for (const [label, value] of [['实体', entities.length], ['关系', relations.length], ['跳数', graph?.hops || 1]]) {
+    for (const [label, value] of [
+      ['实体', entities.length],
+      ['关系', relations.length],
+      ['跳数', graph?.hops || 1],
+      ['视图', graph?.history ? '历史' : '当前'],
+    ]) {
       const item = document.createElement('div');
       item.className = 'meta-item';
       const name = document.createElement('span');
@@ -1071,12 +1102,50 @@
       if (query) params.set('q', query);
       if (type) params.set('entity_type', type);
       params.set('hops', $('entity-graph-hops').value);
+      if ($('entity-graph-history').checked) params.set('history', 'true');
+      if (state.entityGraphSeedId) params.set('entity_id', state.entityGraphSeedId);
+      await loadEntityGraphStatus();
       const graph = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/entity-graph?${params}`);
       state.entityGraph = graph;
       renderGraphLists(graph);
-      setMessage($('entity-graph-message'), `已读取 ${graph.nodes?.length || 0} 个实体和 ${graph.edges?.length || 0} 条关系。`, false, true);
+      const view = graph.history ? '历史' : '当前';
+      const bounded = graph.truncated ? ' 已达到当前视图的有界读取上限。' : '';
+      setMessage($('entity-graph-message'), `已读取${view}视图：${graph.nodes?.length || 0} 个实体和 ${graph.edges?.length || 0} 条关系。${bounded}`, false, true);
     } catch (error) {
       setMessage($('entity-graph-message'), `读取图谱失败：${error.message}`, true);
+    }
+  }
+  async function loadEntityGraphStatus() {
+    if (!state.selectedRegion) return;
+    try {
+      const status = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/entity-graph/status`);
+      const error = String(status.error || status.last_error || '');
+      const statusLabel = String(status.status || 'unknown');
+      const pending = Number(status.pending ?? status.pending_count ?? 0);
+      const text = `图谱状态：${statusLabel} · 节点 ${status.nodes ?? status.entities ?? 0} · 边 ${status.edges ?? status.relations ?? 0} · 已投影记忆 ${status.projected_memories ?? 0} · 待处理 ${pending} · 更新时间 ${formatTime(status.updated_at || '')}${error ? ` · 错误：${error}` : ''}`;
+      setMessage($('entity-graph-status'), text, statusLabel === 'degraded' || Boolean(error), statusLabel === 'ready');
+    } catch (error) {
+      setMessage($('entity-graph-status'), `图谱状态不可用：${error.message}`, true);
+    }
+  }
+  async function rebuildEntityGraph() {
+    if (!state.selectedRegion) return;
+    const button = $('entity-graph-rebuild');
+    button.disabled = true;
+    try {
+      const result = await request(`/api/v1/libraries/${encodeURIComponent(state.selectedRegion)}/entity-graph/rebuild`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      });
+      const error = String(result.error || result.last_error || '');
+      setMessage($('entity-graph-message'), error ? `图谱重建完成但处于降级：${error}` : '图谱已幂等重建。', Boolean(error), !error);
+      await loadEntityGraphStatus();
+      await loadEntityGraph();
+    } catch (error) {
+      setMessage($('entity-graph-message'), `图谱重建失败，现有可读数据已保留：${error.message}`, true);
+      await loadEntityGraphStatus();
+    } finally {
+      button.disabled = false;
     }
   }
   async function inspectGraphEntity(entityId) {
@@ -1417,8 +1486,14 @@
   $('raw-session-tab').addEventListener('click', () => switchWorkspace('raw-session'));
   $('entity-graph-filter-form').addEventListener('submit', (event) => {
     event.preventDefault();
+    state.entityGraphSeedId = null;
     loadEntityGraph();
   });
+  $('entity-graph-history').addEventListener('change', () => {
+    state.entityGraphSeedId = null;
+    loadEntityGraph();
+  });
+  $('entity-graph-rebuild').addEventListener('click', rebuildEntityGraph);
   $('search-form').addEventListener('submit', (event) => runSearch(event));
   $('memory-filter-form').addEventListener('submit', (event) => {
     event.preventDefault();

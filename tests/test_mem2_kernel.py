@@ -759,6 +759,7 @@ def test_mem2_normalizes_library_id_once_for_write_and_search(
         assert result["library_id"] == "default"
         assert result["scope"]["library_id"] == "default"
         assert result["results"][0]["document_id"] == first.json()["id"]
+        assert result["entity_graph_status"]["status"] == "not_configured"
 
         max_library_id = "x" * 248
         padded = client.post(

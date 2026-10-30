@@ -1703,3 +1703,163 @@ def test_console_memory_detail_opens_entity_graph_and_supporting_sources(
                 )
             finally:
                 browser.close()
+
+
+def test_console_bounded_entity_graph_history_filters_and_degradation(
+    tmp_path: Path,
+) -> None:
+    assert CHROME.exists(), f"real Chromium is required at {CHROME}"
+    graph_available = {"value": True}
+
+    def semantic_extractor(_: dict[str, object]) -> list[dict[str, object]]:
+        return []
+
+    def graph_extractor(context: dict[str, object]) -> dict[str, object]:
+        if not graph_available["value"]:
+            raise ValueError("deterministic entity graph outage")
+        content = str(context["memory"]["content"])
+        project = "Legacy Atlas" if content.startswith("Legacy Atlas") else "Current Atlas"
+        return {
+            "entities": [
+                {"type": "project", "canonical_name": project},
+                {"type": "technology", "canonical_name": "Python"},
+            ],
+            "relations": [
+                {
+                    "source": f"project:{project}",
+                    "target": "technology:Python",
+                    "type": "uses",
+                    "evidence": [content],
+                }
+            ],
+        }
+
+    with _manual_semantic_live_app(
+        tmp_path,
+        semantic_extractor,
+        graph_extractor=graph_extractor,
+    ) as (base_url, api_key, _, _):
+        headers = {"Authorization": f"Bearer {api_key}"}
+        with httpx.Client(
+            base_url=base_url, headers=headers, timeout=10, trust_env=False
+        ) as client:
+            region = client.post(
+                "/api/v1/regions",
+                json={
+                    "kind": "topic",
+                    "name": "有界图谱验收",
+                    "region_id": "bounded-graph-browser",
+                },
+            )
+            assert region.status_code == 201, region.text
+            old_memory = client.post(
+                "/api/v1/memories",
+                json={
+                    "region_id": "bounded-graph-browser",
+                    "content": "Legacy Atlas uses Python.",
+                    "memory_type": "domain_fact",
+                    "source_references": ["session:bounded-graph-browser"],
+                    "idempotency_key": "bounded-graph-old",
+                },
+            )
+            assert old_memory.status_code == 201, old_memory.text
+            old_id = str(old_memory.json()["id"])
+            old_detail = client.get(
+                f"/api/v1/libraries/bounded-graph-browser/memories/{old_id}"
+            )
+            assert old_detail.status_code == 200, old_detail.text
+            updated = client.put(
+                "/api/v1/libraries/bounded-graph-browser/document",
+                json={
+                    "path": old_id,
+                    "content": "Current Atlas uses Python.",
+                    "expected_source_version": old_detail.json()["source_version"],
+                    "operation_id": "bounded-graph-supersede",
+                    "actor_type": "user",
+                    "source": "browser-test",
+                    "mode": "supersede",
+                },
+            )
+            assert updated.status_code == 200, updated.text
+            graph = client.get(
+                "/api/v1/libraries/bounded-graph-browser/entity-graph"
+            )
+            assert graph.status_code == 200, graph.text
+            assert "Current Atlas" in graph.text
+            assert "Legacy Atlas" not in graph.text
+
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME),
+                headless=True,
+                args=["--no-sandbox", "--no-proxy-server", "--proxy-bypass-list=*"],
+            )
+            try:
+                page = browser.new_page(viewport={"width": 1440, "height": 1100})
+                page.goto(base_url, wait_until="domcontentloaded")
+                page.get_by_label("API key").fill(api_key)
+                page.get_by_role("button", name="登录").click()
+                page.get_by_role(
+                    "button", name="有界图谱验收 · topic · bounded-graph-browser"
+                ).click()
+
+                page.get_by_role("tab", name="图谱", exact=True).click()
+                expect(page.locator("#entity-graph-workspace")).to_be_visible()
+                expect(page.locator("#entity-graph-status")).to_contain_text(
+                    "图谱状态：ready"
+                )
+                expect(page.locator("#entity-graph-entities")).to_contain_text(
+                    "Current Atlas · project"
+                )
+                expect(page.locator("#entity-graph-entities")).not_to_contain_text(
+                    "Legacy Atlas"
+                )
+
+                query = page.locator("#entity-graph-query")
+                query.fill("Current Atlas")
+                page.get_by_role("button", name="读取图谱", exact=True).click()
+                expect(page.locator("#entity-graph-entities")).to_contain_text(
+                    "Current Atlas · project"
+                )
+
+                page.locator("#entity-graph-type").select_option("technology")
+                query.fill("Python")
+                page.get_by_role("button", name="读取图谱", exact=True).click()
+                expect(page.locator("#entity-graph-entities")).to_contain_text(
+                    "Python · technology"
+                )
+                expect(page.locator("#entity-graph-entities")).not_to_contain_text(
+                    "Current Atlas"
+                )
+
+                page.locator("#entity-graph-type").select_option("")
+                page.locator("#entity-graph-history").check()
+                query.fill("Legacy Atlas")
+                page.get_by_role("button", name="读取图谱", exact=True).click()
+                expect(page.locator("#entity-graph-summary")).to_contain_text("历史")
+                legacy_button = page.locator("#entity-graph-entities").get_by_role(
+                    "button", name="Legacy Atlas · project", exact=True
+                )
+                expect(legacy_button).to_be_visible()
+                assert legacy_button.evaluate(
+                    "node => node.classList.contains('graph-historical')"
+                )
+
+                page.get_by_role("tab", name="记忆", exact=True).click()
+                expect(page.locator("#memory-workspace")).to_be_visible()
+                page.get_by_role("tab", name="原始会话", exact=True).click()
+                expect(page.locator("#raw-session-workspace")).to_be_visible()
+                page.get_by_role("tab", name="图谱", exact=True).click()
+
+                page.get_by_role("button", name="幂等重建", exact=True).click()
+                expect(page.locator("#entity-graph-status")).to_contain_text(
+                    "图谱状态：ready"
+                )
+
+                graph_available["value"] = False
+                page.get_by_role("button", name="幂等重建", exact=True).click()
+                expect(page.locator("#entity-graph-status")).to_contain_text("错误：")
+            finally:
+                browser.close()

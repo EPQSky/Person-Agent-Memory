@@ -1364,7 +1364,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         if self._graph_extractor is None:
             self._entity_graph_store.not_configured(region.region_id)
         self._wait_for_entity_graph_update(region.region_id)
-        return self._entity_graph_store.status(region.region_id)
+        with self._entity_graph_lock:
+            pending = int(
+                region.region_id in self._entity_graph_requested
+                or region.region_id in self._entity_graph_threads
+            )
+        return self._entity_graph_store.status(region.region_id, pending=pending)
 
     async def rebuild_entity_graph(self, library_id: str) -> dict[str, object]:
         return await asyncio.to_thread(self._rebuild_entity_graph_serialized, library_id)
@@ -1382,7 +1387,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         try:
             memories: list[dict[str, object]] = []
             for scope, unit in self._region_unit_pairs(bundle, region):
-                if not _is_formal_semantic_unit(unit):
+                if not _is_graph_formal_semantic_unit(unit):
                     continue
                 memories.append(self._entity_graph_memory_payload(bundle, region, scope, unit))
             return self._entity_graph_store.rebuild(
@@ -1423,6 +1428,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         source_references = unit.user_metadata.get("source_references")
         if not isinstance(source_references, list):
             source_references = list(unit.provenance)
+        unit_payload = _unit_payload(unit, region)
         return {
             "memory_id": unit.id,
             "content": unit.content,
@@ -1430,6 +1436,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "source_references": list(source_references),
             "evidence": evidence,
             "evidence_snippets": _metadata_strings(unit, "evidence_snippets"),
+            "lifecycle": unit.lifecycle.value,
+            "updated_at": str(unit_payload.get("updated_at", "")),
             "region": {
                 "region_id": region.region_id,
                 "kind": region.kind,
@@ -1539,6 +1547,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         q: str | None = None,
         hops: int = 1,
         limit: int = 200,
+        history: bool = False,
         wait_for_update: bool = True,
         wait_timeout: float | None = None,
     ) -> dict[str, object]:
@@ -1556,6 +1565,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             q=q,
             hops=hops,
             limit=limit,
+            history=history,
         )
 
     def entity_graph_memory(
@@ -2999,6 +3009,14 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         if request.library_id is not None:
             library_id = validate_library_id(request.library_id)
             normalized = replace(request, library_id=library_id)
+            library_region = self._graph_region_or_none(library_id)
+            if library_region is not None:
+                return self._search_region_session(
+                    bundle,
+                    normalized,
+                    library_region,
+                    "explicit_library",
+                )
             return self._search_scope(
                 bundle,
                 normalized,
@@ -3044,6 +3062,17 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 )
                 if self._scope_has_units(bundle, session_scope):
                     targets.append((session_scope, region))
+        legacy_scope = _scope_for_normalized_library(region.region_id)
+        if (
+            scope_kind == "explicit_library"
+            and not any(scope == legacy_scope for scope, _ in targets)
+            and self._scope_has_units(bundle, legacy_scope)
+        ):
+            # A library write made before this region was registered remains
+            # in the legacy ``library:<id>`` scope.  Search both namespaces,
+            # while retaining the region context for entity-graph status and
+            # degradation reporting.
+            targets.append((legacy_scope, region))
         response = self._search_across(
             bundle,
             request,
@@ -3156,6 +3185,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         degradation: list[str] = []
         vector_statuses: set[str] = set()
         graph_statuses: set[str] = set()
+        entity_graph_statuses: set[str] = set()
         groups: dict[str, dict[str, object]] = {}
         group_vector_statuses: dict[str, set[str]] = {}
         group_graph_statuses: dict[str, set[str]] = {}
@@ -3175,6 +3205,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "degradation": [],
                 "vector_index_status": "not_configured",
                 "graph_index_status": "not_configured",
+                "entity_graph_status": {"status": "not_configured", "last_error": ""},
                 "result_ids": [],
                 "source_references": [],
             }
@@ -3231,6 +3262,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         group_degradation.append(reason_text)
                     group["degraded"] = True
             raw_errors = response.get("retrieval_errors", [])
+            raw_entity_graph_status = response.get("entity_graph_status")
+            if isinstance(raw_entity_graph_status, Mapping):
+                group["entity_graph_status"] = dict(raw_entity_graph_status)
+                entity_graph_status = str(
+                    raw_entity_graph_status.get("status", "not_configured")
+                )
+                entity_graph_statuses.add(entity_graph_status)
             if isinstance(raw_errors, list):
                 for raw_error in raw_errors:
                     if isinstance(raw_error, dict) and raw_error not in retrieval_errors:
@@ -3316,6 +3354,18 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             graph_status = "degraded"
         else:
             graph_status = "not_configured"
+        combined_entity_graph_status = _combined_index_status(entity_graph_statuses)
+        entity_graph_status_payload: dict[str, object] = {
+            "status": combined_entity_graph_status,
+            "regions": [
+                groups[region_id].get("entity_graph_status", {})
+                for region_id in region_ids
+            ],
+        }
+        if len(region_ids) == 1:
+            single_region_status = groups[region_ids[0]].get("entity_graph_status")
+            if isinstance(single_region_status, Mapping):
+                entity_graph_status_payload = dict(single_region_status)
         result: dict[str, object] = {
             "status": "bound",
             "scope": {
@@ -3334,6 +3384,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             "degradation": degradation,
             "vector_index_status": vector_status,
             "graph_index_status": graph_status,
+            "entity_graph_status": entity_graph_status_payload,
             "results": results,
         }
         if retrieval_errors:
@@ -3364,6 +3415,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 bundle, scope, items, request, degradation, region
             )
             graph_status = self._graph_ready_status(bundle, scope, region)
+            entity_graph_status = self._entity_graph_status_for_region(
+                degradation, region
+            )
             return _search_response(
                 request,
                 scope,
@@ -3372,6 +3426,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 degradation,
                 vector_status="not_configured",
                 graph_status=graph_status,
+                entity_graph_status=entity_graph_status,
                 region=region,
             )
         try:
@@ -3396,6 +3451,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 bundle, scope, units, request, degradation, region
             )
             graph_status = self._graph_ready_status(bundle, scope, region)
+            entity_graph_status = self._entity_graph_status_for_region(
+                degradation, region
+            )
             return _search_response(
                 request,
                 scope,
@@ -3404,6 +3462,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 degradation,
                 vector_status="degraded",
                 graph_status=graph_status,
+                entity_graph_status=entity_graph_status,
                 region=region,
             )
 
@@ -3435,6 +3494,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         )
         items = self._append_graph_expansions(bundle, scope, items, request, degradation, region)
         graph_status = self._graph_ready_status(bundle, scope, region)
+        entity_graph_status = self._entity_graph_status_for_region(degradation, region)
         return _search_response(
             request,
             scope,
@@ -3443,6 +3503,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             degradation,
             vector_status=vector_status,
             graph_status=graph_status,
+            entity_graph_status=entity_graph_status,
             region=region,
         )
 
@@ -3499,6 +3560,25 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             return "not_configured"
         with self._graph_write_lock:
             return self._graph_ready_status_locked(bundle, scope, region)
+
+    def _entity_graph_status_for_region(
+        self,
+        degradation: list[str],
+        region: MemoryRegion | None,
+    ) -> dict[str, object]:
+        if region is None:
+            return {"status": "not_configured", "last_error": ""}
+        try:
+            status = self._entity_graph_store.status(region.region_id)
+        except Exception as error:
+            status = {
+                "status": "degraded",
+                "region_id": region.region_id,
+                "last_error": f"entity graph status unavailable: {error}",
+            }
+        if str(status.get("status", "")) == "degraded" and "graph_unavailable" not in degradation:
+            degradation.append("graph_unavailable")
+        return status
 
     def _graph_ready_status_locked(
         self,
@@ -12828,6 +12908,7 @@ def _search_response(
     *,
     vector_status: str,
     graph_status: str = "not_configured",
+    entity_graph_status: Mapping[str, object] | None = None,
     region: MemoryRegion | None = None,
 ) -> dict[str, object]:
     visible_items = [
@@ -12862,6 +12943,7 @@ def _search_response(
         "degradation": degradation,
         "vector_index_status": vector_status,
         "graph_index_status": graph_status,
+        "entity_graph_status": dict(entity_graph_status or {}),
         "results": _truncate_search_results(results, max(1, min(request.limit, 100))),
     }
     if request.library_id is not None:
@@ -12995,6 +13077,17 @@ def _is_formal_semantic_unit(unit: MemoryUnit) -> bool:
         return False
     memory_type = _metadata_text(unit, "memory_type")
     return memory_type in FORMAL_MEMORY_TYPES and unit.lifecycle.value == "active"
+
+
+def _is_graph_formal_semantic_unit(unit: MemoryUnit) -> bool:
+    if _is_capture_unit(unit):
+        return False
+    memory_type = _metadata_text(unit, "memory_type")
+    return memory_type in FORMAL_MEMORY_TYPES and unit.lifecycle.value in {
+        "active",
+        "superseded",
+        "archived",
+    }
 
 
 def _memory_sort_key(payload: Mapping[str, object]) -> tuple[datetime, str]:
