@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -1861,5 +1862,114 @@ def test_console_bounded_entity_graph_history_filters_and_degradation(
                 graph_available["value"] = False
                 page.get_by_role("button", name="幂等重建", exact=True).click()
                 expect(page.locator("#entity-graph-status")).to_contain_text("错误：")
+            finally:
+                browser.close()
+
+
+def test_console_search_query_subgraph_expands_and_locates_memory(
+    tmp_path: Path,
+) -> None:
+    assert CHROME.exists(), f"real Chromium is required at {CHROME}"
+
+    def semantic_extractor(_: dict[str, object]) -> list[dict[str, object]]:
+        return []
+
+    def graph_extractor(context: dict[str, object]) -> dict[str, object]:
+        source, target = str(context["memory"]["content"]).split(" connects ", 1)
+        content = str(context["memory"]["content"])
+        return {
+            "entities": [
+                {"type": "concept", "canonical_name": source},
+                {"type": "concept", "canonical_name": target},
+            ],
+            "relations": [
+                {
+                    "source": f"concept:{source}",
+                    "target": f"concept:{target}",
+                    "type": "related_to",
+                    "evidence": [content],
+                }
+            ],
+        }
+
+    with _manual_semantic_live_app(
+        tmp_path,
+        semantic_extractor,
+        graph_extractor=graph_extractor,
+    ) as (base_url, api_key, _, _):
+        headers = {"Authorization": f"Bearer {api_key}"}
+        with httpx.Client(
+            base_url=base_url, headers=headers, timeout=10, trust_env=False
+        ) as client:
+            region = client.post(
+                "/api/v1/regions",
+                json={
+                    "kind": "topic",
+                    "name": "检索子图验收",
+                    "region_id": "query-subgraph-browser",
+                },
+            )
+            assert region.status_code == 201, region.text
+            seed = client.post(
+                "/api/v1/memories",
+                json={
+                    "region_id": "query-subgraph-browser",
+                    "content": "Seed connects Hub",
+                    "memory_type": "domain_fact",
+                    "source_references": ["session:query-subgraph-browser"],
+                    "idempotency_key": "query-subgraph-seed",
+                },
+            )
+            assert seed.status_code == 201, seed.text
+            for key, content in (
+                ("query-subgraph-mid", "Hub connects Mid"),
+                ("query-subgraph-leaf", "Mid connects Leaf"),
+            ):
+                response = client.post(
+                    "/api/v1/memories",
+                    json={
+                        "region_id": "query-subgraph-browser",
+                        "content": content,
+                        "memory_type": "domain_fact",
+                        "source_references": ["session:query-subgraph-browser"],
+                        "idempotency_key": key,
+                    },
+                )
+                assert response.status_code == 201, response.text
+
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                executable_path=str(CHROME),
+                headless=True,
+                args=["--no-sandbox", "--no-proxy-server", "--proxy-bypass-list=*"],
+            )
+            try:
+                page = browser.new_page(viewport={"width": 1440, "height": 1100})
+                page.goto(base_url, wait_until="domcontentloaded")
+                page.get_by_label("API key").fill(api_key)
+                page.get_by_role("button", name="登录").click()
+                page.get_by_role(
+                    "button", name="检索子图验收 · topic · query-subgraph-browser"
+                ).click()
+                page.locator("#search-query").fill("Seed")
+                page.get_by_role("button", name="检索选中区域").click()
+                expect(page.locator("#search-query-subgraph")).to_be_visible()
+                expect(page.locator("#search-query-subgraph-message")).to_contain_text(
+                    "查询子图"
+                )
+                expect(page.locator("#search-query-subgraph-entities")).to_contain_text("Seed")
+                expect(page.locator("#search-query-subgraph-entities")).to_contain_text("Mid")
+                expect(page.locator("#search-query-subgraph-entities")).not_to_contain_text("Leaf")
+
+                page.get_by_role("button", name="展开到两跳").click()
+                expect(page.locator("#search-query-subgraph-entities")).to_contain_text("Leaf")
+
+                page.get_by_role(
+                    "button", name=re.compile(r"定位图谱实体：Seed")
+                ).click()
+                expect(page.locator("#document-detail")).to_be_visible()
+                expect(page.locator("#document-content")).to_have_value("Seed connects Hub")
             finally:
                 browser.close()

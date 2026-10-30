@@ -973,8 +973,14 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 requested_budget=request.token_budget,
                 target_model=request.target_model,
             )
-            if "entity_graph_status" in raw:
-                package["entity_graph_status"] = raw["entity_graph_status"]
+            for key in (
+                "entity_graph_status",
+                "query_subgraph",
+                "query_subgraphs",
+                "no_mapped_entities",
+            ):
+                if key in raw:
+                    package[key] = raw[key]
             return package
         except RegionError as error:
             raise HTTPException(
@@ -1353,8 +1359,12 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 selected_kernel.inspect_memory,
                 DocumentInspectRequest(library_id=library_id, path=memory_id),
             )
+        except MemoryGovernanceError as error:
+            raise mutation_error(error) from error
+        graph: dict[str, object]
+        try:
             graph_reader: Any = selected_kernel.entity_graph
-            graph = await asyncio.to_thread(
+            raw_graph = await asyncio.to_thread(
                 graph_reader,
                 library_id,
                 memory_id=memory_id,
@@ -1362,13 +1372,76 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 wait_for_update=True,
                 wait_timeout=ENTITY_GRAPH_MEMORY_DETAIL_GRACE_SECONDS,
             )
-            payload["associated_entities"] = graph.get("nodes", [])
-            payload["associated_relations"] = graph.get("edges", [])
-            payload["entity_graph"] = graph
-            payload["local_graph"] = graph
-            return payload
-        except MemoryGovernanceError as error:
-            raise mutation_error(error) from error
+            graph = dict(raw_graph) if isinstance(raw_graph, dict) else {}
+        except Exception as error:
+            graph = {
+                "region_id": library_id,
+                "nodes": [],
+                "edges": [],
+                "entities": [],
+                "relations": [],
+                "hops": 1,
+                "read_only": True,
+                "status": "degraded",
+                "availability_status": "degraded",
+                "error": str(error),
+                "degradation": ["graph_unavailable"],
+                "graph_mapping_status": "degraded",
+                "no_mapped_entities": False,
+            }
+
+        raw_graph_status = graph.get("entity_graph_status")
+        if isinstance(raw_graph_status, dict):
+            graph_status = dict(raw_graph_status)
+        else:
+            try:
+                status_payload = await asyncio.to_thread(
+                    selected_kernel.entity_graph_status,
+                    library_id,
+                )
+                graph_status = (
+                    dict(status_payload)
+                    if isinstance(status_payload, dict)
+                    else {}
+                )
+            except Exception as error:
+                graph_status = {
+                    "status": str(graph.get("status", "degraded")),
+                    "region_id": library_id,
+                    "last_error": str(graph.get("error", error)),
+                }
+        status_value = str(
+            graph_status.get("status", graph.get("status", "unknown"))
+        )
+        raw_degradation = graph.get("degradation", [])
+        degradation = (
+            list(raw_degradation) if isinstance(raw_degradation, list) else []
+        )
+        if status_value in {"degraded", "unavailable"} and "graph_unavailable" not in degradation:
+            degradation.append("graph_unavailable")
+        nodes = graph.get("nodes", [])
+        has_nodes = isinstance(nodes, list) and bool(nodes)
+        if has_nodes:
+            mapping_status = "mapped"
+        elif status_value in {"degraded", "unavailable"}:
+            mapping_status = "degraded"
+        elif status_value == "not_configured":
+            mapping_status = "not_configured"
+        else:
+            mapping_status = "unmapped"
+        graph["entity_graph_status"] = graph_status
+        graph["degradation"] = degradation
+        graph["graph_mapping_status"] = mapping_status
+        graph["no_mapped_entities"] = mapping_status == "unmapped"
+        payload["associated_entities"] = graph.get("nodes", [])
+        payload["associated_relations"] = graph.get("edges", [])
+        payload["entity_graph"] = graph
+        payload["local_graph"] = graph
+        payload["entity_graph_status"] = graph_status
+        payload["degradation"] = degradation
+        payload["graph_mapping_status"] = mapping_status
+        payload["no_mapped_entities"] = mapping_status == "unmapped"
+        return payload
 
     @app.get(
         "/api/v1/libraries/{library_id}/export.md",

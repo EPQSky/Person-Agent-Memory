@@ -14,7 +14,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, suppress
 from contextvars import ContextVar
@@ -62,7 +62,12 @@ from jiuwen_memory.storage.types import ScoredID, TextQuery
 from jiuwen_memory.storage.vector import VectorProducer
 
 from personal_agent_memory.config import MemoryKernelKind
-from personal_agent_memory.entity_graph import DETAIL_DEFAULT_LIMIT, EntityGraphStore
+from personal_agent_memory.entity_graph import (
+    DETAIL_DEFAULT_LIMIT,
+    GRAPH_MAX_EDGE_LIMIT,
+    GRAPH_MAX_NODE_LIMIT,
+    EntityGraphStore,
+)
 from personal_agent_memory.memory_kernel import (
     CWD_SCOPE_PREFIX,
     FORMAL_MEMORY_TYPES,
@@ -1552,12 +1557,14 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         wait_timeout: float | None = None,
     ) -> dict[str, object]:
         region = self._regions.require_region(validate_library_id(library_id))
+        if self._graph_extractor is None:
+            self._entity_graph_store.not_configured(region.region_id)
         if wait_for_update:
             self._wait_for_entity_graph_update(
                 region.region_id,
                 timeout=30.0 if wait_timeout is None else wait_timeout,
             )
-        return self._entity_graph_store.graph(
+        graph = self._entity_graph_store.graph(
             region.region_id,
             entity_id=entity_id,
             memory_id=memory_id,
@@ -1567,6 +1574,25 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             limit=limit,
             history=history,
         )
+        graph_status = self._entity_graph_store.status(region.region_id)
+        status_value = str(graph_status.get("status", "ready"))
+        graph["status"] = status_value
+        graph["availability_status"] = status_value
+        graph["entity_graph_status"] = graph_status
+        graph["error"] = graph_status.get("last_error", "")
+        graph["degradation"] = (
+            ["graph_unavailable"] if status_value == "degraded" else []
+        )
+        if graph.get("nodes"):
+            graph["graph_mapping_status"] = "mapped"
+        elif status_value == "degraded":
+            graph["graph_mapping_status"] = "degraded"
+        elif status_value == "not_configured":
+            graph["graph_mapping_status"] = "not_configured"
+        else:
+            graph["graph_mapping_status"] = "unmapped"
+        graph["no_mapped_entities"] = not bool(graph.get("nodes"))
+        return graph
 
     def entity_graph_memory(
         self,
@@ -3338,10 +3364,103 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             key=lambda item: float(str(item.get("score", 0.0))),
             reverse=True,
         )
-        results = _truncate_search_results(
-            ranked,
-            max(1, min(request.limit, 100)),
+        # Keep retrieval membership independent from graph enrichment.  The
+        # query subgraph is an optional annotation and must not replace or
+        # filter the formal-memory results, including their document IDs.
+        retrieval_results = tuple(
+            _truncate_search_results(
+                ranked,
+                max(1, min(request.limit, 100)),
+            )
         )
+        results = [dict(item) for item in retrieval_results]
+        query_subgraphs: list[dict[str, object]] = []
+        for region_id in region_ids:
+            region = regions_by_id[region_id]
+            direct_memory_ids = [
+                str(item.get("document_id") or item.get("chunk_id"))
+                for item in retrieval_results
+                if str(item.get("region_id", "")) == region_id
+                and item.get("classification") != "graph_expansion"
+                and str(item.get("document_id") or item.get("chunk_id", ""))
+            ]
+            subgraph = self._query_entity_subgraph(
+                region,
+                list(dict.fromkeys(direct_memory_ids)),
+                request,
+            )
+            query_subgraphs.append(subgraph)
+            group = groups[region_id]
+            group["query_subgraph"] = subgraph
+            subgraph_degradation = subgraph.get("degradation", [])
+            if isinstance(subgraph_degradation, list):
+                group_degradation = cast(list[object], group["degradation"])
+                for reason in subgraph_degradation:
+                    reason_text = str(reason)
+                    if reason_text not in group_degradation:
+                        group_degradation.append(reason_text)
+                    if reason_text not in degradation:
+                        degradation.append(reason_text)
+                if subgraph_degradation:
+                    group["degraded"] = True
+                    group["status"] = "degraded"
+            memory_entities = subgraph.get("memory_entities", {})
+            memory_entity_map = memory_entities if isinstance(memory_entities, dict) else {}
+            raw_mapping_status = subgraph.get("memory_mapping_status", {})
+            mapping_status = (
+                raw_mapping_status if isinstance(raw_mapping_status, dict) else {}
+            )
+            raw_group_graph_status = group.get("entity_graph_status", {})
+            group_graph_status = (
+                dict(raw_group_graph_status)
+                if isinstance(raw_group_graph_status, Mapping)
+                else {
+                    "status": str(
+                        subgraph.get("availability_status", subgraph.get("status", "unknown"))
+                    ),
+                    "last_error": subgraph.get("error", ""),
+                }
+            )
+            graph_status_value = str(
+                group_graph_status.get(
+                    "status", subgraph.get("availability_status", "unknown")
+                )
+            )
+            for item in results:
+                if str(item.get("region_id", "")) != region_id:
+                    continue
+                memory_id = str(item.get("document_id") or item.get("chunk_id") or "")
+                entity_ids = memory_entity_map.get(memory_id, [])
+                if not isinstance(entity_ids, list):
+                    entity_ids = []
+                item_mapping_status = str(
+                    mapping_status.get(memory_id, "unmapped")
+                )
+                if item_mapping_status == "unmapped" and graph_status_value in {
+                    "degraded",
+                    "unavailable",
+                    "not_configured",
+                }:
+                    item_mapping_status = graph_status_value
+                item["graph_entity_ids"] = list(entity_ids)
+                item["graph_mapped"] = item_mapping_status == "mapped"
+                item["graph_mapping_status"] = item_mapping_status
+                item["entity_graph_status"] = {
+                    "status": graph_status_value,
+                    **(
+                        {"last_error": str(group_graph_status["last_error"])[:200]}
+                        if group_graph_status.get("last_error")
+                        else {}
+                    ),
+                }
+                item["degradation"] = list(
+                    cast(list[object], subgraph_degradation)
+                )
+                item["no_mapped_entities"] = item_mapping_status in {
+                    "unmapped",
+                    "not_configured",
+                    "degraded",
+                }
         if vector_statuses == {"ready"}:
             vector_status = "ready"
         elif "degraded" in vector_statuses:
@@ -3391,6 +3510,17 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             result["retrieval_errors"] = retrieval_errors
         if scope_kind == "explicit_regions":
             result["region_groups"] = [groups[region_id] for region_id in region_ids]
+        if len(query_subgraphs) == 1:
+            result["query_subgraph"] = query_subgraphs[0]
+            result["no_mapped_entities"] = bool(
+                query_subgraphs[0].get("no_mapped_entities", False)
+            )
+        else:
+            result["query_subgraphs"] = query_subgraphs
+            result["no_mapped_entities"] = all(
+                bool(graph.get("no_mapped_entities", False))
+                for graph in query_subgraphs
+            )
         return result
 
     def _search_scope(
@@ -3569,6 +3699,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         if region is None:
             return {"status": "not_configured", "last_error": ""}
         try:
+            if self._graph_extractor is None:
+                self._entity_graph_store.not_configured(region.region_id)
             status = self._entity_graph_store.status(region.region_id)
         except Exception as error:
             status = {
@@ -3579,6 +3711,113 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         if str(status.get("status", "")) == "degraded" and "graph_unavailable" not in degradation:
             degradation.append("graph_unavailable")
         return status
+
+    def _query_entity_subgraph(
+        self,
+        region: MemoryRegion,
+        memory_ids: Sequence[str],
+        request: SearchMemoryRequest,
+    ) -> dict[str, object]:
+        empty: dict[str, object] = {
+            "region_id": region.region_id,
+            "nodes": [],
+            "edges": [],
+            "entities": [],
+            "relations": [],
+            "memory_entities": {str(memory_id): [] for memory_id in memory_ids},
+            "direct_memory_ids": list(dict.fromkeys(str(value) for value in memory_ids)),
+            "hops": request.max_graph_hops,
+            "max_nodes": GRAPH_MAX_NODE_LIMIT,
+            "max_edges": GRAPH_MAX_EDGE_LIMIT,
+            "truncated": False,
+            "read_only": True,
+            "query_subgraph": True,
+            "degradation": [],
+            "error": "",
+            "seed_total": len(memory_ids),
+            "seed_limit": GRAPH_MAX_NODE_LIMIT,
+            "seed_truncated": len(memory_ids) > GRAPH_MAX_NODE_LIMIT,
+        }
+        if self._graph_extractor is None:
+            self._entity_graph_store.not_configured(region.region_id)
+            status = self._entity_graph_store.status(region.region_id)
+            mapping_status = {
+                str(memory_id): "not_configured" for memory_id in memory_ids
+            }
+            empty.update(
+                {
+                    "status": "not_configured",
+                    "availability_status": status.get("status", "not_configured"),
+                    "entity_graph_status": status,
+                    "error": status.get("last_error", ""),
+                    "message": "实体图谱未配置，检索结果仍可用。",
+                    "memory_mapping_status": mapping_status,
+                    "mapping_count": 0,
+                    "mapped_memory_count": 0,
+                    "unmapped_memory_count": 0,
+                    "truncated_memory_count": 0,
+                    "no_mapped_entities": False,
+                }
+            )
+            return empty
+        try:
+            self._wait_for_entity_graph_update(region.region_id)
+            status = self._entity_graph_store.status(region.region_id)
+            graph = self._entity_graph_store.query_subgraph(
+                region.region_id,
+                memory_ids,
+                hops=request.max_graph_hops,
+                limit=GRAPH_MAX_NODE_LIMIT,
+                history=request.include_history,
+            )
+            graph_status = str(status.get("status", "ready"))
+            graph["status"] = graph_status
+            graph["availability_status"] = graph_status
+            graph["entity_graph_status"] = status
+            graph["error"] = status.get("last_error", status.get("error", ""))
+            graph_degradation = graph.get("degradation", [])
+            degradation = (
+                list(graph_degradation)
+                if isinstance(graph_degradation, list)
+                else []
+            )
+            if graph_status == "degraded":
+                if "graph_unavailable" not in degradation:
+                    degradation.append("graph_unavailable")
+                graph["message"] = "实体图谱降级，检索结果仍可用。"
+            elif graph.get("no_mapped_entities") is True:
+                graph["status"] = "no_mapped_entities"
+                graph["message"] = "检索结果没有可映射的知识图谱实体。"
+            elif graph.get("truncated"):
+                graph["message"] = "查询子图已截断，部分直接命中记忆未纳入图谱。"
+            else:
+                graph["message"] = "已从直接命中实体生成查询子图。"
+            graph["degradation"] = degradation
+            return graph
+        except Exception as error:
+            status = {
+                "status": "degraded",
+                "region_id": region.region_id,
+                "last_error": str(error),
+            }
+            mapping_status = {str(memory_id): "degraded" for memory_id in memory_ids}
+            empty.update(
+                {
+                    "status": "degraded",
+                    "availability_status": "degraded",
+                    "entity_graph_status": status,
+                    "error": str(error),
+                    "degradation": ["graph_unavailable"],
+                    "memory_mapping_status": mapping_status,
+                    "mapping_count": 0,
+                    "mapped_memory_count": 0,
+                    "unmapped_memory_count": 0,
+                    "truncated_memory_count": 0,
+                    "no_mapped_entities": False,
+                    "message": "实体图谱不可用，检索结果仍可用。",
+                }
+            )
+            return empty
 
     def _graph_ready_status_locked(
         self,
