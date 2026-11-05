@@ -1482,7 +1482,10 @@ if recorded and (
     raise SystemExit(
         f"existing install metadata does not prove ownership of user service definition: {unit_path}"
     )
-def unit_content(daemon_command: str, *, kernel_argument: str = "") -> bytes:
+def unit_content(
+    daemon_command: str, *, kernel_argument: str = "", stop_timeout: bool = True
+) -> bytes:
+    stop_line = "TimeoutStopSec=120\n" if stop_timeout else ""
     return f'''[Unit]
 Description=Personal Agent Memory daemon
 After=network.target
@@ -1492,19 +1495,32 @@ Type=simple
 ExecStart={daemon_command} serve --state-dir {sys.argv[3]} --library-root {sys.argv[4]} --host "127.0.0.1" --port "{port}"{kernel_argument}
 Restart=on-failure
 RestartSec=2
-
+{stop_line}
 [Install]
 WantedBy=default.target
 '''.encode("utf-8")
 
 payload = unit_content(sys.argv[2])
-previous_payload = unit_content(
-    sys.argv[2], kernel_argument=' --memory-kernel "mem2"'
-)
-legacy_payload = unit_content(legacy_daemon_command)
-previous_legacy_payload = unit_content(
-    legacy_daemon_command, kernel_argument=' --memory-kernel "mem2"'
-)
+
+
+def owned_payload_digests() -> set[str]:
+    """Digests of unit variants shipped by this and earlier releases.
+
+    Earlier releases wrote the same unit without TimeoutStopSec, and some wrote a
+    different daemon path or an explicit kernel argument.  Every shipped shape
+    must keep proving installer ownership so an upgrade can rewrite it in place.
+    """
+    digests: set[str] = set()
+    for daemon_command in (sys.argv[2], legacy_daemon_command):
+        for kernel_argument in ("", ' --memory-kernel "mem2"'):
+            for stop_timeout in (True, False):
+                candidate = unit_content(
+                    daemon_command,
+                    kernel_argument=kernel_argument,
+                    stop_timeout=stop_timeout,
+                )
+                digests.add(hashlib.sha256(candidate).hexdigest())
+    return digests
 if unit_path.parent.resolve() != unit_path.parent:
     raise SystemExit(f"user service directory is not a lexical directory: {unit_path.parent}")
 directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -1544,12 +1560,7 @@ def current_state() -> tuple[str, tuple[int, int] | None]:
                 raise SystemExit(
                     f"user service definition does not match install metadata: {unit_path}"
                 )
-        elif digest not in {
-            hashlib.sha256(legacy_payload).hexdigest(),
-            hashlib.sha256(previous_legacy_payload).hexdigest(),
-            hashlib.sha256(previous_payload).hexdigest(),
-            hashlib.sha256(payload).hexdigest(),
-        }:
+        elif digest not in owned_payload_digests():
             raise SystemExit(
                 f"user service definition already exists and is not installer-owned: {unit_path}"
             )
