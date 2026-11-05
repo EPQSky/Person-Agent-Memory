@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
@@ -68,6 +70,50 @@ def _normalized_uri(uri: str | Path) -> tuple[str, bool]:
     if value.startswith(("http://", "https://", "tcp://", "unix:")):
         return value, False
     return str(Path(value).expanduser().resolve()), True
+
+
+_ZERO_BYTE_ARTIFACT_SUFFIXES = (".parquet", ".idx")
+_logger = logging.getLogger(__name__)
+
+
+def _quarantine_zero_byte_artifacts(uri: str) -> list[str]:
+    """Move zero-byte Milvus Lite data and index files out of the live store.
+
+    A crash during flush leaves empty parquet/index artifacts behind.  Every
+    collection read then fails with ``Parquet file size is 0 bytes`` and the
+    whole store degrades.  Empty files hold no data, so relocating them is
+    lossless and lets the store report a partial index instead of erroring.
+    """
+    root = Path(uri)
+    collections = root / "collections"
+    if not collections.is_dir():
+        return []
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+    quarantined: list[str] = []
+    for path in sorted(collections.rglob("*")):
+        if not path.is_file() or path.suffix not in _ZERO_BYTE_ARTIFACT_SUFFIXES:
+            continue
+        try:
+            if path.stat().st_size != 0:
+                continue
+        except OSError:
+            continue
+        relative = path.relative_to(root)
+        destination = root.with_name(f"{root.name}.quarantine") / stamp / relative
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(destination)
+        except OSError:
+            _logger.warning("failed to quarantine zero-byte Milvus artifact %s", path)
+            continue
+        quarantined.append(str(relative))
+    if quarantined:
+        _logger.warning(
+            "quarantined %d zero-byte Milvus artifact(s) under %s",
+            len(quarantined),
+            root,
+        )
+    return quarantined
 
 
 def _literal(value: object) -> str:
@@ -200,6 +246,8 @@ class _MilvusLiteConnection:
         normalized, is_local = _normalized_uri(uri)
         self._uri = normalized
         self._is_local = is_local
+        if is_local:
+            _quarantine_zero_byte_artifacts(normalized)
         options.pop("db_name", None)
         with self._registry_lock:
             shared = self._registry.get(normalized)
