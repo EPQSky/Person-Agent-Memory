@@ -1646,7 +1646,9 @@ def request(path: str, *, method: str = "GET", payload: object | None = None) ->
         headers=headers,
         method=method,
     )
-    with urllib.request.urlopen(http_request, timeout=5) as response:
+    # The first search after startup also loads the vector collection, which can
+    # take far longer than a warm request.
+    with urllib.request.urlopen(http_request, timeout=60) as response:
         return json.load(response)
 
 while time.monotonic() < deadline:
