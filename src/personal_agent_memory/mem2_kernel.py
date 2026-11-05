@@ -987,6 +987,9 @@ class _SensitiveFilteringEvolver:
         return self._delegate.evolve(units, mode)
 
 
+_GRAPH_STATUS_CACHE_SECONDS = 60.0
+
+
 class Mem2MemoryKernel(UnavailableMemoryKernel):
     """Persistent JiuwenMemory runtime exposed through ``MemoryKernelPort``."""
 
@@ -1005,6 +1008,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         semantic_executor: SemanticTaskExecutor | None = None,
         config_overrides: Mapping[str, Any] | None = None,
         regions: RegionRegistry | None = None,
+        graph_status_cache_seconds: float = _GRAPH_STATUS_CACHE_SECONDS,
     ) -> None:
         if embedding_dimension <= 0:
             raise ValueError("embedding dimension must be positive")
@@ -1051,6 +1055,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._maintenance_lock = threading.RLock()
         self._browser_index_lock = threading.RLock()
         self._graph_write_lock = threading.RLock()
+        self._graph_status_cache_seconds = graph_status_cache_seconds
+        self._graph_status_cache: dict[str, object] | None = None
+        self._graph_status_cache_at = 0.0
+        self._graph_status_cache_lock = threading.RLock()
         self._entity_graph_store = EntityGraphStore(
             self._state_dir / "mem2" / "maintenance.sqlite3"
         )
@@ -1261,6 +1269,50 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         )
 
     def graph_status(self, library_id: str | None = None) -> dict[str, object]:
+        """Return graph health without paying for the full scan on every poll.
+
+        The aggregate probe (``library_id is None``) walks every scope, reads the
+        KV projection and fingerprints it, which costs seconds on a populated
+        store.  Status pollers get a short-lived cached value instead; an
+        explicit library probe stays exact because rebuilds verify with it.
+        """
+        if library_id is not None or self._graph_status_cache_seconds <= 0:
+            return self._compute_graph_status(library_id)
+        cached = self._cached_graph_status()
+        if cached is not None:
+            return cached
+        if not self._graph_status_cache_lock.acquire(blocking=False):
+            stale = self._graph_status_cache
+            if stale is not None:
+                return dict(stale)
+            return self._compute_graph_status(None)
+        try:
+            cached = self._cached_graph_status()
+            if cached is not None:
+                return cached
+            payload = self._compute_graph_status(None)
+            self._graph_status_cache = dict(payload)
+            self._graph_status_cache_at = time.monotonic()
+            return payload
+        finally:
+            self._graph_status_cache_lock.release()
+
+    def _cached_graph_status(self) -> dict[str, object] | None:
+        with self._graph_status_cache_lock:
+            payload = self._graph_status_cache
+            cached_at = self._graph_status_cache_at
+        if payload is None:
+            return None
+        if time.monotonic() - cached_at >= self._graph_status_cache_seconds:
+            return None
+        return dict(payload)
+
+    def _invalidate_graph_status_cache(self) -> None:
+        with self._graph_status_cache_lock:
+            self._graph_status_cache = None
+            self._graph_status_cache_at = 0.0
+
+    def _compute_graph_status(self, library_id: str | None = None) -> dict[str, object]:
         with self._lock:
             bundle = self._bundle
         if bundle is None or bundle.graph_store is None:
@@ -1706,6 +1758,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     def _rebuild_graph(self, library_id: str) -> dict[str, object]:
         bundle = self._require_bundle()
+        self._invalidate_graph_status_cache()
         identifier = validate_library_id(library_id)
         region = self._graph_region_or_none(identifier)
         region_id = region.region_id if region is not None else identifier
