@@ -157,6 +157,36 @@ def test_milvus_dense_vector_crud_filters_persistence_and_shutdown(tmp_path: Pat
         reopened.close()
 
 
+def test_milvus_wildcard_scope_matches_every_scope(tmp_path: Path) -> None:
+    """Cross-scope recall passes "*"; it must not filter on the literal string."""
+    data_dir = tmp_path / "vectors.db"
+    store = MilvusLiteVectorStore(uri=data_dir, dim=3)
+    try:
+        for space in ("project:alpha", "project:beta"):
+            store.insert(
+                Scope(org="local", space=space),
+                [
+                    VectorRecord(
+                        id=f"id-{space[-5:]}",
+                        vector=[1.0, 0.0, 0.0],
+                        metadata={"unit_id": space},
+                    )
+                ],
+            )
+        concrete = store.search(
+            Scope(org="local", space="project:alpha"),
+            VectorQuery(vector=[1.0, 0.0, 0.0], top_k=5),
+        )
+        wildcard = store.search(
+            Scope(org="*", space="*", user="*", agent="*", session="*"),
+            VectorQuery(vector=[1.0, 0.0, 0.0], top_k=5),
+        )
+    finally:
+        store.close()
+    assert len(concrete) == 1
+    assert len(wildcard) == 2
+
+
 def test_milvus_bm25_crud_jieba_filters_scores_and_persistence(tmp_path: Path) -> None:
     data_dir = tmp_path / "fulltext.db"
     scope = Scope(org="local", space="project:alpha")

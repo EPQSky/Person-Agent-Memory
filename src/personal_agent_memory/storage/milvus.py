@@ -120,6 +120,69 @@ def _quarantine_zero_byte_artifacts(uri: str) -> list[str]:
     return quarantined
 
 
+def _prune_dangling_manifest_entries(uri: str) -> list[str]:
+    """Drop manifest references to data files that are no longer on disk.
+
+    Milvus Lite records every sealed segment in ``manifest.json``.  When a
+    segment file disappears - a crash left it empty and the startup check
+    quarantined it - the manifest keeps pointing at it, the collection cannot
+    load completely and every search silently returns zero hits.  Rewriting the
+    manifest without those entries lets the surviving segments serve queries.
+    """
+    root = Path(uri)
+    collections = root / "collections"
+    if not collections.is_dir():
+        return []
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+    stashed = root.with_name(f"{root.name}.quarantine") / stamp / "_manifests"
+    pruned: list[str] = []
+    for manifest_path in sorted(collections.glob("*/manifest.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        partitions = manifest.get("partitions")
+        if not isinstance(partitions, dict):
+            continue
+        changed = False
+        for name, partition in partitions.items():
+            if not isinstance(partition, dict):
+                continue
+            # Manifest entries are relative to the partition directory, e.g.
+            # "data/data_000001_000010.parquet" under partitions/_default/.
+            partition_dir = manifest_path.parent / "partitions" / str(name)
+            for key in ("data_files", "delta_files"):
+                files = partition.get(key)
+                if not isinstance(files, list):
+                    continue
+                kept = []
+                for entry in files:
+                    if not isinstance(entry, str):
+                        continue
+                    if (partition_dir / entry).exists():
+                        kept.append(entry)
+                    else:
+                        changed = True
+                        pruned.append(f"{manifest_path.parent.name}/{entry}")
+                partition[key] = kept
+        if not changed:
+            continue
+        backup = stashed / manifest_path.parent.name / manifest_path.name
+        try:
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            backup.write_bytes(manifest_path.read_bytes())
+            temporary = manifest_path.with_name(f"{manifest_path.name}.repair.tmp")
+            temporary.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(manifest_path)
+        except OSError:
+            _logger.warning("failed to repair Milvus manifest %s", manifest_path)
+    if pruned:
+        _logger.warning(
+            "pruned %d dangling Milvus manifest entr(ies) under %s", len(pruned), root
+        )
+    return pruned
+
+
 def _literal(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -162,11 +225,20 @@ def _compile_metadata_filter(expr: FilterExpr | None) -> str:
 
 
 def _scope_expression(scope: Scope) -> str:
-    return " && ".join(
-        f"scope_{field_name.removeprefix('scope_')} == "
-        f"{_literal(str(getattr(scope, field_name.removeprefix('scope_'))))}"
-        for field_name in _SCOPE_FIELDS
-    )
+    """Compile a scope into a Milvus filter expression.
+
+    ``*`` is the wildcard sentinel used by cross-scope recall.  It must drop its
+    clause entirely; comparing against the literal string matches no row and
+    silently turns every recall into zero hits.
+    """
+    clauses: list[str] = []
+    for field_name in _SCOPE_FIELDS:
+        dimension = field_name.removeprefix("scope_")
+        value = str(getattr(scope, dimension))
+        if value == "*":
+            continue
+        clauses.append(f"scope_{dimension} == {_literal(value)}")
+    return " && ".join(clauses)
 
 
 def _scope_key(scope: Scope) -> tuple[str, ...]:
@@ -252,6 +324,7 @@ class _MilvusLiteConnection:
         self._is_local = is_local
         if is_local:
             _quarantine_zero_byte_artifacts(normalized)
+            _prune_dangling_manifest_entries(normalized)
         options.pop("db_name", None)
         with self._registry_lock:
             shared = self._registry.get(normalized)
@@ -291,8 +364,11 @@ class _MilvusLiteConnection:
             client = self._shared.client
             self._shared.client = None
             if client is not None:
+                # milvus-lite does not implement flush_all; flush each collection
+                # so segments are sealed before the embedded server stops.
                 with suppress(Exception):
-                    client.flush_all(timeout=_SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
+                    for collection in client.list_collections():
+                        client.flush(str(collection), timeout=_SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
                 with suppress(Exception):
                     client.close()
             if self._is_local:

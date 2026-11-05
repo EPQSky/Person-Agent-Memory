@@ -5,6 +5,7 @@ from pathlib import Path
 from personal_agent_memory.storage import milvus as milvus_module
 from personal_agent_memory.storage.milvus import (
     _MilvusLiteConnection,
+    _prune_dangling_manifest_entries,
     _quarantine_zero_byte_artifacts,
 )
 
@@ -65,8 +66,12 @@ def test_connection_flushes_before_releasing_the_embedded_server(
         def __init__(self, **_kwargs: object) -> None:
             pass
 
-        def flush_all(self, timeout: float | None = None) -> None:
-            calls.append(("flush_all", timeout))
+        def list_collections(self) -> list[str]:
+            calls.append(("list_collections", None))
+            return ["agent_memory_vectors", "agent_memory_fulltext"]
+
+        def flush(self, name: str, timeout: float | None = None) -> None:
+            calls.append((f"flush:{name}", timeout))
 
         def close(self) -> None:
             calls.append(("close", None))
@@ -83,6 +88,44 @@ def test_connection_flushes_before_releasing_the_embedded_server(
     assert connection.client is not None
     connection.close()
 
-    assert [name for name, _ in calls] == ["flush_all", "close"]
-    assert calls[0][1] == milvus_module._SHUTDOWN_FLUSH_TIMEOUT_SECONDS
+    assert [name for name, _ in calls] == [
+        "list_collections",
+        "flush:agent_memory_vectors",
+        "flush:agent_memory_fulltext",
+        "close",
+    ]
+    assert calls[1][1] == milvus_module._SHUTDOWN_FLUSH_TIMEOUT_SECONDS
     assert len(released) == 1
+
+
+def test_dangling_manifest_entries_are_pruned_with_a_backup(tmp_path: Path) -> None:
+    """A manifest that points at deleted segments makes every search return zero."""
+    root = tmp_path / "milvus.db"
+    collection = root / "collections" / "agent_memory_vectors"
+    (collection / "partitions" / "_default" / "data").mkdir(parents=True)
+    present = collection / "partitions" / "_default" / "data" / "data_000001_000010.parquet"
+    present.write_bytes(b"PAR1")
+    manifest = collection / "manifest.json"
+    manifest.write_text(
+        '{"partitions": {"_default": {"data_files": ['
+        '"data/data_000001_000010.parquet", "data/data_000011_000020.parquet"], '
+        '"delta_files": ["delta/delta_000021_000030.parquet"]}}, "version": 7}',
+        encoding="utf-8",
+    )
+
+    pruned = _prune_dangling_manifest_entries(str(root))
+
+    assert sorted(pruned) == sorted(
+        [
+            "agent_memory_vectors/data/data_000011_000020.parquet",
+            "agent_memory_vectors/delta/delta_000021_000030.parquet",
+        ]
+    )
+    repaired = manifest.read_text(encoding="utf-8")
+    assert "data_000001_000010.parquet" in repaired
+    assert "data_000011_000020.parquet" not in repaired
+    assert "delta_000021_000030.parquet" not in repaired
+    assert "\"version\": 7" in repaired
+    stash = root.with_name("milvus.db.quarantine")
+    assert list(stash.rglob("agent_memory_vectors/manifest.json"))
+    assert _prune_dangling_manifest_entries(str(root)) == []
