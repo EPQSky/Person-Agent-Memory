@@ -73,6 +73,10 @@ def _normalized_uri(uri: str | Path) -> tuple[str, bool]:
 
 
 _ZERO_BYTE_ARTIFACT_SUFFIXES = (".parquet", ".idx")
+# Milvus Lite seals segments during shutdown.  Without an explicit, completed
+# flush the process can exit mid-write and leave 0-byte parquet/index files
+# that make the next startup fail every collection read.
+_SHUTDOWN_FLUSH_TIMEOUT_SECONDS = 20.0
 _logger = logging.getLogger(__name__)
 
 
@@ -287,6 +291,8 @@ class _MilvusLiteConnection:
             client = self._shared.client
             self._shared.client = None
             if client is not None:
+                with suppress(Exception):
+                    client.flush_all(timeout=_SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
                 with suppress(Exception):
                     client.close()
             if self._is_local:
