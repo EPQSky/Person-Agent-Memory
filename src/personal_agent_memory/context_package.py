@@ -206,6 +206,69 @@ def _result_metadata(item: dict[str, object]) -> dict[str, object]:
     return metadata
 
 
+_COMPACT_METADATA_KEYS = (
+    "chunk_id",
+    "document_id",
+    "library_id",
+    "path",
+    "heading",
+    "start_line",
+    "end_line",
+    "source_version",
+    "source_type",
+    "classification",
+    "score",
+    "retrieval_sources",
+    "region_id",
+    "space",
+)
+_MAX_SOURCE_REFERENCES = 2
+_HEAVY_METADATA_KEYS = ("user_metadata", "system_metadata")
+
+
+def _metadata_variants(metadata: dict[str, object]) -> list[dict[str, object]]:
+    """Return progressively smaller metadata payloads, richest variant first.
+
+    A memory with rich provenance carries more metadata than the fixed
+    metadata share of a small token budget.  Dropping such a result would
+    hide a memory that retrieval already matched, so the allocator retries
+    with trimmed metadata before giving up.
+    """
+    variants = [metadata]
+    trimmed = {
+        key: value
+        for key, value in metadata.items()
+        if key not in _HEAVY_METADATA_KEYS
+    }
+    references = trimmed.get("source_references")
+    if isinstance(references, list) and len(references) > _MAX_SOURCE_REFERENCES:
+        trimmed["source_references"] = references[:_MAX_SOURCE_REFERENCES]
+    trimmed["metadata_truncated"] = True
+    if trimmed != metadata:
+        variants.append(trimmed)
+    if isinstance(references, list) and len(references) > 1:
+        single_reference = dict(trimmed)
+        single_reference["source_references"] = references[:1]
+        variants.append(single_reference)
+    minimal = {
+        key: value for key, value in trimmed.items() if key in _COMPACT_METADATA_KEYS
+    }
+    minimal["metadata_truncated"] = True
+    if minimal not in variants:
+        variants.append(minimal)
+    return variants
+
+
+def _mark_metadata_trimmed(payload: dict[str, object]) -> None:
+    degradation = payload.get("degradation")
+    if not isinstance(degradation, list):
+        degradation = []
+        payload["degradation"] = degradation
+    if "result_metadata_trimmed" not in degradation:
+        degradation.append("result_metadata_trimmed")
+    payload["degraded"] = True
+
+
 def _allocate_results(
     results: Sequence[dict[str, object]],
     counter: TokenCounter,
@@ -228,9 +291,15 @@ def _allocate_results(
         )
 
     def include(item: dict[str, object], content_limit: int) -> int | None:
-        metadata = _result_metadata(item)
-        if metadata_tokens([*included, metadata]) > metadata_limit:
+        metadata: dict[str, object] | None = None
+        for candidate in _metadata_variants(_result_metadata(item)):
+            if metadata_tokens([*included, candidate]) <= metadata_limit:
+                metadata = candidate
+                break
+        if metadata is None:
             return None
+        if metadata.get("metadata_truncated"):
+            _mark_metadata_trimmed(payload)
         content, truncated = counter.truncate(str(item["content"]), content_limit)
         if not content:
             return None
@@ -1029,6 +1098,82 @@ def build_context_package(
             "token budget is too small for the complete memory-context-package/v1 envelope"
         )
     return payload
+
+
+_DIAGNOSTIC_MARGIN = 8
+
+DIAGNOSTIC_KEYS = (
+    "entity_graph_status",
+    "query_subgraph",
+    "query_subgraphs",
+    "no_mapped_entities",
+)
+
+
+def _telemetry_within_limits(
+    package: dict[str, object], counter: TokenCounter, effective_budget: int
+) -> bool:
+    """Recompute telemetry for ``package`` and report whether it still fits."""
+    budget = cast(dict[str, object], package["budget"])
+    if budget.get("telemetry_accounting") != TELEMETRY_ACCOUNTING:
+        results = cast(list[dict[str, object]], package.get("results", []))
+        return (
+            _normalized_package_tokens(package, counter, results)
+            <= effective_budget - _DIAGNOSTIC_MARGIN
+        )
+    _recalculate_telemetry(package, counter, effective_budget)
+    allocation = cast(dict[str, int], budget["allocation"])
+    return (
+        cast(int, budget["used_tokens"]) <= effective_budget - _DIAGNOSTIC_MARGIN
+        and allocation["metadata_used"] <= allocation["metadata_limit"] - _DIAGNOSTIC_MARGIN
+        and allocation["graph_used"] <= allocation["graph_limit"]
+    )
+
+
+def attach_diagnostics(
+    package: dict[str, object],
+    raw: Mapping[str, object],
+    *,
+    requested_budget: int,
+    target_model: str,
+) -> dict[str, object]:
+    """Attach retrieval diagnostics while keeping the budget contract intact.
+
+    Diagnostics are not memory content, yet they still occupy response bytes.
+    Attach them only when the package keeps slack inside every allocation
+    limit.  Otherwise omit them, and record the omission only when that note
+    also fits.  Both paths leave telemetry consistent with the final payload.
+    """
+    extras = {key: raw[key] for key in DIAGNOSTIC_KEYS if key in raw}
+    if not extras:
+        return package
+    effective_budget = min(requested_budget, HARD_TOKEN_LIMIT)
+    counter = TokenCounter.for_model(target_model)
+    package.update(extras)
+    if _telemetry_within_limits(package, counter, effective_budget):
+        budget = cast(dict[str, object], package["budget"])
+        if budget.get("telemetry_accounting") == CROSS_REGION_TELEMETRY_ACCOUNTING:
+            budget["used_tokens"] = counter.count(_encoded(package))
+        return package
+    for key in extras:
+        package.pop(key, None)
+    _telemetry_within_limits(package, counter, effective_budget)
+    degradation = package.get("degradation")
+    if not isinstance(degradation, list):
+        degradation = []
+        package["degradation"] = degradation
+    added = "diagnostics_omitted" not in degradation
+    if added:
+        degradation.append("diagnostics_omitted")
+        package["degraded"] = True
+    if added and not _telemetry_within_limits(package, counter, effective_budget):
+        degradation.remove("diagnostics_omitted")
+        package["degraded"] = bool(degradation)
+        _telemetry_within_limits(package, counter, effective_budget)
+    budget = cast(dict[str, object], package["budget"])
+    if budget.get("telemetry_accounting") == CROSS_REGION_TELEMETRY_ACCOUNTING:
+        budget["used_tokens"] = counter.count(_encoded(package))
+    return package
 
 
 def is_safe_markdown_fragment(value: str) -> bool:

@@ -34,7 +34,11 @@ from pydantic import (
 
 from personal_agent_memory import __version__
 from personal_agent_memory.config import Settings
-from personal_agent_memory.context_package import MIN_TOKEN_BUDGET, build_context_package
+from personal_agent_memory.context_package import (
+    MIN_TOKEN_BUDGET,
+    attach_diagnostics,
+    build_context_package,
+)
 from personal_agent_memory.entity_graph import (
     DETAIL_DEFAULT_LIMIT,
     DETAIL_MAX_LIMIT,
@@ -974,15 +978,12 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
                 requested_budget=request.token_budget,
                 target_model=request.target_model,
             )
-            for key in (
-                "entity_graph_status",
-                "query_subgraph",
-                "query_subgraphs",
-                "no_mapped_entities",
-            ):
-                if key in raw:
-                    package[key] = raw[key]
-            return package
+            return attach_diagnostics(
+                package,
+                raw,
+                requested_budget=request.token_budget,
+                target_model=request.target_model,
+            )
         except RegionError as error:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)

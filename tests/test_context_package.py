@@ -708,3 +708,22 @@ def test_cross_region_default_budget_supports_twenty_degraded_regions() -> None:
     assert cross["source_structure_used_tokens"] <= 1_000
     assert cross["graph_used_tokens"] == 0
     assert package["budget"]["used_tokens"] <= 10_000
+
+
+def test_context_package_keeps_result_whose_metadata_exceeds_its_share() -> None:
+    heavy = result("needle evidence")
+    heavy["user_metadata"] = {"provenance": "x" * 4_000}
+
+    package = build_context_package(
+        raw([heavy]),
+        requested_budget=4_000,
+        target_model="gpt-4o-mini",
+    )
+
+    assert package["results"]
+    assert package["results"][0]["metadata_truncated"] is True
+    assert package["results"][0]["content"] == "needle evidence"
+    assert package["degraded"] is True
+    assert "result_metadata_trimmed" in package["degradation"]
+    assert "provenance" not in json.dumps(package["results"][0], ensure_ascii=False)
+    assert_conservative_telemetry(package, TokenCounter.for_model("gpt-4o-mini"))
