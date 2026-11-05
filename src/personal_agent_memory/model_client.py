@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Chat-completion calls run inside background evolve jobs, never in the capture
+# or recall hot path.  They routinely need several seconds, so they must not
+# inherit the short embedding-style timeout.
+_BACKGROUND_LLM_COMPONENTS = frozenset({"graph"})
+_LLM_TIMEOUT_SECONDS = 30.0
+
 
 class ModelServiceError(RuntimeError):
     """A bounded model request failed without exposing request credentials."""
@@ -79,6 +85,35 @@ class ModelTaskProfile:
 
 DEFAULT_GRAPH_TASK_PROFILE = ModelTaskProfile(max_tokens=4096)
 DEFAULT_CANDIDATE_TASK_PROFILE = ModelTaskProfile(max_tokens=2048)
+
+
+SEMANTIC_DISTILLATION_SYSTEM_PROMPT = (
+    "semantic-distillation-v1: return JSON object {\"memories\": [...]}. "
+    "Return zero memories for questions, greetings, one-off task requests, temporary "
+    "plans, one-off outputs, hidden reasoning, tool output, assistant-only inference, or "
+    "content without durable user value. "
+    "Standing-rule exception: a short imperative message still carries durable value when "
+    "it states a rule that governs future work. Treat standing markers (以后, 今后, 一律, "
+    "统一, 每次, 永远, 始终, 默认, 从现在起, from now on, always, never) and bare "
+    "prohibitions (不要, 不用, 别, 禁止, 不得, must not) as durable constraints even when "
+    "the wording is imperative. Phrase such content as a self-contained general rule, not "
+    "as a command: for evidence \"不用走代理\" write \"外部网络访问不使用代理\" instead of "
+    "\"不要走代理\". One-off task commands without a standing marker (for example 全部提交, "
+    "帮我修复, 继续, 提交) are not memories. "
+    "Each memory must be one atomic, self-contained claim that remains understandable "
+    "without the conversation. Never use dialogue references such as above, earlier, just "
+    "now, previous message, 上面, 刚才, 前述, or 上一条. memory_type must be one of decision, "
+    "constraint, preference, domain_fact, reusable_experience, or external_reference. "
+    "confidence must be a number from 0 to 1 and must be at least 0.90. region_hint must "
+    "be source, user, or one topic_id from region_hints. user_event_id must identify a "
+    "supplied user message. evidence_snippet must be an exact contiguous excerpt from that "
+    "user message. The assistant message may provide context but is never user evidence. "
+    "Include claim_subject and claim_value for checkable claims so conflicts can be "
+    "detected. Each result must use content for the complete atomic memory text. durability "
+    "is required for every result: use durable_statement only for stable knowledge, or "
+    "temporary_plan for transient execution plans. Omit the result when durability is not "
+    "clear. Do not publish scheduled or in-progress actions as durable statements."
+)
 
 
 class OpenAICompatibleClient:
@@ -226,29 +261,7 @@ class OpenAICompatibleClient:
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "semantic-distillation-v1: return JSON object {\"memories\": [...]}. "
-                            "Return zero memories for questions, greetings, imperatives, "
-                            "temporary plans, one-off outputs, hidden reasoning, tool output, "
-                            "assistant-only inference, or content without durable user value. "
-                            "Each memory must be one atomic, self-contained claim that remains "
-                            "understandable without the conversation. Never use dialogue "
-                            "references such as above, earlier, just now, previous message, "
-                            "上面, 刚才, 前述, or 上一条. memory_type must be one of decision, "
-                            "constraint, preference, domain_fact, reusable_experience, or "
-                            "external_reference. confidence must be a number from 0 to 1 and "
-                            "must be at least 0.90. region_hint must be source, user, or one "
-                            "topic_id from region_hints. user_event_id must identify a supplied "
-                            "user message. evidence_snippet must be an exact contiguous excerpt "
-                            "from that user message. The assistant message may provide context "
-                            "but is never user evidence. Include claim_subject and claim_value "
-                            "for checkable claims so conflicts can be detected. Each result must "
-                            "use content for the complete atomic memory text. durability is "
-                            "required for every result: use durable_statement only for stable "
-                            "knowledge, or temporary_plan for transient execution plans. Omit "
-                            "the result when durability is not clear. Do not publish scheduled "
-                            "or in-progress actions as durable statements."
-                        ),
+                        "content": SEMANTIC_DISTILLATION_SYSTEM_PROMPT,
                     },
                     {
                         "role": "user",
@@ -352,8 +365,13 @@ class OpenAICompatibleClient:
         path: str,
         payload: dict[str, object],
     ) -> dict[str, Any]:
+        timeout_seconds = (
+            max(endpoint.timeout_seconds, _LLM_TIMEOUT_SECONDS)
+            if component in _BACKGROUND_LLM_COMPONENTS
+            else endpoint.timeout_seconds
+        )
         limit = self._limits[component]
-        if not limit.acquire(timeout=endpoint.timeout_seconds):
+        if not limit.acquire(timeout=timeout_seconds):
             raise ModelServiceError(f"{component} concurrency limit timed out")
         try:
             headers = {"Content-Type": "application/json"}
@@ -375,7 +393,7 @@ class OpenAICompatibleClient:
                 )
                 try:
                     with urllib.request.urlopen(
-                        request, timeout=endpoint.timeout_seconds
+                        request, timeout=timeout_seconds
                     ) as response:
                         raw = response.read(4 * 1024 * 1024 + 1)
                     if len(raw) > 4 * 1024 * 1024:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,9 +21,11 @@ from personal_agent_memory.model_client import (
 class _ModelContractHandler(BaseHTTPRequestHandler):
     requests: list[tuple[str, dict[str, Any]]] = []
     semantic_content: str | None = None
+    delay = 0.0
     lock = threading.Lock()
 
     def do_POST(self) -> None:  # noqa: N802
+        time.sleep(type(self).delay)
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length))
         with type(self).lock:
@@ -94,6 +97,7 @@ def _model_contract_server() -> Iterator[tuple[str, type[_ModelContractHandler]]
     handler = _ModelContractHandler
     handler.requests = []
     handler.semantic_content = None
+    handler.delay = 0.0
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -131,6 +135,9 @@ def test_extraction_tasks_send_deterministic_profiles_with_bounded_output() -> N
         assert semantic["max_tokens"] == 2048
         assert "top_k" not in semantic
         assert "durability" in json.dumps(semantic["messages"], ensure_ascii=False)
+        system_prompt = json.dumps(semantic["messages"], ensure_ascii=False)
+        assert "Standing-rule exception" in system_prompt
+        assert "不用走代理" in system_prompt
 
 
 def test_embedding_and_reranking_payloads_have_no_generation_parameters() -> None:
@@ -209,3 +216,28 @@ def test_semantic_distillation_rejects_invalid_json() -> None:
 
         with pytest.raises(ModelServiceError, match="malformed JSON"):
             client.extract_semantic_memories({"messages": [{"role": "user", "content": "x"}]})
+
+
+def test_background_llm_calls_outlive_the_hot_path_timeout() -> None:
+    """Semantic distillation runs in an evolve job; a 2 s budget rejects real models."""
+    with _model_contract_server() as (base_url, handler):
+        handler.delay = 0.8
+        client = OpenAICompatibleClient(
+            ModelEndpoint(base_url, "embedding-test", timeout_seconds=0.2),
+            None,
+            ModelEndpoint(base_url, "graph-test", timeout_seconds=0.2),
+        )
+        memories = client.extract_semantic_memories({"messages": []})
+    assert memories == []
+
+
+def test_hot_path_components_still_use_the_short_timeout() -> None:
+    with _model_contract_server() as (base_url, handler):
+        handler.delay = 0.8
+        client = OpenAICompatibleClient(
+            ModelEndpoint(base_url, "embedding-test", timeout_seconds=0.2),
+            None,
+            ModelEndpoint(base_url, "graph-test", timeout_seconds=0.2),
+        )
+        with pytest.raises(ModelServiceError):
+            client.embed(["slow embedding"])

@@ -562,6 +562,7 @@ def test_validation_rejects_invalid_semantic_results(tmp_path: Path) -> None:
             turn_id="validation-turn",
         )
         assert round_payload["semantic_status"] == "skipped"
+        assert round_payload["distillation_status"] == "skipped"
         assert round_payload["semantic_memory_ids"] == []
         diagnostics = round_payload["semantic_diagnostics"]
         assert isinstance(diagnostics, list) and len(diagnostics) == 9
@@ -6845,3 +6846,102 @@ def test_final_validation_round_twenty_regressions(tmp_path: Path) -> None:
             )
             assert round_payload["semantic_status"] == "skipped", round_payload
             assert _formal_memories(client, headers, "semantic-project") == []
+
+
+def test_standing_imperative_becomes_a_declarative_constraint_memory(tmp_path: Path) -> None:
+    """A terse standing rule ("不用走代理") must be publishable as a general rule."""
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    executor = ManualSemanticExecutor()
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        messages = context["messages"]
+        assert isinstance(messages, list)
+        user = next(item for item in messages if item["role"] == "user")
+        return [
+            _memory(
+                content="外部网络访问不使用代理",
+                memory_type="constraint",
+                evidence="不用走代理",
+                event_id=str(user["event_id"]),
+                subject="外部网络访问",
+                value="不使用代理",
+            )
+        ]
+
+    with TestClient(_app(state_dir, extractor, executor)) as client:
+        headers = _headers(state_dir)
+        _prepare_project(client, headers, root)
+        _capture_turn(
+            client,
+            headers,
+            session_id="proxy-session",
+            turn_id="proxy-turn",
+            user_content="不用走代理",
+            assistant_content="好的，已改为直连。",
+            cwd=root,
+        )
+        executor.drain()
+        round_payload = _round(
+            client,
+            headers,
+            region_id="semantic-project",
+            session_id="proxy-session",
+            turn_id="proxy-turn",
+        )
+        assert round_payload["semantic_status"] == "completed", round_payload.get(
+            "semantic_diagnostics"
+        )
+        assert len(round_payload["semantic_memory_ids"]) == 1
+        memories = _formal_memories(client, headers, "semantic-project")
+        assert [item.get("content") or item.get("summary") for item in memories] == [
+            "外部网络访问不使用代理"
+        ]
+
+
+def test_one_off_imperative_with_a_one_off_marker_is_not_a_standing_rule(
+    tmp_path: Path,
+) -> None:
+    """"这次不要提交" is a one-off instruction, not a durable constraint."""
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    executor = ManualSemanticExecutor()
+
+    def extractor(context: dict[str, object]) -> list[dict[str, object]]:
+        messages = context["messages"]
+        assert isinstance(messages, list)
+        user = next(item for item in messages if item["role"] == "user")
+        return [
+            _memory(
+                content="代码变更不提交",
+                memory_type="constraint",
+                evidence="不要提交",
+                event_id=str(user["event_id"]),
+                subject="代码变更",
+                value="不提交",
+            )
+        ]
+
+    with TestClient(_app(state_dir, extractor, executor)) as client:
+        headers = _headers(state_dir)
+        _prepare_project(client, headers, root)
+        _capture_turn(
+            client,
+            headers,
+            session_id="oneoff-session",
+            turn_id="oneoff-turn",
+            user_content="这次不要提交",
+            assistant_content="明白，本轮不提交。",
+            cwd=root,
+        )
+        executor.drain()
+        round_payload = _round(
+            client,
+            headers,
+            region_id="semantic-project",
+            session_id="oneoff-session",
+            turn_id="oneoff-turn",
+        )
+        assert round_payload["semantic_status"] == "skipped"
+        assert round_payload["semantic_memory_ids"] == []
+        assert _formal_memories(client, headers, "semantic-project") == []

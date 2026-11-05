@@ -648,6 +648,22 @@ _SEMANTIC_NON_DURABLE_INTENT = re.compile(
     r"尚未(?:选择|决定)",
     re.IGNORECASE,
 )
+_SEMANTIC_STANDING_RULE = re.compile(
+    r"(以后|今后|一律|统一|每次|永远|始终|默认|从今|"
+    r"不要|不用|别用|禁止|不得|from now on|always|never|must not)",
+    re.IGNORECASE,
+)
+_SEMANTIC_ONEOFF_INSTRUCTION = re.compile(r"(这次|本次|这一轮|本轮|现在|暂时)")
+_SEMANTIC_CONSTRAINT_TYPES = frozenset({"constraint", "preference"})
+
+
+def _semantic_standing_rule(evidence_clause: str) -> bool:
+    """True when an imperative clause states a rule for future work, not a one-off ask."""
+    if _SEMANTIC_ONEOFF_INSTRUCTION.search(evidence_clause):
+        return False
+    return bool(_SEMANTIC_STANDING_RULE.search(evidence_clause))
+
+
 _SEMANTIC_IMPERATIVE = re.compile(
     r"^(?:deploy|run|build|test|apply|restart|migrate|install|update|remove|"
     r"delete|create|configure|enable|disable|use(?!\s+of\b)|prefer|choose|adopt|"
@@ -7095,11 +7111,15 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             _normalize_promotion_text(raw_subject)
             and _normalize_promotion_claim_value(raw_value)
         )
+        allow_paraphrase = memory_type in _SEMANTIC_CONSTRAINT_TYPES and (
+            _semantic_standing_rule(evidence_clause)
+        )
         if not _semantic_evidence_supports_content(
             content,
             evidence_snippet,
             claim_value=raw_value if claims_explicit else "",
             context=evidence_clause,
+            allow_paraphrase=allow_paraphrase,
         ):
             return None, "evidence_snippet does not support the semantic content"
         project_scoped = bool(_SEMANTIC_PROJECT_SCOPE.search(content))
@@ -10763,6 +10783,15 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             else:
                 distillation_status = "pending_distillation"
                 legacy_status = "pending"
+            if (
+                complete
+                and record is not None
+                and record["semantic_status"] == "skipped"
+                and distillation_status == "pending_distillation"
+            ):
+                # A skipped semantic record is terminal: report it instead of
+                # leaving the round looking like it still waits for work.
+                distillation_status = "skipped"
             round_payload["status"] = legacy_status
             round_payload["distillation_status"] = distillation_status
             round_payload["last_error"] = last_error
@@ -12694,6 +12723,7 @@ def _semantic_evidence_supports_content(
     *,
     claim_value: str = "",
     context: str = "",
+    allow_paraphrase: bool = False,
 ) -> bool:
     normalized_evidence = _normalize_semantic_support_text(evidence)
     terms = _semantic_support_terms(content)
@@ -12707,18 +12737,20 @@ def _semantic_evidence_supports_content(
     semantic_terms = terms - numeric_terms
     if semantic_terms and not any(term in normalized_evidence for term in semantic_terms):
         return False
-    value_terms = _semantic_support_terms(
-        re.sub(r"\bwithout\b.*$", "", claim_value, flags=re.IGNORECASE)
-    ) & terms
-    if any(term not in normalized_evidence for term in value_terms):
-        return False
-    content_prepositions = _semantic_preposition_terms(content)
-    evidence_prepositions = _semantic_preposition_terms(evidence)
-    if not set(content_prepositions) <= set(evidence_prepositions):
-        return False
-    for preposition, phrase_terms in content_prepositions.items():
-        evidence_terms = evidence_prepositions.get(preposition, set())
-        if not phrase_terms <= evidence_terms:
+    if not allow_paraphrase:
+        value_terms = _semantic_support_terms(
+            re.sub(r"\bwithout\b.*$", "", claim_value, flags=re.IGNORECASE)
+        ) & terms
+        if any(term not in normalized_evidence for term in value_terms):
+            return False
+        content_prepositions = _semantic_preposition_terms(content)
+        evidence_prepositions = _semantic_preposition_terms(evidence)
+        if set(content_prepositions) <= set(evidence_prepositions):
+            for preposition, phrase_terms in content_prepositions.items():
+                evidence_terms = evidence_prepositions.get(preposition, set())
+                if not phrase_terms <= evidence_terms:
+                    return False
+        else:
             return False
     content_terms_without_inference = _semantic_support_terms(
         re.sub(r"\bwithout\b.*$", "", content, flags=re.IGNORECASE)
