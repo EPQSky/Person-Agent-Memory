@@ -6945,3 +6945,46 @@ def test_one_off_imperative_with_a_one_off_marker_is_not_a_standing_rule(
         assert round_payload["semantic_status"] == "skipped"
         assert round_payload["semantic_memory_ids"] == []
         assert _formal_memories(client, headers, "semantic-project") == []
+
+
+def test_session_scoped_durable_memory_is_retargeted_to_a_durable_region(
+    tmp_path: Path,
+) -> None:
+    """A published memory parked in a session region can never be recalled."""
+    from personal_agent_memory.regions import MemoryRegion
+
+    state_dir = tmp_path / "state"
+    root = tmp_path / "project"
+    executor = ManualSemanticExecutor()
+    with TestClient(_app(state_dir, lambda context: [], executor)) as client:
+        headers = _headers(state_dir)
+        _prepare_project(client, headers, root)
+        kernel = client.app.state.memory_kernel
+        session_region = MemoryRegion(
+            region_id="session-ephemeral",
+            kind="session",
+            name="session",
+            space="chat",
+            session_id="session-1",
+        )
+
+        durable = kernel._durable_region_for_cwd(str(root))
+        assert durable is not None
+        assert durable.region_id == "semantic-project"
+
+        target, reason = kernel._semantic_target_region(
+            "source",
+            session_region,
+            memory_type="constraint",
+            durable_region=durable,
+        )
+        assert target.region_id == "semantic-project"
+        assert "ephemeral session" in reason
+
+        fallback, _ = kernel._semantic_target_region(
+            "source",
+            session_region,
+            memory_type="constraint",
+            durable_region=None,
+        )
+        assert fallback.kind == "user"

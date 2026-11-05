@@ -6787,6 +6787,14 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 raw_result,
                 source_region=source_region,
                 user_units=user_units,
+                source_cwd=next(
+                    (
+                        _metadata_text(unit, "cwd")
+                        for unit in reversed(units)
+                        if _metadata_text(unit, "cwd")
+                    ),
+                    "",
+                ),
             )
             if validated is None:
                 if "sensitive-content" in reason:
@@ -6982,6 +6990,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                         "evidence_snippets": [evidence_snippet],
                         "claim_subject": subject,
                         "claim_value": value,
+                        # Keep the workspace context so later promotion can map this
+                        # durable memory back to a project region.
+                        **({"cwd": validated["source_cwd"]} if validated["source_cwd"] else {}),
                         **(
                             {"target_fallback_reason": validated["target_fallback_reason"]}
                             if validated["target_fallback_reason"]
@@ -7069,6 +7080,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         *,
         source_region: MemoryRegion,
         user_units: list[MemoryUnit],
+        source_cwd: str = "",
     ) -> tuple[_SemanticValidation | None, str]:
         if not isinstance(raw_result, Mapping):
             return None, "semantic result must be an object"
@@ -7182,7 +7194,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             and _SEMANTIC_USER_SCOPE_PREFIX.search(content)
         ):
             project_scoped = False
-        if project_scoped and region_hint not in {"", "source", source_region.region_id}:
+        if (
+            project_scoped
+            and source_region.kind != "session"
+            and region_hint not in {"", "source", source_region.region_id}
+        ):
             target_region = source_region
             target_fallback_reason = (
                 "project-scoped content was retained in the source region instead of "
@@ -7193,6 +7209,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 region_hint,
                 source_region,
                 memory_type=memory_type,
+                durable_region=self._durable_region_for_cwd(source_cwd),
             )
         claim_subject, claim_value = _semantic_claim_fields(
             raw_subject,
@@ -7216,9 +7233,23 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "claims_explicit": claims_explicit,
                 "durability": durability,
                 "target_fallback_reason": target_fallback_reason,
+                "source_cwd": source_cwd,
             },
             "",
         )
+
+    def _durable_region_for_cwd(self, cwd: str) -> MemoryRegion | None:
+        """Resolve the durable region a session-scoped memory belongs to."""
+        if not cwd:
+            return None
+        try:
+            resolved = self._regions.resolve(cwd)
+        except RegionBindingError:
+            return None
+        if resolved is None:
+            return None
+        region = resolved.region
+        return region if region.kind in {"project", "topic"} else None
 
     def _semantic_target_region(
         self,
@@ -7226,7 +7257,22 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         source_region: MemoryRegion,
         *,
         memory_type: str,
+        durable_region: MemoryRegion | None = None,
     ) -> tuple[MemoryRegion, str]:
+        if source_region.kind == "session" and region_hint in {
+            "",
+            "source",
+            source_region.region_id,
+        }:
+            # A published memory is durable by definition; an ephemeral session
+            # region is reachable by no search path, so parking it there would
+            # make it permanently unrecallable.
+            target = durable_region or self._regions.ensure_user_region()
+            return (
+                target,
+                "durable memory cannot live in ephemeral session region "
+                f"{source_region.region_id}; retargeted to {target.region_id}",
+            )
         if not region_hint:
             return source_region, "region_hint was missing; retained in the source region"
         if region_hint in {"source", source_region.region_id}:
@@ -9025,6 +9071,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         target: MemoryRegion | None
         if category == "user":
             target = self._regions.ensure_user_region()
+        elif category == "project":
+            # Session-scoped units carry a cwd; resolve it to the durable project
+            # region so project knowledge leaves the ephemeral session scope.
+            target = self._durable_region_for_cwd(_metadata_text(candidate["unit"], "cwd"))
+            if target is None or target.kind != "project":
+                return None
         elif category == "topic":
             topic_id = str(decision.get("topic_id") or "")
             target = next(
