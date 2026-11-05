@@ -526,3 +526,107 @@ def test_compaction_hooks_refresh_then_restore_bounded_recall(tmp_path: Path) ->
     output = json.loads(after.stdout)
     assert output["hookSpecificOutput"]["hookEventName"] == "SessionStart"
     assert "Project fact" in output["hookSpecificOutput"]["additionalContext"]
+
+
+class CaptureHandler(BaseHTTPRequestHandler):
+    failing_event_ids: set[str] = set()
+    delay = 0.0
+    seen: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802
+        time.sleep(self.delay)
+        size = int(self.headers.get("content-length", "0"))
+        body = json.loads(self.rfile.read(size))
+        event_id = str(body.get("event_id"))
+        type(self).seen.append(event_id)
+        status = 503 if event_id in type(self).failing_event_ids else 202
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        with suppress(BrokenPipeError):
+            self.wfile.write(b'{"status": "accepted"}')
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+@contextmanager
+def capture_server(*, delay: float = 0.0) -> Iterator[str]:
+    CaptureHandler.delay = delay
+    CaptureHandler.failing_event_ids = set()
+    CaptureHandler.seen = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def run_capture(
+    event: dict[str, object],
+    *,
+    url: str,
+    plugin_data: Path,
+    timeout_ms: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = {
+        **os.environ,
+        "PERSONAL_AGENT_MEMORY_URL": url,
+        "PERSONAL_AGENT_MEMORY_API_KEY": "ticket11-secret-key",
+        "PLUGIN_DATA": str(plugin_data),
+    }
+    environment.pop("PERSONAL_AGENT_MEMORY_SPOOL_DIR", None)
+    environment.pop("PERSONAL_AGENT_MEMORY_TIMEOUT_MS", None)
+    if timeout_ms is not None:
+        environment["PERSONAL_AGENT_MEMORY_TIMEOUT_MS"] = str(timeout_ms)
+    return subprocess.run(
+        ["node", str(PLUGIN / "scripts" / "capture.mjs")],
+        input=json.dumps(event),
+        text=True,
+        capture_output=True,
+        timeout=10,
+        env=environment,
+        check=False,
+    )
+
+
+def test_capture_default_timeout_covers_a_slow_but_healthy_daemon(tmp_path: Path) -> None:
+    """A 500 ms client budget used to abandon commits the daemon had accepted."""
+    plugin_data = tmp_path / "plugin-data"
+    with capture_server(delay=0.7) as url:
+        result = run_capture(user_event(), url=url, plugin_data=plugin_data)
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert not list((plugin_data / "capture" / "spool").glob("event-*.json"))
+
+
+def test_spool_replay_does_not_stop_at_a_failing_record(tmp_path: Path) -> None:
+    plugin_data = tmp_path / "plugin-data"
+    spool = plugin_data / "capture" / "spool"
+    spool.mkdir(parents=True)
+    base = {
+        "session_id": "replay-session",
+        "turn_id": "replay-turn",
+        "event_kind": "user",
+        "occurred_at": "2026-01-01T00:00:00.000Z",
+        "cwd": "/srv/project",
+    }
+    poison = spool / "event-0001.json"
+    healthy = spool / "event-0002.json"
+    poison.write_text(json.dumps({**base, "event_id": "poison", "content": "poison"}))
+    healthy.write_text(json.dumps({**base, "event_id": "healthy", "content": "healthy"}))
+    now = time.time()
+    os.utime(poison, (now - 60, now - 60))
+    os.utime(healthy, (now - 30, now - 30))
+
+    with capture_server() as url:
+        CaptureHandler.failing_event_ids = {"poison"}
+        result = run_capture(user_event(), url=url, plugin_data=plugin_data)
+
+    assert result.returncode == 0
+    assert not healthy.exists(), "a failing record must not block the queue"
+    assert poison.exists(), "a transiently failing record is kept for retry"

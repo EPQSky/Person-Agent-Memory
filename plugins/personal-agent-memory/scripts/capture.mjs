@@ -292,7 +292,7 @@ async function pruneState(deadline) {
 function requestTimeout() {
   return Math.min(
     2000,
-    Math.max(100, Number.parseInt(process.env.PERSONAL_AGENT_MEMORY_TIMEOUT_MS ?? "500", 10) || 500),
+    Math.max(100, Number.parseInt(process.env.PERSONAL_AGENT_MEMORY_TIMEOUT_MS ?? "1200", 10) || 1200),
   );
 }
 
@@ -323,7 +323,7 @@ async function spoolDirectories() {
   await mkdir(quarantine, { recursive: true, mode: 0o700 });
   const writers = join(root, "writers");
   await mkdir(writers, { recursive: true, mode: 0o700 });
-  return { spool, quarantine, writers };
+  return { root, spool, quarantine, writers };
 }
 
 async function acquireWriterSlot(directories, deadline) {
@@ -499,6 +499,36 @@ function validCapture(event) {
   );
 }
 
+function replayCursorPath(directories) {
+  return join(directories.root, "cursors", "spool.json");
+}
+
+async function readReplayCursor(directories) {
+  try {
+    const raw = JSON.parse(await readFile(replayCursorPath(directories), "utf8"));
+    return typeof raw?.last_attempted === "string" ? raw.last_attempted : "";
+  } catch {
+    return "";
+  }
+}
+
+async function writeReplayCursor(directories, name) {
+  await mkdir(join(directories.root, "cursors"), { recursive: true, mode: 0o700 });
+  await writeFile(replayCursorPath(directories), JSON.stringify({ last_attempted: name }), {
+    encoding: "utf8",
+    mode: 0o600,
+  }).catch(() => {});
+}
+
+function rotateAfter(entries, lastAttempted) {
+  if (!lastAttempted) return entries;
+  const index = entries.findIndex((entry) => entry.name === lastAttempted);
+  if (index < 0 || entries.length < 2) return entries;
+  // Start after the last attempted record so one permanently failing record
+  // can never block the rest of the queue (head-of-line blocking).
+  return [...entries.slice(index + 1), ...entries.slice(0, index + 1)];
+}
+
 async function replay(key, hookDeadline) {
   const directories = await spoolDirectories();
   if (!directories) return;
@@ -507,9 +537,15 @@ async function replay(key, hookDeadline) {
     try {
       await pruneSpool(directories, undefined, deadline);
       let processed = 0;
-      for (const entry of await spoolEntries(directories, deadline)) {
-        if (processed >= REPLAY_RECORD_BUDGET || Date.now() >= deadline) return;
+      let lastAttempted = "";
+      const entries = rotateAfter(
+        await spoolEntries(directories, deadline),
+        await readReplayCursor(directories),
+      );
+      for (const entry of entries) {
+        if (processed >= REPLAY_RECORD_BUDGET || Date.now() >= deadline) break;
         processed += 1;
+        lastAttempted = entry.name;
         let event;
         try {
           if (entry.size > MAX_CONTENT_BYTES + 8192) throw new Error("oversized spool record");
@@ -521,7 +557,7 @@ async function replay(key, hookDeadline) {
         }
         try {
           const remaining = deadline - Date.now();
-          if (remaining <= 0) return;
+          if (remaining <= 0) break;
           const result = await request("/api/v1/capture/events", event, key, remaining);
           if (result === "accepted") {
             await unlink(entry.path).catch(() => {});
@@ -531,11 +567,12 @@ async function replay(key, hookDeadline) {
             await rename(entry.path, join(directories.quarantine, entry.name)).catch(() => {});
             continue;
           }
-          return;
+          // Transient failure: keep scanning instead of aborting the queue.
         } catch {
-          return;
+          // Network failure is transient as well; never stop the whole queue.
         }
       }
+      if (lastAttempted) await writeReplayCursor(directories, lastAttempted);
     } finally {
       if (Date.now() < deadline) await pruneSpool(directories, undefined, deadline);
     }
