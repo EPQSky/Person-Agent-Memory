@@ -451,6 +451,30 @@ class MilvusLiteVectorStore(_JiuwenMilvusVectorStore):  # type: ignore[misc]
         with wrap_backend("milvus vector update"):
             super().update(scope, records)
 
+    def existing_ids(self, scope: Scope, ids: list[str]) -> set[str]:
+        """Return the logical ids that already have a row in ``scope``.
+
+        Only the ``logical_id`` field is fetched, so index drift probes do not
+        pay for transferring the full vectors.
+        """
+        if not ids:
+            return set()
+        values = ", ".join(_literal(_physical_id(scope, item)) for item in ids)
+        filter_expression = f"id in [{values}]"
+        scope_filter = _scope_expression(scope)
+        if scope_filter:
+            filter_expression = f"{filter_expression} && {scope_filter}"
+        try:
+            rows = self.client.query(
+                self._collection,
+                filter=filter_expression,
+                output_fields=["logical_id"],
+                consistency_level=self._consistency,
+            )
+        except Exception as exc:
+            raise BackendError(f"milvus vector existing-ids: {exc}") from exc
+        return {str(row["logical_id"]) for row in rows}
+
     def close(self) -> None:
         with self._state_lock:
             self._collection_ready = False

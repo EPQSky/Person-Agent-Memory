@@ -7,6 +7,7 @@ import base64
 import difflib
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -43,9 +44,10 @@ from jiuwen_memory.common.type_def import (
     FilterGroup,
     FilterLogic,
     FilterOp,
+    LifecycleState,
     memory_key,
 )
-from jiuwen_memory.common.type_def.memory_codec import dumps
+from jiuwen_memory.common.type_def.memory_codec import dumps, loads
 from jiuwen_memory.construction import EvolveMode
 from jiuwen_memory.control import (
     DeleteMode,
@@ -58,7 +60,7 @@ from jiuwen_memory.storage import FulltextStore, GraphStore, VectorStore
 from jiuwen_memory.storage.fulltext import FulltextProducer
 from jiuwen_memory.storage.graph import GraphProducer
 from jiuwen_memory.storage.kv import load_units
-from jiuwen_memory.storage.types import ScoredID, TextQuery
+from jiuwen_memory.storage.types import IndexWriteMode, ScoredID, TextQuery
 from jiuwen_memory.storage.vector import VectorProducer
 
 from personal_agent_memory.config import MemoryKernelKind
@@ -134,6 +136,8 @@ from personal_agent_memory.storage import (
     SQLiteKVStore,
 )
 
+logger = logging.getLogger(__name__)
+
 _STORE_TARGET = "personal-agent-memory-local"
 _AUDIT_TARGET = "personal-agent-memory-sqlite"
 _EMBEDDER_TARGET = "personal-agent-memory-openai"
@@ -144,6 +148,13 @@ _PROMOTION_MIGRATION_BATCH_SIZE = 100
 _PROMOTION_RECOVERY_BATCH_SIZE = 100
 _BROWSER_INDEX_RETRY_BATCH_SIZE = 100
 _BROWSER_INDEX_RETRY_MAX = 1_000
+_INDEX_RECOVERY_BATCH_SIZE = 16
+_INDEX_RECOVERY_PROBE_BATCH_SIZE = 512
+_INDEX_RECOVERY_INTERVAL_SECONDS = 600.0
+_INDEX_RECOVERY_MAX_ATTEMPTS = 5
+_VECTOR_MAIN_COLLECTION = "agent_memory_vectors"
+_MEMORY_KEY_PREFIX = "/memory/"
+_MEMORY_CHUNK_PREFIX = "/index/chunks/"
 _LINEAGE_MIGRATION_BATCH_SIZE = 100
 PromotionClassifier = Callable[[str, Mapping[str, object]], Mapping[str, object]]
 SemanticExtractor = Callable[[dict[str, object]], list[dict[str, object]]]
@@ -987,6 +998,92 @@ class _SensitiveFilteringEvolver:
         return self._delegate.evolve(units, mode)
 
 
+def _main_vector_store(bundle: _RuntimeBundle) -> VectorStore | None:
+    """Return the primary (L2 content) vector store of the runtime bundle."""
+    return next(
+        (
+            store
+            for store in bundle.stores
+            if isinstance(store, VectorStore)
+            and getattr(store, "_collection", "") == _VECTOR_MAIN_COLLECTION
+        ),
+        None,
+    )
+
+
+def _decode_index_ids(raw: bytes) -> list[str]:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _group_units_by_index(
+    engine: object, units: list[MemoryUnit]
+) -> list[tuple[object, list[MemoryUnit]]]:
+    groups: dict[int, tuple[object, list[MemoryUnit]]] = {}
+    for unit in units:
+        resolver = getattr(engine, "_index_for_unit", None)
+        builder = resolver(unit) if callable(resolver) else getattr(engine, "_index", None)
+        if builder is None:
+            continue
+        marker = id(builder)
+        if marker not in groups:
+            groups[marker] = (builder, [])
+        groups[marker][1].append(unit)
+    return list(groups.values())
+
+
+def _unindexed_units(
+    bundle: _RuntimeBundle, vector_store: VectorStore
+) -> list[MemoryUnit]:
+    """Return active units whose vector rows are absent from the store."""
+    missing: list[MemoryUnit] = []
+    for scope in bundle.kv_store.scopes():
+        units: list[MemoryUnit] = []
+        for _, raw in bundle.kv_store.scan(scope, prefix=_MEMORY_KEY_PREFIX):
+            unit = loads(raw)
+            if unit is None or unit.lifecycle is not LifecycleState.ACTIVE:
+                continue
+            units.append(unit)
+        if not units:
+            continue
+        tracked: dict[str, list[str]] = {}
+        requested: list[str] = []
+        for unit in units:
+            try:
+                raw_ids = bundle.kv_store.get(scope, f"{_MEMORY_CHUNK_PREFIX}{unit.id}")
+            except Exception:
+                chunk_ids: list[str] = []
+            else:
+                chunk_ids = _decode_index_ids(raw_ids)
+            if not chunk_ids:
+                chunk_ids = [f"{unit.id}-0"]
+            tracked[unit.id] = chunk_ids
+            requested.extend(chunk_ids)
+        found: set[str] = set()
+        probe_failed = False
+        existing_ids = getattr(vector_store, "existing_ids", None)
+        for start in range(0, len(requested), _INDEX_RECOVERY_PROBE_BATCH_SIZE):
+            probe = requested[start : start + _INDEX_RECOVERY_PROBE_BATCH_SIZE]
+            try:
+                if callable(existing_ids):
+                    found.update(existing_ids(scope, probe))
+                else:
+                    found.update(record.id for record in vector_store.get(scope, probe))
+            except Exception as error:
+                logger.warning("memory index recovery: vector probe failed: %s", error)
+                probe_failed = True
+                break
+        if probe_failed:
+            continue
+        missing.extend(unit for unit in units if not set(tracked[unit.id]) & found)
+    return missing
+
+
 _GRAPH_STATUS_CACHE_SECONDS = 60.0
 
 
@@ -1054,6 +1151,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._lock = threading.RLock()
         self._maintenance_lock = threading.RLock()
         self._browser_index_lock = threading.RLock()
+        self._index_recovery_lock = threading.RLock()
+        self._index_recovery_thread: threading.Thread | None = None
+        self._index_recovery_stop = threading.Event()
+        self._index_recovery_attempts: dict[str, int] = {}
         self._graph_write_lock = threading.RLock()
         self._graph_status_cache_seconds = graph_status_cache_seconds
         self._graph_status_cache: dict[str, object] | None = None
@@ -1135,6 +1236,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 self._recover_promotion_outbox(bundle)
                 self._recover_semantic_distillations()
                 self._schedule_entity_graph_recovery()
+                self._index_recovery_stop.clear()
+                self._schedule_index_recovery()
             except Exception as error:
                 self._promotion_schema_ready = False
                 self._bundle = None
@@ -1219,6 +1322,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         await asyncio.to_thread(self._close)
 
     def _close(self) -> None:
+        self._index_recovery_stop.set()
         self._wait_for_semantic_tasks()
         self._wait_for_promotion_threads()
         self._wait_for_scope_graph_updates()
@@ -1541,6 +1645,113 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             )
             self._entity_graph_threads[region_id] = thread
         thread.start()
+
+    def _schedule_index_recovery(self) -> None:
+        """Rebuild search-index rows for active units that lost them.
+
+        The KV store is the source of truth for memory units, but recall reads
+        the vector and fulltext collections.  A hard shutdown or a damaged
+        Milvus segment can therefore leave an active unit that is stored yet
+        unreachable.  Recovery re-embeds only the affected units, so the cost
+        follows the damage instead of the library size.
+        """
+        if not self._vector_enabled:
+            return
+        with self._index_recovery_lock:
+            if (
+                self._index_recovery_thread is not None
+                and self._index_recovery_thread.is_alive()
+            ):
+                return
+            thread = threading.Thread(
+                target=self._recover_missing_index,
+                name="memory-index-recovery",
+                daemon=True,
+            )
+            self._index_recovery_thread = thread
+        thread.start()
+
+    def _recover_missing_index(self) -> None:
+        try:
+            while True:
+                bundle = self._bundle
+                if bundle is None:
+                    return
+                try:
+                    repaired, remaining = self._repair_missing_index(bundle)
+                except Exception as error:
+                    logger.warning("memory index recovery failed: %s", error)
+                else:
+                    if repaired or remaining:
+                        logger.info(
+                            "memory index recovery: rebuilt %d unit(s), %d still unindexed",
+                            repaired,
+                            remaining,
+                        )
+                if self._index_recovery_stop.wait(_INDEX_RECOVERY_INTERVAL_SECONDS):
+                    return
+                if self._bundle is not bundle:
+                    return
+        finally:
+            with self._index_recovery_lock:
+                if self._index_recovery_thread is threading.current_thread():
+                    self._index_recovery_thread = None
+
+    def _repair_missing_index(self, bundle: _RuntimeBundle) -> tuple[int, int]:
+        vector_store = _main_vector_store(bundle)
+        engine = getattr(bundle.runtime.api, "_engine", None)
+        if vector_store is None or engine is None:
+            return 0, 0
+        missing = _unindexed_units(bundle, vector_store)
+        pending = [
+            unit
+            for unit in missing
+            if self._index_recovery_attempts.get(unit.id, 0) < _INDEX_RECOVERY_MAX_ATTEMPTS
+        ]
+        repaired = 0
+        for start in range(0, len(pending), _INDEX_RECOVERY_BATCH_SIZE):
+            if self._bundle is not bundle:
+                break
+            batch = pending[start : start + _INDEX_RECOVERY_BATCH_SIZE]
+            for builder, group in _group_units_by_index(engine, batch):
+                try:
+                    builder.build(group, mode=IndexWriteMode.RETRIEVAL_ONLY)
+                except Exception as error:
+                    logger.warning(
+                        "memory index recovery: rebuild failed for %d unit(s): %s",
+                        len(group),
+                        error,
+                    )
+                    continue
+                repaired += len(group)
+            self._record_index_recovery_outcome(bundle, vector_store, batch)
+        remaining = len(_unindexed_units(bundle, vector_store))
+        return repaired, remaining
+
+    def _record_index_recovery_outcome(
+        self,
+        bundle: _RuntimeBundle,
+        vector_store: VectorStore,
+        batch: list[MemoryUnit],
+    ) -> None:
+        """Give up on units that stay unindexed after repeated attempts.
+
+        Embedding can fail for reasons that survive a retry, such as an
+        oversized payload.  Exhausted units are skipped until the next restart
+        so a broken unit cannot drive an endless re-embed loop.
+        """
+        still_missing = {unit.id for unit in _unindexed_units(bundle, vector_store)}
+        for unit in batch:
+            if unit.id not in still_missing:
+                continue
+            attempts = self._index_recovery_attempts.get(unit.id, 0) + 1
+            if attempts >= _INDEX_RECOVERY_MAX_ATTEMPTS:
+                logger.warning(
+                    "memory index recovery: giving up on unit %s after %d attempts",
+                    unit.id,
+                    attempts,
+                )
+            self._index_recovery_attempts[unit.id] = attempts
 
     def _schedule_entity_graph_recovery(self) -> None:
         if self._graph_extractor is None:

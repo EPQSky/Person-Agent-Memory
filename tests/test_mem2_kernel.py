@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -23,6 +24,7 @@ from jiuwen_memory.storage.types import (
     VectorRecord,
 )
 from jiuwen_memory.storage.vector import VectorProducer, VectorStore
+from pymilvus import MilvusClient
 
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import Settings
@@ -211,6 +213,34 @@ def _endpoint(tmp_path: Path, base_url: str) -> ModelEndpoint:
         max_concurrency=1,
         retries=0,
     )
+
+
+def _drop_search_index_rows(state_dir: Path) -> None:
+    """Simulate Milvus row loss: keep the KV source of truth, drop index rows."""
+    client = MilvusClient(uri=str(state_dir / "mem2" / "milvus.db"), db_name="default")
+    try:
+        for collection in ("agent_memory_vectors", "agent_memory_fulltext"):
+            client.load_collection(collection)
+            client.delete(collection, filter='id != ""')
+            client.flush(collection)
+    finally:
+        client.close()
+
+
+def _wait_for_results(
+    client: TestClient,
+    headers: dict[str, str],
+    query: str,
+    *,
+    timeout: float = 30.0,
+) -> list[dict[str, object]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        results = _search(client, headers, query)["results"]
+        if results:
+            return list(results)  # type: ignore[arg-type]
+        time.sleep(0.2)
+    return []
 
 
 def _write(
@@ -932,3 +962,40 @@ def test_mem2_model_failure_uses_public_rest_and_mcp_degraded_fallback(
         assert mcp["results"][0]["document_id"] == memory_id
         assert mcp["degraded"] is True
         assert "model_unavailable" in mcp["degradation"]
+
+
+def test_mem2_startup_rebuilds_active_units_whose_index_rows_were_lost(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    with (
+        _embedding_server() as (base_url, _),
+        TestClient(_app(state_dir, embedding=_endpoint(tmp_path, base_url))) as client,
+    ):
+        headers = _headers(state_dir)
+        memory_id = _write(client, headers, "ORACLE-42 deployment rollback", "lost-index")
+        assert _search(client, headers, "ORACLE-42")["results"]
+
+    _drop_search_index_rows(state_dir)
+
+    with (
+        _embedding_server() as (base_url, _),
+        TestClient(_app(state_dir, embedding=_endpoint(tmp_path, base_url))) as client,
+    ):
+        headers = _headers(state_dir)
+        results = _wait_for_results(client, headers, "ORACLE-42")
+
+    assert [item["document_id"] for item in results] == [memory_id]
+
+    probe = MilvusClient(uri=str(state_dir / "mem2" / "milvus.db"), db_name="default")
+    try:
+        probe.load_collection("agent_memory_vectors")
+        rebuilt = probe.query(
+            "agent_memory_vectors",
+            filter=f'logical_id like "{memory_id}%"',
+            output_fields=["logical_id"],
+            limit=5,
+        )
+    finally:
+        probe.close()
+    assert rebuilt
