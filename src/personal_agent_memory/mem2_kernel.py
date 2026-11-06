@@ -14452,7 +14452,7 @@ def _validated_promotion_decision(
         explicit = False
         reason = "sensitive content requires manual review"
     status = "skip"
-    if category in {"user", "topic"}:
+    if category in {"user", "topic", "project"}:
         if not explicit_source or not explicit:
             reason = "promotion requires an explicit source statement"
         elif float(confidence) < 0.9:

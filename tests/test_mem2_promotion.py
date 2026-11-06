@@ -14,7 +14,10 @@ from jiuwen_memory.common.type_def.memory_codec import dumps
 
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import Settings
-from personal_agent_memory.mem2_kernel import Mem2MemoryKernel
+from personal_agent_memory.mem2_kernel import (
+    Mem2MemoryKernel,
+    _validated_promotion_decision,
+)
 from personal_agent_memory.storage.sqlite import SQLiteKVStore
 
 
@@ -2426,3 +2429,32 @@ def test_promotion_reads_evidence_from_another_agent_scope(tmp_path: Path) -> No
 
     assert [unit.id for unit in found] == [evidence.id]
     store.close()
+
+
+def test_project_classification_promotes_only_with_explicit_source() -> None:
+    raw = {
+        "category": "project",
+        "confidence": 0.95,
+        "explicit": True,
+        "claim_subject": "repository:build-tool",
+        "claim_value": "pnpm",
+        "reason": "project fact",
+    }
+
+    promoted = _validated_promotion_decision(
+        raw,
+        content="This repository uses pnpm for builds",
+        explicit_source=True,
+        topic_ids=set(),
+    )
+    assert promoted["status"] == "promote"
+    assert promoted["category"] == "project"
+
+    withheld = _validated_promotion_decision(
+        raw,
+        content="This repository uses pnpm for builds",
+        explicit_source=False,
+        topic_ids=set(),
+    )
+    assert withheld["status"] == "skip"
+    assert withheld["reason"] == "promotion requires an explicit source statement"
