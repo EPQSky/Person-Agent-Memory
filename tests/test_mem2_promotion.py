@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from jiuwen_memory.api import MemoryUnit
 from jiuwen_memory.common.type_def import Scope, memory_key
-from jiuwen_memory.common.type_def.memory_codec import dumps
+from jiuwen_memory.common.type_def.memory_codec import dumps, loads
 
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import Settings
@@ -18,6 +18,7 @@ from personal_agent_memory.mem2_kernel import (
     Mem2MemoryKernel,
     _validated_promotion_decision,
 )
+from personal_agent_memory.regions import MemoryRegion
 from personal_agent_memory.storage.sqlite import SQLiteKVStore
 
 
@@ -2458,3 +2459,40 @@ def test_project_classification_promotes_only_with_explicit_source() -> None:
     )
     assert withheld["status"] == "skip"
     assert withheld["reason"] == "promotion requires an explicit source statement"
+
+
+def test_promoted_session_source_is_archived_not_left_active(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir)) as client:
+        kernel = client.app.state.memory_kernel
+        bundle = kernel._bundle
+        scope = Scope(
+            org="local", space="chat", user="local", agent="codex", session="session-seven"
+        )
+        unit = MemoryUnit(
+            id="session-source-unit",
+            scope=scope,
+            user_metadata={"memory_type": "capture", "event_kind": "user"},
+        )
+        bundle.kv_store.insert(scope, memory_key(unit.id), dumps(unit))
+        region = MemoryRegion(
+            region_id="session-seven-region",
+            kind="session",
+            name="session",
+            space="chat",
+            session_id="session-seven",
+            temporary=False,
+        )
+        candidate = {
+            "region": region,
+            "scope": scope,
+            "unit": unit,
+            "source_units": (),
+            "explicit": True,
+        }
+
+        kernel._archive_promoted_session_sources(bundle, [candidate])
+
+        stored = loads(bundle.kv_store.get(scope, memory_key(unit.id)))
+        assert stored is not None
+        assert stored.lifecycle.value == "archived"

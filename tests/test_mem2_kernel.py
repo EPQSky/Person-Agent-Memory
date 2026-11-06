@@ -999,3 +999,21 @@ def test_mem2_startup_rebuilds_active_units_whose_index_rows_were_lost(
     finally:
         probe.close()
     assert rebuilt
+
+
+def test_mem2_write_without_index_is_repaired_without_waiting_for_sweep(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    with (
+        _embedding_server() as (base_url, handler),
+        TestClient(_app(state_dir, embedding=_endpoint(tmp_path, base_url))) as client,
+    ):
+        headers = _headers(state_dir)
+        handler.fail = True
+        memory_id = _write(client, headers, "NOINDEX-42 deployment rollback", "noindex")
+        handler.fail = False
+
+        results = _wait_for_results(client, headers, "NOINDEX-42", timeout=15)
+
+    assert [item["document_id"] for item in results] == [memory_id]

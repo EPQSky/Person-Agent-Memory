@@ -1154,6 +1154,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._index_recovery_lock = threading.RLock()
         self._index_recovery_thread: threading.Thread | None = None
         self._index_recovery_stop = threading.Event()
+        self._index_recovery_wake = threading.Event()
         self._index_recovery_attempts: dict[str, int] = {}
         self._graph_write_lock = threading.RLock()
         self._graph_status_cache_seconds = graph_status_cache_seconds
@@ -1237,6 +1238,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 self._recover_semantic_distillations()
                 self._schedule_entity_graph_recovery()
                 self._index_recovery_stop.clear()
+                self._index_recovery_wake.clear()
                 self._schedule_index_recovery()
             except Exception as error:
                 self._promotion_schema_ready = False
@@ -1323,6 +1325,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     def _close(self) -> None:
         self._index_recovery_stop.set()
+        self._index_recovery_wake.set()
         self._wait_for_semantic_tasks()
         self._wait_for_promotion_threads()
         self._wait_for_scope_graph_updates()
@@ -1646,6 +1649,31 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             self._entity_graph_threads[region_id] = thread
         thread.start()
 
+
+    def _request_index_recovery_if_unindexed(
+        self, bundle: _RuntimeBundle, scope: Scope, unit: MemoryUnit
+    ) -> None:
+        """Wake the repair loop when a fresh unit has no vector index rows.
+
+        The embedded kernel swallows embedding failures, so a write can report
+        success while the unit stays unsearchable.  The chunk tracking row is
+        a local key lookup, which keeps this check cheap on the write path,
+        and waking the repair loop re-embeds the unit within seconds instead
+        of waiting for the periodic sweep.
+        """
+        try:
+            raw = bundle.kv_store.get(scope, f"{_MEMORY_CHUNK_PREFIX}{unit.id}")
+        except Exception:
+            raw = b""
+        if _decode_index_ids(raw):
+            return
+        logger.warning(
+            "memory %s was written without a vector index; scheduling repair",
+            unit.id,
+        )
+        self._schedule_index_recovery()
+        self._index_recovery_wake.set()
+
     def _schedule_index_recovery(self) -> None:
         """Rebuild search-index rows for active units that lost them.
 
@@ -1688,9 +1716,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                             repaired,
                             remaining,
                         )
-                if self._index_recovery_stop.wait(_INDEX_RECOVERY_INTERVAL_SECONDS):
+                if self._index_recovery_stop.is_set():
                     return
-                if self._bundle is not bundle:
+                self._index_recovery_wake.wait(_INDEX_RECOVERY_INTERVAL_SECONDS)
+                self._index_recovery_wake.clear()
+                if self._index_recovery_stop.is_set() or self._bundle is not bundle:
                     return
         finally:
             with self._index_recovery_lock:
@@ -3225,6 +3255,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryKernelUnavailableError("mem2 runtime did not create a memory unit")
         unit = units[0]
         if isinstance(request, CreateMemoryRequest):
+            self._request_index_recovery_if_unindexed(bundle, scope, unit)
             semantic_write = user_metadata.get("semantic_schema") == "semantic-distillation-v1"
             try:
                 if index_token is not None:
@@ -8790,6 +8821,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     )
                     continue
                 outcome_status = str(outcome["decision"].get("status", ""))
+                if outcome_status != "conflict":
+                    self._archive_promoted_session_sources(
+                        bundle, [item[0] for item in items]
+                    )
                 if outcome_status == "conflict":
                     conflict_groups += 1
                     skipped += 1
@@ -8822,6 +8857,55 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         finally:
             with self._promotion_threads_lock:
                 self._promotion_threads.pop(job_id, None)
+
+
+    def _archive_promoted_session_sources(
+        self,
+        bundle: _RuntimeBundle,
+        candidates: list[_PromotionCandidate],
+    ) -> None:
+        """Archive promoted units that lived in an ephemeral session region.
+
+        Promotion copies a unit into a durable region.  Keeping the session
+        copy active would leave a formal memory inside a scope that expires,
+        and would surface the same fact twice whenever the session is
+        searched.  Archive the source instead of deleting it so its evidence
+        and lineage stay readable.
+        """
+        groups: dict[tuple[str, str, str, str, str], tuple[Scope, str, list[str]]] = {}
+        for candidate in candidates:
+            region = candidate["region"]
+            if region.kind != "session":
+                continue
+            unit = candidate["unit"]
+            if unit.lifecycle is not LifecycleState.ACTIVE:
+                continue
+            scope = unit.scope
+            key = (scope.org, scope.space, scope.user, scope.agent, scope.session)
+            entry = groups.get(key)
+            if entry is None:
+                entry = (scope, region.region_id, [])
+                groups[key] = entry
+            if unit.id not in entry[2]:
+                entry[2].append(unit.id)
+        for scope, region_id, unit_ids in groups.values():
+            try:
+                bundle.runtime.api.delete(
+                    DeleteSelector(
+                        unit_ids=unit_ids,
+                        scope=scope,
+                        mode=DeleteMode.ARCHIVE,
+                    ),
+                    security=_security_for(scope),
+                )
+            except Exception as error:
+                logger.warning(
+                    "promotion could not archive %d session source unit(s): %s",
+                    len(unit_ids),
+                    error,
+                )
+                continue
+            self._remove_graph_nodes(bundle, scope, unit_ids, region_id)
 
     def _update_promotion_job(
         self,
