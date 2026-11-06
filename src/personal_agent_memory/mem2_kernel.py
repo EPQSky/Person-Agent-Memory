@@ -1807,7 +1807,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             return 0
         missing = _unindexed_units(bundle, vector_store)
         for unit in missing:
-            self._enqueue_index_outbox(unit.scope, unit.id, unit.scope.space)
+            self._enqueue_index_outbox(
+                unit.scope, unit.id, unit.scope.space, reset_failed=True
+            )
         return len(missing)
 
     def _process_index_outbox(self, bundle: _RuntimeBundle) -> int:
@@ -1833,7 +1835,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             if unit is None or unit.lifecycle is not LifecycleState.ACTIVE:
                 self._clear_index_outbox(unit_id)
                 continue
-            attempt = int(row["attempts"]) + 1
             error = ""
             try:
                 for builder, group in _group_units_by_index(engine, [unit]):
@@ -1846,13 +1847,18 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 continue
             self._fail_index_outbox(
                 unit.id,
-                attempt,
+                int(row["attempts"]),
                 error or "index rows missing after rebuild",
             )
         return repaired
 
     def _enqueue_index_outbox(
-        self, scope: Scope, unit_id: str, region_id: str = ""
+        self,
+        scope: Scope,
+        unit_id: str,
+        region_id: str = "",
+        *,
+        reset_failed: bool = False,
     ) -> None:
         now = time.time()
         stamp = datetime.now(UTC).isoformat()
@@ -1865,9 +1871,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     last_error, status, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, '', 'pending', ?, ?)
                 ON CONFLICT(unit_id) DO UPDATE SET
-                    next_attempt_at = MIN(
-                        index_outbox.next_attempt_at, excluded.next_attempt_at
-                    ),
+                    status = CASE WHEN ? THEN 'pending' ELSE index_outbox.status END,
+                    attempts = CASE WHEN ? THEN 0 ELSE index_outbox.attempts END,
+                    next_attempt_at = CASE
+                        WHEN ? THEN excluded.next_attempt_at
+                        ELSE MIN(index_outbox.next_attempt_at, excluded.next_attempt_at)
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1881,6 +1890,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     now,
                     stamp,
                     stamp,
+                    int(reset_failed),
+                    int(reset_failed),
+                    int(reset_failed),
                 ),
             )
 
@@ -1896,16 +1908,20 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 ).fetchall()
             )
 
-    def _fail_index_outbox(self, unit_id: str, attempts: int, error: str) -> None:
+    def _fail_index_outbox(
+        self, unit_id: str, expected_attempts: int, error: str
+    ) -> None:
+        attempts = expected_attempts + 1
         failed = attempts >= _INDEX_RECOVERY_MAX_ATTEMPTS
         delay = min(
             _INDEX_RETRY_MAX_SECONDS,
             _INDEX_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
         )
         with closing(self._maintenance_db()) as connection, connection:
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE index_outbox SET attempts = ?, next_attempt_at = ?, "
-                "last_error = ?, status = ?, updated_at = ? WHERE unit_id = ?",
+                "last_error = ?, status = ?, updated_at = ? "
+                "WHERE unit_id = ? AND attempts = ? AND status = 'pending'",
                 (
                     attempts,
                     time.time() + delay,
@@ -1913,9 +1929,10 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                     "failed" if failed else "pending",
                     datetime.now(UTC).isoformat(),
                     unit_id,
+                    expected_attempts,
                 ),
             )
-        if failed:
+        if cursor.rowcount and failed:
             logger.warning(
                 "memory index recovery: giving up on unit %s after %d attempts",
                 unit_id,

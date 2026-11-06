@@ -1064,7 +1064,14 @@ def test_mem2_index_outbox_reports_units_that_never_index(tmp_path: Path) -> Non
             if status["vector_index_status"] == "degraded":
                 break
 
-    status = client.get("/api/v1/status", headers=headers).json()
-    assert status["vector_index_status"] == "degraded"
-    assert status["vector_index_failed"] == 1
-    assert status["vector_index_pending"] == 0
+        assert status["vector_index_status"] == "degraded"
+        assert status["vector_index_failed"] == 1
+        assert status["vector_index_pending"] == 0
+
+        kernel._queue_unindexed_units(bundle)
+        with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+            row = connection.execute(
+                "SELECT status FROM index_outbox WHERE unit_id IS NOT NULL"
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "pending"
