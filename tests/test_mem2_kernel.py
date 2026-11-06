@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -213,6 +214,23 @@ def _endpoint(tmp_path: Path, base_url: str) -> ModelEndpoint:
         max_concurrency=1,
         retries=0,
     )
+
+
+def _wait_for_index_status(
+    client: TestClient,
+    headers: dict[str, str],
+    expected: str,
+    *,
+    timeout: float = 20.0,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    status: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        status = client.get("/api/v1/status", headers=headers).json()
+        if status["vector_index_status"] == expected:
+            return status
+        time.sleep(0.2)
+    return status
 
 
 def _drop_search_index_rows(state_dir: Path) -> None:
@@ -1015,5 +1033,38 @@ def test_mem2_write_without_index_is_repaired_without_waiting_for_sweep(
         handler.fail = False
 
         results = _wait_for_results(client, headers, "NOINDEX-42", timeout=15)
+        status = _wait_for_index_status(client, headers, "ready", timeout=20)
 
     assert [item["document_id"] for item in results] == [memory_id]
+    assert status["vector_index_status"] == "ready"
+    assert status["vector_index_pending"] == 0
+    assert status["vector_index_failed"] == 0
+
+
+def test_mem2_index_outbox_reports_units_that_never_index(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with (
+        _embedding_server() as (base_url, handler),
+        TestClient(_app(state_dir, embedding=_endpoint(tmp_path, base_url))) as client,
+    ):
+        headers = _headers(state_dir)
+        handler.fail = True
+        _write(client, headers, "FAILINDEX-7 deployment rollback", "fail-index")
+
+        kernel = client.app.state.memory_kernel
+        bundle = kernel._bundle
+        for _ in range(10):
+            with sqlite3.connect(state_dir / "mem2" / "maintenance.sqlite3") as connection:
+                connection.execute(
+                    "UPDATE index_outbox SET next_attempt_at = 0 WHERE status = 'pending'"
+                )
+                connection.commit()
+            kernel._process_index_outbox(bundle)
+            status = client.get("/api/v1/status", headers=headers).json()
+            if status["vector_index_status"] == "degraded":
+                break
+
+    status = client.get("/api/v1/status", headers=headers).json()
+    assert status["vector_index_status"] == "degraded"
+    assert status["vector_index_failed"] == 1
+    assert status["vector_index_pending"] == 0

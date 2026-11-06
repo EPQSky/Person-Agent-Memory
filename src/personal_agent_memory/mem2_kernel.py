@@ -150,8 +150,12 @@ _BROWSER_INDEX_RETRY_BATCH_SIZE = 100
 _BROWSER_INDEX_RETRY_MAX = 1_000
 _INDEX_RECOVERY_BATCH_SIZE = 16
 _INDEX_RECOVERY_PROBE_BATCH_SIZE = 512
-_INDEX_RECOVERY_INTERVAL_SECONDS = 600.0
 _INDEX_RECOVERY_MAX_ATTEMPTS = 5
+_INDEX_SWEEP_INTERVAL_SECONDS = 6 * 3600.0
+_INDEX_RETRY_BASE_SECONDS = 5.0
+_INDEX_RETRY_MAX_SECONDS = 600.0
+_INDEX_OUTBOX_IDLE_SECONDS = 5.0
+_INDEX_OUTBOX_BUSY_SECONDS = 0.1
 _VECTOR_MAIN_COLLECTION = "agent_memory_vectors"
 _MEMORY_KEY_PREFIX = "/memory/"
 _MEMORY_CHUNK_PREFIX = "/index/chunks/"
@@ -807,6 +811,22 @@ _GOVERNANCE_AUDIT_SCHEMA = """CREATE TABLE IF NOT EXISTS governance_events (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )"""
 _BROWSER_INDEX_SCHEMA_VERSION = 4
+_INDEX_OUTBOX_SCHEMA = """CREATE TABLE IF NOT EXISTS index_outbox (
+    unit_id TEXT PRIMARY KEY,
+    region_id TEXT NOT NULL DEFAULT '',
+    scope_org TEXT NOT NULL,
+    scope_space TEXT NOT NULL,
+    scope_user TEXT NOT NULL,
+    scope_agent TEXT NOT NULL,
+    scope_session TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'failed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)"""
+
 _BROWSER_INDEX_SCHEMA = """CREATE TABLE IF NOT EXISTS memory_browser_index (
     region_id TEXT NOT NULL,
     unit_id TEXT NOT NULL,
@@ -998,6 +1018,27 @@ class _SensitiveFilteringEvolver:
         return self._delegate.evolve(units, mode)
 
 
+def _unit_has_index_rows(
+    bundle: _RuntimeBundle,
+    vector_store: VectorStore,
+    scope: Scope,
+    unit_id: str,
+) -> bool:
+    """Check the vector store for any index row of ``unit_id``."""
+    try:
+        raw = bundle.kv_store.get(scope, f"{_MEMORY_CHUNK_PREFIX}{unit_id}")
+    except Exception:
+        raw = b""
+    ids = _decode_index_ids(raw) or [f"{unit_id}-0"]
+    existing_ids = getattr(vector_store, "existing_ids", None)
+    try:
+        if callable(existing_ids):
+            return bool(existing_ids(scope, ids))
+        return bool(vector_store.get(scope, ids))
+    except Exception:
+        return False
+
+
 def _main_vector_store(bundle: _RuntimeBundle) -> VectorStore | None:
     """Return the primary (L2 content) vector store of the runtime bundle."""
     return next(
@@ -1155,7 +1196,6 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._index_recovery_thread: threading.Thread | None = None
         self._index_recovery_stop = threading.Event()
         self._index_recovery_wake = threading.Event()
-        self._index_recovery_attempts: dict[str, int] = {}
         self._graph_write_lock = threading.RLock()
         self._graph_status_cache_seconds = graph_status_cache_seconds
         self._graph_status_cache: dict[str, object] | None = None
@@ -1651,15 +1691,19 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
 
     def _request_index_recovery_if_unindexed(
-        self, bundle: _RuntimeBundle, scope: Scope, unit: MemoryUnit
+        self,
+        bundle: _RuntimeBundle,
+        scope: Scope,
+        unit: MemoryUnit,
+        region_id: str = "",
     ) -> None:
-        """Wake the repair loop when a fresh unit has no vector index rows.
+        """Queue a fresh unit for repair when its vector index is missing.
 
         The embedded kernel swallows embedding failures, so a write can report
-        success while the unit stays unsearchable.  The chunk tracking row is
-        a local key lookup, which keeps this check cheap on the write path,
-        and waking the repair loop re-embeds the unit within seconds instead
-        of waiting for the periodic sweep.
+        success while the unit stays unsearchable.  The chunk tracking row is a
+        local key lookup, which keeps this check cheap on the write path, and
+        the repair worker re-embeds the unit within seconds instead of waiting
+        for the next sweep.
         """
         if not self._vector_enabled:
             return
@@ -1668,23 +1712,18 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         except Exception:
             raw = b""
         if _decode_index_ids(raw):
+            self._clear_index_outbox(unit.id)
             return
         logger.warning(
-            "memory %s was written without a vector index; scheduling repair",
+            "memory %s was written without a vector index; queueing repair",
             unit.id,
         )
+        self._enqueue_index_outbox(unit.scope, unit.id, region_id)
         self._schedule_index_recovery()
         self._index_recovery_wake.set()
 
     def _schedule_index_recovery(self) -> None:
-        """Rebuild search-index rows for active units that lost them.
-
-        The KV store is the source of truth for memory units, but recall reads
-        the vector and fulltext collections.  A hard shutdown or a damaged
-        Milvus segment can therefore leave an active unit that is stored yet
-        unreachable.  Recovery re-embeds only the affected units, so the cost
-        follows the damage instead of the library size.
-        """
+        """Run the index repair worker once for this process."""
         if not self._vector_enabled:
             return
         with self._index_recovery_lock:
@@ -1701,28 +1740,56 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             self._index_recovery_thread = thread
         thread.start()
 
+    def index_status(self) -> dict[str, object]:
+        """Report the durable index repair queue."""
+        if not self._vector_enabled:
+            return {"status": "not_configured", "pending": 0, "failed": 0}
+        try:
+            pending, failed = self._index_outbox_counts()
+        except Exception:
+            return {"status": "unknown", "pending": 0, "failed": 0}
+        if failed:
+            status = "degraded"
+        elif pending:
+            status = "pending"
+        else:
+            status = "ready"
+        return {"status": status, "pending": pending, "failed": failed}
+
     def _recover_missing_index(self) -> None:
+        next_sweep = 0.0
         first_pass = True
         try:
             while True:
                 bundle = self._bundle
                 if bundle is None:
                     return
+                queued = 0
+                repaired = 0
                 try:
-                    repaired, remaining = self._repair_missing_index(bundle)
+                    if time.monotonic() >= next_sweep:
+                        queued = self._queue_unindexed_units(bundle)
+                        next_sweep = time.monotonic() + _INDEX_SWEEP_INTERVAL_SECONDS
+                    repaired = self._process_index_outbox(bundle)
                 except Exception as error:
                     logger.warning("memory index recovery failed: %s", error)
-                else:
-                    if first_pass or repaired or remaining:
-                        logger.info(
-                            "memory index recovery: rebuilt %d unit(s), %d still unindexed",
-                            repaired,
-                            remaining,
-                        )
+                if first_pass or queued or repaired:
+                    pending, failed = self._index_outbox_counts()
+                    logger.info(
+                        "memory index recovery: queued %d, repaired %d, pending %d, failed %d",
+                        queued,
+                        repaired,
+                        pending,
+                        failed,
+                    )
                 first_pass = False
                 if self._index_recovery_stop.is_set():
                     return
-                self._index_recovery_wake.wait(_INDEX_RECOVERY_INTERVAL_SECONDS)
+                if repaired >= _INDEX_RECOVERY_BATCH_SIZE:
+                    delay = _INDEX_OUTBOX_BUSY_SECONDS
+                else:
+                    delay = _INDEX_OUTBOX_IDLE_SECONDS
+                self._index_recovery_wake.wait(delay)
                 self._index_recovery_wake.clear()
                 if self._index_recovery_stop.is_set() or self._bundle is not bundle:
                     return
@@ -1731,61 +1798,140 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 if self._index_recovery_thread is threading.current_thread():
                     self._index_recovery_thread = None
 
-    def _repair_missing_index(self, bundle: _RuntimeBundle) -> tuple[int, int]:
+    def _queue_unindexed_units(self, bundle: _RuntimeBundle) -> int:
+        """Find unindexed active units and move them into the durable queue."""
+        if not self._vector_enabled:
+            return 0
+        vector_store = _main_vector_store(bundle)
+        if vector_store is None:
+            return 0
+        missing = _unindexed_units(bundle, vector_store)
+        for unit in missing:
+            self._enqueue_index_outbox(unit.scope, unit.id, unit.scope.space)
+        return len(missing)
+
+    def _process_index_outbox(self, bundle: _RuntimeBundle) -> int:
+        rows = self._due_index_outbox(_INDEX_RECOVERY_BATCH_SIZE)
+        if not rows:
+            return 0
         vector_store = _main_vector_store(bundle)
         engine = getattr(bundle.runtime.api, "_engine", None)
         if vector_store is None or engine is None:
-            return 0, 0
-        missing = _unindexed_units(bundle, vector_store)
-        pending = [
-            unit
-            for unit in missing
-            if self._index_recovery_attempts.get(unit.id, 0) < _INDEX_RECOVERY_MAX_ATTEMPTS
-        ]
+            return 0
         repaired = 0
-        for start in range(0, len(pending), _INDEX_RECOVERY_BATCH_SIZE):
-            if self._bundle is not bundle:
-                break
-            batch = pending[start : start + _INDEX_RECOVERY_BATCH_SIZE]
-            for builder, group in _group_units_by_index(engine, batch):
-                try:
-                    builder.build(group, mode=IndexWriteMode.RETRIEVAL_ONLY)
-                except Exception as error:
-                    logger.warning(
-                        "memory index recovery: rebuild failed for %d unit(s): %s",
-                        len(group),
-                        error,
-                    )
-                    continue
-                repaired += len(group)
-            self._record_index_recovery_outcome(bundle, vector_store, batch)
-        remaining = len(_unindexed_units(bundle, vector_store))
-        return repaired, remaining
-
-    def _record_index_recovery_outcome(
-        self,
-        bundle: _RuntimeBundle,
-        vector_store: VectorStore,
-        batch: list[MemoryUnit],
-    ) -> None:
-        """Give up on units that stay unindexed after repeated attempts.
-
-        Embedding can fail for reasons that survive a retry, such as an
-        oversized payload.  Exhausted units are skipped until the next restart
-        so a broken unit cannot drive an endless re-embed loop.
-        """
-        still_missing = {unit.id for unit in _unindexed_units(bundle, vector_store)}
-        for unit in batch:
-            if unit.id not in still_missing:
+        for row in rows:
+            scope = Scope(
+                org=str(row["scope_org"]),
+                space=str(row["scope_space"]),
+                user=str(row["scope_user"]),
+                agent=str(row["scope_agent"]),
+                session=str(row["scope_session"]),
+            )
+            unit_id = str(row["unit_id"])
+            units = load_units(bundle.kv_store, scope, [unit_id])
+            unit = units[0] if units else None
+            if unit is None or unit.lifecycle is not LifecycleState.ACTIVE:
+                self._clear_index_outbox(unit_id)
                 continue
-            attempts = self._index_recovery_attempts.get(unit.id, 0) + 1
-            if attempts >= _INDEX_RECOVERY_MAX_ATTEMPTS:
-                logger.warning(
-                    "memory index recovery: giving up on unit %s after %d attempts",
-                    unit.id,
+            attempt = int(row["attempts"]) + 1
+            error = ""
+            try:
+                for builder, group in _group_units_by_index(engine, [unit]):
+                    builder.update(group, mode=IndexWriteMode.RETRIEVAL_ONLY)
+            except Exception as exc:
+                error = type(exc).__name__
+            if not error and _unit_has_index_rows(bundle, vector_store, scope, unit.id):
+                self._clear_index_outbox(unit.id)
+                repaired += 1
+                continue
+            self._fail_index_outbox(
+                unit.id,
+                attempt,
+                error or "index rows missing after rebuild",
+            )
+        return repaired
+
+    def _enqueue_index_outbox(
+        self, scope: Scope, unit_id: str, region_id: str = ""
+    ) -> None:
+        now = time.time()
+        stamp = datetime.now(UTC).isoformat()
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO index_outbox (
+                    unit_id, region_id, scope_org, scope_space, scope_user,
+                    scope_agent, scope_session, attempts, next_attempt_at,
+                    last_error, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, '', 'pending', ?, ?)
+                ON CONFLICT(unit_id) DO UPDATE SET
+                    next_attempt_at = MIN(
+                        index_outbox.next_attempt_at, excluded.next_attempt_at
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    unit_id,
+                    region_id,
+                    scope.org,
+                    scope.space,
+                    scope.user,
+                    scope.agent,
+                    scope.session,
+                    now,
+                    stamp,
+                    stamp,
+                ),
+            )
+
+    def _due_index_outbox(self, limit: int) -> list[sqlite3.Row]:
+        with closing(self._maintenance_db()) as connection:
+            connection.row_factory = sqlite3.Row
+            return list(
+                connection.execute(
+                    "SELECT * FROM index_outbox "
+                    "WHERE status = 'pending' AND next_attempt_at <= ? "
+                    "ORDER BY next_attempt_at, created_at LIMIT ?",
+                    (time.time(), limit),
+                ).fetchall()
+            )
+
+    def _fail_index_outbox(self, unit_id: str, attempts: int, error: str) -> None:
+        failed = attempts >= _INDEX_RECOVERY_MAX_ATTEMPTS
+        delay = min(
+            _INDEX_RETRY_MAX_SECONDS,
+            _INDEX_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+        )
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute(
+                "UPDATE index_outbox SET attempts = ?, next_attempt_at = ?, "
+                "last_error = ?, status = ?, updated_at = ? WHERE unit_id = ?",
+                (
                     attempts,
-                )
-            self._index_recovery_attempts[unit.id] = attempts
+                    time.time() + delay,
+                    error[:200],
+                    "failed" if failed else "pending",
+                    datetime.now(UTC).isoformat(),
+                    unit_id,
+                ),
+            )
+        if failed:
+            logger.warning(
+                "memory index recovery: giving up on unit %s after %d attempts",
+                unit_id,
+                attempts,
+            )
+
+    def _clear_index_outbox(self, unit_id: str) -> None:
+        with closing(self._maintenance_db()) as connection, connection:
+            connection.execute("DELETE FROM index_outbox WHERE unit_id = ?", (unit_id,))
+
+    def _index_outbox_counts(self) -> tuple[int, int]:
+        with closing(self._maintenance_db()) as connection:
+            row = connection.execute(
+                "SELECT SUM(status = 'pending'), SUM(status = 'failed') FROM index_outbox"
+            ).fetchone()
+        return int(row[0] or 0), int(row[1] or 0)
 
     def _schedule_entity_graph_recovery(self) -> None:
         if self._graph_extractor is None:
@@ -3259,7 +3405,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             raise MemoryKernelUnavailableError("mem2 runtime did not create a memory unit")
         unit = units[0]
         if isinstance(request, CreateMemoryRequest):
-            self._request_index_recovery_if_unindexed(bundle, scope, unit)
+            self._request_index_recovery_if_unindexed(
+                bundle,
+                scope,
+                unit,
+                indexed_region.region_id if indexed_region is not None else "",
+            )
             semantic_write = user_metadata.get("semantic_schema") == "semantic-distillation-v1"
             try:
                 if index_token is not None:
@@ -11461,6 +11612,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     ) -> None:
         connection.executescript(_BROWSER_INDEX_SCHEMA)
         connection.executescript(_SEMANTIC_PUBLICATION_SCHEMA)
+        connection.executescript(_INDEX_OUTBOX_SCHEMA)
         browser_columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(memory_browser_index)").fetchall()

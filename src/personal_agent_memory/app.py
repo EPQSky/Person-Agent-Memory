@@ -451,16 +451,20 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
         )
 
 
-    async def status_payload() -> dict[str, str]:
+    async def status_payload() -> dict[str, object]:
         key = key_store.read()
         kernel_health = await asyncio.to_thread(selected_kernel.health)
         graph_status = await asyncio.to_thread(selected_kernel.graph_status)
+        index_status = await asyncio.to_thread(selected_kernel.index_status)
         return {
             "status": "ready" if kernel_health.status == "ready" else "degraded",
             "memory_kernel": kernel_health.kind,
             "memory_kernel_status": kernel_health.status,
             "memory_kernel_detail": kernel_health.detail,
             "graph_index_status": str(graph_status.get("status", "not_configured")),
+            "vector_index_status": str(index_status.get("status", "unknown")),
+            "vector_index_pending": int(index_status.get("pending", 0) or 0),
+            "vector_index_failed": int(index_status.get("failed", 0) or 0),
             "api_key_fingerprint": key_store.fingerprint(key),
         }
 
@@ -486,11 +490,11 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
         return {"status": "ok"}
 
     @app.get("/api/v1/status", dependencies=[Depends(authenticate)])
-    async def api_status() -> dict[str, str]:
+    async def api_status() -> dict[str, object]:
         return await status_payload()
 
     @app.get("/mcp/health", dependencies=[Depends(authenticate)])
-    async def mcp_status() -> dict[str, str]:
+    async def mcp_status() -> dict[str, object]:
         return await status_payload()
 
     @app.post("/api/v1/auth/rotate", dependencies=[Depends(authenticate)])

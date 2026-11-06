@@ -577,6 +577,9 @@ class UnavailableMemoryKernel:
     def graph_status(self, library_id: str | None = None) -> dict[str, object]:
         return {"status": "unavailable", "backend": "mem2"}
 
+    def index_status(self) -> dict[str, object]:
+        return {"status": "unavailable", "pending": 0, "failed": 0}
+
     def entity_graph_status(self, library_id: str) -> dict[str, object]:
         self._raise()
 
