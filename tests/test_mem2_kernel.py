@@ -233,6 +233,28 @@ def _wait_for_index_status(
     return status
 
 
+def _mark_index_outbox_failed(
+    client: TestClient,
+    headers: dict[str, str],
+    state_dir: Path,
+) -> None:
+    """Drive the repair worker until one unit is marked as permanently failed."""
+    kernel = client.app.state.memory_kernel
+    bundle = kernel._bundle
+    assert bundle is not None
+    database = state_dir / "mem2" / "maintenance.sqlite3"
+    for _ in range(10):
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE index_outbox SET next_attempt_at = 0 WHERE status = 'pending'"
+            )
+            connection.commit()
+        kernel._process_index_outbox(bundle)
+        if client.get("/api/v1/status", headers=headers).json()["vector_index_failed"]:
+            return
+    raise AssertionError("index outbox never reported a failed unit")
+
+
 def _drop_search_index_rows(state_dir: Path) -> None:
     """Simulate Milvus row loss: keep the KV source of truth, drop index rows."""
     client = MilvusClient(uri=str(state_dir / "mem2" / "milvus.db"), db_name="default")
@@ -1039,6 +1061,115 @@ def test_mem2_write_without_index_is_repaired_without_waiting_for_sweep(
     assert status["vector_index_status"] == "ready"
     assert status["vector_index_pending"] == 0
     assert status["vector_index_failed"] == 0
+
+
+def test_mem2_manual_retry_requeues_failed_index_units_and_repairs_them(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    with (
+        _embedding_server() as (base_url, handler),
+        TestClient(_app(state_dir, embedding=_endpoint(tmp_path, base_url))) as client,
+    ):
+        headers = _headers(state_dir)
+        handler.fail = True
+        memory_id = _write(client, headers, "RETRY-88 deployment rollback", "retry-all")
+        _mark_index_outbox_failed(client, headers, state_dir)
+        degraded = client.get("/api/v1/status", headers=headers).json()
+        assert degraded["vector_index_status"] == "degraded"
+        assert degraded["vector_index_failed"] == 1
+
+        handler.fail = False
+        retry = client.post("/api/v1/index-repairs/retry", headers=headers, json={})
+        assert retry.status_code == 200, retry.text
+        assert retry.json() == {
+            "status": "queued",
+            "requested": 1,
+            "queued": 1,
+            "not_failed": 0,
+        }
+
+        results = _wait_for_results(client, headers, "RETRY-88", timeout=15)
+        status = _wait_for_index_status(client, headers, "ready", timeout=20)
+
+    assert [item["document_id"] for item in results] == [memory_id]
+    assert status["vector_index_status"] == "ready"
+    assert status["vector_index_failed"] == 0
+    assert status["vector_index_pending"] == 0
+
+
+def test_mem2_manual_retry_only_resets_failed_units(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with (
+        _embedding_server() as (base_url, _),
+        TestClient(_app(state_dir, embedding=_endpoint(tmp_path, base_url))) as client,
+    ):
+        headers = _headers(state_dir)
+        database = state_dir / "mem2" / "maintenance.sqlite3"
+        not_due = time.time() + 600.0
+        with sqlite3.connect(database) as connection:
+            connection.executemany(
+                "INSERT INTO index_outbox (unit_id, region_id, scope_org, scope_space, "
+                "scope_user, scope_agent, scope_session, attempts, next_attempt_at, "
+                "last_error, status, created_at, updated_at) "
+                "VALUES (?, '', 'org', 'space', 'user', 'agent', 'session', ?, ?, '', ?, "
+                "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                [
+                    ("ghost-failed-unit", 5, not_due, "failed"),
+                    ("pending-unit", 2, not_due, "pending"),
+                ],
+            )
+            connection.commit()
+
+        response = client.post(
+            "/api/v1/index-repairs/retry",
+            headers=headers,
+            json={"unit_ids": ["ghost-failed-unit", "pending-unit", "missing-unit"]},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "status": "queued",
+            "requested": 3,
+            "queued": 1,
+            "not_failed": 2,
+        }
+
+        rejected = client.post(
+            "/api/v1/index-repairs/retry",
+            headers=headers,
+            json={"unit_ids": ["   "]},
+        )
+        assert rejected.status_code == 422
+
+        with sqlite3.connect(database) as connection:
+            row = connection.execute(
+                "SELECT status, attempts, next_attempt_at FROM index_outbox "
+                "WHERE unit_id = 'pending-unit'"
+            ).fetchone()
+
+    assert row is not None
+    assert row[0] == "pending"
+    assert row[1] == 2
+    assert row[2] > time.time()
+
+
+def test_mem2_manual_retry_reports_not_configured_without_embedding(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    with TestClient(_app(state_dir)) as client:
+        response = client.post(
+            "/api/v1/index-repairs/retry",
+            headers=_headers(state_dir),
+            json={},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "status": "not_configured",
+            "requested": 0,
+            "queued": 0,
+            "not_failed": 0,
+        }
 
 
 def test_mem2_index_outbox_reports_units_that_never_index(tmp_path: Path) -> None:

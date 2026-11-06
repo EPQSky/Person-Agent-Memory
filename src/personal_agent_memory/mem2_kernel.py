@@ -90,6 +90,7 @@ from personal_agent_memory.memory_kernel import (
     EvolveMemoryRequest,
     GetMemoryRegionRequest,
     HistoryDiffRequest,
+    IndexStatus,
     KernelHealth,
     ListDocumentsRequest,
     ListForgottenRequest,
@@ -113,6 +114,7 @@ from personal_agent_memory.memory_kernel import (
     RestoreForgottenRequest,
     RetentionCleanupRequest,
     RetentionPolicyRequest,
+    RetryIndexRepairsRequest,
     SearchMemoryRequest,
     UnavailableMemoryKernel,
     UpdateRegionBindingRequest,
@@ -150,6 +152,8 @@ _BROWSER_INDEX_RETRY_BATCH_SIZE = 100
 _BROWSER_INDEX_RETRY_MAX = 1_000
 _INDEX_RECOVERY_BATCH_SIZE = 16
 _INDEX_RECOVERY_PROBE_BATCH_SIZE = 512
+# Keep each UPDATE well below SQLite's historic 999 placeholder limit.
+_INDEX_RETRY_RESET_BATCH_SIZE = 400
 _INDEX_RECOVERY_MAX_ATTEMPTS = 5
 _INDEX_SWEEP_INTERVAL_SECONDS = 6 * 3600.0
 _INDEX_RETRY_BASE_SECONDS = 5.0
@@ -1740,7 +1744,33 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             self._index_recovery_thread = thread
         thread.start()
 
-    def index_status(self) -> dict[str, object]:
+    def retry_index_repairs(self, request: RetryIndexRepairsRequest) -> dict[str, object]:
+        """Reset failed index repairs so the worker retries them now.
+
+        Only ``failed`` entries are touched.  A ``pending`` entry keeps its
+        backoff schedule, so a manual retry cannot be used to bypass the
+        exponential delay that protects a struggling embedding service.
+        """
+        if not self._vector_enabled:
+            return {
+                "status": "not_configured",
+                "requested": 0,
+                "queued": 0,
+                "not_failed": 0,
+            }
+        unit_ids = tuple(dict.fromkeys(request.unit_ids or ()))
+        requested, queued = self._reset_failed_index_outbox(unit_ids)
+        if queued:
+            self._schedule_index_recovery()
+            self._index_recovery_wake.set()
+        return {
+            "status": "queued",
+            "requested": requested,
+            "queued": queued,
+            "not_failed": requested - queued,
+        }
+
+    def index_status(self) -> IndexStatus:
         """Report the durable index repair queue."""
         if not self._vector_enabled:
             return {"status": "not_configured", "pending": 0, "failed": 0}
@@ -1949,6 +1979,38 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 "SELECT SUM(status = 'pending'), SUM(status = 'failed') FROM index_outbox"
             ).fetchone()
         return int(row[0] or 0), int(row[1] or 0)
+
+    def _reset_failed_index_outbox(self, unit_ids: tuple[str, ...]) -> tuple[int, int]:
+        """Move failed rows back to the pending state.
+
+        Returns ``(requested, queued)``.  With an explicit ``unit_ids`` tuple
+        the count of requested ids is authoritative, so ids that are unknown or
+        not failed are reported as ``not_failed`` instead of raising.
+        """
+        stamp = datetime.now(UTC).isoformat()
+        queued = 0
+        with closing(self._maintenance_db()) as connection, connection:
+            if unit_ids:
+                requested = len(unit_ids)
+                for start in range(0, requested, _INDEX_RETRY_RESET_BATCH_SIZE):
+                    chunk = unit_ids[start : start + _INDEX_RETRY_RESET_BATCH_SIZE]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    cursor = connection.execute(
+                        "UPDATE index_outbox SET status = 'pending', attempts = 0, "
+                        "next_attempt_at = 0, updated_at = ? "
+                        f"WHERE status = 'failed' AND unit_id IN ({placeholders})",
+                        (stamp, *chunk),
+                    )
+                    queued += cursor.rowcount
+            else:
+                cursor = connection.execute(
+                    "UPDATE index_outbox SET status = 'pending', attempts = 0, "
+                    "next_attempt_at = 0, updated_at = ? WHERE status = 'failed'",
+                    (stamp,),
+                )
+                requested = cursor.rowcount
+                queued = cursor.rowcount
+        return requested, queued
 
     def _schedule_entity_graph_recovery(self) -> None:
         if self._graph_extractor is None:

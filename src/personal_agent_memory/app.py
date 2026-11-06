@@ -84,6 +84,7 @@ from personal_agent_memory.memory_kernel import (
     RestoreForgottenRequest,
     RetentionCleanupRequest,
     RetentionPolicyRequest,
+    RetryIndexRepairsRequest,
     SearchMemoryRequest,
     UpdateRegionBindingRequest,
     UpdateRetentionPolicyRequest,
@@ -221,6 +222,24 @@ class McpRpcRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+
+
+class IndexRepairRetry(BaseModel):
+    unit_ids: list[str] | None = Field(default=None, max_length=1_000)
+
+    @field_validator("unit_ids")
+    @classmethod
+    def validate_unit_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned: list[str] = []
+        for item in value:
+            text = item.strip()
+            if not text or len(text) > 200:
+                raise ValueError("each unit id must be 1-200 characters")
+            if text not in cleaned:
+                cleaned.append(text)
+        return cleaned
 
 
 class SearchRequest(BaseModel):
@@ -492,6 +511,14 @@ def create_app(settings: Settings, *, memory_kernel: MemoryKernelPort | None = N
     @app.get("/api/v1/status", dependencies=[Depends(authenticate)])
     async def api_status() -> dict[str, object]:
         return await status_payload()
+
+    @app.post("/api/v1/index-repairs/retry", dependencies=[Depends(authenticate)])
+    async def retry_index_repairs(request: IndexRepairRetry | None = None) -> dict[str, object]:
+        unit_ids = tuple(request.unit_ids) if request and request.unit_ids else None
+        return await asyncio.to_thread(
+            selected_kernel.retry_index_repairs,
+            RetryIndexRepairsRequest(unit_ids=unit_ids),
+        )
 
     @app.get("/mcp/health", dependencies=[Depends(authenticate)])
     async def mcp_status() -> dict[str, object]:

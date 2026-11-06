@@ -39,7 +39,33 @@ KV 中的记忆单元是源数据，Milvus 中的向量行与全文行是派生�
 - 按 `RETRIEVAL_ONLY` 模式重建，只用检索索引构建器，不重复写正排本体。
 - 重建后再次探测逻辑 id，通过才删除条目。
 - 失败则 `attempts += 1`，按 5 秒起步、倍增至最长 600 秒的指数退避安排下次尝试（5/10/20/40/80 秒）。
-- 连续 5 次失败标记为 `failed`，不再自动重试，等待人工或下一次版本升级。
+- 连续 5 次失败标记为 `failed`，不再自动重试，等待人工重试、兜底扫描或下一次版本升级。
+
+### 手动重试
+
+失败条目可以立即重试，不必等待 6 小时扫描：
+
+```http
+POST /api/v1/index-repairs/retry
+Authorization: Bearer <api-key>
+Content-Type: application/json
+
+{"unit_ids": ["unit-id-1", "unit-id-2"]}
+```
+
+- 省略请求体、`{}`、`{"unit_ids": null}` 或 `{"unit_ids": []}` 表示重试全部 `failed` 条目。
+- 只有 `failed` 条目会被重置为 `pending`，同时清零 `attempts` 并把 `next_attempt_at` 设为立即到期。
+- `pending` 条目不受影响，继续遵守指数退避，避免手动重试绕过保护机制。
+- 指定了不存在的 id 或非 `failed` 的 id 不报错，计入 `not_failed`。
+- 未配置嵌入端点时不修改队列，直接返回 `status = not_configured`。
+
+响应示例：
+
+```json
+{"status": "queued", "requested": 2, "queued": 2, "not_failed": 0}
+```
+
+`status` 取值：`queued`（已入队，工作线程会立即处理）、`not_configured`（没有可重试的索引）。
 
 ### 兜底扫描
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, NoReturn, Protocol, TypeAlias, runtime_checkable
+from typing import Literal, NoReturn, Protocol, TypeAlias, TypedDict, runtime_checkable
 
 from personal_agent_memory.config import MemoryKernelKind, Settings
 from personal_agent_memory.regions import RegionKind
@@ -44,6 +44,14 @@ class KernelHealth:
     kind: MemoryKernelKind
     status: KernelStatus
     detail: str = ""
+
+
+class IndexStatus(TypedDict):
+    """Durable vector-index repair queue summary."""
+
+    status: str
+    pending: int
+    failed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +375,18 @@ class CaptureRoundsRequest:
     turn_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RetryIndexRepairsRequest:
+    """Retry failed vector-index repairs.
+
+    ``None`` or an empty tuple means every entry that is currently in the
+    ``failed`` state.  Pending entries are never touched, because they still
+    follow their own backoff schedule.
+    """
+
+    unit_ids: tuple[str, ...] | None = None
+
+
 MemoryWriteRequest: TypeAlias = CreateMemoryRequest | CaptureMemoryRequest
 MemoryInspectRequest: TypeAlias = DocumentInspectRequest
 MemoryUpdateRequest: TypeAlias = DocumentUpdateRequest
@@ -512,6 +532,10 @@ class MemoryKernelPort(Protocol):
 
     def list_capture_rounds(self, request: CaptureRoundsRequest) -> list[dict[str, object]]: ...
 
+    def index_status(self) -> IndexStatus: ...
+
+    def retry_index_repairs(self, request: RetryIndexRepairsRequest) -> dict[str, object]: ...
+
 
 
 
@@ -577,7 +601,7 @@ class UnavailableMemoryKernel:
     def graph_status(self, library_id: str | None = None) -> dict[str, object]:
         return {"status": "unavailable", "backend": "mem2"}
 
-    def index_status(self) -> dict[str, object]:
+    def index_status(self) -> IndexStatus:
         return {"status": "unavailable", "pending": 0, "failed": 0}
 
     def entity_graph_status(self, library_id: str) -> dict[str, object]:
@@ -753,6 +777,9 @@ class UnavailableMemoryKernel:
         self._raise()
 
     def list_capture_rounds(self, request: CaptureRoundsRequest) -> list[dict[str, object]]:
+        self._raise()
+
+    def retry_index_repairs(self, request: RetryIndexRepairsRequest) -> dict[str, object]:
         self._raise()
 
 
