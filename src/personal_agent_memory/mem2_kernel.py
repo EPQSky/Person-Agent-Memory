@@ -1661,6 +1661,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         and waking the repair loop re-embeds the unit within seconds instead
         of waiting for the periodic sweep.
         """
+        if not self._vector_enabled:
+            return
         try:
             raw = bundle.kv_store.get(scope, f"{_MEMORY_CHUNK_PREFIX}{unit.id}")
         except Exception:
