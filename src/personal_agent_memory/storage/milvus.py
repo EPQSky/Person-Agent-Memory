@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import threading
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -19,6 +18,7 @@ from jiuwen_memory.common.errors import (
     NotFoundError,
     ValidationError,
 )
+from jiuwen_memory.common.log import get_logger
 from jiuwen_memory.common.type_def import (
     FilterClause,
     FilterExpr,
@@ -77,7 +77,7 @@ _ZERO_BYTE_ARTIFACT_SUFFIXES = (".parquet", ".idx")
 # flush the process can exit mid-write and leave 0-byte parquet/index files
 # that make the next startup fail every collection read.
 _SHUTDOWN_FLUSH_TIMEOUT_SECONDS = 20.0
-_logger = logging.getLogger(__name__)
+_logger = get_logger(__name__)
 
 
 def _quarantine_zero_byte_artifacts(uri: str) -> list[str]:

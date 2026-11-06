@@ -7,7 +7,6 @@ import base64
 import difflib
 import hashlib
 import json
-import logging
 import os
 import re
 import sqlite3
@@ -38,6 +37,7 @@ from jiuwen_memory.api import (
 from jiuwen_memory.common.audit.base import AuditLogger, AuditProducer
 from jiuwen_memory.common.embedder.base import Embedder, EmbedderProducer
 from jiuwen_memory.common.embedder.embedder_impl.openai_embedder import OpenAIEmbedder
+from jiuwen_memory.common.log import get_logger
 from jiuwen_memory.common.type_def import (
     FilterClause,
     FilterExpr,
@@ -136,7 +136,7 @@ from personal_agent_memory.storage import (
     SQLiteKVStore,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _STORE_TARGET = "personal-agent-memory-local"
 _AUDIT_TARGET = "personal-agent-memory-sqlite"
@@ -1702,6 +1702,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         thread.start()
 
     def _recover_missing_index(self) -> None:
+        first_pass = True
         try:
             while True:
                 bundle = self._bundle
@@ -1712,12 +1713,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 except Exception as error:
                     logger.warning("memory index recovery failed: %s", error)
                 else:
-                    if repaired or remaining:
+                    if first_pass or repaired or remaining:
                         logger.info(
                             "memory index recovery: rebuilt %d unit(s), %d still unindexed",
                             repaired,
                             remaining,
                         )
+                first_pass = False
                 if self._index_recovery_stop.is_set():
                     return
                 self._index_recovery_wake.wait(_INDEX_RECOVERY_INTERVAL_SECONDS)
