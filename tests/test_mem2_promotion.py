@@ -4,13 +4,18 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from jiuwen_memory.api import MemoryUnit
+from jiuwen_memory.common.type_def import Scope, memory_key
+from jiuwen_memory.common.type_def.memory_codec import dumps
 
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import Settings
 from personal_agent_memory.mem2_kernel import Mem2MemoryKernel
+from personal_agent_memory.storage.sqlite import SQLiteKVStore
 
 
 def _app(state_dir: Path):
@@ -2389,3 +2394,35 @@ def test_explicit_preference_subject_conflicts_with_ordinary_user_memory(
         assert source["id"] not in " ".join(str(item["id"]) for item in active)
         history = client.get("/api/v1/libraries/alpha/history", headers=headers).json()
         assert len([item for item in history if item["action"] == "conflict"]) == 1
+
+
+def test_promotion_reads_evidence_from_another_agent_scope(tmp_path: Path) -> None:
+    store = SQLiteKVStore(tmp_path / "kv.sqlite3")
+    evidence_scope = Scope(
+        org="local", space="chat", user="local", agent="codex", session="session-one"
+    )
+    memory_scope = Scope(
+        org="local",
+        space="chat",
+        user="local",
+        agent="personal-agent-memory",
+        session="session-one",
+    )
+    evidence = MemoryUnit(
+        id="evidence-unit",
+        scope=evidence_scope,
+        user_metadata={"event_kind": "user", "memory_type": "capture"},
+    )
+    store.insert(evidence_scope, memory_key(evidence.id), dumps(evidence))
+    distilled = MemoryUnit(
+        id="distilled-unit",
+        scope=memory_scope,
+        user_metadata={"source_unit_ids": [evidence.id]},
+    )
+    kernel = Mem2MemoryKernel(tmp_path / "state")
+    bundle = SimpleNamespace(kv_store=store)
+
+    found = kernel._promotion_source_units(bundle, memory_scope, distilled)
+
+    assert [unit.id for unit in found] == [evidence.id]
+    store.close()

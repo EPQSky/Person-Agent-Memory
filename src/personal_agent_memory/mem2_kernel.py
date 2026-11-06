@@ -9164,7 +9164,21 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             source_ids = _metadata_strings(unit, "provenance")
         if not source_ids:
             return ()
-        return tuple(load_units(bundle.kv_store, scope, list(dict.fromkeys(source_ids))))
+        wanted = list(dict.fromkeys(source_ids))
+        # Distilled memories are written under the memory agent while their
+        # evidence stays in the same session space under the agent that
+        # captured it.  Look across the known agents before giving up, or the
+        # promotion guard sees no user evidence and refuses to promote.
+        found: dict[str, MemoryUnit] = {}
+        for candidate_scope in (
+            scope,
+            *(replace(scope, agent=agent) for agent in _SEARCH_AGENTS),
+        ):
+            for source in load_units(bundle.kv_store, candidate_scope, wanted):
+                found.setdefault(source.id, source)
+            if len(found) == len(wanted):
+                break
+        return tuple(found[source_id] for source_id in wanted if source_id in found)
 
     @staticmethod
     def _promotion_group_sources(
