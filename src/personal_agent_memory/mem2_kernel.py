@@ -1130,6 +1130,7 @@ def _unindexed_units(
 
 
 _GRAPH_STATUS_CACHE_SECONDS = 60.0
+_EMBEDDING_REPROBE_SECONDS = 60.0
 
 
 class Mem2MemoryKernel(UnavailableMemoryKernel):
@@ -1143,6 +1144,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         *,
         embedding: ModelEndpoint | None = None,
         embedding_dimension: int = _DEFAULT_EMBEDDING_DIM,
+        embedding_reprobe_seconds: float = _EMBEDDING_REPROBE_SECONDS,
         graph: ModelEndpoint | None = None,
         promotion_classifier: PromotionClassifier | None = None,
         semantic_extractor: SemanticExtractor | None = None,
@@ -1178,7 +1180,12 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         self._bundle: _RuntimeBundle | None = None
         self._startup_error: str | None = None
         self._state_ready = False
+        self._vector_capable = False
         self._vector_enabled = False
+        self._embedding_reprobe_seconds = embedding_reprobe_seconds
+        self._embedding_reprobe_lock = threading.RLock()
+        self._embedding_reprobe_thread: threading.Thread | None = None
+        self._embedding_reprobe_stop = threading.Event()
         self._vector_degradation = "embedding_not_configured"
         self._embedding_detail = "embedding endpoint is not configured; vector recall is disabled"
         self._embedding_api_key_cache: str | None = None
@@ -1284,6 +1291,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 self._index_recovery_stop.clear()
                 self._index_recovery_wake.clear()
                 self._schedule_index_recovery()
+                self._embedding_reprobe_stop.clear()
+                self._schedule_embedding_reprobe()
             except Exception as error:
                 self._promotion_schema_ready = False
                 self._bundle = None
@@ -1370,6 +1379,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
     def _close(self) -> None:
         self._index_recovery_stop.set()
         self._index_recovery_wake.set()
+        self._embedding_reprobe_stop.set()
+        self._wait_for_embedding_probe()
         self._wait_for_semantic_tasks()
         self._wait_for_promotion_threads()
         self._wait_for_scope_graph_updates()
@@ -1751,13 +1762,17 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         backoff schedule, so a manual retry cannot be used to bypass the
         exponential delay that protects a struggling embedding service.
         """
-        if not self._vector_enabled:
+        if not self._vector_capable:
             return {
                 "status": "not_configured",
                 "requested": 0,
                 "queued": 0,
                 "not_failed": 0,
             }
+        if not self._vector_enabled:
+            # Probe once so a manual retry works without waiting for the
+            # watchdog; requeued rows stay pending if the endpoint is still down.
+            self._recover_embedding()
         unit_ids = tuple(dict.fromkeys(request.unit_ids or ()))
         requested, queued = self._reset_failed_index_outbox(unit_ids)
         if queued:
@@ -1772,13 +1787,13 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
 
     def index_status(self) -> IndexStatus:
         """Report the durable index repair queue."""
-        if not self._vector_enabled:
+        if not self._vector_capable:
             return {"status": "not_configured", "pending": 0, "failed": 0}
         try:
             pending, failed = self._index_outbox_counts()
         except Exception:
             return {"status": "unknown", "pending": 0, "failed": 0}
-        if failed:
+        if failed or not self._vector_enabled:
             status = "degraded"
         elif pending:
             status = "pending"
@@ -4079,6 +4094,8 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         security = _security_for(scope)
         degradation: list[str] = []
         embedding_configured = self._vector_enabled
+        # A configured but unhealthy endpoint is degraded, not unconfigured.
+        disabled_vector_status = "degraded" if self._vector_capable else "not_configured"
         if not embedding_configured:
             degradation.append(self._vector_degradation)
             items, failed, truncated = self._keyword_fallback(bundle, scope, request)
@@ -4099,7 +4116,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 items,
                 [],
                 degradation,
-                vector_status="not_configured",
+                vector_status=disabled_vector_status,
                 graph_status=graph_status,
                 entity_graph_status=entity_graph_status,
                 region=region,
@@ -4161,7 +4178,7 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
             for channel_error in reported_errors
         )
         vector_status = (
-            "not_configured"
+            disabled_vector_status
             if not embedding_configured
             else "degraded"
             if vector_failed
@@ -8836,6 +8853,11 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         for thread in threads:
             thread.join(timeout=30.0)
 
+    def _wait_for_embedding_probe(self) -> None:
+        thread = self._embedding_reprobe_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+
     def _run_promotion_job(
         self,
         job_id: str,
@@ -12521,7 +12543,9 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
                 },
             }
 
-        vector_enabled = self._vector_enabled
+        # The runtime always carries the embedder once an endpoint is
+        # configured, so a transient outage never requires a runtime rebuild.
+        vector_enabled = self._vector_capable
         engine_params: dict[str, str] = {
             "index_builder": "default",
             "retriever": "default",
@@ -12604,38 +12628,113 @@ class Mem2MemoryKernel(UnavailableMemoryKernel):
         return _deep_merge(base, self._config_overrides)
 
     def _prepare_embedding(self) -> None:
-        endpoint = self._embedding
-        if endpoint is None:
+        if self._embedding is None:
+            self._vector_capable = False
             self._vector_enabled = False
             self._vector_degradation = "embedding_not_configured"
             self._embedding_detail = (
                 "embedding endpoint is not configured; vector recall is disabled"
             )
             return
-        try:
-            embedder = self._new_openai_embedder(self._embedding_dimension)
-            vectors = embedder.embed(["embedding dimension probe"])
-        except Exception as error:
+        self._vector_capable = True
+        self._refresh_embedding_state(initial=True)
+
+    def _refresh_embedding_state(self, *, initial: bool) -> bool:
+        """Probe the endpoint and update the reported embedding state.
+
+        ``_vector_capable`` fixes the runtime composition at startup.  Later
+        probes only flip ``_vector_enabled``, so a recovered endpoint needs no
+        runtime rebuild.
+        """
+        ok, actual_dimension, error_name = self._probe_embedding_dimension()
+        if not ok:
             self._vector_enabled = False
             self._vector_degradation = "embedding_unavailable"
             self._embedding_detail = (
-                "embedding endpoint probe failed; vector recall is disabled: "
-                f"{type(error).__name__}"
+                "embedding endpoint probe failed; vector recall is disabled until "
+                f"the endpoint recovers: {error_name}"
             )
-            return
-        actual_dimension = len(vectors[0]) if vectors and vectors[0] else 0
+            return False
         if actual_dimension != self._embedding_dimension:
             self._vector_enabled = False
             self._vector_degradation = "embedding_dimension_mismatch"
+            if initial:
+                # A dimension mismatch is a configuration error, so the
+                # runtime is assembled without vector support.
+                self._vector_capable = False
             self._embedding_detail = (
                 "embedding dimension mismatch: configured "
                 f"{self._embedding_dimension}, actual {actual_dimension}; "
                 "vector recall is disabled"
             )
-            return
+            return False
         self._vector_enabled = True
         self._vector_degradation = ""
         self._embedding_detail = "embedding endpoint validated"
+        return True
+
+    def _probe_embedding_dimension(self) -> tuple[bool, int, str]:
+        try:
+            embedder = self._new_openai_embedder(self._embedding_dimension)
+            vectors = embedder.embed(["embedding dimension probe"])
+        except Exception as error:
+            return False, 0, type(error).__name__
+        return True, len(vectors[0]) if vectors and vectors[0] else 0, ""
+
+    def _schedule_embedding_reprobe(self) -> None:
+        """Start the endpoint watchdog once per process."""
+        if self._embedding is None or self._embedding_reprobe_seconds <= 0:
+            return
+        with self._embedding_reprobe_lock:
+            if (
+                self._embedding_reprobe_thread is not None
+                and self._embedding_reprobe_thread.is_alive()
+            ):
+                return
+            thread = threading.Thread(
+                target=self._watch_embedding_endpoint,
+                name="memory-embedding-probe",
+                daemon=True,
+            )
+            self._embedding_reprobe_thread = thread
+        thread.start()
+
+    def _watch_embedding_endpoint(self) -> None:
+        try:
+            while not self._embedding_reprobe_stop.wait(self._embedding_reprobe_seconds):
+                if self._vector_enabled or not self._vector_capable:
+                    continue
+                try:
+                    self._recover_embedding()
+                except Exception as error:
+                    logger.warning("memory embedding probe failed: %s", error)
+        finally:
+            with self._embedding_reprobe_lock:
+                if self._embedding_reprobe_thread is threading.current_thread():
+                    self._embedding_reprobe_thread = None
+
+    def _recover_embedding(self) -> bool:
+        """Re-probe the endpoint and turn vector recall back on when it answers."""
+        with self._embedding_reprobe_lock:
+            if self._vector_enabled:
+                return True
+            if not self._vector_capable:
+                return False
+            if not self._refresh_embedding_state(initial=False):
+                return False
+            logger.info("memory embedding endpoint recovered; vector recall enabled")
+            bundle = self._bundle
+            if bundle is None:
+                return True
+            try:
+                self._queue_unindexed_units(bundle)
+            except Exception as error:
+                logger.warning(
+                    "memory index sweep after embedding recovery failed: %s", error
+                )
+            self._schedule_index_recovery()
+            self._index_recovery_wake.set()
+            return True
 
     def _new_openai_embedder(self, dimension: int) -> OpenAIEmbedder:
         endpoint = self._embedding

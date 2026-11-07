@@ -1153,6 +1153,116 @@ def test_mem2_manual_retry_only_resets_failed_units(tmp_path: Path) -> None:
     assert row[2] > time.time()
 
 
+def test_mem2_embedding_recovers_without_restart(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with _embedding_server() as (base_url, handler):
+        handler.fail = True
+        endpoint = _endpoint(tmp_path, base_url)
+        kernel = Mem2MemoryKernel(
+            state_dir, embedding=endpoint, embedding_reprobe_seconds=0.2
+        )
+        with TestClient(_app(state_dir, embedding=endpoint, kernel=kernel)) as client:
+            headers = _headers(state_dir)
+            health = client.get("/mcp/health", headers=headers).json()
+            assert health["memory_kernel_status"] == "degraded"
+            assert "embedding" in health["memory_kernel_detail"].lower()
+            startup = client.get("/api/v1/status", headers=headers).json()
+            # 端点配置存在，只是暂时不可达：运行时已装配嵌入器，可自动恢复。
+            assert startup["vector_index_status"] == "degraded"
+
+            memory_id = _write(
+                client, headers, "LATE-RECOVERY-77 deployment", "late-recovery"
+            )
+            during_outage = _search(client, headers, "LATE-RECOVERY-77")
+            assert during_outage["degraded"] is True
+            assert during_outage["vector_index_status"] == "degraded"
+
+            handler.fail = False
+            status = _wait_for_index_status(client, headers, "ready", timeout=25)
+            results = _wait_for_results(client, headers, "LATE-RECOVERY-77", timeout=25)
+
+    assert [item["document_id"] for item in results] == [memory_id]
+    assert status["vector_index_status"] == "ready"
+    assert status["vector_index_failed"] == 0
+    assert status["vector_index_pending"] == 0
+
+    probe = MilvusClient(uri=str(state_dir / "mem2" / "milvus.db"), db_name="default")
+    try:
+        probe.load_collection("agent_memory_vectors")
+        rebuilt = probe.query(
+            "agent_memory_vectors",
+            filter=f'logical_id like "{memory_id}%"',
+            output_fields=["logical_id"],
+            limit=5,
+        )
+    finally:
+        probe.close()
+    assert rebuilt
+
+
+def test_mem2_manual_retry_probes_embedding_endpoint(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with _embedding_server() as (base_url, handler):
+        handler.fail = True
+        endpoint = _endpoint(tmp_path, base_url)
+        # 关闭后台探测，确保是接口本身触发的重新探测。
+        kernel = Mem2MemoryKernel(
+            state_dir, embedding=endpoint, embedding_reprobe_seconds=0
+        )
+        with TestClient(_app(state_dir, embedding=endpoint, kernel=kernel)) as client:
+            headers = _headers(state_dir)
+            assert (
+                client.get("/api/v1/status", headers=headers).json()["vector_index_status"]
+                == "degraded"
+            )
+
+            handler.fail = False
+            response = client.post(
+                "/api/v1/index-repairs/retry", headers=headers, json={}
+            )
+            assert response.status_code == 200, response.text
+            assert response.json() == {
+                "status": "queued",
+                "requested": 0,
+                "queued": 0,
+                "not_failed": 0,
+            }
+            status = _wait_for_index_status(client, headers, "ready", timeout=20)
+
+    assert status["vector_index_status"] == "ready"
+
+
+def test_mem2_dimension_mismatch_is_not_auto_recovered(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with _embedding_server() as (base_url, handler):
+        handler.dimension = 1_024
+        endpoint = _endpoint(tmp_path, base_url)
+        kernel = Mem2MemoryKernel(
+            state_dir,
+            embedding=endpoint,
+            embedding_dimension=1_536,
+            embedding_reprobe_seconds=0.2,
+        )
+        with TestClient(
+            _app(
+                state_dir,
+                embedding=endpoint,
+                embedding_dimension=1_536,
+                kernel=kernel,
+            )
+        ) as client:
+            headers = _headers(state_dir)
+            time.sleep(1.0)
+            status = client.get("/api/v1/status", headers=headers).json()
+            retry = client.post(
+                "/api/v1/index-repairs/retry", headers=headers, json={}
+            )
+            retry_body = retry.json()
+
+    assert status["vector_index_status"] == "not_configured"
+    assert retry_body["status"] == "not_configured"
+
+
 def test_mem2_manual_retry_reports_not_configured_without_embedding(
     tmp_path: Path,
 ) -> None:
