@@ -10,6 +10,7 @@ from personal_agent_memory import __version__
 from personal_agent_memory.app import create_app
 from personal_agent_memory.config import ConfigurationError, Settings
 from personal_agent_memory.model_client import ModelEndpoint
+from personal_agent_memory.provisioning import ProvisioningError, provision_package
 
 cli = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -42,6 +43,33 @@ def ensure_port_available(host: str, port: int) -> None:
         raise ConfigurationError(f"port {port} on {host} is already in use") from error
     finally:
         probe.close()
+
+
+@cli.command()
+def setup(
+    state_dir: str | None = typer.Option(
+        None, "--state-dir", help="Directory for protected platform state."
+    ),
+    library_root: str | None = typer.Option(
+        None, "--library-root", help="Parent directory containing memory libraries."
+    ),
+    port: int | None = typer.Option(
+        None, "--port", min=1, max=65535, help="Loopback service port."
+    ),
+) -> None:
+    """Initialize the package installation for the current user."""
+    try:
+        summary = provision_package(state_dir=state_dir, library_root=library_root, port=port)
+    except (ProvisioningError, ValueError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo("package setup complete")
+    typer.echo(f"Version: {summary['version']}")
+    typer.echo(f"State directory: {summary['state_dir']}")
+    typer.echo(f"Memory library root: {summary['library_root']}")
+    typer.echo(f"API key file: {summary['api_key_path']}")
+    typer.echo(f"Metadata file: {summary['metadata_path']}")
+    typer.echo(f"Web: http://127.0.0.1:{summary['port']}")
 
 
 @cli.command()
