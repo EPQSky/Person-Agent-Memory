@@ -201,6 +201,18 @@ personal-agent-memory-uninstall --purge
 `--purge` 会删除 `mem2/` 中的记忆、图数据和审计记录。执行前必须完成备份。如果
 安装器不能证明路径所有权，卸载器会保留该路径并报告原因。
 
+发行包用户必须先运行用户态卸载，再移除发行包：
+
+```bash
+personal-agent-memory setup --uninstall
+# 然后使用 apt/dnf 移除发行包
+```
+
+如果先移除发行包，用户级 unit 可能残留在
+`~/.config/systemd/user/personal-agent-memory.service`。残留 unit 仍被用户级
+systemd 管理器加载，并会因程序文件缺失而反复启动失败。此时先停止并删除该
+unit，再运行 `systemctl --user daemon-reload`，然后重新执行 `setup --uninstall`。
+
 ## 发行验证
 
 发行验收的唯一入口是：

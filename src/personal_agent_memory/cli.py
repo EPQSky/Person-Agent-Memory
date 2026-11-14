@@ -11,6 +11,12 @@ from personal_agent_memory.app import create_app
 from personal_agent_memory.config import ConfigurationError, Settings
 from personal_agent_memory.model_client import ModelEndpoint
 from personal_agent_memory.provisioning import ProvisioningError, provision_package
+from personal_agent_memory.service_registration import (
+    integrate_package_setup,
+    setup_summary,
+    uninstall_package,
+    uninstall_summary,
+)
 
 cli = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -56,20 +62,31 @@ def setup(
     port: int | None = typer.Option(
         None, "--port", min=1, max=65535, help="Loopback service port."
     ),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Remove package user integration."),
+    purge: bool = typer.Option(
+        False, "--purge", help="Also remove platform state (never memory libraries)."
+    ),
+    adopt_marketplace: bool = typer.Option(
+        False,
+        "--adopt-marketplace",
+        help="Replace an existing marketplace at another source.",
+    ),
 ) -> None:
-    """Initialize the package installation for the current user."""
+    """Initialize or remove the package installation for the current user."""
+    if purge and not uninstall:
+        raise typer.BadParameter("--purge requires --uninstall")
     try:
-        summary = provision_package(state_dir=state_dir, library_root=library_root, port=port)
+        if uninstall:
+            typer.echo(uninstall_summary(uninstall_package(purge=purge)))
+            return
+        summary = integrate_package_setup(
+            provision_package(state_dir=state_dir, library_root=library_root, port=port),
+            adopt_marketplace=adopt_marketplace,
+        )
     except (ProvisioningError, ValueError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=2) from error
-    typer.echo("package setup complete")
-    typer.echo(f"Version: {summary['version']}")
-    typer.echo(f"State directory: {summary['state_dir']}")
-    typer.echo(f"Memory library root: {summary['library_root']}")
-    typer.echo(f"API key file: {summary['api_key_path']}")
-    typer.echo(f"Metadata file: {summary['metadata_path']}")
-    typer.echo(f"Web: http://127.0.0.1:{summary['port']}")
+    typer.echo(setup_summary(summary))
 
 
 @cli.command()
