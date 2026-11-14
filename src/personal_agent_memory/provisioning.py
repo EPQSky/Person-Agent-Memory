@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -183,8 +184,27 @@ def _check_command_shadowing() -> None:
 
 
 def _check_unit_conflict(unit_path: Path, metadata: dict[str, object] | None) -> None:
-    if not unit_path.exists():
+    try:
+        info = unit_path.lstat()
+    except FileNotFoundError:
         return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ProvisioningError(
+            f"user service definition must be a regular non-symlink file: {unit_path}"
+        )
+    # A package setup may be repeated. Existing metadata proves ownership only
+    # when it points at this exact unit and records its current digest.
+    if metadata and metadata.get("unit_path") == str(unit_path):
+        recorded = metadata.get("unit_sha256")
+        if isinstance(recorded, str) and len(recorded) == 64:
+            try:
+                digest = hashlib.sha256(unit_path.read_bytes()).hexdigest()
+            except OSError as error:
+                raise ProvisioningError(
+                    f"cannot inspect user service definition: {error}"
+                ) from error
+            if digest == recorded:
+                return
     raise ProvisioningError(
         f"user service definition already exists and is not owned by this package: {unit_path}; "
         "stop/remove the other installation before running setup"
@@ -337,6 +357,21 @@ def provision_package(
             "api_key_path": str(api_key_path),
             "port": chosen_port,
         }
+        # Preserve integration ownership records across the core phase.  The
+        # service phase may then prove an existing unit and avoid needless
+        # metadata replacement during an idempotent rerun.
+        if metadata:
+            for key in (
+                "unit_path",
+                "unit_sha256",
+                "unit_ownership",
+                "plugin_id",
+                "plugin_ownership",
+                "plugin_registration_source",
+                "plugin_install_path",
+            ):
+                if key in metadata:
+                    payload[key] = metadata[key]
         if metadata != payload:
             _write_metadata(metadata_path, payload)
     except OSError as error:
