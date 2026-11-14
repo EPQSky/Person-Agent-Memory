@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+# Intentionally empty: package removal never performs user teardown.
+exit 0

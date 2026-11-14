@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+# Intentionally empty: package installation never performs user setup.
+exit 0

@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+# Intentionally empty: user state is never removed by package lifecycle hooks.
+exit 0
