@@ -30,7 +30,10 @@ MCP 只公开读取工具：`memory_search` 和 `memory_get`。系统不提供�
 
 ## 支持矩阵
 
-已测试的发行目标是 Ubuntu 22.04 和 Ubuntu 24.04 x86_64。
+脚本安装器的既有验收目标是 Ubuntu 22.04 和 Ubuntu 24.04 x86_64。发行包矩阵脚本
+还定义 Ubuntu 22.04、Ubuntu 24.04、Rocky Linux 9 和 Fedora 的干净容器验收入口；
+只有在该矩阵实际完成并保存日志后，才能把对应组合写成已测试承诺。本次发布文档不把
+未运行的矩阵写成通过结果。
 
 其他主流 x86_64 Linux 发行版可以使用本发行版，但需要具备以下条件：
 
@@ -49,19 +52,98 @@ MCP 只公开读取工具：`memory_search` 和 `memory_get`。系统不提供�
 
 Alpine、非 systemd 环境、ARM、Windows 和 macOS 不属于本发行版范围。
 
+## 安装渠道与权限
+
+本项目有两条安装渠道。两条渠道可以共存，但只能有一个用户态服务负责同一套平台
+状态；若检测到既有脚本安装，`personal-agent-memory setup` 会拒绝接管，并提示先
+完成原渠道的卸载或迁移。
+
+### 发行包渠道
+
+发行包安装需要 root 权限。包只安装程序、插件、wrapper 和文档，不在包的生命周期脚本
+中执行用户初始化，不调用 `systemctl --user`，也不读取 `$HOME`。安装包后，使用普通用户
+显式初始化：
+
+```bash
+personal-agent-memory setup \
+  --state-dir "$HOME/.local/share/personal-agent-memory" \
+  --library-root "$HOME/.local/share/personal-agent-memory/libraries"
+```
+
+初始化会创建用户态服务、API 密钥和 Codex 注册。升级前后都使用同一个 `setup` 入口；
+卸载时先运行 `personal-agent-memory setup --uninstall`，再用 `apt remove` 或 `dnf remove`
+移除程序包。普通卸载保留平台状态、API 密钥、记忆库和用户配置。
+
+### 脚本渠道
+
+脚本渠道不需要 root，但需要 Python、`uv`、Node.js、Codex CLI、Git 和用户级 systemd。
+脚本渠道只为当前用户安装程序和用户态集成：
+
+```bash
+chmod +x install.sh uninstall.sh
+./install.sh
+```
+
+脚本渠道的卸载入口是 `personal-agent-memory-uninstall`。不要用脚本渠道的卸载器清理
+发行包管理器登记的文件，也不要让两个渠道同时管理同一个用户态服务。
+
 ## 发行资产
 
 每个 Release 必须发布以下匹配资产：
 
+- `personal-agent-memory_<version>_amd64.deb`：Debian/Ubuntu 发行包。
+- `personal-agent-memory-<version>-1.x86_64.rpm`：RPM 发行包。
+- `apt/`：包含 `dists/stable/main/binary-amd64/Packages.gz` 的离线 APT 源。
+- `rpm/`：包含 `repodata/` 的离线 DNF 源。
+- `SHA256SUMS`：覆盖 `apt/` 和 `rpm/` 下全部资产。
+- `ASSET-MANIFEST.json`：记录每个资产的相对路径、大小和 SHA-256。
 - `install.sh`：无特权安装和原地升级入口。
 - `uninstall.sh`：稳定卸载入口。安装器会把它复制到用户可执行目录。
 - 同一标签的源码归档。归档包含 `pyproject.toml`、`uv.lock`、插件目录和两个脚本。
+
+资产由 `scripts/build-packages.sh` 和 `scripts/build-offline-repository.sh` 生成。发布前
+逐项检查 `SHA256SUMS`，不要从网络下载缺失依赖；离线源只应引用本地路径或内网地址。
 
 执行安装前，请审查下载的脚本。请确认 `pyproject.toml` 中的版本与插件清单一致。
 请保留源码归档以便审计。删除源码归档后，已安装的卸载器仍可使用。
 
 `uv.lock` 必须锁定 `JiuwenMemory==0.2.0`、`milvus-lite==3.2.2`、
 `pymilvus==3.0.2` 和其他必需依赖。
+
+## 离线安装与升级
+
+在目标机上复制 `.deb` 或 `.rpm`、`SHA256SUMS` 和 `ASSET-MANIFEST.json`。先校验资产：
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+Debian/Ubuntu 使用本地包文件安装：
+
+```bash
+sudo apt install ./personal-agent-memory_<version>_amd64.deb
+personal-agent-memory setup
+```
+
+RPM 系统使用本地包文件安装：
+
+```bash
+sudo dnf install ./personal-agent-memory-<version>-1.x86_64.rpm
+personal-agent-memory setup
+```
+
+如果目标机需要通过离线源安装多个本地包，使用发布目录中的 `apt/` 或 `rpm/`。不要
+执行 `apt update` 或 `dnf makecache` 访问公网；将源配置为本地路径或已批准的内网地址，
+并把 `SHA256SUMS` 校验作为安装前置步骤。离线仓库验证入口是：
+
+```bash
+scripts/verify-offline-repository.sh \
+  --repository ./release-repository \
+  --image <包含包管理器的本地镜像>
+```
+
+升级使用同一渠道的更高版本包，然后重复 `personal-agent-memory setup`。包安装和升级
+不创建用户数据；用户初始化、服务注册和 Codex 注册都由 `setup` 明确执行。
 
 ## 自动安装
 
@@ -236,7 +318,18 @@ PAM_INSTALL_ACCEPTANCE_DEDICATED_USER=1 \
 - 数据保留和故障放行。
 - 项目工作树状态不变。
 
-发行门禁必须在 Ubuntu 22.04 和 Ubuntu 24.04 x86_64 上运行。
+发行门禁必须在 Ubuntu 22.04 和 Ubuntu 24.04 x86_64 上运行。发行包发布还应使用
+四发行版矩阵入口；该入口需要已构建的 `.deb` 和 `.rpm`：
+
+```bash
+./scripts/verify-release-matrix.sh \
+  --deb ./release/personal-agent-memory_<version>_amd64.deb \
+  --rpm ./release/personal-agent-memory-<version>-1.x86_64.rpm
+```
+
+矩阵脚本在 Ubuntu 22.04、Ubuntu 24.04、Rocky Linux 9 和 Fedora 容器中使用隔离的
+`HOME` 与 `XDG_*` 目录，并使用 `--network none`。脚本失败时保留当前终端输出中的发行版
+名称和失败命令；发布记录必须只声明实际返回成功的组合。
 
 需要明确验证 `uv` 引导时，请在未把 `uv` 加入 `PATH` 的一次性用户中运行：
 
