@@ -69,13 +69,19 @@ if [ "$1" = run ]; then
   done
   [ "$emit" = true ] || exit 0
   prefix=${prefix:-/opt/personal-agent-memory}
-  mkdir -p "$output$prefix/runtime/bin" "$output$prefix/bin" "$output$prefix/plugins/personal-agent-memory/.codex-plugin"
-  printf '#!/bin/sh\nif [ "${1:-}" = - ]; then exec /usr/bin/python3 "$@"; fi\nprintf "0.2.1\n"\n' > "$output$prefix/runtime/bin/python3"
+  mkdir -p "$output$prefix/runtime/bin" "$output$prefix/bin" \
+    "$output$prefix/plugins/personal-agent-memory/.codex-plugin"
+  printf '#!/bin/sh\nif [ "${1:-}" = - ]; then exec /usr/bin/python3 "$@"; fi\n' \
+    > "$output$prefix/runtime/bin/python3"
+  printf 'printf "0.3.0\\n"\n' >> "$output$prefix/runtime/bin/python3"
   chmod 755 "$output$prefix/runtime/bin/python3"
-  printf '#!/bin/sh\nprintf "0.2.1\n"\n' > "$output$prefix/bin/personal-agent-memory"
+  printf '#!/bin/sh\n' > "$output$prefix/bin/personal-agent-memory"
+  printf 'printf "0.3.0\\n"\n' >> "$output$prefix/bin/personal-agent-memory"
   chmod 755 "$output$prefix/bin/personal-agent-memory"
-  printf '{"version":"0.2.1"}\n' > "$output$prefix/plugins/personal-agent-memory/.codex-plugin/plugin.json"
-  printf '{"project_version":"0.2.1","plugin_version":"0.2.1"}\n' > "$output/manifest.json"
+  printf '{"version":"0.3.0"}\n' \
+    > "$output$prefix/plugins/personal-agent-memory/.codex-plugin/plugin.json"
+  printf '{"project_version":"0.3.0","plugin_version":"0.3.0"}\n' \
+    > "$output/manifest.json"
 fi
 """,
         encoding="utf-8",
@@ -224,7 +230,15 @@ def test_payload_builder_rejects_unverified_runtime_before_engine(tmp_path: Path
     output = tmp_path / "payload"
     env = {**os.environ, "PAM_CONTAINER_ENGINE": str(engine)}
     result = subprocess.run(
-        [str(SCRIPT), "--output", str(output), "--runtime-url", "https://example.invalid/python.tar.gz", "--runtime-sha256", "0" * 63],
+        [
+            str(SCRIPT),
+            "--output",
+            str(output),
+            "--runtime-url",
+            "https://example.invalid/python.tar.gz",
+            "--runtime-sha256",
+            "0" * 63,
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -258,15 +272,23 @@ if [ "$1" = run ]; then
   done
   if [ "$emit" != true ]; then exit 0; fi
   prefix=${prefix:-/opt/personal-agent-memory}
-  mkdir -p "$output$prefix/runtime/bin" "$output$prefix/bin" "$output$prefix/plugins/personal-agent-memory/.codex-plugin"
-  printf '#!/bin/sh\nif [ "${1:-}" = - ]; then exec /usr/bin/python3 "$@"; fi\nprintf "0.2.1\n"\n' > "$output$prefix/runtime/bin/python3"
+  mkdir -p "$output$prefix/runtime/bin" "$output$prefix/bin" \
+    "$output$prefix/plugins/personal-agent-memory/.codex-plugin"
+  printf '#!/bin/sh\nif [ "${1:-}" = - ]; then exec /usr/bin/python3 "$@"; fi\n' \
+    > "$output$prefix/runtime/bin/python3"
+  printf 'printf "0.3.0\\n"\n' >> "$output$prefix/runtime/bin/python3"
   chmod 755 "$output$prefix/runtime/bin/python3"
-  printf '#!/bin/sh\nprintf "0.2.1\n"\n' > "$output$prefix/bin/personal-agent-memory"
+  printf '#!/bin/sh\n' > "$output$prefix/bin/personal-agent-memory"
+  printf 'printf "0.3.0\\n"\n' >> "$output$prefix/bin/personal-agent-memory"
   chmod 755 "$output$prefix/bin/personal-agent-memory"
-  printf '{"version":"0.2.1"}\n' > "$output$prefix/plugins/personal-agent-memory/.codex-plugin/plugin.json"
-  manifest_version=0.2.1
+  printf '{"version":"0.3.0"}\n' \
+    > "$output$prefix/plugins/personal-agent-memory/.codex-plugin/plugin.json"
+  manifest_version=0.3.0
   [ "${PAM_FAKE_MISMATCH:-}" = 1 ] && manifest_version=0.2.0
-  printf '{"project":"personal-agent-memory","project_version":"%s","plugin_version":"%s"}\n' "$manifest_version" "$manifest_version" > "$output/manifest.json"
+  manifest_format='{"project":"personal-agent-memory",'
+  manifest_format+='"project_version":"%s","plugin_version":"%s"}\n'
+  printf "$manifest_format" "$manifest_version" "$manifest_version" \
+    > "$output/manifest.json"
 fi
 """,
         encoding="utf-8",

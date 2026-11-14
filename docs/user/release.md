@@ -101,8 +101,18 @@ chmod +x install.sh uninstall.sh
 - `uninstall.sh`：稳定卸载入口。安装器会把它复制到用户可执行目录。
 - 同一标签的源码归档。归档包含 `pyproject.toml`、`uv.lock`、插件目录和两个脚本。
 
-资产由 `scripts/build-packages.sh` 和 `scripts/build-offline-repository.sh` 生成。发布前
-逐项检查 `SHA256SUMS`，不要从网络下载缺失依赖；离线源只应引用本地路径或内网地址。
+资产由 `scripts/build-packages.sh` 和 `scripts/build-offline-repository.sh` 生成。宿主机缺少
+`rpmbuild` 或 `dpkg-deb` 时，使用容器化构建入口；它只在首次构建工具镜像时需要网络，
+实际包构建使用 `--network none`：
+
+```bash
+scripts/build-packages-container.sh \
+  --payload ./payload \
+  --output ../release/packages
+```
+
+发布前逐项检查 `SHA256SUMS`，不要从网络下载缺失依赖；离线源只应引用本地路径或内网
+地址。
 
 执行安装前，请审查下载的脚本。请确认 `pyproject.toml` 中的版本与插件清单一致。
 请保留源码归档以便审计。删除源码归档后，已安装的卸载器仍可使用。

@@ -967,7 +967,7 @@ def test_real_codex_cli_add_to_managed_uninstall_contract(tmp_path: Path) -> Non
     codex = shutil.which("codex")
     if codex is None:
         pytest.skip("Codex CLI is required for the real managed uninstall contract")
-    environment, paths, _ = uninstall_test_environment(tmp_path, release_version="0.2.1")
+    environment, paths, _ = uninstall_test_environment(tmp_path, release_version="0.3.0")
     shutil.rmtree(paths["codex_home"])
     paths["codex_home"].mkdir()
     setup_environment = {**environment, "CODEX_HOME": str(paths["codex_home"])}
@@ -1845,7 +1845,7 @@ def test_supported_environment_installs_service_plugin_and_healthy_hook(
     fake_bin = tmp_path / "bin"
     plugin_install = (
         home
-        / ".codex/plugins/cache/personal-agent-memory/personal-agent-memory/0.2.1"
+        / ".codex/plugins/cache/personal-agent-memory/personal-agent-memory/0.3.0"
     )
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -2329,7 +2329,7 @@ esac
                 if directory_mode == "preexisting-state"
                 else "installer-created-exclusive"
             ),
-            "installed_version": "0.2.1",
+            "installed_version": "0.3.0",
             "marketplace_ownership": "preexisting" if legacy_upgrade else "installer-managed",
             "marketplace_source": str(ROOT),
             "marketplace_update_pending": False,
@@ -2340,7 +2340,7 @@ esac
             "daemon_path": str(fake_bin / "personal-agent-memory"),
             "unit_path": str(unit),
             "plugin_id": "personal-agent-memory@personal-agent-memory",
-            "plugin_version": "0.2.1",
+            "plugin_version": "0.3.0",
             "plugin_registration_source": str(
                 ROOT / "plugins/personal-agent-memory"
             ),
@@ -2409,7 +2409,7 @@ esac
             for line in log.splitlines()
         )
         assert "installer-test-secret" not in result.stdout
-        assert "Installed version: 0.2.1" in result.stdout
+        assert "Installed version: 0.3.0" in result.stdout
         for expected in (
             "Memory kernel:    mem2 (JiuwenMemory 0.2.0)",
             "Service status: active",
@@ -2582,7 +2582,7 @@ esac
                 / ".codex-plugin"
                 / "plugin.json",
             ):
-                rewrite_release_version(path, "0.2.1", "0.2.2")
+                rewrite_release_version(path, "0.3.0", "0.2.2")
 
             remove_count = command_log.read_text(encoding="utf-8").count(
                 "codex plugin marketplace remove personal-agent-memory --json"
@@ -2747,7 +2747,7 @@ esac
                 / ".codex-plugin"
                 / "plugin.json",
             ):
-                rewrite_release_version(path, "0.2.1", "0.2.3")
+                rewrite_release_version(path, "0.3.0", "0.2.3")
 
             next_upgrade = subprocess.run(
                 [str(next_release / "install.sh"), "--port", str(port)],

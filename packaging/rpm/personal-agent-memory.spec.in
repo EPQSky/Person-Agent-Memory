@@ -6,6 +6,9 @@ License: Apache-2.0
 BuildArch: x86_64
 Source0: root.tar.gz
 
+# This is a file-only payload. There are no compiled sources or debug files.
+%global debug_package %{nil}
+
 %description
 Self-contained daemon and Codex plugin payload. User setup is explicit.
 

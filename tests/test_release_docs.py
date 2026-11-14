@@ -17,6 +17,7 @@ def test_release_document_covers_package_and_script_channels() -> None:
         'SHA256SUMS',
         'ASSET-MANIFEST.json',
         'verify-release-matrix.sh',
+        'build-packages-container.sh',
         '--network none',
         '不把\n未运行的矩阵写成通过结果',
     ):

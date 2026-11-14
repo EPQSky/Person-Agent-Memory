@@ -26,11 +26,11 @@ def test_package_builder_help_and_scripts_are_file_only() -> None:
         for name in ("postinst", "prerm", "postrm")
     )
     lifecycle += (ROOT / "packaging/rpm/personal-agent-memory.spec.in").read_text(encoding="utf-8")
-    for marker in ("%post", "%preun", "%postun"):
+    for marker in ("%post", "%preun", "%postun", "%global debug_package %{nil}"):
         assert marker in lifecycle
 
 
-def make_payload(tmp_path: Path, version: str = "0.2.1") -> tuple[Path, Path]:
+def make_payload(tmp_path: Path, version: str = "0.3.0") -> tuple[Path, Path]:
     source = tmp_path / "source"
     payload = tmp_path / "payload"
     source.mkdir()
@@ -84,13 +84,13 @@ def test_package_metadata_requires_matching_project_payload_and_plugin_versions(
     )
     assert result.returncode == 0, result.stderr
     metadata = json.loads(output.read_text(encoding="utf-8"))
-    assert metadata["version"] == "0.2.1"
+    assert metadata["version"] == "0.3.0"
     assert metadata["payload_prefix"] == "/opt/personal-agent-memory"
     assert metadata["package_installation"] == "files-only-no-user-operations"
 
 
 def test_package_metadata_rejects_version_drift(tmp_path: Path) -> None:
-    source, payload = make_payload(tmp_path, version="0.2.1")
+    source, payload = make_payload(tmp_path, version="0.3.0")
     drift_manifest = json.loads((payload / "manifest.json").read_text(encoding="utf-8"))
     drift_manifest.update({"project_version": "0.2.0", "plugin_version": "0.2.0"})
     (payload / "manifest.json").write_text(json.dumps(drift_manifest), encoding="utf-8")
@@ -141,7 +141,7 @@ for arg do
   shift
 done
 mkdir -p "$top/RPMS/x86_64"
-touch "$top/RPMS/x86_64/personal-agent-memory-0.2.1.rpm"
+touch "$top/RPMS/x86_64/personal-agent-memory-0.3.0.rpm"
 """,
         encoding="utf-8",
     )
@@ -156,7 +156,7 @@ touch "$top/RPMS/x86_64/personal-agent-memory-0.2.1.rpm"
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert (output / "personal-agent-memory_0.2.1_amd64.deb").exists()
+    assert (output / "personal-agent-memory_0.3.0_amd64.deb").exists()
     assert list(output.glob("*.rpm"))
 
 
@@ -192,3 +192,12 @@ def test_package_e2e_harness_declares_full_acceptance_flow() -> None:
         "SKIP:",
     ):
         assert marker in harness
+
+
+def test_container_package_builder_provides_host_tooling_fallback() -> None:
+    builder = (ROOT / "scripts/build-packages-container.sh").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "scripts/package-builder.Dockerfile").read_text(encoding="utf-8")
+    assert "--network none" in builder
+    assert "build-packages.sh" in builder
+    assert "dpkg" in dockerfile
+    assert "rpm-build" in dockerfile
