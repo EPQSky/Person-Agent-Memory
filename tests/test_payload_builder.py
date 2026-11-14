@@ -73,14 +73,14 @@ if [ "$1" = run ]; then
     "$output$prefix/plugins/personal-agent-memory/.codex-plugin"
   printf '#!/bin/sh\nif [ "${1:-}" = - ]; then exec /usr/bin/python3 "$@"; fi\n' \
     > "$output$prefix/runtime/bin/python3"
-  printf 'printf "0.3.0\\n"\n' >> "$output$prefix/runtime/bin/python3"
+  printf 'printf "0.3.1\\n"\n' >> "$output$prefix/runtime/bin/python3"
   chmod 755 "$output$prefix/runtime/bin/python3"
   printf '#!/bin/sh\n' > "$output$prefix/bin/personal-agent-memory"
-  printf 'printf "0.3.0\\n"\n' >> "$output$prefix/bin/personal-agent-memory"
+  printf 'printf "0.3.1\\n"\n' >> "$output$prefix/bin/personal-agent-memory"
   chmod 755 "$output$prefix/bin/personal-agent-memory"
-  printf '{"version":"0.3.0"}\n' \
+  printf '{"version":"0.3.1"}\n' \
     > "$output$prefix/plugins/personal-agent-memory/.codex-plugin/plugin.json"
-  printf '{"project_version":"0.3.0","plugin_version":"0.3.0"}\n' \
+  printf '{"project_version":"0.3.1","plugin_version":"0.3.1"}\n' \
     > "$output/manifest.json"
 fi
 """,
@@ -276,14 +276,14 @@ if [ "$1" = run ]; then
     "$output$prefix/plugins/personal-agent-memory/.codex-plugin"
   printf '#!/bin/sh\nif [ "${1:-}" = - ]; then exec /usr/bin/python3 "$@"; fi\n' \
     > "$output$prefix/runtime/bin/python3"
-  printf 'printf "0.3.0\\n"\n' >> "$output$prefix/runtime/bin/python3"
+  printf 'printf "0.3.1\\n"\n' >> "$output$prefix/runtime/bin/python3"
   chmod 755 "$output$prefix/runtime/bin/python3"
   printf '#!/bin/sh\n' > "$output$prefix/bin/personal-agent-memory"
-  printf 'printf "0.3.0\\n"\n' >> "$output$prefix/bin/personal-agent-memory"
+  printf 'printf "0.3.1\\n"\n' >> "$output$prefix/bin/personal-agent-memory"
   chmod 755 "$output$prefix/bin/personal-agent-memory"
-  printf '{"version":"0.3.0"}\n' \
+  printf '{"version":"0.3.1"}\n' \
     > "$output$prefix/plugins/personal-agent-memory/.codex-plugin/plugin.json"
-  manifest_version=0.3.0
+  manifest_version=0.3.1
   [ "${PAM_FAKE_MISMATCH:-}" = 1 ] && manifest_version=0.2.0
   manifest_format='{"project":"personal-agent-memory",'
   manifest_format+='"project_version":"%s","plugin_version":"%s"}\n'

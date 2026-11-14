@@ -4,7 +4,8 @@
 `uninstall.sh` 和对应源码归档。先审查本地文件，再执行安装。生产安装不要使用
 `curl | sh`。
 
-面向用户的安装、模型配置和日常使用说明见 [使用说明](usage.md)。
+面向用户的安装、模型配置和日常使用说明见 [使用说明](usage.md)。当前稳定发行版为
+[v0.3.1](https://github.com/EPQSky/Person-Agent-Memory/releases/tag/v0.3.1)。
 
 ## 产品范围
 
@@ -30,10 +31,10 @@ MCP 只公开读取工具：`memory_search` 和 `memory_get`。系统不提供�
 
 ## 支持矩阵
 
-脚本安装器的既有验收目标是 Ubuntu 22.04 和 Ubuntu 24.04 x86_64。发行包矩阵脚本
-还定义 Ubuntu 22.04、Ubuntu 24.04、Rocky Linux 9 和 Fedora 的干净容器验收入口；
-只有在该矩阵实际完成并保存日志后，才能把对应组合写成已测试承诺。本次发布文档不把
-未运行的矩阵写成通过结果。
+脚本安装器的完整运行时验收目标是 Ubuntu 22.04 和 Ubuntu 24.04 x86_64。v0.3.1 的
+DEB/RPM 包文件已在 Ubuntu 22.04、Ubuntu 24.04、Rocky Linux 9 和 Fedora 44 的无网络
+容器中完成安装、版本检查和卸载保留外部数据验证。该包文件矩阵不等同于完整服务初始化、
+记忆写入和记忆召回验收；其他发行版仍需完成完整运行时验收后才能写成支持承诺。
 
 其他主流 x86_64 Linux 发行版可以使用本发行版，但需要具备以下条件：
 
@@ -93,10 +94,12 @@ chmod +x install.sh uninstall.sh
 
 - `personal-agent-memory_<version>_amd64.deb`：Debian/Ubuntu 发行包。
 - `personal-agent-memory-<version>-1.x86_64.rpm`：RPM 发行包。
+- `personal-agent-memory-<version>-offline-repositories.tar.gz`：包含 `apt/`、`rpm/`、
+  `SHA256SUMS` 和 `ASSET-MANIFEST.json` 的离线仓库归档。
 - `apt/`：包含 `dists/stable/main/binary-amd64/Packages.gz` 的离线 APT 源。
 - `rpm/`：包含 `repodata/` 的离线 DNF 源。
-- `SHA256SUMS`：覆盖 `apt/` 和 `rpm/` 下全部资产。
-- `ASSET-MANIFEST.json`：记录每个资产的相对路径、大小和 SHA-256。
+- `SHA256SUMS`：覆盖离线仓库中的 `apt/` 和 `rpm/` 全部资产。
+- `ASSET-MANIFEST.json`：记录离线仓库每个资产的相对路径、大小和 SHA-256。
 - `install.sh`：无特权安装和原地升级入口。
 - `uninstall.sh`：稳定卸载入口。安装器会把它复制到用户可执行目录。
 - 同一标签的源码归档。归档包含 `pyproject.toml`、`uv.lock`、插件目录和两个脚本。

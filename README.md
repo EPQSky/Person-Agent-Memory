@@ -4,6 +4,13 @@
 可检索、可治理、可审计的长期记忆。它通过 Codex Hook、MCP（Model Context Protocol）和
 本机管理台提供采集、检索和治理能力。
 
+## 当前发行版
+
+当前稳定发行版为 [v0.3.1](https://github.com/EPQSky/Person-Agent-Memory/releases/tag/v0.3.1)。
+Linux 用户可以从 GitHub Release 获取 Debian/Ubuntu 的 DEB 包、RPM 系发行版的 RPM 包和
+离线仓库资产。包渠道需要 root 权限；无 root 安装和完整初始化流程见
+[Linux 发行说明](docs/user/release.md)。
+
 Personal Agent Memory 只服务单个本地用户和本机 Codex 会话。服务只监听回环地址，不使用
 Docker，不需要系统级服务，也不提供远程同步。
 
@@ -80,8 +87,10 @@ Memory 把这些内容从会话上下文中分离出来，形成独立的记忆�
 
 ## 支持范围
 
-已测试 Linux x86_64 上的 Ubuntu 22.04 和 Ubuntu 24.04。运行需要 Python 3.11-3.13、
-`uv`、Node.js、Codex CLI、Git 和用户级 `systemd`。
+完整运行时和脚本安装器已测试 Linux x86_64 上的 Ubuntu 22.04 和 Ubuntu 24.04。运行需要
+Python 3.11-3.13、`uv`、Node.js、Codex CLI、Git 和用户级 `systemd`。v0.3.1 的 DEB/RPM
+包文件还完成了 Ubuntu 22.04、Ubuntu 24.04、Rocky Linux 9 和 Fedora 44 的离线安装与
+卸载保留数据验证；这不等同于这些发行版上的完整服务初始化验收。
 
 当前版本只支持单用户、本机使用。以下能力不在范围内：
 

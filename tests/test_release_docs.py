@@ -18,8 +18,9 @@ def test_release_document_covers_package_and_script_channels() -> None:
         'ASSET-MANIFEST.json',
         'verify-release-matrix.sh',
         'build-packages-container.sh',
+        'personal-agent-memory-<version>-offline-repositories.tar.gz',
         '--network none',
-        '不把\n未运行的矩阵写成通过结果',
+        'v0.3.1',
     ):
         assert marker in text
 

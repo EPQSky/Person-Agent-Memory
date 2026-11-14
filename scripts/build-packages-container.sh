@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 ENGINE=${PAM_CONTAINER_ENGINE:-docker}
-IMAGE=${PAM_PACKAGE_BUILDER_IMAGE:-personal-agent-memory-package-builder:0.3.0}
+IMAGE=${PAM_PACKAGE_BUILDER_IMAGE:-personal-agent-memory-package-builder:0.3.1}
 PAYLOAD=""
 OUTPUT=""
 SOURCE="$ROOT"

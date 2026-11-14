@@ -311,7 +311,7 @@ def test_setup_registers_plugin_service_and_health_summary(tmp_path: Path, monke
             return json.dumps(
                 {
                     "pluginId": "personal-agent-memory@personal-agent-memory",
-                    "version": "0.3.0",
+                    "version": "0.3.1",
                     "installedPath": str(plugin_path),
                 }
             )
@@ -321,7 +321,7 @@ def test_setup_registers_plugin_service_and_health_summary(tmp_path: Path, monke
                     "installed": [
                         {
                             "pluginId": "personal-agent-memory@personal-agent-memory",
-                            "version": "0.3.0",
+                            "version": "0.3.1",
                             "installedPath": str(plugin_path),
                             "source": {"path": str(marketplace)},
                             "enabled": True,
@@ -409,7 +409,7 @@ def test_setup_uninstall_removes_owned_service_and_plugin_but_keeps_data(
             return json.dumps(
                 {
                     "pluginId": "personal-agent-memory@personal-agent-memory",
-                    "version": "0.3.0",
+                    "version": "0.3.1",
                     "installedPath": str(plugin_path),
                 }
             )
@@ -419,7 +419,7 @@ def test_setup_uninstall_removes_owned_service_and_plugin_but_keeps_data(
                     "installed": [
                         {
                             "pluginId": "personal-agent-memory@personal-agent-memory",
-                            "version": "0.3.0",
+                            "version": "0.3.1",
                             "installedPath": str(plugin_path),
                             "source": {"path": str(marketplace)},
                             "enabled": True,
@@ -511,7 +511,7 @@ def test_plugin_list_requires_exactly_one_marketplace_entry(tmp_path: Path, monk
 
     monkeypatch.setattr(service_registration, "_run", fake_run)
     with pytest.raises(ProvisioningError, match="exactly one"):
-        service_registration.register_plugin(version="0.3.0")
+        service_registration.register_plugin(version="0.3.1")
 
 
 def test_plugin_remove_not_found_is_idempotent_but_other_errors_propagate(monkeypatch) -> None:
@@ -546,8 +546,8 @@ def test_service_failure_restores_metadata_unit_and_plugin(tmp_path: Path, monke
     original = {
         "schema_version": 2,
         "install_method": "package",
-        "installed_version": "0.3.0",
-        "plugin_version": "0.3.0",
+        "installed_version": "0.3.1",
+        "plugin_version": "0.3.1",
         "state_dir": str(state),
         "state_dir_ownership": "package-managed",
         "library_root": str(libraries),
@@ -557,7 +557,7 @@ def test_service_failure_restores_metadata_unit_and_plugin(tmp_path: Path, monke
     }
     metadata_path.write_text(json.dumps(original), encoding="utf-8")
     summary = {
-        "version": "0.3.0",
+        "version": "0.3.1",
         "state_dir": str(state),
         "library_root": str(libraries),
         "api_key_path": str(state / "api-key"),
@@ -584,7 +584,7 @@ def test_service_failure_restores_metadata_unit_and_plugin(tmp_path: Path, monke
             return json.dumps(
                 {
                     "pluginId": "personal-agent-memory@personal-agent-memory",
-                    "version": "0.3.0",
+                    "version": "0.3.1",
                     "installedPath": str(plugin),
                 }
             )
@@ -594,7 +594,7 @@ def test_service_failure_restores_metadata_unit_and_plugin(tmp_path: Path, monke
                     "installed": [
                         {
                             "pluginId": "personal-agent-memory@personal-agent-memory",
-                            "version": "0.3.0",
+                            "version": "0.3.1",
                             "installedPath": str(plugin),
                             "source": {"path": str(source)},
                             "enabled": True,
@@ -659,7 +659,7 @@ def test_register_plugin_adopts_foreign_marketplace_only_when_requested(
             return json.dumps(
                 {
                     "pluginId": "personal-agent-memory@personal-agent-memory",
-                    "version": "0.3.0",
+                    "version": "0.3.1",
                     "installedPath": str(plugin),
                 }
             )
@@ -669,7 +669,7 @@ def test_register_plugin_adopts_foreign_marketplace_only_when_requested(
                     "installed": [
                         {
                             "pluginId": "personal-agent-memory@personal-agent-memory",
-                            "version": "0.3.0",
+                            "version": "0.3.1",
                             "installedPath": str(plugin),
                             "source": {"path": str(source)},
                             "enabled": True,
@@ -681,7 +681,7 @@ def test_register_plugin_adopts_foreign_marketplace_only_when_requested(
 
     monkeypatch.setattr(service_registration, "_run", fake_run)
     with pytest.raises(ProvisioningError, match="adopt-marketplace"):
-        service_registration.register_plugin(version="0.3.0")
+        service_registration.register_plugin(version="0.3.1")
     # Recreate responses for the explicit adoption attempt.
     marketplace_lists = iter(
         [
@@ -689,7 +689,7 @@ def test_register_plugin_adopts_foreign_marketplace_only_when_requested(
             {"marketplaces": [{"name": "personal-agent-memory", "root": str(source)}]},
         ]
     )
-    service_registration.register_plugin(version="0.3.0", adopt_marketplace=True)
+    service_registration.register_plugin(version="0.3.1", adopt_marketplace=True)
     assert any(args[:3] == ["plugin", "marketplace", "remove"] for _, args in calls)
 
 
@@ -793,7 +793,7 @@ def test_adoption_failure_restores_foreign_marketplace(tmp_path: Path, monkeypat
     }
     metadata_path.write_text(json.dumps(original), encoding="utf-8")
     summary = {
-        "version": "0.3.0",
+        "version": "0.3.1",
         "state_dir": str(state),
         "library_root": str(library),
         "api_key_path": str(state / "api-key"),
@@ -871,7 +871,7 @@ def test_new_marketplace_is_removed_when_later_setup_fails(tmp_path: Path, monke
     }
     metadata_path.write_text(json.dumps(original), encoding="utf-8")
     summary = {
-        "version": "0.3.0",
+        "version": "0.3.1",
         "state_dir": str(state),
         "library_root": str(library),
         "api_key_path": str(state / "api-key"),
@@ -908,7 +908,7 @@ def test_new_marketplace_is_removed_when_later_setup_fails(tmp_path: Path, monke
             return json.dumps(
                 {
                     "pluginId": "personal-agent-memory@personal-agent-memory",
-                    "version": "0.3.0",
+                    "version": "0.3.1",
                     "installedPath": str(plugin),
                 }
             )
@@ -918,7 +918,7 @@ def test_new_marketplace_is_removed_when_later_setup_fails(tmp_path: Path, monke
                     "installed": [
                         {
                             "pluginId": "personal-agent-memory@personal-agent-memory",
-                            "version": "0.3.0",
+                            "version": "0.3.1",
                             "installedPath": str(plugin),
                             "source": {"path": str(source)},
                             "enabled": True,
@@ -986,7 +986,7 @@ def test_uninstall_preserves_external_same_name_plugin(tmp_path: Path, monkeypat
                 "plugin_ownership": "package-managed",
                 "plugin_registration_source": str(source),
                 "plugin_install_path": str(source / "plugin"),
-                "plugin_version": "0.3.0",
+                "plugin_version": "0.3.1",
             }
         ),
         encoding="utf-8",
@@ -1005,7 +1005,7 @@ def test_uninstall_preserves_external_same_name_plugin(tmp_path: Path, monkeypat
                             "pluginId": "personal-agent-memory@personal-agent-memory",
                             "source": {"path": str(foreign)},
                             "installedPath": str(source / "plugin"),
-                            "version": "0.3.0",
+                            "version": "0.3.1",
                         }
                     ]
                 }
@@ -1194,7 +1194,7 @@ def test_foreign_non_adoption_failure_does_not_remove_plugin_or_marketplace(
         encoding="utf-8",
     )
     summary = {
-        "version": "0.3.0",
+        "version": "0.3.1",
         "state_dir": str(state),
         "library_root": str(library),
         "api_key_path": str(state / "api-key"),
