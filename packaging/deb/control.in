@@ -1,0 +1,8 @@
+Package: personal-agent-memory
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Personal Agent Memory maintainers <maintainers@example.invalid>
+Description: Local-first personal memory platform for coding agents
+ Self-contained daemon and Codex plugin payload. Run personal-agent-memory setup as the user after installation.

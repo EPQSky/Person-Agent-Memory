@@ -1,0 +1,32 @@
+Name: personal-agent-memory
+Version: @VERSION@
+Release: 1
+Summary: Local-first personal memory platform for coding agents
+License: Apache-2.0
+BuildArch: x86_64
+Source0: root.tar.gz
+
+%description
+Self-contained daemon and Codex plugin payload. User setup is explicit.
+
+%prep
+%setup -q -c -T
+%{__tar} -xzf %{SOURCE0}
+
+%install
+mkdir -p %{buildroot}
+cp -a ./* %{buildroot}/
+
+%files
+/opt/personal-agent-memory
+/usr/bin/personal-agent-memory
+/usr/share/doc/personal-agent-memory
+
+%post
+# Intentionally empty: package installation never performs user setup.
+
+%preun
+# Intentionally empty: package removal never performs user teardown.
+
+%postun
+# Intentionally empty: user state is never removed by package lifecycle hooks.
