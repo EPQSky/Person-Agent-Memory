@@ -1,0 +1,13 @@
+[Unit]
+Description=Personal Agent Memory daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=@INSTALL_PREFIX@/bin/personal-agent-memory serve --state-dir %h/.local/share/personal-agent-memory --library-root %h/memory-libraries --host 127.0.0.1 --port 7331
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

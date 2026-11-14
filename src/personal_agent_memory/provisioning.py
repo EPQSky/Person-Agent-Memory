@@ -58,20 +58,71 @@ def _read_metadata(path: Path) -> dict[str, object] | None:
 
 
 def _plugin_manifest_path() -> Path:
+    """Locate the plugin shipped beside the installed payload.
+
+    A package installation places this module below
+    ``<prefix>/venv/lib/pythonX.Y/site-packages`` while the plugin is at
+    ``<prefix>/plugins``.  Walking ancestors avoids a hard-coded ``/opt``
+    prefix and works for custom prefixes such as ``/srv/pam``.
+    """
+    candidates: list[Path] = []
     configured = os.environ.get("PERSONAL_AGENT_MEMORY_PLUGIN_MANIFEST")
-    candidates = [Path(configured)] if configured else []
-    source_root = Path(__file__).resolve().parents[2]
+    if configured:
+        candidates.append(Path(configured).expanduser())
+
+    configured_prefix = os.environ.get("PERSONAL_AGENT_MEMORY_INSTALL_PREFIX")
+    if configured_prefix:
+        candidates.append(
+            Path(configured_prefix).expanduser()
+            / "plugins/personal-agent-memory/.codex-plugin/plugin.json"
+        )
+
+    payload_manifest = os.environ.get("PERSONAL_AGENT_MEMORY_PAYLOAD_MANIFEST")
+    if payload_manifest:
+        payload_path = Path(payload_manifest).expanduser()
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            plugin_path = payload.get("plugin_manifest")
+            if isinstance(plugin_path, str) and plugin_path:
+                candidate = Path(plugin_path).expanduser()
+                if not candidate.is_absolute():
+                    candidate = payload_path.parent / candidate
+                candidates.append(candidate)
+
+    package_file = Path(__file__).resolve()
+    plugin_relative = Path("plugins/personal-agent-memory/.codex-plugin/plugin.json")
+    # For a wheel payload, one of these ancestors is <prefix>.  For a source
+    # checkout, the repository root is also found by this walk.
+    candidates.extend(ancestor / plugin_relative for ancestor in package_file.parents)
+    source_root = package_file.parents[2]
+    candidates.append(source_root / plugin_relative)
     candidates.extend(
         [
-            source_root / "plugins/personal-agent-memory/.codex-plugin/plugin.json",
-            Path("/opt/personal-agent-memory/plugins/personal-agent-memory/.codex-plugin/plugin.json"),
+            Path(
+                "/opt/personal-agent-memory/plugins/personal-agent-memory/.codex-plugin/plugin.json"
+            ),
             Path("/usr/share/personal-agent-memory/plugin.json"),
         ]
     )
+    seen: set[Path] = set()
     for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise ProvisioningError("cannot find the installed Codex plugin manifest")
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+    raise ProvisioningError(
+        "cannot find the installed Codex plugin manifest; "
+        "set PERSONAL_AGENT_MEMORY_INSTALL_PREFIX or "
+        "PERSONAL_AGENT_MEMORY_PLUGIN_MANIFEST"
+    )
 
 
 def _versions() -> tuple[str, str, str]:
